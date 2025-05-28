@@ -5,7 +5,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 def get_sheet():
     scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    return gspread.authorize(creds).open_by_url("https://docs.google.com/spreadsheets/d/1rE6rbUnCPiL8OgBj6hPWNppOV1uaIl8m41nrv-x1xg/edit")
+    return gspread.authorize(creds).open_by_url("https://docs.google.com/spreadsheets/d/1rE6rbUnCPiL8OgBj6hPWNppOV1uaII8im41nrv-x1xg/edit")
 
 def log_scout_decision(token, action):
     try:
