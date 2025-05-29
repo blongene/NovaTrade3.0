@@ -13,8 +13,7 @@ def start_rotation_signaler():
 
 if __name__ == "__main__":
     print("📡 Orion Cloud Boot Sequence Initiated")
-    set_telegram_webhook()
-
+    
     print("✅ Webhook armed. Launching modules...")
     threading.Thread(target=run_watchdog).start()
     threading.Thread(target=start_rotation_signaler).start()
