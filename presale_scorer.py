@@ -95,18 +95,28 @@ _{description}_
         ping_webhook_debug(f"❌ Telegram send error: {e}")
         print(f"❌ Telegram send failed: {e}")
 
-for i, row in enumerate(rows):
-    status = row[1].strip().upper()
-    token = row[0].strip().upper()
+def run_presale_scorer():
+    data = worksheet.get_all_values()
+    headers = data[0]
+    rows = data[1:]
 
-    if status != "PENDING":
-        continue
-    if already_sent(token):
-        mark_sent(i)
-        continue
+    for i, row in enumerate(rows):
+        status = row[1].strip().upper()
+        token = row[0].strip().upper()
 
-    score = score_token(row)
-    if score >= ALERT_THRESHOLD:
-        description = row[6] if len(row) > 6 else "No description"
-        send_presale_alert(token, int(score), description)
-        mark_sent(i)
+        if status != "PENDING":
+            continue
+        if already_sent(token):
+            mark_sent(i)
+            continue
+
+        score = score_token(row)
+        if score >= ALERT_THRESHOLD:
+            description = row[6] if len(row) > 6 else "No description"
+            send_presale_alert(token, int(score), description)
+            mark_sent(i)
+
+# Run if called directly
+if __name__ == "__main__":
+    print("🔍 Starting presale scoring loop...")
+    run_presale_scorer()
