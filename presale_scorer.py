@@ -18,7 +18,7 @@ scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/au
 creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
 client = gspread.authorize(creds)
 sheet = client.open_by_url(SHEET_URL)
-worksheet = sheet.worksheet(SHEET_NAME)
+worksheet = sheet.worksheet(Presale_Stream)
 
 HYPE_KEYWORDS = ["utility", "ai", "real", "staking", "tokenomics", "launchpad", "audit", "deflationary", "tool", "platform"]
 
