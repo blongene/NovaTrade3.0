@@ -13,7 +13,6 @@ sheet = gspread.authorize(creds).open_by_url("https://docs.google.com/spreadshee
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-print(f"⚠️ Triggering alert for {row['Token']}")
 def send_rotation_alert(token, roi, sentiment, days_held):
     message = (
         f"🔁 *Rotation Suggestion: {token}*\n"
@@ -31,7 +30,6 @@ def send_rotation_alert(token, roi, sentiment, days_held):
     requests.post(url, data=data)
 
 def scan_rotation_candidates():
-    print("🧠 Running Rotation Signal Engine...")
     ws = sheet.worksheet("Rotation_Stats")
     data = ws.get_all_records()
     for row in data:
@@ -41,8 +39,9 @@ def scan_rotation_candidates():
                 roi = float(row["Follow-up ROI"])
                 sentiment = row["Sentiment"]
                 if roi <= 0.5 or sentiment.strip().lower() == "weak":
-                    print(f"🚨 Triggering rotation alert for {row['Token']}")
+                    print(f"⚠️ Triggering alert for {row['Token']}")  # <== INSIDE here
                     send_rotation_alert(row["Token"], roi, sentiment, row["Days Held"])
         except Exception as e:
             print(f"Error processing row {row}: {e}")
+
 
