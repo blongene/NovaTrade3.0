@@ -3,6 +3,10 @@ from nova_watchdog import run_watchdog
 from rotation_signal_engine import scan_rotation_candidates
 from roi_milestone_alert import scan_roi_tracking  # ✅ fixed here
 from token_vault_sync import sync_token_vault
+from presale_scorer import run_presale_scorer
+
+# Call once at boot or wrap in scheduler
+run_presale_scorer()
 
 print("📡 Orion Cloud Boot Sequence Initiated")
 
