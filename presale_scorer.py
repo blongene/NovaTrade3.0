@@ -10,8 +10,8 @@ from utils import ping_webhook_debug
 SHEET_NAME = "Presale_Stream"
 ALERT_THRESHOLD = 85
 TELEGRAM_TOKEN = os.environ.get("BOT_TOKEN")
-TELEGRAM_CHAT_ID = "7099419756"
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1rE6rbUnCPiL8OgBj6hPWNppOV1uaII8im41nrv-x1xg/edit"
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+SHEET_URL = os.environ.get("SHEET_URL")
 
 # === AUTH ===
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -105,18 +105,3 @@ def run_presale_scorer():
         token = row[0].strip().upper()
 
         if status != "PENDING":
-            continue
-        if already_sent(token):
-            mark_sent(i)
-            continue
-
-        score = score_token(row)
-        if score >= ALERT_THRESHOLD:
-            description = row[6] if len(row) > 6 else "No description"
-            send_presale_alert(token, int(score), description)
-            mark_sent(i)
-
-# Run if called directly
-if __name__ == "__main__":
-    print("🔍 Starting presale scoring loop...")
-    run_presale_scorer()
