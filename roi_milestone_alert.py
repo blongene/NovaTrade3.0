@@ -39,7 +39,8 @@ def scan_roi_tracking():
             continue
         for milestone in ["7d ROI", "14d ROI", "30d ROI"]:
             status_col = f"{milestone} Alerted"
-            roi_str = row.get(milestone, "").strip()
+            roi_raw = row.get(milestone, "")
+            roi_str = str(roi_raw).strip() if roi_raw is not None else ""
             if row.get(status_col, "").strip().upper() != "YES" and roi_str:
                 try:
                     roi = float(roi_str)
