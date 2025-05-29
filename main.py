@@ -9,7 +9,7 @@ def start_rotation_signaler():
     while True:
         print("🔁 Checking for stalled rotation candidates...")
         scan_rotation_candidates()
-        time.sleep(3600)  # Runs every 1 hour
+        time.sleep(60)  # Runs every 60 seconds
 
 if __name__ == "__main__":
     print("📡 Orion Cloud Boot Sequence Initiated")
