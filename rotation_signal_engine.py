@@ -34,14 +34,16 @@ def scan_rotation_candidates():
     data = ws.get_all_records()
     for row in data:
         try:
+            print(f"Checking {row['Token']}: ROI {row['Follow-up ROI']}, Sentiment {row['Sentiment']}, Days Held {row['Days Held']}")
             if row["Status"] == "Active" and int(row["Days Held"]) >= 2:
                 roi = float(row["Follow-up ROI"])
                 sentiment = row["Sentiment"]
                 if roi <= 0.5 or sentiment.strip().lower() == "weak":
+                    print(f"🚨 Triggering rotation alert for {row['Token']}")
                     send_rotation_alert(row["Token"], roi, sentiment, row["Days Held"])
         except Exception as e:
             print(f"Error processing row {row}: {e}")
 
 if __name__ == "__main__":
     print("🧠 Running Rotation Signal Engine...")
-    check_stalled_tokens()
+    scan_rotation_candidates()
