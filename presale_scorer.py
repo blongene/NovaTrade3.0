@@ -58,7 +58,7 @@ def score_token(row):
     return total_score
 
 def already_sent(token):
-    existing = sheet.worksheet("Scout_Decisions").col_values(2)
+    existing = sheet.worksheet("Scout Decisions").col_values(2)
     return token.upper() in [t.upper() for t in existing]
 
 def mark_sent(row_num):
