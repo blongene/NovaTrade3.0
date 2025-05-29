@@ -24,16 +24,25 @@ worksheet = sheet.worksheet(SHEET_NAME)
 HYPE_KEYWORDS = ["utility", "ai", "real", "staking", "tokenomics", "launchpad", "audit", "deflationary", "tool", "platform"]
 
 def score_token(row):
-    sentiment_score = float(row[3]) if row[3] else 0
+    sentiment_raw = row[3].lower() if row[3] else ""
     market_cap = row[4].lower() if row[4] else "unknown"
     launch_date = row[5]
     description = row[6].lower() if row[6] else ""
     token = row[0]
 
-    # Sentiment (0–40 pts)
-    s_pts = max(min(int(sentiment_score * 100 / 2.5), 40), 0)
+    # Sentiment Score (0–40 pts)
+    if "skyrocket" in sentiment_raw or "🚀" in sentiment_raw:
+        s_pts = 40
+    elif "high" in sentiment_raw or "🔥" in sentiment_raw:
+        s_pts = 30
+    elif "moderate" in sentiment_raw or "👍" in sentiment_raw:
+        s_pts = 20
+    elif "low" in sentiment_raw or "😐" in sentiment_raw:
+        s_pts = 10
+    else:
+        s_pts = 0
 
-    # Market Cap (0–20 pts)
+    # Market Cap Score (0–20 pts)
     if "micro" in market_cap:
         m_pts = 20
     elif "nano" in market_cap:
@@ -43,14 +52,14 @@ def score_token(row):
     else:
         m_pts = 5
 
-    # Freshness (0–20 pts)
+    # Freshness Score (0–20 pts)
     try:
         days_to_launch = (datetime.strptime(launch_date, "%Y-%m-%d") - datetime.utcnow()).days
         f_pts = 20 if days_to_launch <= 3 else max(0, 15 - days_to_launch)
     except:
         f_pts = 10
 
-    # Keyword Hype (0–20 pts)
+    # Keyword Hype Score (0–20 pts)
     match_count = sum(1 for kw in HYPE_KEYWORDS if kw in description)
     k_pts = min(match_count * 4, 20)
 
