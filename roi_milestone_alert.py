@@ -24,7 +24,8 @@ def send_milestone_alert(token, milestone, roi):
         "text": message,
         "parse_mode": "Markdown"
     }
-    requests.post(url, data=data)
+    response = requests.post(url, data=data)
+    print(f"📬 Telegram response: {response.status_code}, {response.text}")
 
 def scan_roi_tracking():
     ws = sheet.worksheet("ROI_Tracking")
@@ -38,18 +39,15 @@ def scan_roi_tracking():
             continue
         for milestone in ["7d ROI", "14d ROI", "30d ROI"]:
             status_col = f"{milestone} Alerted"
-            try:
-                if (
-                    row.get(status_col, "").strip().upper() != "YES"
-                    and row.get(milestone)
-                    and isinstance(row[milestone], (int, float))
-                ):
-                    roi = row[milestone]
+            roi_str = row.get(milestone, "").strip()
+            if row.get(status_col, "").strip().upper() != "YES" and roi_str:
+                try:
+                    roi = float(roi_str)
                     send_milestone_alert(token, milestone.replace(" ROI", ""), roi)
                     log_ws.append_row([now, token, milestone, roi, "Ping Sent"])
                     cell = ws.find(token)
-                    ws.update_cell(cell.row, ws.find(status_col).col, "YES")
-            except Exception as e:
-                print(f"❌ Error on {token}, {milestone}: {e}")
-
-__all__ = ["scan_roi_tracking"]
+                    status_cell = ws.find(status_col)
+                    ws.update_cell(cell.row, status_cell.col, "YES")
+                    print(f"✅ Logged milestone for {token} @ {milestone}")
+                except Exception as e:
+                    print(f"❌ Error processing milestone for {token} - {milestone}: {e}")
