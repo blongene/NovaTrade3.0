@@ -105,28 +105,40 @@ _{description}_
         print(f"❌ Telegram send failed: {e}")
 
 def run_presale_scorer():
+    print("📊 Checking Presale_Stream...")
     data = worksheet.get_all_values()
     headers = data[0]
     rows = data[1:]
+    print(f"📋 Found {len(rows)} presale rows to evaluate")
 
     for i, row in enumerate(rows):
         if len(row) < 7:
+            print(f"⛔️ Row {i+2} skipped: not enough columns")
             continue
 
         status = row[7].strip().upper() if len(row) > 7 else ""
         token = row[0].strip().upper()
 
+        print(f"🔎 Evaluating {token} (Status: {status})")
+
         if status != "PENDING":
+            print(f"➡️ Skipping {token} — not pending")
             continue
         if already_sent(token):
+            print(f"🟡 Skipping {token} — already logged in Scout Decisions")
             mark_sent(i)
             continue
 
         score = score_token(row)
+        print(f"📈 {token} scored {score}/100")
+
         if score >= ALERT_THRESHOLD:
             description = row[6] if len(row) > 6 else "No description"
+            print(f"🚀 ALERT: {token} passed threshold — sending ping...")
             send_presale_alert(token, int(score), description)
             mark_sent(i)
+        else:
+            print(f"❌ BELOW THRESHOLD: {token} only scored {score}")
 
 # Only runs when executed directly (not on import)
 if __name__ == "__main__":
