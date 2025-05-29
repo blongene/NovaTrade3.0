@@ -14,13 +14,12 @@ TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
 def send_milestone_alert(token, milestone, roi):
     message = (
-        f"📈 *{milestone} ROI Milestone Hit: {token}*
-"
-        f"ROI: {roi}x after {milestone.lower()}.
-
-"
-        f"Would you still vote YES today?"
+        f"📈 *{milestone} ROI Milestone Hit: {token}*\n"
+        f"- ROI: {roi}x\n"
+        f"- Days Since Decision: {days}\n\n"
+        f"Would you make the same decision again? (YES / NO)"
     )
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {
         "chat_id": TELEGRAM_CHAT_ID,
