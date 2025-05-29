@@ -1,9 +1,23 @@
-import os
 from telegram_webhook import telegram_app, set_telegram_webhook
-from nova_watchdog import start_watchdog
+from nova_watchdog import run_watchdog
+from rotation_signal_engine import scan_rotation_candidates
+
+import threading
+import time
+
+def start_rotation_signaler():
+    while True:
+        print("🔁 Checking for stalled rotation candidates...")
+        scan_rotation_candidates()
+        time.sleep(3600)  # Runs every 1 hour
 
 if __name__ == "__main__":
     print("📡 Orion Cloud Boot Sequence Initiated")
     set_telegram_webhook()
-    start_watchdog()
-    telegram_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+    print("✅ Webhook armed. Launching modules...")
+    threading.Thread(target=run_watchdog).start()
+    threading.Thread(target=start_rotation_signaler).start()
+
+    print("🧠 NovaTrade system is live.")
+    telegram_app.run(host="0.0.0.0", port=10000)
