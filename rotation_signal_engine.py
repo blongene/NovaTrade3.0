@@ -1,9 +1,8 @@
-
 import gspread
+import os
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 import requests
-import time
 
 # Setup
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -15,13 +14,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_rotation_alert(token, roi, sentiment, days_held):
-    message = f"🔁 *Rotation Suggestion: {token}*
-
-- Days Held: {days_held}
-- ROI: {roi}x
-- Sentiment: {sentiment}
-
-Would you like to rotate out of this token?"
+    message = (
+        f"🔁 *Rotation Suggestion: {token}*\n"
+        f"- Days Held: {days_held}\n"
+        f"- ROI: {roi}x\n"
+        f"- Sentiment: {sentiment}\n\n"
+        f"Would you like to rotate out of this token?"
+    )
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {
         "chat_id": TELEGRAM_CHAT_ID,
