@@ -6,8 +6,8 @@ from telegram_webhook import telegram_app
 from presale_scorer import run_presale_scorer
 from nova_watchdog import run_watchdog
 from rotation_signal_engine import scan_rotation_candidates
-from roi_followups import scan_roi_tracking
-from sync_token_vault import sync_token_vault
+from roi_milestone_alert import scan_roi_tracking
+from token_vault_sync import sync_token_vault
 
 app = telegram_app
 
