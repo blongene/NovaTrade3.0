@@ -4,7 +4,7 @@ import time
 
 from telegram_webhook import telegram_app
 from presale_scorer import run_presale_scorer
-from watchdog import run_watchdog
+from nova_watchdog import run_watchdog
 from rotation_signals import scan_rotation_candidates
 from roi_followups import scan_roi_tracking
 from sync_token_vault import sync_token_vault
