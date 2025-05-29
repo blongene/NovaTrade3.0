@@ -1,6 +1,5 @@
 from flask import Flask, request
-import os, json, requests
-from datetime import datetime
+import os, requests
 from utils import log_scout_decision, ping_webhook_debug
 
 telegram_app = Flask(__name__)
@@ -31,10 +30,13 @@ def webhook():
         return 'FAIL', 500
 
 def set_telegram_webhook():
-    token = os.environ["BOT_TOKEN"]
-    url = os.environ["WEBHOOK_URL"]
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{token}/setWebhook?url={url}")
-        print(f"✅ Webhook set: {r.text}")
-    except Exception as e:
-        print(f"❌ Failed to set webhook: {e}")
+    token = os.environ.get("BOT_TOKEN")
+    url = os.environ.get("WEBHOOK_URL")
+    if token and url:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{token}/setWebhook?url={url}")
+            print(f"✅ Webhook set: {r.text}")
+        except Exception as e:
+            print(f"❌ Failed to set webhook: {e}")
+    else:
+        print("❌ BOT_TOKEN or WEBHOOK_URL not found in environment")
