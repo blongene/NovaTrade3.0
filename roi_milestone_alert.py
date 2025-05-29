@@ -15,8 +15,7 @@ TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 def send_milestone_alert(token, milestone, roi):
     message = (
         f"📈 *{milestone} ROI Milestone Hit: {token}*\n"
-        f"- ROI: {roi}x\n"
-        f"- Days Since Decision: {days}\n\n"
+        f"- ROI: {roi}x\n\n"
         f"Would you make the same decision again? (YES / NO)"
     )
 
@@ -40,17 +39,17 @@ def scan_roi_tracking():
             continue
         for milestone in ["7d ROI", "14d ROI", "30d ROI"]:
             status_col = f"{milestone} Alerted"
-            if row.get(status_col, "").strip().upper() != "YES" and row.get(milestone):
-                roi = row[milestone]
-                send_milestone_alert(token, milestone.replace(" ROI", ""), roi)
-                log_ws.append_row([now, token, milestone, roi, "Ping Sent"])
-                cell = ws.find(token)
-                ws.update_cell(cell.row, ws.find(status_col).col, "YES")
-
-def check_roi_milestones():
-    scan_roi_tracking()
+            roi_value = row.get(milestone)
+            if row.get(status_col, "").strip().upper() != "YES" and roi_value:
+                try:
+                    roi = float(roi_value)
+                    send_milestone_alert(token, milestone.replace(" ROI", ""), roi)
+                    log_ws.append_row([now, token, milestone, roi, "Ping Sent"])
+                    cell = ws.find(token)
+                    ws.update_cell(cell.row, ws.find(status_col).col, "YES")
+                except ValueError:
+                    print(f"⚠️ Skipping {token} - non-numeric ROI: {roi_value}")
 
 if __name__ == "__main__":
-    print("📊 Checking ROI milestone alerts...")
-    check_roi_milestones()
-
+    print("📈 Checking for ROI milestone follow-ups...")
+    scan_roi_tracking()
