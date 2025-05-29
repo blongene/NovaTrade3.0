@@ -27,7 +27,15 @@ def send_rotation_alert(token, roi, sentiment, days_held):
         "text": message,
         "parse_mode": "Markdown"
     }
-    requests.post(url, data=data)
+
+    try:
+        response = requests.post(url, data=data)
+        if response.status_code == 200:
+            print(f"✅ Alert sent for {token}")
+        else:
+            print(f"❌ Failed to send alert for {token}: {response.text}")
+    except Exception as e:
+        print(f"🔥 Telegram POST failed for {token}: {e}")
 
 def scan_rotation_candidates():
     print("🧠 Running Rotation Signal Engine...")
