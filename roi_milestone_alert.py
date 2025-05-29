@@ -47,6 +47,10 @@ def scan_roi_tracking():
                 cell = ws.find(token)
                 ws.update_cell(cell.row, ws.find(status_col).col, "YES")
 
+def check_roi_milestones():
+    scan_roi_tracking()
+
 if __name__ == "__main__":
     print("📊 Checking ROI milestone alerts...")
-    scan_roi_tracking()
+    check_roi_milestones()
+
