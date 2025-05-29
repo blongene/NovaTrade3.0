@@ -1,4 +1,4 @@
-from telegram_webhook import telegram_app, set_telegram_webhook
+from telegram_webhook import telegram_app
 from nova_watchdog import run_watchdog
 from rotation_signal_engine import scan_rotation_candidates
 
