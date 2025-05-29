@@ -4,24 +4,22 @@ import requests
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 
-# Google Sheets setup
+# Setup auth
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name("token_vault.json", scope)
-client = gspread.authorize(creds)
-sheet = client.open_by_url("https://docs.google.com/spreadsheets/d/1rE6rbUnCPiL8OgBj6hPWNppOV1uaII8im41nrv-x1xg/edit")
-ws = sheet.worksheet("ROI_Tracking")
+sheet = gspread.authorize(creds).open_by_url(os.getenv("SHEET_URL"))
 
-# Telegram setup
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
-def send_roi_alert(token, milestone, current_roi):
+def send_milestone_alert(token, milestone, roi):
     message = (
-        f"📈 *ROI Milestone Alert!*\n"
-        f"Token: {token}\n"
-        f"Milestone: {milestone}\n"
-        f"Current ROI: {current_roi}x\n"
-        f"Would you like to take action?"
+        f"📈 *{milestone} ROI Milestone Hit: {token}*
+"
+        f"ROI: {roi}x after {milestone.lower()}.
+
+"
+        f"Would you still vote YES today?"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {
@@ -31,20 +29,25 @@ def send_roi_alert(token, milestone, current_roi):
     }
     requests.post(url, data=data)
 
-def check_roi_milestones():
-    today_str = datetime.now().strftime("%-m/%-d/%Y").replace('/0', '/')
+def scan_roi_tracking():
+    ws = sheet.worksheet("ROI_Tracking")
+    log_ws = sheet.worksheet("ROI_Review_Log")
     rows = ws.get_all_records()
-    print(f"🔍 Checking {len(rows)} ROI milestone rows...")
+    now = datetime.utcnow().isoformat()
+
     for row in rows:
-        try:
-            if row["Target Date"].strip() == today_str:
-                token = row["Token"]
-                milestone = row["Milestone"]
-                current_roi = row.get("ROI at Check", "N/A")
-                print(f"🚨 Sending ROI alert for {token} ({milestone})")
-                send_roi_alert(token, milestone, current_roi)
-        except Exception as e:
-            print(f"Error processing row: {e}")
+        token = row.get("Token", "").strip()
+        if not token:
+            continue
+        for milestone in ["7d ROI", "14d ROI", "30d ROI"]:
+            status_col = f"{milestone} Alerted"
+            if row.get(status_col, "").strip().upper() != "YES" and row.get(milestone):
+                roi = row[milestone]
+                send_milestone_alert(token, milestone.replace(" ROI", ""), roi)
+                log_ws.append_row([now, token, milestone, roi, "Ping Sent"])
+                cell = ws.find(token)
+                ws.update_cell(cell.row, ws.find(status_col).col, "YES")
 
 if __name__ == "__main__":
-    check_roi_milestones()
+    print("📊 Checking ROI milestone alerts...")
+    scan_roi_tracking()
