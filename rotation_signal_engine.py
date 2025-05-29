@@ -10,7 +10,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_name("token_vault.json", sco
 sheet = gspread.authorize(creds).open_by_url("https://docs.google.com/spreadsheets/d/1rE6rbUnCPiL8OgBj6hPWNppOV1uaII8im41nrv-x1xg/edit")
 
 # Telegram Secrets
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_rotation_alert(token, roi, sentiment, days_held):
