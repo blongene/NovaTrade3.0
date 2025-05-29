@@ -14,6 +14,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_rotation_alert(token, roi, sentiment, days_held):
+    print(f"📨 Preparing to send alert for {token}")  # NEW LINE
+
     message = (
         f"🔁 *Rotation Suggestion: {token}*\n"
         f"- Days Held: {days_held}\n"
@@ -30,10 +32,11 @@ def send_rotation_alert(token, roi, sentiment, days_held):
 
     try:
         response = requests.post(url, data=data)
+        print(f"📬 Telegram response: {response.status_code}, {response.text}")  # UPDATED
         if response.status_code == 200:
             print(f"✅ Alert sent for {token}")
         else:
-            print(f"❌ Failed to send alert for {token}: {response.text}")
+            print(f"❌ Failed to send alert for {token}")
     except Exception as e:
         print(f"🔥 Telegram POST failed for {token}: {e}")
 
