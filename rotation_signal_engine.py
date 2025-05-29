@@ -30,6 +30,7 @@ def send_rotation_alert(token, roi, sentiment, days_held):
     requests.post(url, data=data)
 
 def scan_rotation_candidates():
+    print("🧠 Running Rotation Signal Engine...")
     ws = sheet.worksheet("Rotation_Stats")
     data = ws.get_all_records()
     for row in data:
@@ -44,6 +45,3 @@ def scan_rotation_candidates():
         except Exception as e:
             print(f"Error processing row {row}: {e}")
 
-if __name__ == "__main__":
-    print("🧠 Running Rotation Signal Engine...")
-    scan_rotation_candidates()
