@@ -28,7 +28,7 @@ def score_token(row):
     market_cap = row[4].lower() if row[4] else "unknown"
     launch_date = row[5]
     description = row[6].lower() if row[6] else ""
-    token = row[1]
+    token = row[0]
 
     # Sentiment (0–40 pts)
     s_pts = max(min(int(sentiment_score * 100 / 2.5), 40), 0)
@@ -62,7 +62,7 @@ def already_sent(token):
     return token.upper() in [t.upper() for t in existing]
 
 def mark_sent(row_num):
-    worksheet.update_cell(row_num + 1, 2, "SENT")  # Column B = Status
+    worksheet.update_cell(row_num + 1, 8, "SENT")  # Column H = Status
 
 def send_presale_alert(token, score, description):
     text = f"""💡 *New Presale Scouted!*
@@ -101,7 +101,10 @@ def run_presale_scorer():
     rows = data[1:]
 
     for i, row in enumerate(rows):
-        status = row[1].strip().upper()
+        if len(row) < 7:
+            continue
+
+        status = row[7].strip().upper() if len(row) > 7 else ""
         token = row[0].strip().upper()
 
         if status != "PENDING":
@@ -116,7 +119,7 @@ def run_presale_scorer():
             send_presale_alert(token, int(score), description)
             mark_sent(i)
 
-# Run if called directly
+# Only runs when executed directly (not on import)
 if __name__ == "__main__":
     print("🔍 Starting presale scoring loop...")
     run_presale_scorer()
