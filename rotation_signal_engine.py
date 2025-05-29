@@ -29,7 +29,7 @@ def send_rotation_alert(token, roi, sentiment, days_held):
     }
     requests.post(url, data=data)
 
-def check_stalled_tokens():
+def scan_rotation_candidates():
     ws = sheet.worksheet("Rotation_Stats")
     data = ws.get_all_records()
     for row in data:
