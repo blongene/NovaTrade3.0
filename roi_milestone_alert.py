@@ -27,7 +27,7 @@ def send_milestone_alert(token, milestone, roi):
     }
     requests.post(url, data=data)
 
-def scan_roi_tracking():
+def check_roi_milestones():
     ws = sheet.worksheet("ROI_Tracking")
     log_ws = sheet.worksheet("ROI_Review_Log")
     rows = ws.get_all_records()
