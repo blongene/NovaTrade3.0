@@ -105,43 +105,49 @@ _{description}_
 
 def run_presale_scorer():
     print("📊 Checking Presale_Stream for PENDING tokens...")
-    data = worksheet.get_all_values()
-    headers = data[0]
-    rows = data[1:]
-    print(f"📋 Found {len(rows)} presale rows")
+    try:
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            print("⛔️ No data or only headers found in Presale_Stream")
+            return
+        headers = data[0]
+        rows = data[1:]
+        print(f"📋 Found {len(rows)} presale rows")
 
-    for i, row in enumerate(rows):
-        if len(row) < 7:
-            print(f"⛔️ Row {i+2} skipped: too short")
-            continue
+        for i, row in enumerate(rows):
+            if len(row) < 7:
+                print(f"⛔️ Row {i+2} skipped: too short")
+                continue
 
-        token = row[0].strip().upper()
-        status = row[7].strip().upper() if len(row) > 7 else ""
+            token = row[0].strip().upper()
+            status = row[7].strip().upper() if len(row) > 7 else ""
 
-        print(f"🔎 Evaluating {token} — Status: {status}")
+            print(f"🔎 Evaluating {token} — Status: {status}")
 
-        if status != "PENDING":
-            print(f"⏭️ Skipping {token}: not PENDING")
-            continue
+            if status != "PENDING":
+                print(f"⏭️ Skipping {token}: not PENDING")
+                continue
 
-        if already_sent(token):
-            print(f"🟡 Already seen in Scout Decisions: {token}")
-            mark_sent(i)
-            continue
-
-        try:
-            score = score_token(row)
-            print(f"📈 {token} scored {score}/100")
-
-            if score >= ALERT_THRESHOLD:
-                print(f"🚀 {token} passed threshold — sending alert...")
-                description = row[6] if len(row) > 6 else "No description"
-                send_presale_alert(token, int(score), description)
+            if already_sent(token):
+                print(f"🟡 Already seen in Scout Decisions: {token}")
                 mark_sent(i)
-            else:
-                print(f"❌ {token} below threshold — not alerting")
-        except Exception as e:
-            print(f"❌ ERROR scoring {token}: {e}")
+                continue
+
+            try:
+                score = score_token(row)
+                print(f"📈 {token} scored {score}/100")
+
+                if score >= ALERT_THRESHOLD:
+                    print(f"🚀 {token} passed threshold — sending alert...")
+                    description = row[6] if len(row) > 6 else "No description"
+                    send_presale_alert(token, int(score), description)
+                    mark_sent(i)
+                else:
+                    print(f"❌ {token} below threshold — not alerting")
+            except Exception as e:
+                print(f"❌ ERROR scoring {token}: {e}")
+    except Exception as fatal:
+        print(f"💥 FATAL ERROR in presale_scorer: {fatal}")
 
 # Call on startup
 if __name__ == "__main__":
