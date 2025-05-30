@@ -36,7 +36,7 @@ print("🧠 Running Rotation Signal Engine...")
 scan_rotation_candidates(rotation_rows)
 
 print("📈 Checking for ROI milestone follow-ups...")
-scan_roi_tracking(rotation_ws)
+scan_roi_tracking()
 run_milestone_alerts(rotation_ws)
 
 print("✅ Token Vault synced with latest Scout Decisions.")
