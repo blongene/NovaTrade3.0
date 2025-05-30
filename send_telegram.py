@@ -4,7 +4,7 @@ import requests
 
 def send_message(message="📡 Orion Heartbeat\nSystem is live."):
     token = os.environ["BOT_TOKEN"]
-    chat_id = os.environ["CHAT_ID"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message}
@@ -16,7 +16,7 @@ def send_message(message="📡 Orion Heartbeat\nSystem is live."):
 
 def send_rotation_alert(token_name, message):
     token = os.environ["BOT_TOKEN"]
-    chat_id = os.environ["CHAT_ID"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
