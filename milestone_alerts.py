@@ -1,42 +1,52 @@
-# 🚀 Milestone Alert Logic
-print("🚀 Checking for milestone ROI alerts...")
-milestone_days = [3, 7, 14, 30]
-for i, row in enumerate(rows[1:], start=2):
+import os
+import gspread
+from datetime import datetime
+from utils import send_telegram_message
+from dotenv import load_dotenv
+
+load_dotenv()
+
+PROMPT_MEMORY = {}
+
+def check_milestone_alerts():
     try:
-        token = str(row.get("Token", "")).strip()
-        decision = str(row.get("Decision", "")).strip().upper()
-        days_held = int(row.get("Days Held", "0") or 0)
+        gc = gspread.service_account(filename="sentiment-log-service.json")
+        sh = gc.open_by_url(os.getenv("SHEET_URL"))
+        ws = sh.worksheet("Rotation_Stats")
+        rows = ws.get_all_records()
 
-        if decision != "YES" or not token or days_held not in milestone_days:
-            continue
+        milestone_days = [3, 7, 14, 30]
+        for i, row in enumerate(rows, start=2):
+            token = str(row.get("Token", "")).strip()
+            decision = str(row.get("Decision", "")).strip().upper()
+            days_held_raw = row.get("Days Held", "")
 
-        # Check if already alerted
-        memory_key = f"{token}_milestone"
-        if PROMPT_MEMORY.get(memory_key) == days_held:
-            continue  # already alerted for this milestone
+            try:
+                days_held = int(str(days_held_raw).strip())
+            except:
+                continue
 
-        # Send milestone alert
-        message = f"📍 Milestone Alert: *{token}*\n– Days Held: {days_held}d\n– This token has now reached a {days_held}d milestone.\nWould you like to review or consider rotation?"
+            if decision != "YES" or not token:
+                continue
 
-        keyboard = {
-            "inline_keyboard": [[
-                {"text": "🔁 Review", "callback_data": f"YES|{token}"},
-                {"text": "❌ Skip", "callback_data": f"SKIP|{token}"}
-            ]]
-        }
+            if days_held in milestone_days:
+                milestone_key = f"{token}_milestone_{days_held}"
+                if PROMPT_MEMORY.get(milestone_key):
+                    continue  # Already alerted
 
-        resp = requests.post(
-            f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}/sendMessage",
-            json={
-                "chat_id": os.getenv("CHAT_ID"),
-                "text": message,
-                "parse_mode": "Markdown",
-                "reply_markup": keyboard
-            }
-        )
+                message = (
+                    f"📍 *Milestone Alert: {token}*\n"
+                    f"– Days Held: {days_held}d\n"
+                    f"This token has now reached a {days_held}d milestone.\n"
+                    f"Would you like to review or consider rotation?"
+                )
+                sent = send_telegram_message(message)
 
-        print(f"📬 Milestone alert sent for {token} @ {days_held}d: {resp.text}")
-        PROMPT_MEMORY[memory_key] = days_held
+                if sent:
+                    PROMPT_MEMORY[milestone_key] = True
+                    print(f"📬 Milestone alert sent for {token} @ {days_held}d: {sent}")
+                else:
+                    print(f"⚠️ Failed to send milestone alert for {token}")
 
     except Exception as e:
-        print(f"❌ Milestone Alert Engine failed for row {i}: {e}")
+        print(f"❌ Milestone Alert Engine failed: {e}")
