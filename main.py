@@ -1,11 +1,11 @@
 from flask import Flask
 from telegram_webhook import telegram_app, set_telegram_webhook
-from watchdog import run_watchdog
+from nova_watchdog import run_watchdog
 from rotation_signal_engine import scan_rotation_candidates
 from roi_tracker import scan_roi_tracking
 from milestone_alerts import run_milestone_alerts
 from token_vault_sync import sync_token_vault
-from scout_to_planner_sync import sync_rotation_log, sync_rotation_planner
+from scout_to_planner_sync import  sync_rotation_planner
 from presale_scorer import run_presale_scorer
 from nova_trigger_watcher import check_nova_trigger
 
