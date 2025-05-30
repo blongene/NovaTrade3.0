@@ -8,7 +8,7 @@ SHEET_URL = os.environ.get("SHEET_URL")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-def run_rotation_signals():
+def scan_rotation_candidates():
     print("🧠 Running Rotation Signal Engine...")
 
     try:
