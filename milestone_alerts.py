@@ -8,7 +8,7 @@ load_dotenv()
 
 PROMPT_MEMORY = {}
 
-def check_milestone_alerts():
+def run_milestone_alerts():
     try:
         gc = gspread.service_account(filename="sentiment-log-service.json")
         sh = gc.open_by_url(os.getenv("SHEET_URL"))
