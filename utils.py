@@ -39,9 +39,9 @@ import os
 def send_telegram_message(message):
     try:
         bot_token = os.getenv("BOT_TOKEN")
-        chat_id = os.getenv("CHAT_ID")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if not bot_token or not chat_id:
-            raise Exception("Missing BOT_TOKEN or CHAT_ID")
+            raise Exception("Missing BOT_TOKEN or TELEGRAM_CHAT_ID")
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
