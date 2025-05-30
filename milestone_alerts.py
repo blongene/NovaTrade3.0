@@ -1,7 +1,7 @@
 import os
 import gspread
-from datetime import datetime
 import requests
+from datetime import datetime
 
 def send_milestone_alert(token, days):
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -31,20 +31,28 @@ def send_milestone_alert(token, days):
         print(f"⚠️ Telegram error for {token}: {e}")
 
 def run_milestone_alerts():
+    print("🚀 Checking for milestone ROI alerts...")
     try:
         gc = gspread.service_account(filename="sentiment-log-service.json")
         sheet = gc.open_by_url(os.environ["SHEET_URL"])
-        ws = sheet.worksheet("Rotation_Stats")
+        ws = sheet.worksheet("Rotation_Log")
         rows = ws.get_all_records()
 
         MILESTONES = [3, 7, 30]
-        for i, row in enumerate(rows, start=2):  # start=2 for row index
+
+        for i, row in enumerate(rows, start=2):
+            token = row.get("Token", "").strip()
+            days_held = row.get("Days Held", "").strip()
+
+            if not token or not days_held:
+                continue
+
             try:
-                token = row["Token"]
-                days = int(row["Days Held"])
+                days = int(days_held)
                 if days in MILESTONES:
                     send_milestone_alert(token, days)
-            except Exception as e:
-                print(f"⚠️ Milestone check error at row {i}: {e}")
-    except Exception as outer:
-        print(f"❌ Failed to run milestone alerts: {outer}")
+            except ValueError:
+                continue
+
+    except Exception as e:
+        print(f"❌ Milestone Alert Engine failed: {e}")
