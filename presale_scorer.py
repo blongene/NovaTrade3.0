@@ -131,7 +131,7 @@ def run_presale_scorer():
                 continue
 
             token = row[0].strip().upper()
-            status = row[7].strip().upper() if len(row) > 7 else ""
+            status = row[8].strip().upper() if len(row) > 8 else ""
 
             print(f"🔎 Evaluating {token} — Status: {status}")
 
