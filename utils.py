@@ -22,3 +22,13 @@ def ping_webhook_debug(msg):
         sheet.worksheet("Webhook_Debug").update_acell("A1", f"{datetime.now().isoformat()} - {msg}")
     except:
         pass
+
+def log_rotation_alert(token, milestone):
+    try:
+        sheet = get_sheet()
+        ws = sheet.worksheet("Rotation_Log")
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row([now, f"MILESTONE {milestone}", token, "AUTO"])
+        print(f"📌 Rotation_Log updated for {token} @ {milestone}d")
+    except Exception as e:
+        ping_webhook_debug(f"❌ Failed to log milestone for {token}: {e}")
