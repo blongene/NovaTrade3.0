@@ -43,8 +43,6 @@ if __name__ == "__main__":
 
     # Sync decision logs + planner entries
     sync_token_vault()
-    print("🧲 Syncing Confirmed Tokens to Rotation_Log...")
-    sync_rotation_log()
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
 
