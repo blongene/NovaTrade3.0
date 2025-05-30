@@ -1,52 +1,66 @@
-from flask import Flask
-import threading
+import os
 import time
-
-from telegram_webhook import telegram_app
+from dotenv import load_dotenv
+from flask import Flask
+from telegram_webhook import set_telegram_webhook
 from presale_scorer import run_presale_scorer
-from nova_watchdog import run_watchdog
-from rotation_signal_engine import scan_rotation_candidates
-from roi_milestone_alert import scan_roi_tracking
 from token_vault_sync import sync_token_vault
-from rotation_executor import sync_confirmed_to_rotation_log
-from scout_to_planner_sync import sync_rotation_planner
-from roi_tracker import scan_roi_tracking
+from planner_sync import sync_rotation_log, sync_rotation_planner
+from roi_tracker import update_roi_days
 from milestone_alerts import run_milestone_alerts
-app = telegram_app
+from rotation_signal_engine import scan_rotation_candidates
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# 🚀 Boot sequence
+load_dotenv()
+print("⚙️ Attempting to load worksheet: Presale_Stream")
+
+# Authenticate Google Sheets
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+client = gspread.authorize(creds)
+
+sheet = client.open_by_url(os.getenv("SHEET_URL"))
+scout_ws = sheet.worksheet("Presale_Stream")
+print("✅ Loaded worksheet: Presale_Stream")
+
+# Initialize Flask app
+app = Flask(__name__)
+set_telegram_webhook()
+
+# 🔁 Launch all active modules
 print("📡 Orion Cloud Boot Sequence Initiated")
 print("✅ Webhook armed. Launching modules...")
 
-run_watchdog()
+print("🔍 Starting Watchdog...")
+rotation_ws = sheet.worksheet("Rotation_Stats")
+rotation_rows = rotation_ws.get_all_records()
+
+print("🧠 Running Rotation Signal Engine...")
 scan_rotation_candidates(rotation_rows)
-scan_roi_tracking()
+
+print("📈 Checking for ROI milestone follow-ups...")
+update_roi_days(rotation_ws)
+run_milestone_alerts(rotation_ws)
+
+print("✅ Token Vault synced with latest Scout Decisions.")
 sync_token_vault()
+
 print("🧲 Syncing Confirmed Tokens to Rotation_Log...")
-sync_confirmed_to_rotation_log()
+sync_rotation_log()
+
 print("📋 Syncing Scout Decisions → Rotation_Planner...")
 sync_rotation_planner()
+
 print("📈 Checking for ROI milestone follow-ups...")
-scan_roi_tracking()
-print("🚀 Checking for milestone ROI alerts...")
-run_milestone_alerts()
+update_roi_days(rotation_ws)
+run_milestone_alerts(rotation_ws)
 
-def presale_loop(interval_minutes=60):
-    def loop():
-        while True:
-            print(f"⏰ Running presale scan every {interval_minutes} min")
-            try:
-                run_presale_scorer()
-            except Exception as e:
-                print(f"⚠️ Presale scorer error: {e}")
-            time.sleep(interval_minutes * 60)
-    t = threading.Thread(target=loop)
-    t.daemon = True
-    t.start()
+print("⏰ Running presale scan every 60 min")
+run_presale_scorer()
 
-presale_loop(interval_minutes=60)
-
+print("💥 run_presale_scorer() BOOTED")
 print("🧠 NovaTrade system is live.")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host='0.0.0.0', port=10000)
