@@ -14,12 +14,19 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SHEET_URL = os.environ.get("SHEET_URL")
 
 # === AUTH ===
+print("⚙️ Attempting to load worksheet:", SHEET_NAME)
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
 client = gspread.authorize(creds)
 sheet = client.open_by_url(SHEET_URL)
-worksheet = sheet.worksheet("Presale_Stream")
+try:
+    worksheet = sheet.worksheet(SHEET_NAME)
+    print(f"✅ Loaded worksheet: {SHEET_NAME}")
+except Exception as e:
+    print(f"❌ Failed to load worksheet '{SHEET_NAME}': {e}")
+    worksheet = None
 
+# === KEYWORDS ===
 HYPE_KEYWORDS = ["utility", "ai", "real", "staking", "tokenomics", "launchpad", "audit", "deflationary", "tool", "platform"]
 
 def score_token(row):
@@ -58,19 +65,19 @@ def score_token(row):
     match_count = sum(1 for kw in HYPE_KEYWORDS if kw in description)
     k_pts = min(match_count * 4, 20)
 
-    total_score = s_pts + m_pts + f_pts + k_pts
-    return total_score
+    return s_pts + m_pts + f_pts + k_pts
 
 def already_sent(token):
     try:
         existing = sheet.worksheet("Scout Decisions").col_values(2)
         return token.upper() in [t.upper() for t in existing]
     except Exception as e:
-        print(f"⚠️ Could not check Scout Decisions: {e}")
+        print(f"⚠️ Could not access Scout Decisions: {e}")
         return False
 
 def mark_sent(row_num):
-    worksheet.update_cell(row_num + 1, 8, "SENT")  # Column H = Status
+    if worksheet:
+        worksheet.update_cell(row_num + 1, 8, "SENT")
 
 def send_presale_alert(token, score, description):
     text = f"""💡 *New Presale Scouted!*
@@ -95,20 +102,24 @@ _{description}_
         "parse_mode": "Markdown",
         "reply_markup": json.dumps(keyboard)
     }
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        res = requests.post(url, json=payload)
-        print(f"📬 Telegram response: {res.status_code}, {res.text}")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        response = requests.post(url, json=payload)
+        print(f"📬 Telegram response: {response.status_code}, {response.text}")
     except Exception as e:
+        print(f"❌ Telegram send error: {e}")
         ping_webhook_debug(f"❌ Telegram send error: {e}")
-        print(f"❌ Telegram send failed: {e}")
 
 def run_presale_scorer():
-    print("📊 Checking Presale_Stream for PENDING tokens...")
+    print("💥 run_presale_scorer() BOOTED")
+    if not worksheet:
+        print("🚫 No worksheet loaded — skipping scan.")
+        return
     try:
         data = worksheet.get_all_values()
+        print(f"📦 Raw worksheet data length: {len(data)}")
         if not data or len(data) < 2:
-            print("⛔️ No data or only headers found in Presale_Stream")
+            print("⛔️ No presale rows found")
             return
         headers = data[0]
         rows = data[1:]
@@ -136,7 +147,6 @@ def run_presale_scorer():
             try:
                 score = score_token(row)
                 print(f"📈 {token} scored {score}/100")
-
                 if score >= ALERT_THRESHOLD:
                     print(f"🚀 {token} passed threshold — sending alert...")
                     description = row[6] if len(row) > 6 else "No description"
@@ -148,8 +158,3 @@ def run_presale_scorer():
                 print(f"❌ ERROR scoring {token}: {e}")
     except Exception as fatal:
         print(f"💥 FATAL ERROR in presale_scorer: {fatal}")
-
-# Call on startup
-if __name__ == "__main__":
-    print("🔍 Starting presale scoring loop...")
-    run_presale_scorer()
