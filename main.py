@@ -4,7 +4,7 @@ from flask import Flask
 from telegram_webhook import set_telegram_webhook
 from presale_scorer import run_presale_scorer
 from token_vault_sync import sync_token_vault
-from planner_sync import sync_rotation_log, sync_rotation_planner
+from scout_to_planner_sync import sync_rotation_log, sync_rotation_planner
 from roi_tracker import update_roi_days
 from milestone_alerts import run_milestone_alerts
 from rotation_signal_engine import scan_rotation_candidates
