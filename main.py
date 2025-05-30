@@ -9,7 +9,7 @@ from rotation_signal_engine import scan_rotation_candidates
 from roi_milestone_alert import scan_roi_tracking
 from token_vault_sync import sync_token_vault
 from rotation_executor import sync_confirmed_to_rotation_log
-
+from scout_to_planner_sync import sync_rotation_planner
 app = telegram_app
 
 # 🚀 Boot sequence
@@ -22,6 +22,8 @@ scan_roi_tracking()
 sync_token_vault()
 print("🧲 Syncing Confirmed Tokens to Rotation_Log...")
 sync_confirmed_to_rotation_log()
+print("📋 Syncing Scout Decisions → Rotation_Planner...")
+sync_rotation_planner()
 
 def presale_loop(interval_minutes=60):
     def loop():
