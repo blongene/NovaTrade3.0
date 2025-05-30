@@ -19,7 +19,7 @@ print("📡 Orion Cloud Boot Sequence Initiated")
 print("✅ Webhook armed. Launching modules...")
 
 run_watchdog()
-scan_rotation_candidates()
+scan_rotation_candidates(rotation_rows)
 scan_roi_tracking()
 sync_token_vault()
 print("🧲 Syncing Confirmed Tokens to Rotation_Log...")
