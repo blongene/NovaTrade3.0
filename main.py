@@ -4,7 +4,7 @@ from flask import Flask
 from telegram_webhook import set_telegram_webhook
 from presale_scorer import run_presale_scorer
 from token_vault_sync import sync_token_vault
-from scout_to_planner_sync import sync_rotation_log, sync_rotation_planner
+from scout_to_planner_sync import sync_rotation_planner
 from roi_tracker import update_roi_days
 from milestone_alerts import run_milestone_alerts
 from rotation_signal_engine import scan_rotation_candidates
@@ -41,9 +41,6 @@ run_milestone_alerts(rotation_ws)
 
 print("✅ Token Vault synced with latest Scout Decisions.")
 sync_token_vault()
-
-print("🧲 Syncing Confirmed Tokens to Rotation_Log...")
-sync_rotation_log()
 
 print("📋 Syncing Scout Decisions → Rotation_Planner...")
 sync_rotation_planner()
