@@ -37,7 +37,7 @@ def scan_roi_tracking():
 
         try:
             timestamp_str = row[timestamp_idx].strip()
-            timestamp_dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+            timestamp_dt = datetime.strptime(timestamp_str, "%m/%d/%Y %H:%M:%S")
             days_held = (now - timestamp_dt).days
 
             # For now, follow-up ROI is time-based: "Xd since vote"
