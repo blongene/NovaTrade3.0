@@ -2,9 +2,7 @@ import os
 import gspread
 from datetime import datetime
 from utils import send_telegram_message
-from dotenv import load_dotenv
 
-load_dotenv()
 
 PROMPT_MEMORY = {}
 
