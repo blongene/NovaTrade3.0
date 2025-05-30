@@ -3,7 +3,7 @@
 import os
 import requests
 from datetime import datetime
-from utils import log_rotation_alert, ping_webhook_debug
+from utils import log_scout_decision, ping_webhook_debug
 
 PROMPT_MEMORY = {}
 
