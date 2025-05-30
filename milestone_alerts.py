@@ -1,66 +1,50 @@
 import os
 import gspread
-import requests
 from datetime import datetime
-from oauth2client.service_account import ServiceAccountCredentials
+import requests
 
-SHEET_URL = os.environ.get("SHEET_URL")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
+def send_milestone_alert(token, days):
+    chat_id = os.environ.get("CHAT_ID")
+    bot_token = os.environ.get("BOT_TOKEN")
+    if not chat_id or not bot_token:
+        print("⚠️ Missing CHAT_ID or BOT_TOKEN in environment.")
+        return
 
-MILESTONES = [3, 7, 30]  # Days held milestones to trigger alerts
+    message = (
+        f"📍 *Milestone Alert: {token}*\n"
+        f"– Days Held: {days}d\n"
+        f"– This token has now reached a {days}d milestone.\n"
+        f"Would you like to review or consider rotation?"
+    )
 
-def run_milestone_alerts():
-    print("🚀 Checking for milestone ROI alerts...")
-
-    # Authenticate
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_url(SHEET_URL)
-    log_ws = sheet.worksheet("Rotation_Log")
-
-    data = log_ws.get_all_values()
-    headers = data[0]
-    rows = data[1:]
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
 
     try:
-        token_idx = headers.index("Token")
-        days_idx = headers.index("Days Held")
-        last_col = len(headers) + 1  # Extra column for "Milestone Alerted" memory (optional)
-
-        for i, row in enumerate(rows):
-            if len(row) <= max(token_idx, days_idx):
-                continue
-
-            token = row[token_idx].strip().upper()
-            try:
-                days = int(row[days_idx])
-            except ValueError:
-                continue
-
-            # Check if any milestone matches this row
-            if days in MILESTONES:
-                message = f"""📍 *Milestone Alert: {token}*
-- Days Held: {days}
-- This token has now reached a {days}d hold milestone.
-
-Would you like to review or consider rotation?"""
-
-                payload = {
-                    "chat_id": CHAT_ID,
-                    "text": message,
-                    "parse_mode": "Markdown"
-                }
-
-                try:
-                    response = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload)
-                    if response.ok:
-                        print(f"📬 Milestone alert sent for {token} @ {days}d")
-                    else:
-                        print(f"⚠️ Telegram error for {token}: {response.text}")
-                except Exception as e:
-                    print(f"❌ Failed to send milestone alert for {token}: {e}")
-
+        r = requests.post(url, json=payload)
+        print(f"📬 Milestone alert sent for {token} @ {days}d: {r.text}")
     except Exception as e:
-        print(f"❌ Milestone Alert Engine failed: {e}")
+        print(f"⚠️ Telegram error for {token}: {e}")
+
+def run_milestone_alerts():
+    try:
+        gc = gspread.service_account(filename="sentiment-log-service.json")
+        sheet = gc.open_by_url(os.environ["SHEET_URL"])
+        ws = sheet.worksheet("Rotation_Stats")
+        rows = ws.get_all_records()
+
+        MILESTONES = [3, 7, 30]
+        for i, row in enumerate(rows, start=2):  # start=2 for row index
+            try:
+                token = row["Token"]
+                days = int(row["Days Held"])
+                if days in MILESTONES:
+                    send_milestone_alert(token, days)
+            except Exception as e:
+                print(f"⚠️ Milestone check error at row {i}: {e}")
+    except Exception as outer:
+        print(f"❌ Failed to run milestone alerts: {outer}")
