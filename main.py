@@ -5,7 +5,7 @@ from telegram_webhook import set_telegram_webhook
 from presale_scorer import run_presale_scorer
 from token_vault_sync import sync_token_vault
 from scout_to_planner_sync import sync_rotation_planner
-from roi_tracker import update_roi_days
+from roi_tracker import scan_roi_tracking
 from milestone_alerts import run_milestone_alerts
 from rotation_signal_engine import scan_rotation_candidates
 import gspread
@@ -36,7 +36,7 @@ print("🧠 Running Rotation Signal Engine...")
 scan_rotation_candidates(rotation_rows)
 
 print("📈 Checking for ROI milestone follow-ups...")
-update_roi_days(rotation_ws)
+scan_roi_tracking(rotation_ws)
 run_milestone_alerts(rotation_ws)
 
 print("✅ Token Vault synced with latest Scout Decisions.")
