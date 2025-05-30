@@ -1,58 +1,42 @@
-import os
-import gspread
-import requests
-from datetime import datetime
-
-def send_milestone_alert(token, days):
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    bot_token = os.environ.get("BOT_TOKEN")
-    if not chat_id or not bot_token:
-        print("⚠️ Missing TELEGRAM_CHAT_ID or BOT_TOKEN in environment.")
-        return
-
-    message = (
-        f"📍 *Milestone Alert: {token}*\n"
-        f"– Days Held: {days}d\n"
-        f"– This token has now reached a {days}d milestone.\n"
-        f"Would you like to review or consider rotation?"
-    )
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-
+# 🚀 Milestone Alert Logic
+print("🚀 Checking for milestone ROI alerts...")
+milestone_days = [3, 7, 14, 30]
+for i, row in enumerate(rows[1:], start=2):
     try:
-        r = requests.post(url, json=payload)
-        print(f"📬 Milestone alert sent for {token} @ {days}d: {r.text}")
-    except Exception as e:
-        print(f"⚠️ Telegram error for {token}: {e}")
+        token = str(row.get("Token", "")).strip()
+        decision = str(row.get("Decision", "")).strip().upper()
+        days_held = int(row.get("Days Held", "0") or 0)
 
-def run_milestone_alerts():
-    print("🚀 Checking for milestone ROI alerts...")
-    try:
-        gc = gspread.service_account(filename="sentiment-log-service.json")
-        sheet = gc.open_by_url(os.environ["SHEET_URL"])
-        ws = sheet.worksheet("Rotation_Log")
-        rows = ws.get_all_records()
+        if decision != "YES" or not token or days_held not in milestone_days:
+            continue
 
-        MILESTONES = [3, 7, 30]
+        # Check if already alerted
+        memory_key = f"{token}_milestone"
+        if PROMPT_MEMORY.get(memory_key) == days_held:
+            continue  # already alerted for this milestone
 
-        for i, row in enumerate(rows, start=2):
-            token = row.get("Token", "").strip()
-            days_held = row.get("Days Held", "").strip()
+        # Send milestone alert
+        message = f"📍 Milestone Alert: *{token}*\n– Days Held: {days_held}d\n– This token has now reached a {days_held}d milestone.\nWould you like to review or consider rotation?"
 
-            if not token or not days_held:
-                continue
+        keyboard = {
+            "inline_keyboard": [[
+                {"text": "🔁 Review", "callback_data": f"YES|{token}"},
+                {"text": "❌ Skip", "callback_data": f"SKIP|{token}"}
+            ]]
+        }
 
-            try:
-                days = int(days_held)
-                if days in MILESTONES:
-                    send_milestone_alert(token, days)
-            except ValueError:
-                continue
+        resp = requests.post(
+            f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}/sendMessage",
+            json={
+                "chat_id": os.getenv("CHAT_ID"),
+                "text": message,
+                "parse_mode": "Markdown",
+                "reply_markup": keyboard
+            }
+        )
+
+        print(f"📬 Milestone alert sent for {token} @ {days_held}d: {resp.text}")
+        PROMPT_MEMORY[memory_key] = days_held
 
     except Exception as e:
-        print(f"❌ Milestone Alert Engine failed: {e}")
+        print(f"❌ Milestone Alert Engine failed for row {i}: {e}")
