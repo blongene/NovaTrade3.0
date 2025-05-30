@@ -1,6 +1,5 @@
 import os
 import time
-from dotenv import load_dotenv
 from flask import Flask
 from telegram_webhook import set_telegram_webhook
 from presale_scorer import run_presale_scorer
@@ -11,9 +10,6 @@ from milestone_alerts import run_milestone_alerts
 from rotation_signal_engine import scan_rotation_candidates
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-
-load_dotenv()
-print("⚙️ Attempting to load worksheet: Presale_Stream")
 
 # Authenticate Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
