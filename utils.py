@@ -7,14 +7,43 @@ def get_sheet():
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
     return gspread.authorize(creds).open_by_url("https://docs.google.com/spreadsheets/d/1rE6rbUnCPiL8OgBj6hPWNppOV1uaII8im41nrv-x1xg/edit")
 
-def log_scout_decision(token, action):
+def log_scout_decision(token, decision):
+    print(f"📥 Logging decision: {decision} for token {token}")
     try:
-        sheet = get_sheet()
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
         ws = sheet.worksheet("Scout Decisions")
-        timestamp = datetime.now().isoformat()
-        ws.append_row([timestamp, token, action, "Telegram"])
+        planner_ws = sheet.worksheet("Rotation_Planner")
+
+        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        existing = ws.get_all_records()
+        new_row = [
+            now,
+            token.upper(),
+            decision.upper(),
+            "Telegram"
+        ]
+        ws.append_row(new_row)
+        print("✅ Decision logged to Scout Decisions")
+
+        # Auto-confirm logic for YES votes
+        if decision.upper() == "YES":
+            planner_data = planner_ws.get_all_values()
+            headers = planner_data[0]
+            token_idx = headers.index("Token")
+            confirm_idx = headers.index("Confirmed")
+
+            for i, row in enumerate(planner_data[1:], start=2):
+                if row[token_idx].strip().upper() == token.upper():
+                    planner_ws.update_cell(i, confirm_idx + 1, "YES")
+                    print(f"✅ Auto-confirmed token {token} in Rotation_Planner")
+                    break
+
     except Exception as e:
-        ping_webhook_debug(f"❌ Decision log error: {e}")
+        print(f"❌ Failed to log decision for {token}: {e}")
+        ping_webhook_debug(f"❌ Log Scout Decision error: {e}")
 
 def ping_webhook_debug(msg):
     try:
