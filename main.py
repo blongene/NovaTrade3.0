@@ -8,7 +8,7 @@ from token_vault_sync import sync_token_vault
 from scout_to_planner_sync import sync_rotation_planner
 from presale_scorer import run_presale_scorer
 from nova_trigger_watcher import check_nova_trigger
-from roi_feedback_sync import sync_roi_feedback  # ✅ NEW
+from roi_feedback_sync import run_roi_feedback_sync  # ✅ NEW
 from nova_trigger import trigger_nova_ping  # ✅ Autopings (e.g., boot pings)
 
 import gspread
