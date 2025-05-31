@@ -13,7 +13,7 @@ def run_roi_feedback_sync():
     client = gspread.authorize(creds)
     sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-    feedback_ws = sheet.worksheet("ROI_Tracking")
+    feedback_ws = sheet.worksheet("Rotation_Log")
     review_ws = sheet.worksheet("ROI_Review_Log")
 
     feedback_data = feedback_ws.get_all_records()
