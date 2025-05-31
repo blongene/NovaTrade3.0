@@ -51,7 +51,7 @@ if __name__ == "__main__":
 
     # Sync ROI feedback into review log
     print("📥 Syncing ROI feedback responses...")
-    sync_roi_feedback()
+    run_roi_feedback_sync()
 
     # Listen for NovaTrigger (manual A1 pings)
     check_nova_trigger()
