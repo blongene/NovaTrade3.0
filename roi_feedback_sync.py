@@ -1,57 +1,55 @@
+
 import gspread
-import os
 from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
+import os
 
-def sync_roi_feedback():
-    print("🔄 Syncing ROI review feedback...")
+def run_roi_feedback_sync():
+    print("🔄 Syncing ROI feedback to ROI_Review_Log...")
 
-    # Auth and Sheets
+    # Auth
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
     client = gspread.authorize(creds)
     sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
+    feedback_ws = sheet.worksheet("ROI_Tracking")
     review_ws = sheet.worksheet("ROI_Review_Log")
-    stats_ws = sheet.worksheet("Rotation_Stats")
 
-    # Load values
-    review_data = review_ws.get_all_values()
-    stats_data = stats_ws.get_all_values()
-    review_headers = review_data[0]
-    stats_headers = stats_data[0]
-    review_rows = review_data[1:]
-    stats_rows = stats_data[1:]
+    feedback_data = feedback_ws.get_all_records()
+    headers = feedback_ws.row_values(1)
 
-    token_idx = review_headers.index("Token")
-    feedback_idx = review_headers.index("Would You Say YES Again?")
-    
-    if "Reaffirmed" not in stats_headers:
-        stats_ws.update_cell(1, len(stats_headers)+1, "Reaffirmed")
-        stats_headers.append("Reaffirmed")
+    # Identify column indexes
+    try:
+        token_idx = headers.index("Token")
+        roi_idx = headers.index("Follow-up ROI")
+        vote_idx = headers.index("Would You Say YES Again?")
+        synced_idx = headers.index("Synced?")
+    except ValueError as e:
+        print("❌ Missing required column in ROI_Tracking:", e)
+        return
 
-    reaffirm_idx = stats_headers.index("Reaffirmed")
-    stats_token_idx = stats_headers.index("Token")
+    new_logs = []
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    updates_made = 0
+    for i, row in enumerate(feedback_data):
+        synced = row.get("Synced?", "").strip().upper()
+        token = row.get("Token", "").strip()
+        roi = row.get("Follow-up ROI", "").strip()
+        vote = row.get("Would You Say YES Again?", "").strip()
 
-    for i, row in enumerate(review_rows):
-        if len(row) <= feedback_idx or row[feedback_idx].strip() == "":
-            continue
+        if synced in ["✅", "YES", "TRUE"] or not token or not roi:
+            continue  # Skip already synced or incomplete rows
 
-        token = row[token_idx].strip().upper()
-        feedback = row[feedback_idx].strip().upper()
+        # Prepare new log entry
+        log_entry = [now, token, roi, vote]
+        new_logs.append(log_entry)
 
-        for j, stats_row in enumerate(stats_rows):
-            if len(stats_row) > stats_token_idx and stats_row[stats_token_idx].strip().upper() == token:
-                stats_ws.update_cell(j+2, reaffirm_idx+1, feedback)
-                print(f"✅ Synced feedback for {token}: {feedback}")
-                updates_made += 1
-                break
+        # Mark as synced
+        feedback_ws.update_cell(i + 2, synced_idx + 1, "✅")
 
-        # Reset user feedback cell so it doesn't resync
-        review_ws.update_cell(i+2, feedback_idx+1, "")
-
-    if updates_made == 0:
-        print("ℹ️ No new feedback to sync.")
+    if new_logs:
+        print(f"✍️ Logging {len(new_logs)} new feedback entries...")
+        review_ws.append_rows(new_logs)
     else:
-        print(f"🔁 Synced {updates_made} feedback responses to Rotation_Stats.")
+        print("🟡 No new ROI feedback to sync.")
