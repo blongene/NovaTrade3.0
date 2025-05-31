@@ -56,3 +56,9 @@ if __name__ == "__main__":
     print("🧠 NovaTrade system is live.")
 
     telegram_app.run(host="0.0.0.0", port=10000)
+
+from nova_trigger_listener import listen_for_nova_trigger
+
+# Run listener in background thread
+import threading
+threading.Thread(target=listen_for_nova_trigger, daemon=True).start()
