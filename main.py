@@ -5,13 +5,16 @@ from rotation_signal_engine import scan_rotation_candidates
 from roi_tracker import scan_roi_tracking
 from milestone_alerts import run_milestone_alerts
 from token_vault_sync import sync_token_vault
-from scout_to_planner_sync import  sync_rotation_planner
+from scout_to_planner_sync import sync_rotation_planner
 from presale_scorer import run_presale_scorer
 from nova_trigger_watcher import check_nova_trigger
+from nova_trigger_sender import trigger_nova_ping  # 🆕 Add this line
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
+import threading
+from nova_trigger_listener import listen_for_nova_trigger  # already present
 
 # Load worksheet (e.g. Presale_Stream) on boot
 def load_presale_stream():
@@ -55,10 +58,11 @@ if __name__ == "__main__":
     print("💥 run_presale_scorer() BOOTED")
     print("🧠 NovaTrade system is live.")
 
+    # 🔔 Send autonomous test ping after full system boot
+    trigger_nova_ping("SOS")
+
+    # Start background listener thread
+    threading.Thread(target=listen_for_nova_trigger, daemon=True).start()
+
+    # Start Flask app
     telegram_app.run(host="0.0.0.0", port=10000)
-
-from nova_trigger_listener import listen_for_nova_trigger
-
-# Run listener in background thread
-import threading
-threading.Thread(target=listen_for_nova_trigger, daemon=True).start()
