@@ -8,16 +8,15 @@ from token_vault_sync import sync_token_vault
 from scout_to_planner_sync import sync_rotation_planner
 from presale_scorer import run_presale_scorer
 from nova_trigger_watcher import check_nova_trigger
-from nova_trigger_sender import trigger_nova_ping  # 🆕 Add this line
-from roi_feedback_sync import sync_roi_feedback
+from roi_feedback_sync import sync_roi_feedback  # ✅ NEW
+from nova_trigger import trigger_nova_ping  # ✅ Autopings (e.g., boot pings)
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
 import threading
-from nova_trigger_listener import listen_for_nova_trigger  # already present
 
-# Load worksheet (e.g. Presale_Stream) on boot
+# Load worksheet on boot
 def load_presale_stream():
     print("⚙️ Attempting to load worksheet: Presale_Stream")
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -28,7 +27,7 @@ def load_presale_stream():
     print("✅ Loaded worksheet: Presale_Stream")
     return worksheet
 
-# Launch Webhook + Background Modules
+# Main boot sequence
 if __name__ == "__main__":
     set_telegram_webhook()
 
@@ -39,19 +38,26 @@ if __name__ == "__main__":
     run_watchdog()
 
     print("🧠 Running Rotation Signal Engine...")
-    rotation_ws = load_presale_stream()  # Used only for boot validation
+    rotation_ws = load_presale_stream()
 
-    # Run rotation performance + follow-up logic
+    # ROI tracking and milestone checks
     scan_roi_tracking()
     run_milestone_alerts()
 
-    # Sync decision logs + planner entries
+    # Sync vaults and planners
     sync_token_vault()
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
 
-    # Check if NovaTrigger wants attention
+    # Sync ROI feedback into review log
+    print("📥 Syncing ROI feedback responses...")
+    sync_roi_feedback()
+
+    # Listen for NovaTrigger (manual A1 pings)
     check_nova_trigger()
+
+    # Optional: trigger test boot ping
+    trigger_nova_ping("NOVA UPDATE")
 
     print("⏰ Running presale scan every 60 min")
     run_presale_scorer()
@@ -59,14 +65,5 @@ if __name__ == "__main__":
     print("💥 run_presale_scorer() BOOTED")
     print("🧠 NovaTrade system is live.")
 
-    # 🔔 Send autonomous test ping after full system boot
-    trigger_nova_ping("SOS")
-
-    # Start background listener thread
-    threading.Thread(target=listen_for_nova_trigger, daemon=True).start()
-
-    # Start Flask app
+    # Flask webhook service
     telegram_app.run(host="0.0.0.0", port=10000)
-
-    # Sync user feedback from ROI log
-    sync_roi_feedback()
