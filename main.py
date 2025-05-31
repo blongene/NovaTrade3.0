@@ -8,7 +8,7 @@ from token_vault_sync import sync_token_vault
 from scout_to_planner_sync import sync_rotation_planner
 from presale_scorer import run_presale_scorer
 from nova_trigger_watcher import check_nova_trigger
-from nova_trigger_sender import trigger_nova_ping  # 🆕 Add this line
+from nova_trigger import trigger_nova_ping  # 🆕 Add this line
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
