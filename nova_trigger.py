@@ -26,6 +26,6 @@ def trigger_nova_ping(message_type="SOS"):
         print(f"⚠️ Invalid message_type: {message_type}")
         return
 
-    nova_ws.update("A1", message_type)
+    nova_ws.update("A1", [[message_type]])
     print(f"✅ NovaTrigger set to '{message_type}' at {datetime.utcnow()}")
 
