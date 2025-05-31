@@ -9,6 +9,7 @@ from scout_to_planner_sync import sync_rotation_planner
 from presale_scorer import run_presale_scorer
 from nova_trigger_watcher import check_nova_trigger
 from nova_trigger_sender import trigger_nova_ping  # 🆕 Add this line
+from roi_feedback_sync import sync_roi_feedback
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -66,3 +67,6 @@ if __name__ == "__main__":
 
     # Start Flask app
     telegram_app.run(host="0.0.0.0", port=10000)
+
+    # Sync user feedback from ROI log
+    sync_roi_feedback()
