@@ -53,8 +53,6 @@ if __name__ == "__main__":
     sync_token_vault()
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
-
-    # after a key function runs:
     log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
     print("📥 Syncing ROI feedback responses...")
@@ -67,6 +65,7 @@ if __name__ == "__main__":
 
     print("⏰ Running presale scan every 60 min")
     run_presale_scorer()
+    log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
     print("💥 run_presale_scorer() BOOTED")
     print("🧠 NovaTrade system is live.")
