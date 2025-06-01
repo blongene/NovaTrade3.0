@@ -1,52 +1,44 @@
-import gspread
-import os
 from datetime import datetime
+import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-
-SHEET_URL = os.environ.get("SHEET_URL")
+import os
 
 def scan_roi_tracking():
-    print("📈 Checking for ROI milestone follow-ups...")
-
-    # Authenticate
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_url(SHEET_URL)
-    log_ws = sheet.worksheet("Rotation_Log")
-
-    # Load data
-    data = log_ws.get_all_values()
-    headers = data[0]
-    rows = data[1:]
-
-    # Required columns
     try:
-        timestamp_idx = headers.index("Timestamp")
-        days_held_idx = headers.index("Days Held")
-        followup_idx = headers.index("Follow-up ROI")
-    except ValueError:
-        print("❌ Missing required columns: 'Timestamp', 'Days Held', or 'Follow-up ROI'")
-        return
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(
+            "sentiment-log-service.json", scope
+        )
+        client = gspread.authorize(creds)
 
-    now = datetime.utcnow()
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        rotation_log = sheet.worksheet("Rotation_Log")
 
-    for i, row in enumerate(rows):
-        if len(row) <= max(timestamp_idx, days_held_idx, followup_idx):
-            continue
+        rows = rotation_log.get_all_records()
+        now = datetime.utcnow()
 
-        try:
-            timestamp_str = row[timestamp_idx].strip()
-            timestamp_dt = datetime.strptime(timestamp_str, "%m/%d/%Y %H:%M:%S")
-            days_held = (now - timestamp_dt).days
+        for i, row in enumerate(rows):
+            entry = row.get("Timestamp", "")
+            if not entry:
+                continue
 
-            # For now, follow-up ROI is time-based: "Xd since vote"
-            roi_text = f"{days_held}d since vote"
+            try:
+                # Accept both ISO and standard format
+                if "T" in entry:
+                    ts = datetime.fromisoformat(entry.replace("Z", ""))
+                else:
+                    ts = datetime.strptime(entry, "%m/%d/%Y %H:%M:%S")
 
-            # Update both columns in Rotation_Log
-            log_ws.update_cell(i + 2, days_held_idx + 1, str(days_held))
-            log_ws.update_cell(i + 2, followup_idx + 1, roi_text)
+                days = (now - ts).days
+                rotation_log.update_cell(i + 2, 9, days)  # "Days Held"
+                rotation_log.update_cell(i + 2, 10, f"{days}d since vote")  # "Follow-up ROI"
+                print(f"🔁 Updated ROI tracker for row {i + 2} — {days}d since vote")
 
-            print(f"🔁 Updated ROI tracker for row {i+2} — {roi_text}")
-        except Exception as e:
-            print(f"⚠️ Failed to update row {i+2}: {e}")
+            except Exception as e:
+                print(f"⚠️ Failed to update row {i + 2}: {e}")
+
+    except Exception as e:
+        print(f"❌ ROI tracking error: {e}")
