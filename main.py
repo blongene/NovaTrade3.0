@@ -11,6 +11,7 @@ from nova_trigger_watcher import check_nova_trigger
 from roi_feedback_sync import run_roi_feedback_sync
 from nova_trigger import trigger_nova_ping
 from orion_voice_loop import run_orion_voice_loop  # ✅ NEW
+from nova_heartbeat import log_heartbeat
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -50,6 +51,9 @@ if __name__ == "__main__":
     sync_token_vault()
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
+
+    # after a key function runs:
+    log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
     print("📥 Syncing ROI feedback responses...")
     run_roi_feedback_sync()
