@@ -13,6 +13,7 @@ from nova_trigger import trigger_nova_ping
 from orion_voice_loop import run_orion_voice_loop  # ✅ NEW
 from nova_heartbeat import log_heartbeat
 from stalled_asset_detector import run_stalled_asset_detector
+from claim_tracker import check_claims
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -68,7 +69,7 @@ if __name__ == "__main__":
     run_presale_scorer()
     log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
     run_stalled_asset_detector()
-    
+    check_claims()
     print("💥 run_presale_scorer() BOOTED")
     print("🧠 NovaTrade system is live.")
 
