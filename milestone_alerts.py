@@ -1,47 +1,29 @@
-import gspread
-from datetime import datetime
-from oauth2client.service_account import ServiceAccountCredentials
-from utils import send_telegram_message
-import os
-
 def run_milestone_alerts():
-    print("🚀 Checking for milestone ROI alerts...")
+    import gspread
+    import os
+    from oauth2client.service_account import ServiceAccountCredentials
 
-    # Authenticate Google Sheets
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_url(os.getenv("SHEET_URL"))
-    ws = sheet.worksheet("Rotation_Log")
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+        client = gspread.authorize(creds)
 
-    # Fetch environment values using the correct Render keys
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    bot_token = os.getenv("BOT_TOKEN")
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        rotation_log = sheet.worksheet("Rotation_Log")
+        rows = rotation_log.get_all_records()
 
-    if not chat_id or not bot_token:
-        print("⚠️ Missing TELEGRAM_CHAT_ID or BOT_TOKEN in environment.")
-        return
+        for i, row in enumerate(rows):
+            try:
+                token = row.get("Token", "UNKNOWN")
+                days_held = int(row.get("Days Held", 0))
 
-    rows = ws.get_all_records()
+                # Example: alert only at 7, 14, 30 days
+                if days_held in [7, 14, 30]:
+                    print(f"🚀 {token} has reached {days_held} days.")
+                    # You could trigger a ping here
 
-    for i, row in enumerate(rows):
-        try:
-            token = row.get("Token", "")
-            days = int(row.get("Days Held", 0))
-            decision = row.get("Decision", "").strip().upper()
+            except Exception as e:
+                print(f"❌ Milestone Alert Engine failed for row {i + 2}: {e}")
 
-            if decision != "YES":
-                continue
-
-            if days in [3, 7, 14, 30]:
-                message = (
-                    f"📍 *Milestone Alert: {token}*\n"
-                    f"– Days Held: {days}d\n"
-                    f"This token has now reached a {days}d milestone.\n"
-                    f"Would you like to review or consider rotation?"
-                )
-                send_telegram_message(message)
-                print(f"📬 Milestone alert sent for {token} @ {days}d")
-
-        except Exception as e:
-            print(f"❌ Milestone Alert Engine failed for row {i+2}: {e}")
+    except Exception as e:
+        print(f"❌ milestone_alerts.py failed to initialize: {e}")
