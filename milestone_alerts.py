@@ -15,12 +15,12 @@ def run_milestone_alerts():
         for i, row in enumerate(rows):
             try:
                 token = row.get("Token", "UNKNOWN")
-                days_held = int(row.get("Days Held", 0))
+                days_str = str(row.get("Days Held", "")).strip()
+                days_held = int(days_str) if days_str.isdigit() else 0
 
-                # Example: alert only at 7, 14, 30 days
-                if days_held in [7, 14, 30]:
-                    print(f"🚀 {token} has reached {days_held} days.")
-                    # You could trigger a ping here
+                if days_held in [3, 7, 14, 30]:
+                    print(f"🚀 {token} hit milestone: {days_held}d")
+                    # Optional: ping logic here
 
             except Exception as e:
                 print(f"❌ Milestone Alert Engine failed for row {i + 2}: {e}")
