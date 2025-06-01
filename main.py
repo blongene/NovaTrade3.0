@@ -46,7 +46,9 @@ if __name__ == "__main__":
     rotation_ws = load_presale_stream()
 
     scan_roi_tracking()
+    log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
     run_milestone_alerts()
+    log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
     sync_token_vault()
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
