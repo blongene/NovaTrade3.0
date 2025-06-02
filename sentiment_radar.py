@@ -4,6 +4,7 @@ import os
 import requests
 import datetime
 from googleapiclient.discovery import build
+from bs4 import BeautifulSoup
 
 def run_sentiment_radar():
     try:
@@ -60,6 +61,26 @@ def run_sentiment_radar():
                         logs.append([now, token, term, title[:120], "YouTube"])
         else:
             print("⚠️ YOUTUBE_API_KEY not set. Skipping YouTube scan.")
+
+        # ---- TELEGRAM (Search via t.me/s/crypto_group) ----
+        public_channels = ["CryptoMoonShots", "CryptoGems", "AltcoinAlerts", "DeFiMillion", "CryptoWhaleGroup"]
+
+        for token, aliases in alias_map.items():
+            search_terms = [token] + aliases
+            for channel in public_channels:
+                url = f"https://t.me/s/{channel}"
+                try:
+                    html = requests.get(url).text
+                    soup = BeautifulSoup(html, "html.parser")
+                    messages = soup.find_all("div", class_="tgme_widget_message_text")
+
+                    for term in search_terms:
+                        for msg in messages:
+                            text = msg.get_text()
+                            if term.lower() in text.lower():
+                                logs.append([now, token, term, text[:120], f"Telegram - {channel}"])
+                except Exception as te:
+                    print(f"⚠️ Telegram scan failed for @{channel}: {te}")
 
         # ---- Append results ----
         if logs:
