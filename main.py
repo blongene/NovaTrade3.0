@@ -14,6 +14,7 @@ from orion_voice_loop import run_orion_voice_loop  # ✅ NEW
 from nova_heartbeat import log_heartbeat
 from stalled_asset_detector import run_stalled_asset_detector
 from claim_tracker import check_claims
+from binance_executor import execute_buy, execute_sell
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
