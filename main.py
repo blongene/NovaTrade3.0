@@ -14,6 +14,7 @@ from orion_voice_loop import run_orion_voice_loop  # ✅ NEW
 from nova_heartbeat import log_heartbeat
 from stalled_asset_detector import run_stalled_asset_detector
 from claim_tracker import check_claims
+from sentiment_radar import run_sentiment_radar
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -57,10 +58,15 @@ if __name__ == "__main__":
     sync_rotation_planner()
     log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
+    # Sync ROI feedback into review log
     print("📥 Syncing ROI feedback responses...")
     run_roi_feedback_sync()
 
-    # Listen once for NovaTrigger on boot (manual pings)
+    # Run sentiment radar
+    print("📡 Running Sentiment Radar...")
+    run_sentiment_radar()
+
+    # Listen for NovaTrigger (manual A1 pings)
     check_nova_trigger()
 
     trigger_nova_ping("NOVA UPDATE")
