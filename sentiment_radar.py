@@ -41,7 +41,7 @@ def run_sentiment_radar():
                     posts = response.json().get("data", {}).get("children", [])
                     for post in posts:
                         text = post["data"].get("title", "")[:80]
-                        logs.append([token, "Reddit", term, text, now])
+                        logs.append([now, token, term, text[:80], "Reddit"])
 
         # 📺 YOUTUBE SCAN (Unofficial public comment API)
         for token, aliases in alias_map.items():
@@ -60,7 +60,7 @@ def run_sentiment_radar():
                             text = comment["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
                             for alias in aliases + [token]:
                                 if re.search(rf"\b{alias}\b", text, re.IGNORECASE):
-                                    logs.append([token, "YouTube", alias, text[:80], now])
+                                    logs.append([now, token, alias, text[:80], "YouTube"])
                                     break
 
         # Future: Telegram logic
