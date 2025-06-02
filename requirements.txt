@@ -4,3 +4,4 @@ oauth2client
 requests
 pandas
 web3==6.10.0
+python-binance
