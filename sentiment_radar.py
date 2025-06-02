@@ -1,17 +1,21 @@
+# sentiment_radar.py
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
 import requests
 import datetime
+import re
 
 def run_sentiment_radar():
     try:
+        print("📡 Running Sentiment Radar...")
         # Auth
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
         client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
-        
+
         radar_tab = sheet.worksheet("Sentiment_Radar")
         targets_tab = sheet.worksheet("Sentiment_Targets")
 
@@ -24,26 +28,49 @@ def run_sentiment_radar():
             alias_map[token] = aliases
 
         logs = []
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Check each token/alias across mock sources (placeholder for future Reddit/YouTube API calls)
+        # 🔴 REDDIT SCAN
         for token, aliases in alias_map.items():
             search_terms = [token] + aliases
             for term in search_terms:
-                # Example Reddit search (mocked as real API not used here)
-                response = requests.get(f"https://www.reddit.com/search.json?q={term}&limit=5", headers={'User-agent': 'NovaRadar/1.0'})
+                url = f"https://www.reddit.com/search.json?q={term}&limit=5"
+                headers = {'User-agent': 'NovaRadar/1.0'}
+                response = requests.get(url, headers=headers)
                 if response.status_code == 200:
                     posts = response.json().get("data", {}).get("children", [])
                     for post in posts:
-                        title = post["data"].get("title", "")
-                        timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                        logs.append([timestamp, token, term, title, "Reddit"])
+                        text = post["data"].get("title", "")[:80]
+                        logs.append([token, "Reddit", term, text, now])
 
-        # Append results to Sentiment_Radar
+        # 📺 YOUTUBE SCAN (Unofficial public comment API)
+        for token, aliases in alias_map.items():
+            search_query = f"{token} crypto"
+            yt_api = f"https://yt.lemnoslife.com/videos?part=snippet&q={search_query}&maxResults=3&type=video"
+            yt_response = requests.get(yt_api)
+            if yt_response.status_code == 200:
+                videos = yt_response.json().get("items", [])
+                for video in videos:
+                    video_id = video["id"]["videoId"]
+                    comments_url = f"https://yt.lemnoslife.com/comments?part=snippet&videoId={video_id}"
+                    comment_response = requests.get(comments_url)
+                    if comment_response.status_code == 200:
+                        comments = comment_response.json().get("items", [])
+                        for comment in comments:
+                            text = comment["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
+                            for alias in aliases + [token]:
+                                if re.search(rf"\b{alias}\b", text, re.IGNORECASE):
+                                    logs.append([token, "YouTube", alias, text[:80], now])
+                                    break
+
+        # Future: Telegram logic
+
+        # ✅ Append results
         if logs:
             radar_tab.append_rows(logs, value_input_option="RAW")
             print(f"✅ Sentiment Radar logged {len(logs)} mentions.")
         else:
             print("✅ Sentiment Radar found no mentions.")
-    
+
     except Exception as e:
         print(f"❌ Sentiment Radar failed: {e}")
