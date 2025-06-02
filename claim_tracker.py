@@ -6,6 +6,7 @@ from web3 import Web3
 from oauth2client.service_account import ServiceAccountCredentials
 from nova_heartbeat import log_heartbeat
 from nova_trigger import trigger_nova_ping
+import time  # ✅ ADDED for rate-limiting
 
 # Wallets
 METAMASK_WALLET = "0x980032AAB743379a99C4Fd18A4538c8A5DCF47d6"
@@ -39,12 +40,13 @@ def check_claims():
             unlock_date = row[unlock_col - 1].strip()
             claimed = row[claimed_col - 1].strip()
 
-            # Skip if already claimed manually
+            # ✅ Add throttle delay to avoid quota errors
+            time.sleep(1.5)
+
             if "✅" in claimed:
                 ws.update_cell(i, status_col, "✅ Claimed")
                 continue
 
-            # Calculate days since unlock
             if unlock_date:
                 try:
                     unlock_dt = datetime.strptime(unlock_date, "%Y-%m-%d")
@@ -57,7 +59,6 @@ def check_claims():
                 ws.update_cell(i, days_col, "")
                 continue
 
-            # Lookup wallet balance (placeholder logic — to expand per token)
             if source == "MetaMask":
                 wallet = METAMASK_WALLET
             elif source == "Best Wallet":
@@ -65,8 +66,6 @@ def check_claims():
             else:
                 continue
 
-            # [NOTE] Replace below with actual token contract logic if needed
-            # For now: assume token is unclaimed if Days > 0
             if days_since > 0:
                 ws.update_cell(i, status_col, "⚠️ Claim Now")
                 flagged.append(token)
