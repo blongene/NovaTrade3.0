@@ -15,6 +15,8 @@ from nova_heartbeat import log_heartbeat
 from stalled_asset_detector import run_stalled_asset_detector
 from claim_tracker import check_claims
 from binance_executor import execute_buy, execute_sell
+execute_buy("ZENBOT")  # Or dynamically from a YES vote
+execute_sell("ZENBOT")  # When flagged stalled and user confirms
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
