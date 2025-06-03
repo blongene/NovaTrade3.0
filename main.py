@@ -15,6 +15,7 @@ from nova_heartbeat import log_heartbeat
 from stalled_asset_detector import run_stalled_asset_detector
 from claim_tracker import check_claims
 from sentiment_radar import run_sentiment_radar
+from staking_yield_tracker import run_staking_yield_tracker
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -31,6 +32,14 @@ def load_presale_stream():
     worksheet = sheet.worksheet("Presale_Stream")
     print("✅ Loaded worksheet: Presale_Stream")
     return worksheet
+
+def start_staking_yield_loop():
+    def loop():
+        while True:
+            print("🔁 Checking staking yield...")
+            run_staking_yield_tracker()
+            time.sleep(21600)  # 6 hours in seconds
+    threading.Thread(target=loop, daemon=True).start()
 
 # Main boot sequence
 if __name__ == "__main__":
@@ -78,5 +87,6 @@ if __name__ == "__main__":
     check_claims()
     print("💥 run_presale_scorer() BOOTED")
     print("🧠 NovaTrade system is live.")
+    start_staking_yield_loop()
 
     telegram_app.run(host="0.0.0.0", port=10000)
