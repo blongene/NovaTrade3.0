@@ -16,6 +16,7 @@ from stalled_asset_detector import run_stalled_asset_detector
 from claim_tracker import check_claims
 from sentiment_radar import run_sentiment_radar
 from staking_yield_tracker import run_staking_yield_tracker
+from rotation_stats_sync import run_rotation_stats_sync
 
 import time
 import gspread
@@ -89,5 +90,6 @@ if __name__ == "__main__":
     print("💥 run_presale_scorer() BOOTED")
     print("🧠 NovaTrade system is live.")
     start_staking_yield_loop()
-
+    run_rotation_stats_sync()
+    
     telegram_app.run(host="0.0.0.0", port=10000)
