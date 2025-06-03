@@ -38,5 +38,5 @@ def run_staking_yield_tracker():
             log_heartbeat("Staking Tracker", f"{token} Yield = {yield_percent}%")
 
             # Optional alert if yield is 0
-           if yield_percent == 0:
-               ping_webhook_debug(f"⚠️ {token} staking yield is 0%. Verify staking is active.")
+            if yield_percent == 0:
+                ping_webhook_debug(f"⚠️ {token} staking yield is 0%. Verify staking is active.")
