@@ -18,6 +18,7 @@ from sentiment_radar import run_sentiment_radar
 from staking_yield_tracker import run_staking_yield_tracker
 from rotation_stats_sync import run_rotation_stats_sync
 from rotation_feedback_engine import run_rotation_feedback_engine
+from performance_dashboard import run_performance_dashboard
 
 import time
 import gspread
@@ -93,5 +94,7 @@ if __name__ == "__main__":
     start_staking_yield_loop()
     run_rotation_stats_sync()
     run_rotation_feedback_engine()
+    print("📊 Running Performance Dashboard...")
+    run_performance_dashboard()
     
     telegram_app.run(host="0.0.0.0", port=10000)
