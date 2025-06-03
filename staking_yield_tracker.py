@@ -40,3 +40,12 @@ def run_staking_yield_tracker():
             # Optional alert if yield is 0
             if yield_percent == 0:
                 ping_webhook_debug(f"⚠️ {token} staking yield is 0%. Verify staking is active.")
+
+            updated = True
+
+        if not updated:
+            log_heartbeat("Staking Tracker", "Token not found in Rotation_Log")
+
+    except Exception as e:
+        ping_webhook_debug(f"❌ Staking Yield Tracker Error: {str(e)}")
+        print(f"❌ Error: {e}")
