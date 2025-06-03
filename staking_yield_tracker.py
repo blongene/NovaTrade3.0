@@ -2,7 +2,8 @@ import os
 from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from utils import ping_webhook_debug, log_heartbeat
+from utils import ping_webhook_debug
+from nova_heartbeat import log_heartbeat
 
 # === Setup ===
 TOKEN = "MIND"
