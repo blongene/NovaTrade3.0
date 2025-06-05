@@ -2,7 +2,7 @@ import gspread
 import os
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
-from utils import send_telegram_prompt
+from send_telegram import send_rotation_alert
 
 def run_rebalance_scanner():
     print("📊 Running Rebalancer Scanner...")
@@ -40,7 +40,7 @@ def run_rebalance_scanner():
 
         # Telegram prompt
         for token, msg in alerts:
-            send_telegram_prompt(msg, token)
+            send_rotation_alert(token, msg)
 
         if not alerts:
             print("✅ Portfolio within tolerance. No rebalance needed.")
