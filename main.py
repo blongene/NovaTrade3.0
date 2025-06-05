@@ -10,7 +10,7 @@ from presale_scorer import run_presale_scorer
 from nova_trigger_watcher import check_nova_trigger
 from roi_feedback_sync import run_roi_feedback_sync
 from nova_trigger import trigger_nova_ping
-from orion_voice_loop import run_orion_voice_loop  # ✅ NEW
+from orion_voice_loop import run_orion_voice_loop
 from nova_heartbeat import log_heartbeat
 from stalled_asset_detector import run_stalled_asset_detector
 from claim_tracker import check_claims
@@ -40,24 +40,29 @@ def load_presale_stream():
     print("✅ Loaded worksheet: Presale_Stream")
     return worksheet
 
+# Staking yield loop every 6 hours
 def start_staking_yield_loop():
     def loop():
         while True:
             print("🔁 Checking staking yield...")
             run_staking_yield_tracker()
-            time.sleep(21600)  # 6 hours in seconds
+            time.sleep(21600)  # 6 hours
     threading.Thread(target=loop, daemon=True).start()
+
+# Run scheduled hourly functions
+def run_schedule_loop():
+    while True:
+        schedule.run_pending()
+        time.sleep(5)
 
 # Main boot sequence
 if __name__ == "__main__":
     set_telegram_webhook()
-
     print("📡 Orion Cloud Boot Sequence Initiated")
     print("✅ Webhook armed. Launching modules...")
 
-    # Run real-time voice trigger in background
-    threading.Thread(target=run_orion_voice_loop).start()  # ✅ New fast scanner
-
+    # Background scanners
+    threading.Thread(target=run_orion_voice_loop).start()
     print("🔍 Starting Watchdog...")
     run_watchdog()
 
@@ -74,33 +79,35 @@ if __name__ == "__main__":
     sync_rotation_planner()
     log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
-    # Sync ROI feedback into review log
     print("📥 Syncing ROI feedback responses...")
     run_roi_feedback_sync()
 
-    # Run sentiment radar
     print("📡 Running Sentiment Radar...")
     run_sentiment_radar()
 
-    # Listen for NovaTrigger (manual A1 pings)
     check_nova_trigger()
-
     trigger_nova_ping("NOVA UPDATE")
 
     print("⏰ Running presale scan every 60 min")
     run_presale_scorer()
-    schedule.every(60).minutes.do(run_rotation_log_updater)
     log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
+
     run_stalled_asset_detector()
     check_claims()
     print("💥 run_presale_scorer() BOOTED")
     print("🧠 NovaTrade system is live.")
+
     start_staking_yield_loop()
+
     run_rotation_stats_sync()
     run_rotation_feedback_engine()
+
     print("📊 Running Performance Dashboard...")
     run_performance_dashboard()
-    # Run every 60 min
+
+    # Schedule recurring modules
+    schedule.every(60).minutes.do(run_rotation_log_updater)
     schedule.every(60).minutes.do(run_rebalance_scanner)
+    threading.Thread(target=run_schedule_loop, daemon=True).start()
 
     telegram_app.run(host="0.0.0.0", port=10000)
