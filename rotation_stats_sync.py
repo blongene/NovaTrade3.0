@@ -1,57 +1,74 @@
-import os
 import gspread
-from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
-
-SHEET_URL = os.getenv("SHEET_URL")
+import os
+from datetime import datetime
 
 def run_rotation_stats_sync():
+    print("📋 Syncing Rotation_Stats tab...")
+
     try:
-        # Setup auth
+        # Auth
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
         client = gspread.authorize(creds)
-        sheet = client.open_by_url(SHEET_URL)
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
         log_ws = sheet.worksheet("Rotation_Log")
+        review_ws = sheet.worksheet("ROI_Review_Log")
         stats_ws = sheet.worksheet("Rotation_Stats")
 
         log_data = log_ws.get_all_records()
-        stats_data = stats_ws.get_all_records()
-        existing_tokens = [row.get("Token", "").strip().upper() for row in stats_data]
+        review_data = review_ws.get_all_records()
+
+        stats = []
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
         for row in log_data:
-            token = row.get("Token", "").strip().upper()
-            if token in existing_tokens:
+            token = row.get("Token", "").strip()
+            initial_roi = row.get("Score", "").strip()
+            status = row.get("Status", "").strip()
+            days_held = row.get("Days Held", "").strip()
+            sentiment = row.get("Sentiment", "")
+
+            # Lookup follow-up ROI from review tab
+            follow_up = next((r["ROI"] for r in review_data if r["Token"].strip() == token and r.get("ROI")), None)
+
+            # Validate that both initial and follow-up ROI are numeric
+            try:
+                initial = float(initial_roi)
+                follow = float(follow_up)
+            except:
+                print(f"⚠️ Skipping {token} — non-numeric ROI or missing value (Initial: {initial_roi}, Follow-up: {follow_up})")
                 continue
 
-            date = row.get("Timestamp", "")
-            decision = "YES"
-            sentiment = row.get("Sentiment", "")
-            status = row.get("Status", "Active")
-            days_held = row.get("Days Held", 0)
-            follow_up_roi = row.get("Follow-up ROI", "")
-            initial_roi = ""  # Optional: fetch from scout or ROI tab if needed
-
-            # Compute basic performance tag
-            perf = ""
+            # Compute performance
             try:
-                roi_val = float(follow_up_roi.strip('%'))
-                if roi_val >= 50:
-                    perf = "🏆 Win"
-                elif roi_val <= -25:
-                    perf = "❌ Loss"
-                else:
-                    perf = "🟡 Breakeven"
-            except:
-                perf = "—"
+                performance = round((follow - initial) / initial * 100, 2)
+            except ZeroDivisionError:
+                performance = 0.0
 
-            stats_ws.append_row([
-                date, token, decision, initial_roi, sentiment, status, days_held, follow_up_roi, perf
-            ], value_input_option="USER_ENTERED")
+            stats.append([
+                now,
+                token,
+                "YES",
+                initial,
+                sentiment,
+                status,
+                days_held,
+                follow,
+                performance
+            ])
 
-            print(f"📊 Logged to Rotation_Stats: {token}")
+        # Write new Rotation_Stats sheet
+        headers = [
+            "Date", "Token", "Decision", "Initial ROI", "Sentiment", "Status",
+            "Days Held", "Follow-up ROI", "Performance"
+        ]
+        stats_ws.clear()
+        stats_ws.append_row(headers)
+        if stats:
+            stats_ws.append_rows(stats, value_input_option="USER_ENTERED")
+        print(f"✅ Rotation_Stats updated: {len(stats)} rows")
 
     except Exception as e:
         print(f"❌ rotation_stats_sync failed: {e}")
-
