@@ -20,6 +20,7 @@ from rotation_stats_sync import run_rotation_stats_sync
 from rotation_feedback_engine import run_rotation_feedback_engine
 from performance_dashboard import run_performance_dashboard
 from rebalance_scanner import run_rebalance_scanner
+from rotation_log_updater import run_rotation_log_updater
 
 import time
 import gspread
@@ -88,6 +89,7 @@ if __name__ == "__main__":
 
     print("⏰ Running presale scan every 60 min")
     run_presale_scorer()
+    schedule.every(60).minutes.do(run_rotation_log_updater)
     log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
     run_stalled_asset_detector()
     check_claims()
