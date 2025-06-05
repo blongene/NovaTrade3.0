@@ -1,51 +1,68 @@
 import gspread
-import os
 from oauth2client.service_account import ServiceAccountCredentials
+import os
 from datetime import datetime
-from send_telegram import send_rotation_alert
 
-def run_rebalance_scanner():
-    print("📊 Running Rebalancer Scanner...")
+
+def run_rotation_stats_sync():
+    print("\U0001f4cb Syncing Rotation_Stats tab...")
 
     try:
+        # Auth
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
         client = gspread.authorize(creds)
-
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
+
         log_ws = sheet.worksheet("Rotation_Log")
-        portfolio_ws = sheet.worksheet("Portfolio_Targets")
+        review_ws = sheet.worksheet("ROI_Review_Log")
+        stats_ws = sheet.worksheet("Rotation_Stats")
 
-        # Build current weight snapshot
         log_data = log_ws.get_all_records()
-        total_alloc = sum(float(r.get("Allocation", 0)) for r in log_data if r.get("Status") == "Active")
-        current_weights = {
-            r["Token"]: round(float(r["Allocation"]) / total_alloc * 100, 2)
-            for r in log_data if r.get("Status") == "Active"
-        }
+        review_data = review_ws.get_all_records()
 
-        # Load targets
-        target_data = portfolio_ws.get_all_records()
-        alerts = []
+        stats = []
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-        for row in target_data:
-            token = row["Token"]
-            target_pct = float(row["Target %"])
-            actual_pct = current_weights.get(token, 0.0)
-            drift = round(actual_pct - target_pct, 2)
+        for row in log_data:
+            token = row.get("Token", "").strip()
+            initial_roi = row.get("Score", "").strip()
+            status = row.get("Status", "").strip()
+            days_held = row.get("Days Held", "").strip()
+            sentiment = row.get("Sentiment", "")
 
-            if abs(drift) >= 5:
-                msg = f"{token} is {actual_pct}% (target {target_pct}%). Rebalance?"
-                alerts.append((token, msg))
+            # Lookup follow-up ROI from review tab
+            follow_up = next((r["ROI"] for r in review_data if r["Token"].strip() == token and r.get("ROI")), None)
 
-        # Telegram prompt
-        for token, msg in alerts:
-            send_rotation_alert(token, msg)
+            try:
+                initial = float(initial_roi)
+                follow = float(follow_up)
+                performance = round((follow - initial) / initial * 100, 2)
+            except:
+                continue  # Skip rows with invalid data
 
-        if not alerts:
-            print("✅ Portfolio within tolerance. No rebalance needed.")
-        else:
-            print(f"⚠️ {len(alerts)} drift alerts sent.")
+            stats.append([
+                now,
+                token,
+                "YES",
+                initial,
+                sentiment,
+                status,
+                days_held,
+                follow,
+                performance
+            ])
+
+        # Write new Rotation_Stats sheet
+        headers = [
+            "Date", "Token", "Decision", "Initial ROI", "Sentiment", "Status",
+            "Days Held", "Follow-up ROI", "Performance"
+        ]
+        stats_ws.clear()
+        stats_ws.append_row(headers)
+        if stats:
+            stats_ws.append_rows(stats, value_input_option="USER_ENTERED")
+        print(f"✅ Rotation_Stats updated: {len(stats)} rows")
 
     except Exception as e:
-        print(f"❌ Rebalance scanner failed: {e}")
+        print(f"❌ rotation_stats_sync failed: {e}")
