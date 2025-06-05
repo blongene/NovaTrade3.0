@@ -21,7 +21,7 @@ def scan_roi_tracking():
 
     tracking_updates = []
 
-    for i, row in enumerate(log_data, start=2):  # Start at row 2
+    for i, row in enumerate(log_data, start=2):  # Start at row 2 (after headers)
         token = row.get("Token", "").strip()
         timestamp_str = row.get("Timestamp", "").strip()
 
@@ -29,14 +29,15 @@ def scan_roi_tracking():
             continue
 
         try:
+            # Parse timestamp and calculate days held
             vote_time = datetime.strptime(timestamp_str, "%m/%d/%Y %H:%M:%S")
             days_held = (now - vote_time).days
-            log_ws.update_cell(i, 9, days_held)  # Column I = Days Held
+            log_ws.update_cell(i, 9, days_held)  # Column I = "Days Held"
         except Exception as e:
             print(f"❌ Failed to parse timestamp for {token}: {e}")
             continue
 
-        # Only write to ROI_Tracking — not Follow-up ROI in Rotation_Log
+        # Append to ROI_Tracking (only)
         tracking_updates.append([
             token,
             now.strftime("%Y-%m-%d"),
