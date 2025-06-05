@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 
 
-def run_rotation_stats_sync():
+def run_rebalance_scanner():
     print("\U0001f4cb Syncing Rotation_Stats tab...")
 
     try:
