@@ -20,7 +20,7 @@ def run_sentiment_radar():
         summary_ws = sheet.worksheet("Sentiment_Summary")
 
         YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-        TWITTER_BEARER = os.getenv("TWITTER_BEARER")
+        TWITTER_BEARER = os.getenv("TWITTER_BEARER_TOKEN")
 
         # === DATA ===
         tokens = targets_ws.get_all_records()
