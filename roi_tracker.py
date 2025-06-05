@@ -3,42 +3,37 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
 
+# Updated ROI Tracker to avoid writing '2d since vote' into Rotation_Log
 def scan_roi_tracking():
-    try:
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
-            "sentiment-log-service.json", scope
-        )
-        client = gspread.authorize(creds)
+    print("🔁 Updating Days Held in Rotation_Log and tracking ROI...")
 
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
-        rotation_log = sheet.worksheet("Rotation_Log")
+    # Load worksheet and data
+    sheet = client.open_by_url(os.getenv("SHEET_URL"))
+    log_ws = sheet.worksheet("Rotation_Log")
+    tracking_ws = sheet.worksheet("ROI_Tracking")
 
-        rows = rotation_log.get_all_records()
-        now = datetime.utcnow()
+    log_data = log_ws.get_all_records()
+    now = datetime.utcnow()
 
-        for i, row in enumerate(rows):
-            entry = row.get("Timestamp", "")
-            if not entry:
-                continue
+    tracking_updates = []
 
-            try:
-                # Accept both ISO and standard format
-                if "T" in entry:
-                    ts = datetime.fromisoformat(entry.replace("Z", ""))
-                else:
-                    ts = datetime.strptime(entry, "%m/%d/%Y %H:%M:%S")
+    for i, row in enumerate(log_data, start=2):  # Row offset for header
+        token = row.get("Token", "").strip()
+        timestamp_str = row.get("Timestamp", "").strip()
+        if not token or not timestamp_str:
+            continue
 
-                days = (now - ts).days
-                rotation_log.update_cell(i + 2, 9, days)  # "Days Held"
-                rotation_log.update_cell(i + 2, 10, f"{days}d since vote")  # "Follow-up ROI"
-                print(f"🔁 Updated ROI tracker for row {i + 2} — {days}d since vote")
+        try:
+            vote_time = datetime.strptime(timestamp_str, "%m/%d/%Y %H:%M:%S")
+            days_held = (now - vote_time).days
+            log_ws.update_cell(i, 9, days_held)  # Column I = Days Held
+        except Exception as e:
+            print(f"❌ Failed to parse timestamp for {token}: {e}")
+            continue
 
-            except Exception as e:
-                print(f"⚠️ Failed to update row {i + 2}: {e}")
+        # Write to ROI_Tracking instead of Rotation_Log!Follow-up ROI
+        tracking_updates.append([token, now.strftime("%Y-%m-%d"), days_held, f"{days_held}d since vote"])
 
-    except Exception as e:
-        print(f"❌ ROI tracking error: {e}")
+    if tracking_updates:
+        tracking_ws.append_rows(tracking_updates, value_input_option="USER_ENTERED")
+        print(f"✅ ROI Tracker updated {len(tracking_updates)} rows")
