@@ -62,7 +62,33 @@ def run_sentiment_radar():
         else:
             print("⚠️ YOUTUBE_API_KEY not set. Skipping YouTube scan.")
 
-        # ---- TELEGRAM (Search via t.me/s/crypto_group) ----
+        # ---- TWITTER (X) ----
+        TWITTER_BEARER = os.getenv("TWITTER_BEARER_TOKEN")
+        if TWITTER_BEARER:
+            for token, aliases in alias_map.items():
+                search_terms = [token] + aliases
+                for term in search_terms:
+                    headers = {
+                        "Authorization": f"Bearer {TWITTER_BEARER}",
+                        "User-Agent": "NovaRadar/1.0"
+                    }
+                    params = {
+                        "query": f"{term} crypto",
+                        "max_results": 5,
+                        "tweet.fields": "text"
+                    }
+                    url = "https://api.twitter.com/2/tweets/search/recent"
+                    try:
+                        resp = requests.get(url, headers=headers, params=params)
+                        if resp.status_code == 200:
+                            for tweet in resp.json().get("data", []):
+                                logs.append([now, token, term, tweet["text"][:120], "Twitter"])
+                    except Exception as te:
+                        print(f"⚠️ Twitter scan failed for {term}: {te}")
+        else:
+            print("⚠️ TWITTER_BEARER_TOKEN not set. Skipping Twitter scan.")
+
+        # ---- TELEGRAM (optional) ----
         public_channels = ["CryptoMoonShots", "CryptoGems", "AltcoinAlerts", "DeFiMillion", "CryptoWhaleGroup"]
 
         for token, aliases in alias_map.items():
