@@ -62,9 +62,6 @@ def log_rotation_alert(token, milestone):
     except Exception as e:
         ping_webhook_debug(f"❌ Failed to log milestone for {token}: {e}")
 
-import requests
-import os
-
 def send_telegram_message(message):
     try:
         bot_token = os.getenv("BOT_TOKEN")
@@ -83,3 +80,34 @@ def send_telegram_message(message):
         return response.json()
     except Exception as e:
         ping_webhook_debug(f"❌ Telegram send error: {e}")
+
+import os
+import requests
+
+def send_telegram_prompt(token, message, buttons=["YES", "NO"], prefix="REBALANCE"):
+    bot_token = os.environ.get("BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not bot_token or not chat_id:
+        print("❌ BOT_TOKEN or TELEGRAM_CHAT_ID not found.")
+        return
+
+    button_data = [
+        [{"text": btn, "callback_data": f"{btn}|{token}"}] for btn in buttons
+    ]
+    payload = {
+        "chat_id": chat_id,
+        "text": f"🔁 *{prefix} ALERT*\n\n{message}",
+        "parse_mode": "Markdown",
+        "reply_markup": {"inline_keyboard": button_data}
+    }
+
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        r = requests.post(url, json=payload)
+        if r.ok:
+            print(f"✅ Telegram prompt sent for {token}")
+        else:
+            print(f"⚠️ Telegram error: {r.text}")
+    except Exception as e:
+        print(f"❌ Telegram prompt failed: {e}")
