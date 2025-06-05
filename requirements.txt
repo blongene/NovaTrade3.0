@@ -8,3 +8,4 @@ python-binance
 google-api-python-client>=2.0.0
 bs4
 textblob
+schedule
