@@ -19,6 +19,7 @@ from staking_yield_tracker import run_staking_yield_tracker
 from rotation_stats_sync import run_rotation_stats_sync
 from rotation_feedback_engine import run_rotation_feedback_engine
 from performance_dashboard import run_performance_dashboard
+from rebalance_scanner import run_rebalance_scanner
 
 import time
 import gspread
@@ -96,5 +97,7 @@ if __name__ == "__main__":
     run_rotation_feedback_engine()
     print("📊 Running Performance Dashboard...")
     run_performance_dashboard()
-    
+    # Run every 60 min
+    schedule.every(60).minutes.do(run_rebalance_scanner)
+
     telegram_app.run(host="0.0.0.0", port=10000)
