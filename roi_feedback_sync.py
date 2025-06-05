@@ -6,45 +6,59 @@ import os
 def run_roi_feedback_sync():
     print("🔄 Syncing ROI feedback from ROI_Review_Log...")
 
-    # Authenticate with Google Sheets
+    # Authenticate
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
     client = gspread.authorize(creds)
 
-    # Open the correct sheet and worksheet
     sheet = client.open_by_url(os.getenv("SHEET_URL"))
     review_ws = sheet.worksheet("ROI_Review_Log")
+    stats_ws = sheet.worksheet("Rotation_Stats")
 
-    # Load worksheet data
-    data = review_ws.get_all_records()
-    headers = review_ws.row_values(1)
+    review_data = review_ws.get_all_records()
+    stats_data = stats_ws.get_all_records()
+    review_headers = review_ws.row_values(1)
+    stats_headers = stats_ws.row_values(1)
 
+    # Column indexes
     try:
-        timestamp_idx = headers.index("Timestamp")
-        token_idx = headers.index("Token")
-        roi_idx = headers.index("ROI")
-        vote_idx = headers.index("Would You Say YES Again?")
-        synced_idx = headers.index("Synced?")
+        token_idx = review_headers.index("Token")
+        vote_idx = review_headers.index("Would You Say YES Again?")
+        feedback_idx = review_headers.index("Feedback")
+        synced_idx = review_headers.index("Synced?")
     except ValueError as e:
-        print("❌ Missing required column in ROI_Review_Log:", e)
+        print("❌ Missing column in ROI_Review_Log:", e)
         return
 
-    new_syncs = []
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        stats_token_idx = stats_headers.index("Token")
+        revote_col = stats_headers.index("Re-Vote") + 1
+        notes_col = stats_headers.index("Feedback Notes") + 1
+    except ValueError as e:
+        print("❌ Missing column in Rotation_Stats:", e)
+        return
 
-    for i, row in enumerate(data):
-        synced = str(row.get("Synced?", "")).strip().upper()
-        token = str(row.get("Token", "")).strip()
-        roi = str(row.get("ROI", "")).strip()
-        vote = str(row.get("Would You Say YES Again?", "")).strip()
+    updated = 0
+    for i, row in enumerate(review_data):
+        token = row.get("Token", "").strip().upper()
+        vote = row.get("Would You Say YES Again?", "").strip().upper()
+        feedback = row.get("Feedback", "").strip()
+        synced = row.get("Synced?", "").strip()
 
-        if synced in ["✅", "YES", "TRUE"] or not token or not roi:
-            continue  # Skip already synced or incomplete
+        if synced in ["✅", "TRUE", "YES"] or not token or not vote:
+            continue
 
-        # This is where you'd handle storing or using the feedback (e.g. write to a DB or another tab)
-        print(f"📥 Feedback received on {token} — ROI: {roi}, Vote: {vote}")
+        # Find matching row in Rotation_Stats
+        for j, stat in enumerate(stats_data):
+            stat_token = stat.get("Token", "").strip().upper()
+            if stat_token == token:
+                row_num = j + 2
+                stats_ws.update_cell(row_num, revote_col, vote)
+                if feedback:
+                    stats_ws.update_cell(row_num, notes_col, feedback)
+                review_ws.update_cell(i + 2, synced_idx + 1, "✅")
+                updated += 1
+                print(f"📥 Synced feedback for {token}: {vote}, Notes: {feedback}")
+                break
 
-        # Mark as synced in the sheet
-        review_ws.update_cell(i + 2, synced_idx + 1, "✅")
-
-    print("✅ ROI feedback sync complete.")
+    print(f"✅ ROI feedback sync complete. {updated} row(s) updated.")
