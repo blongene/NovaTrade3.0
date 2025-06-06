@@ -24,11 +24,11 @@ def run_rotation_stats_sync():
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
         for row in log_data:
-            token = row.get("Token", "").strip()
-            initial_roi = row.get("Score", "").strip()
-            status = row.get("Status", "").strip()
-            days_held = row.get("Days Held", "").strip()
-            sentiment = row.get("Sentiment", "")
+            token = str(row.get("Token", "")).strip()
+            initial_roi = str(row.get("Score", "")).strip()
+            status = str(row.get("Status", "")).strip()
+            days_held = str(row.get("Days Held", "")).strip()
+            sentiment = str(row.get("Sentiment", "")).strip()
 
             # Lookup follow-up ROI from review tab
             follow_up = next((r["ROI"] for r in review_data if r["Token"].strip() == token and r.get("ROI")), None)
