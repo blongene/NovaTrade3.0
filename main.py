@@ -104,6 +104,9 @@ if __name__ == "__main__":
 
     print("📊 Running Performance Dashboard...")
     run_performance_dashboard()
+    
+    print("🔁 Running initial rebalance scan...")
+    run_rebalance_scanner()  # Force 1st rebalance ping immediately
 
     # Schedule recurring modules
     schedule.every(60).minutes.do(run_rotation_log_updater)
