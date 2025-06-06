@@ -6,7 +6,6 @@ import os
 def run_roi_feedback_sync():
     print("🔄 Syncing ROI feedback from ROI_Review_Log...")
 
-    # Authenticate
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
     client = gspread.authorize(creds)
@@ -20,7 +19,6 @@ def run_roi_feedback_sync():
     review_headers = review_ws.row_values(1)
     stats_headers = stats_ws.row_values(1)
 
-    # Column indexes
     try:
         token_idx = review_headers.index("Token")
         vote_idx = review_headers.index("Would You Say YES Again?")
@@ -48,14 +46,11 @@ def run_roi_feedback_sync():
         if synced in ["✅", "TRUE", "YES"] or not token or not vote:
             continue
 
-        # Find matching row in Rotation_Stats
         for j, stat in enumerate(stats_data):
-            stat_token = stat.get("Token", "").strip().upper()
-            if stat_token == token:
-                row_num = j + 2
-                stats_ws.update_cell(row_num, revote_col, vote)
+            if stat.get("Token", "").strip().upper() == token:
+                stats_ws.update_cell(j + 2, revote_col, vote)
                 if feedback:
-                    stats_ws.update_cell(row_num, notes_col, feedback)
+                    stats_ws.update_cell(j + 2, notes_col, feedback)
                 review_ws.update_cell(i + 2, synced_idx + 1, "✅")
                 updated += 1
                 print(f"📥 Synced feedback for {token}: {vote}, Notes: {feedback}")
