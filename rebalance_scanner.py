@@ -2,10 +2,11 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
 from datetime import datetime
+from send_telegram import send_rotation_alert
 
 
 def run_rebalance_scanner():
-    print("\U0001f4cb Syncing Rotation_Stats tab...")
+    print("📊 Running Rebalance Scanner...")
 
     try:
         # Auth
@@ -14,55 +15,37 @@ def run_rebalance_scanner():
         client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-        log_ws = sheet.worksheet("Rotation_Log")
-        review_ws = sheet.worksheet("ROI_Review_Log")
-        stats_ws = sheet.worksheet("Rotation_Stats")
-
-        log_data = log_ws.get_all_records()
-        review_data = review_ws.get_all_records()
-
-        stats = []
+        ws = sheet.worksheet("Rebalancer")
+        rows = ws.get_all_records()
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-        for row in log_data:
-            token = row.get("Token", "").strip()
-            initial_roi = row.get("Score", "").strip()
-            status = row.get("Status", "").strip()
-            days_held = row.get("Days Held", "").strip()
-            sentiment = row.get("Sentiment", "")
-
-            # Lookup follow-up ROI from review tab
-            follow_up = next((r["ROI"] for r in review_data if r["Token"].strip() == token and r.get("ROI")), None)
+        for i, row in enumerate(rows, start=2):
+            token = str(row.get("Token", "")).strip()
+            current_pct = str(row.get("Current %", "")).replace("%", "").strip()
+            target_pct = str(row.get("Target %", "")).replace("%", "").strip()
+            notes = str(row.get("Notes", "")).strip()
+            wallet = row.get("Wallet", "Binance_Portfolio")
 
             try:
-                initial = float(initial_roi)
-                follow = float(follow_up)
-                performance = round((follow - initial) / initial * 100, 2)
+                current = float(current_pct)
+                target = float(target_pct)
             except:
-                continue  # Skip rows with invalid data
+                continue  # Skip if invalid number
 
-            stats.append([
-                now,
-                token,
-                "YES",
-                initial,
-                sentiment,
-                status,
-                days_held,
-                follow,
-                performance
-            ])
+            if notes.lower() in ["overweight", "undersized"]:
+                # Send Telegram prompt
+                message = (
+                    f"⚖️ *Rebalance Suggestion: {token}*\n"
+                    f"Wallet: `{wallet}`\n\n"
+                    f"*Current %:* {current}%\n"
+                    f"*Target %:* {target}%\n"
+                    f"Status: *{notes}*\n\n"
+                    f"Would you like to rebalance now?"
+                )
 
-        # Write new Rotation_Stats sheet
-        headers = [
-            "Date", "Token", "Decision", "Initial ROI", "Sentiment", "Status",
-            "Days Held", "Follow-up ROI", "Performance"
-        ]
-        stats_ws.clear()
-        stats_ws.append_row(headers)
-        if stats:
-            stats_ws.append_rows(stats, value_input_option="USER_ENTERED")
-        print(f"✅ Rotation_Stats updated: {len(stats)} rows")
+                send_rotation_alert(token, message)
+
+                print(f"📨 Rebalance alert sent for {token}")
 
     except Exception as e:
-        print(f"❌ rotation_stats_sync failed: {e}")
+        print(f"❌ rebalance_scanner failed: {e}")
