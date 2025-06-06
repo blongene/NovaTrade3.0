@@ -4,8 +4,9 @@ import os
 from datetime import datetime
 from send_telegram import send_rotation_alert
 
+
 def run_rebalance_scanner():
-    print("📊 Running Rebalance Scanner...")
+    print("\U0001f4ca Running Rebalance Scanner...")
 
     try:
         # Auth
@@ -14,34 +15,18 @@ def run_rebalance_scanner():
         client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-        ws = sheet.worksheet("Rebalance")  # ✅ Correct tab name
-        rows = ws.get_all_records()
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        target_ws = sheet.worksheet("Portfolio_Targets")
+        rows = target_ws.get_all_records()
 
-        for i, row in enumerate(rows, start=2):
-            token = str(row.get("Token", "")).strip()
-            current_pct = str(row.get("Current %", "")).replace("%", "").strip()
-            target_pct = str(row.get("Target %", "")).replace("%", "").strip()
-            notes = str(row.get("Notes", "")).strip()
-            wallet = row.get("Wallet", "Binance_Portfolio")
+        for row in rows:
+            token = row.get("Token", "").strip()
+            status = row.get("Notes", "").strip().lower()
 
-            try:
-                current = float(current_pct)
-                target = float(target_pct)
-            except:
-                continue  # Skip if invalid number
-
-            if notes.lower() in ["overweight", "undersized"]:
-                message = (
-                    f"⚖️ *Rebalance Suggestion: {token}*\n"
-                    f"Wallet: `{wallet}`\n\n"
-                    f"*Current %:* {current}%\n"
-                    f"*Target %:* {target}%\n"
-                    f"Status: *{notes}*\n\n"
-                    f"Would you like to rebalance now?"
-                )
+            if status in ["overweight", "underdsized"]:
+                message = f"⚖️ *Rebalance Candidate Detected: {token}*\n– Status: {status.title()}\n\nWould you like to adjust this holding to meet target allocations?"
                 send_rotation_alert(token, message)
-                print(f"📨 Rebalance alert sent for {token}")
+
+        print("✅ Rebalance scanner complete.")
 
     except Exception as e:
         print(f"❌ rebalance_scanner failed: {e}")
