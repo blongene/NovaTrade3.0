@@ -4,7 +4,6 @@ import os
 from datetime import datetime
 from send_telegram import send_rotation_alert
 
-
 def run_rebalance_scanner():
     print("📊 Running Rebalance Scanner...")
 
@@ -15,7 +14,7 @@ def run_rebalance_scanner():
         client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-        ws = sheet.worksheet("Rebalancer")
+        ws = sheet.worksheet("Rebalance")  # ✅ Correct tab name
         rows = ws.get_all_records()
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -33,7 +32,6 @@ def run_rebalance_scanner():
                 continue  # Skip if invalid number
 
             if notes.lower() in ["overweight", "undersized"]:
-                # Send Telegram prompt
                 message = (
                     f"⚖️ *Rebalance Suggestion: {token}*\n"
                     f"Wallet: `{wallet}`\n\n"
@@ -42,9 +40,7 @@ def run_rebalance_scanner():
                     f"Status: *{notes}*\n\n"
                     f"Would you like to rebalance now?"
                 )
-
                 send_rotation_alert(token, message)
-
                 print(f"📨 Rebalance alert sent for {token}")
 
     except Exception as e:
