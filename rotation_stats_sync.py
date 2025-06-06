@@ -2,6 +2,13 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
 from datetime import datetime
+from send_telegram import send_rotation_alert
+
+
+def clean_roi_value(raw_roi):
+    if isinstance(raw_roi, str):
+        return float(raw_roi.replace('%', '').strip())
+    return float(raw_roi)
 
 def run_rotation_stats_sync():
     print("📋 Syncing Rotation_Stats tab...")
@@ -35,8 +42,8 @@ def run_rotation_stats_sync():
 
             # Validate that both initial and follow-up ROI are numeric
             try:
-                initial = float(initial_roi)
-                follow = float(follow_up)
+                initial = clean_roi_value(initial_roi)
+                follow = clean_roi_value(follow_up)
             except:
                 print(f"⚠️ Skipping {token} — non-numeric ROI or missing value (Initial: {initial_roi}, Follow-up: {follow_up})")
                 continue
