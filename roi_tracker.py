@@ -17,11 +17,14 @@ def scan_roi_tracking():
     tracking_ws = sheet.worksheet("ROI_Tracking")
 
     log_data = log_ws.get_all_records()
+    existing_rows = tracking_ws.get_all_records()
+
     now = datetime.utcnow()
+    today_str = now.strftime("%Y-%m-%d")
 
     tracking_updates = []
 
-    for i, row in enumerate(log_data, start=2):  # Start at row 2 (after headers)
+    for i, row in enumerate(log_data, start=2):
         token = row.get("Token", "").strip()
         timestamp_str = row.get("Timestamp", "").strip()
 
@@ -29,18 +32,20 @@ def scan_roi_tracking():
             continue
 
         try:
-            # Parse timestamp and calculate days held
             vote_time = datetime.strptime(timestamp_str, "%m/%d/%Y %H:%M:%S")
             days_held = (now - vote_time).days
-            log_ws.update_cell(i, 9, days_held)  # Column I = "Days Held"
+            log_ws.update_cell(i, 9, days_held)  # Update Days Held (Col I)
         except Exception as e:
             print(f"❌ Failed to parse timestamp for {token}: {e}")
             continue
 
-        # Append to ROI_Tracking (only)
+        # ✅ Deduplication check
+        if any(r["Token"] == token and r["Date"] == today_str for r in existing_rows):
+            continue
+
         tracking_updates.append([
             token,
-            now.strftime("%Y-%m-%d"),
+            today_str,
             days_held,
             f"{days_held}d since vote"
         ])
@@ -48,3 +53,5 @@ def scan_roi_tracking():
     if tracking_updates:
         tracking_ws.append_rows(tracking_updates, value_input_option="USER_ENTERED")
         print(f"✅ ROI Tracker updated {len(tracking_updates)} rows")
+    else:
+        print("⚠️ No new ROI tracking entries needed (all rows already logged).")
