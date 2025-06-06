@@ -10,6 +10,10 @@ PROMPT_MEMORY = {}
 
 MILESTONES = [3, 7, 14, 30]
 
+# rotation_signal_engine.py
+
+def scan_rotation_candidates():
+    print("🧠 scan_rotation_candidates stub is active.")
 
 def run_milestone_alerts():
     print("\U0001F6A7 Scanning for milestone alerts...")
