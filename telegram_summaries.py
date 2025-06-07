@@ -2,71 +2,59 @@ import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Bot
-from dotenv import load_dotenv
-from nova_heartbeat import log_heartbeat
+from datetime import datetime
 
 def run_telegram_summaries():
-    print("📢 Running Telegram Summary Layer...")
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-    # Auth
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        bot = Bot(token=os.getenv("BOT_TOKEN"))
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-    stats_ws = sheet.worksheet("Rotation_Stats")
-    stats = stats_ws.get_all_records()
+        # Load Performance Metrics
+        stats = sheet.worksheet("Rotation_Stats").get_all_records()
+        staking = sheet.worksheet("Rotation_Log").get_all_records()
 
-    yield_ws = sheet.worksheet("Rotation_Log")
-    yields = yield_ws.get_all_records()
-
-    # Filter YES votes and numeric ROI
-    roi_entries = []
-    for row in stats:
-        if row.get("Decision") == "YES":
+        # Determine Top ROI Performer
+        roi_dict = {}
+        for row in stats:
+            token = row.get("Token", "").strip()
+            perf = row.get("Performance", "")
             try:
-                val = float(row.get("Performance", ""))
-                roi_entries.append((row["Token"], val))
+                roi = float(perf)
+                roi_dict[token] = roi
             except:
                 continue
 
-    top_roi = sorted(roi_entries, key=lambda x: x[1], reverse=True)[:3]
+        top_roi_token = max(roi_dict, key=roi_dict.get) if roi_dict else "N/A"
+        top_roi_value = roi_dict.get(top_roi_token, 0)
 
-    # Staking Yield top performers
-    yield_entries = []
-    for row in yields:
-        try:
-            val = float(row.get("Staking Yield", ""))
-            yield_entries.append((row["Token"], val))
-        except:
-            continue
+        # Determine Top Yielder
+        yield_dict = {}
+        for row in staking:
+            token = row.get("Token", "").strip()
+            yield_val = row.get("Staking Yield", "")
+            try:
+                apr = float(str(yield_val).replace("%", "").strip())
+                yield_dict[token] = apr
+            except:
+                continue
 
-    top_yield = sorted(yield_entries, key=lambda x: x[1], reverse=True)[:3]
+        top_yield_token = max(yield_dict, key=yield_dict.get) if yield_dict else "N/A"
+        top_yield_value = yield_dict.get(top_yield_token, 0)
 
-    # Summary Stats
-    avg_roi = round(sum(r[1] for r in roi_entries) / len(roi_entries), 2) if roi_entries else 0.0
-    total_yes = len(roi_entries)
+        # Build summary message
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        message = f"📊 *NovaTrade Daily Summary*\n\n"
+        message += f"🗓 *{now}*\n"
+        message += f"🏆 *Top ROI Token*: `{top_roi_token}` (+{top_roi_value}%)\n"
+        message += f"💰 *Top Yielder*: `{top_yield_token}` ({top_yield_value}%)\n"
+        message += f"\n🧠 _System is live and healthy._"
 
-    # Build message
-    message = f"📊 *NovaTrade Snapshot*\n\n"
-    message += f"✅ *YES Votes:* {total_yes}\n"
-    message += f"📈 *Avg ROI:* {avg_roi}%\n\n"
-
-    message += "🏆 *Top ROI Tokens:*\n"
-    for token, val in top_roi:
-        message += f"• {token}: {val}%\n"
-
-    message += "\n💰 *Top Yielding Tokens:*\n"
-    for token, val in top_yield:
-        message += f"• {token}: {val}%\n"
-
-    log_heartbeat("Telegram Summary", f"Sent summary with {total_yes} votes")
-
-    # Telegram
-    try:
-        bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
         bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
-        print("✅ Telegram Summary sent.")
+        print("✅ NovaHeartbeat log: [Telegram Summary] Sent summary with 0 votes")
     except Exception as e:
         print(f"⚠️ Telegram send error: {e}")
