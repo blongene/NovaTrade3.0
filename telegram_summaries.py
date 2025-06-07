@@ -24,9 +24,8 @@ def run_telegram_summaries():
             continue
 
     top = sorted(roi_data, key=lambda x: x[1], reverse=True)[:3]
-    message = "📈 Top ROI Tokens:
-" + "
-".join([f"{t}: +{r:.2f}x" for t, r in top])
+    summary_lines = [f"{t}: +{r:.2f}x" for t, r in top]
+    message = "📈 Top ROI Tokens:\n" + "\n".join(summary_lines)
 
     TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
     CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
