@@ -21,7 +21,6 @@ from rotation_feedback_engine import run_rotation_feedback_engine
 from rotation_log_updater import run_rotation_log_updater
 from performance_dashboard import run_performance_dashboard
 from rebalance_scanner import run_rebalance_scanner
-from rotation_log_updater import run_rotation_log_updater
 from telegram_summaries import run_telegram_summaries
 from rotation_memory import run_rotation_memory
 
@@ -62,19 +61,24 @@ if __name__ == "__main__":
     print("🧠 Running Rotation Signal Engine...")
     rotation_ws = load_presale_stream()
 
+    # ROI + Milestones
     scan_roi_tracking()
-    log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
     run_milestone_alerts()
     log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
-    sync_token_vault()
+    # Vault + Planner + Feedback
+    try:
+        sync_token_vault()
+    except Exception as e:
+        print(f"⚠️ Vault sync error: {e}")
+
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
-    log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
     print("📥 Syncing ROI feedback responses...")
     run_roi_feedback_sync()
 
+    # Sentiment + Presales
     print("📡 Running Sentiment Radar...")
     run_sentiment_radar()
 
@@ -85,19 +89,19 @@ if __name__ == "__main__":
     run_presale_scorer()
     schedule.every(60).minutes.do(run_rotation_log_updater)
 
+    # Stalled Assets + Claims + Yield
     run_stalled_asset_detector()
     check_claims()
-    print("💥 run_presale_scorer() BOOTED")
-    print("🧠 NovaTrade system is live.")
     start_staking_yield_loop()
 
+    # Rotation Performance + Dashboard
     run_rotation_stats_sync()
     run_rotation_log_updater()
     run_rotation_feedback_engine()
-
     print("📊 Running Performance Dashboard...")
     run_performance_dashboard()
 
+    # Rebalancing + Summaries
     print("🔁 Running initial rebalance scan...")
     run_rebalance_scanner()
     schedule.every(60).minutes.do(run_rebalance_scanner)
@@ -108,4 +112,6 @@ if __name__ == "__main__":
     print("🧠 Running Rotation Memory Sync...")
     run_rotation_memory()
 
+    print("🧠 NovaTrade system is live.")
+    print("💥 run_presale_scorer() BOOTED")
     telegram_app.run(host="0.0.0.0", port=10000)
