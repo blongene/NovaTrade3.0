@@ -19,7 +19,7 @@ def sync_token_vault():
     scout_df = pd.DataFrame(scout_ws.get_all_records())
 
     # Fallback columns if not present
-    for col in ["Decision", "Last Reviewed", "Source"]:
+    for col in ["Decision", "Last Reviewed", "Source", "Score", "Sentiment", "Market Cap"]:
         if col not in vault_df.columns:
             vault_df[col] = ""
 
@@ -32,9 +32,18 @@ def sync_token_vault():
         token = row["Token"]
         match = scout_latest[scout_latest["Token"] == token]
         if not match.empty:
-            vault_df.at[idx, "Decision"] = match["Decision"].values[0]
-            vault_df.at[idx, "Last Reviewed"] = match["Timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S").values[0]
-            vault_df.at[idx, "Source"] = match["Source"].values[0]
+            if vault_df.at[idx, "Decision"] == "":
+                vault_df.at[idx, "Decision"] = match["Decision"].values[0]
+            if vault_df.at[idx, "Last Reviewed"] == "":
+                vault_df.at[idx, "Last Reviewed"] = match["Timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S").values[0]
+            if vault_df.at[idx, "Source"] == "":
+                vault_df.at[idx, "Source"] = match["Source"].values[0]
+            if vault_df.at[idx, "Score"] == "":
+                vault_df.at[idx, "Score"] = match["Score"].values[0]
+            if vault_df.at[idx, "Sentiment"] == "":
+                vault_df.at[idx, "Sentiment"] = match["Sentiment"].values[0]
+            if vault_df.at[idx, "Market Cap"] == "":
+                vault_df.at[idx, "Market Cap"] = match["Market Cap"].values[0]
 
     # Push changes
     vault_ws.clear()
