@@ -29,6 +29,14 @@ def run_performance_dashboard():
     top_token = max(token_rois, key=token_rois.get, default="N/A")
     bottom_token = min(token_rois, key=token_rois.get, default="N/A")
 
+    # Look for the most recent valid timestamp in NovaHeartbeat
+    try:
+        heartbeat_rows = sheet.worksheet("NovaHeartbeat").get_all_records()
+        latest_valid = next((r for r in reversed(heartbeat_rows) if r.get("Timestamp")), None)
+        last_update = latest_valid["Timestamp"] if latest_valid else "N/A"
+    except Exception as e:
+        last_update = "N/A"
+
     dashboard.update("A2", [
         ["Total YES Votes", total_votes],
         ["Average ROI (YES)", f"{avg_roi}%"],
@@ -37,5 +45,5 @@ def run_performance_dashboard():
         ["Projected Portfolio Value", "$5,000.00"],
         ["% Progress to $250K Goal", "2.0%"],
         ["Unique Tokens Rotated", len(set(token_rois.keys()))],
-        ["Last Updated", str(sheet.worksheet("NovaHeartbeat").get_all_records()[-1]["Timestamp"])]
+        ["Last Updated", last_update]
     ])
