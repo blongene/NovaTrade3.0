@@ -1,6 +1,7 @@
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
 
 def run_performance_dashboard():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -29,13 +30,12 @@ def run_performance_dashboard():
     top_token = max(token_rois, key=token_rois.get, default="N/A")
     bottom_token = min(token_rois, key=token_rois.get, default="N/A")
 
-    # Look for the most recent valid timestamp in NovaHeartbeat
+    # Low-quota fallback: only fetch NovaHeartbeat!A2 (not all records)
     try:
-        heartbeat_rows = sheet.worksheet("NovaHeartbeat").get_all_records()
-        latest_valid = next((r for r in reversed(heartbeat_rows) if r.get("Timestamp")), None)
-        last_update = latest_valid["Timestamp"] if latest_valid else "N/A"
-    except Exception as e:
-        last_update = "N/A"
+        value = sheet.worksheet("NovaHeartbeat").acell("A2").value
+        last_update = value if value else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    except:
+        last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     dashboard.update("A2", [
         ["Total YES Votes", total_votes],
