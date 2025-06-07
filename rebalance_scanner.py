@@ -2,7 +2,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
 from datetime import datetime
-from send_telegram import send_rotation_alert
+from utils import send_telegram_prompt
 
 def run_rebalance_scanner():
     print("📊 Running Rebalance Scanner...")
@@ -22,7 +22,8 @@ def run_rebalance_scanner():
 
             if status in ["overweight", "undersized"]:
                 message = f"⚖️ *Rebalance Candidate Detected: {token}*\n– Status: {status.title()}\n\nWould you like to adjust this holding to meet target allocations?"
-                send_rotation_alert(token, message)
+        message = f"Token *{token}* has hit rebalance criteria.\n\nScore: {score}\nSentiment: {sentiment}\nMarket Cap: {market_cap}"
+        send_telegram_prompt(token, message, buttons=["ROTATE", "HOLD"], prefix="REBALANCE")
 
         print("✅ Rebalance scanner complete.")
 
