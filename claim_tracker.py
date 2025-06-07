@@ -23,46 +23,57 @@ def check_claims():
                 continue
 
             claimable = str(row.get("Claimable", "")).strip().upper() == "TRUE"
-            claimed = str(row.get("Claimed?", "")).strip().lower() == "claimed"
+            claimed_str = str(row.get("Claimed?", "")).strip().lower()
+            claimed = claimed_str in ["claimed", "yes", "✅"]
             unlock_date_str = row.get("Unlock Date", "")
             wallet = row.get("Wallet", "").strip()
             contract = row.get("Contract", "").strip()
 
-            if not unlock_date_str:
-                continue
+            if unlock_date_str:
+                try:
+                    unlock_date = datetime.strptime(unlock_date_str, "%Y-%m-%d")
+                    days_since_unlock = (now - unlock_date).days
+                    if not claimed:
+                        tracker_ws.update_acell(f"J{i}", str(days_since_unlock))
+                    else:
+                        tracker_ws.update_acell(f"J{i}", "")  # Clear if claimed
+                except Exception as e:
+                    print(f"⚠️ Could not parse unlock date for {token}: {e}")
+                    tracker_ws.update_acell(f"J{i}", "❓")
+            else:
+                tracker_ws.update_acell(f"J{i}", "")  # Clear if no date
 
-            try:
-                unlock_date = datetime.strptime(unlock_date_str, "%Y-%m-%d")
-                days_since_unlock = (now - unlock_date).days
-                tracker_ws.update_acell(f"J{i}", days_since_unlock)
-            except Exception as e:
-                print(f"⚠️ Could not parse unlock date for {token}: {e}")
-                continue
-
+            # Set status based on claimability
             if claimable and not claimed:
                 tracker_ws.update_acell(f"I{i}", "⚠️ Claim Now")
                 print(f"⚠️ Claim reminder: {token} is unlocked and not claimed.")
+            elif claimed:
+                tracker_ws.update_acell(f"I{i}", "✅ Claimed")
+            else:
+                tracker_ws.update_acell(f"I{i}", "🕒 Pending")
 
+            # If claimed, log it into Rotation_Log if not already there
             if claimed:
-                # Write token into Rotation_Log with basic data if not already present
                 log_data = log_ws.get_all_records()
-                existing = any(str(entry["Token"]).strip().upper() == token.upper() for entry in log_data)
-                if not existing:
+                exists = any(str(entry["Token"]).strip().upper() == token.upper() for entry in log_data)
+                if not exists:
                     print(f"✅ Logging claimed token {token} to Rotation_Log...")
                     new_row = [
                         now.strftime("%Y-%m-%d %H:%M:%S"),
                         token,
                         "Active",
                         "", "", "", "",  # Score, Sentiment, Market Cap, Scout URL
-                        "100%",  # Allocation
-                        "0",  # Days Held
-                        "0",  # Follow-up ROI
-                        "", "", "",  # Staking Yield, Contract Address, Initial Claimed
+                        "100%",          # Allocation
+                        "0",             # Days Held
+                        "0",             # Follow-up ROI
+                        "", "", "",      # Staking Yield, Contract, Initial Claimed
                         now.strftime("%Y-%m-%d %H:%M:%S"),  # Last Checked
                         "✅ Healthy"
                     ]
                     log_ws.append_row(new_row)
+
             time.sleep(1.5)  # Throttle to stay under quota
+
         print("✅ Claim tracker complete.")
     except Exception as e:
         print(f"❌ Claim tracker error: {e}")
