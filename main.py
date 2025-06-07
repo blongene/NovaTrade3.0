@@ -22,6 +22,8 @@ from rotation_log_updater import run_rotation_log_updater
 from performance_dashboard import run_performance_dashboard
 from rebalance_scanner import run_rebalance_scanner
 from rotation_log_updater import run_rotation_log_updater
+from telegram_summaries import run_telegram_summaries
+from rotation_memory import run_rotation_memory
 
 import time
 import gspread
@@ -88,8 +90,9 @@ if __name__ == "__main__":
     print("💥 run_presale_scorer() BOOTED")
     print("🧠 NovaTrade system is live.")
     start_staking_yield_loop()
+
     run_rotation_stats_sync()
-    run_rotation_log_updater()  # 🩹 Patch ROI from ROI_Review_Log into Rotation_Log
+    run_rotation_log_updater()
     run_rotation_feedback_engine()
 
     print("📊 Running Performance Dashboard...")
@@ -98,5 +101,11 @@ if __name__ == "__main__":
     print("🔁 Running initial rebalance scan...")
     run_rebalance_scanner()
     schedule.every(60).minutes.do(run_rebalance_scanner)
+
+    print("📢 Running Telegram Summary Layer...")
+    run_telegram_summaries()
+
+    print("🧠 Running Rotation Memory Sync...")
+    run_rotation_memory()
 
     telegram_app.run(host="0.0.0.0", port=10000)
