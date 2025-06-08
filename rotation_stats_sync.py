@@ -1,5 +1,6 @@
 import os
 import gspread
+import re
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -20,6 +21,7 @@ def run_rotation_stats_sync():
         token = row.get("Token", "").strip()
         entry_date = row.get("Timestamp", "").strip()
         followup = row.get("Follow-up ROI", "").strip()
+        initial_roi = row.get("Score", "").strip()
 
         if not token or not entry_date:
             continue
@@ -27,19 +29,21 @@ def run_rotation_stats_sync():
         if (token, entry_date) in stats_tokens:
             continue
 
-        try:
-            initial_roi = float(row.get("Score", ""))
-            followup_roi = float(followup) if followup and followup != "N/A" else None
-            performance = round(followup_roi / initial_roi, 2) if followup_roi else "N/A"
-        except:
-            initial_roi = "N/A"
+        # Validate numeric ROI values
+        def is_numeric(val):
+            return re.match(r"^-?\d+(\.\d+)?$", str(val))
+
+        followup_roi = float(followup) if is_numeric(followup) else None
+        init_roi = float(initial_roi) if is_numeric(initial_roi) else None
+
+        if followup_roi is not None and init_roi:
+            performance = round(followup_roi / init_roi, 2)
+        else:
             performance = "N/A"
 
-        days_held = row.get("Days Held", "")
-
         stats_ws.append_row([
-            entry_date, token, "YES", initial_roi, row.get("Sentiment", ""),
-            row.get("Status", ""), days_held, followup, performance, "", ""
+            entry_date, token, "YES", init_roi if init_roi else "N/A", row.get("Sentiment", ""),
+            row.get("Status", ""), row.get("Days Held", ""), followup if followup_roi else "N/A", performance, "", ""
         ])
 
         print(f"✅ Synced {token} to Rotation_Stats")
