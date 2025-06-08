@@ -23,6 +23,7 @@ from performance_dashboard import run_performance_dashboard
 from rebalance_scanner import run_rebalance_scanner
 from telegram_summaries import run_telegram_summaries
 from rotation_memory import run_rotation_memory
+from rotation_log_cleanup import run_rotation_log_cleanup  # ✅ NEW LINE
 
 import time
 import gspread
@@ -82,36 +83,4 @@ if __name__ == "__main__":
     print("📡 Running Sentiment Radar...")
     run_sentiment_radar()
 
-    check_nova_trigger()
-    trigger_nova_ping("NOVA UPDATE")
-
-    print("⏰ Running presale scan every 60 min")
-    run_presale_scorer()
-    schedule.every(60).minutes.do(run_rotation_log_updater)
-
-    # Stalled Assets + Claims + Yield
-    run_stalled_asset_detector()
-    check_claims()
-    start_staking_yield_loop()
-
-    # Rotation Performance + Dashboard
-    run_rotation_stats_sync()
-    run_rotation_log_updater()
-    run_rotation_feedback_engine()
-    print("📊 Running Performance Dashboard...")
-    run_performance_dashboard()
-
-    # Rebalancing + Summaries
-    print("🔁 Running initial rebalance scan...")
-    run_rebalance_scanner()
-    schedule.every(60).minutes.do(run_rebalance_scanner)
-
-    print("📢 Running Telegram Summary Layer...")
-    run_telegram_summaries()
-
-    print("🧠 Running Rotation Memory Sync...")
-    run_rotation_memory()
-
-    print("🧠 NovaTrade system is live.")
-    print("💥 run_presale_scorer() BOOTED")
-    telegram_app.run(host="0.0.0.0", port=10000)
+    check_nova_trigger
