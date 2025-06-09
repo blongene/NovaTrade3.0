@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
-from telegram_notifier import send_alert  # Only if needed
+# from telegram_notifier import send_alert  # Disabled to prevent module error
 
 # Optional toggle
 ENABLE_YOUTUBE = False
