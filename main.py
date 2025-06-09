@@ -22,6 +22,7 @@ from performance_dashboard import run_performance_dashboard
 from rebalance_scanner import run_rebalance_scanner
 from telegram_summaries import run_telegram_summaries
 from rotation_memory import run_rotation_memory
+from rotation_log_updater import run_rotation_log_updater
 
 import time
 import gspread
