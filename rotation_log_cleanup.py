@@ -6,24 +6,38 @@ from oauth2client.service_account import ServiceAccountCredentials
 def run_rotation_log_cleanup():
     print("🧹 Running cleanup on Rotation_Log...")
 
-    # Authenticate and open sheet
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_url(os.getenv("SHEET_URL"))
-    log_ws = sheet.worksheet("Rotation_Log")
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        log_ws = sheet.worksheet("Rotation_Log")
 
-    # Get data
-    log_data = log_ws.get_all_values()
-    header = log_data[0]
-    data = log_data[1:]
+        log_data = log_ws.get_all_values()
+        if not log_data:
+            print("⚠️ No data found in Rotation_Log.")
+            return
 
-    roi_col = header.index("Follow-up ROI") + 1  # 1-based index for update_cell
+        header = log_data[0]
+        data = log_data[1:]
 
-    for i, row in enumerate(data):
-        value = row[roi_col - 1].strip()
-        if value and not re.match(r"^-?\d+(\.\d+)?$", value):
-            log_ws.update_cell(i + 2, roi_col, "")  # +2 = 1 for header, 1 for 1-based indexing
-            print(f"❌ Non-numeric ROI cleared in row {i+2}: '{value}'")
+        if "Follow-up ROI" not in header:
+            print("⚠️ 'Follow-up ROI' column missing in Rotation_Log.")
+            return
 
-    print("✅ Cleanup complete. Rotation_Log now sanitized.")
+        roi_col = header.index("Follow-up ROI") + 1
+        cleaned = 0
+
+        for i, row in enumerate(data):
+            if len(row) <= roi_col - 1:
+                continue
+            value = row[roi_col - 1].strip()
+            if value and not re.match(r"^-?\d+(\.\d+)?$", value):
+                log_ws.update_cell(i + 2, roi_col, "")
+                cleaned += 1
+                print(f"❌ Cleared non-numeric ROI in row {i+2}: '{value}'")
+
+        print(f"✅ Cleanup complete. {cleaned} entries sanitized.")
+
+    except Exception as e:
+        print(f"❌ Rotation Log cleanup error: {e}")
