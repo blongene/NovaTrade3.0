@@ -42,4 +42,13 @@ def run_rotation_stats_sync():
         if followup_roi is not None and init_roi:
             performance = round(followup_roi / init_roi, 2)
         else:
-            performance = "N/
+            performance = "N/A"
+
+        stats_ws.append_row([
+            entry_date, token, "YES", init_roi if init_roi is not None else "N/A",
+            row.get("Sentiment", ""), row.get("Status", ""),
+            row.get("Days Held", ""), followup if followup_roi is not None else "N/A",
+            performance, "", ""
+        ])
+
+        print(f"✅ Synced {token} to Rotation_Stats")
