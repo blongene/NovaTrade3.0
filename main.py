@@ -84,3 +84,36 @@ if __name__ == "__main__":
     run_sentiment_radar()
 
     check_nova_trigger
+    print("⏰ Running presale scan every 60 min")
+    run_presale_scorer()
+    schedule.every(60).minutes.do(run_rotation_log_updater)
+
+    run_stalled_asset_detector()
+    check_claims()
+    start_staking_yield_loop()
+
+    run_rotation_stats_sync()
+    run_rotation_log_updater()
+    run_rotation_feedback_engine()
+    print("📊 Running Performance Dashboard...")
+    run_performance_dashboard()
+
+    print("🔁 Running initial rebalance scan...")
+    run_rebalance_scanner()
+    schedule.every(60).minutes.do(run_rebalance_scanner)
+
+    print("📢 Running Telegram Summary Layer...")
+    run_telegram_summaries()
+
+    print("🧠 Running Rotation Memory Sync...")
+    run_rotation_memory()
+
+    print("🧹 Cleaning Rotation_Log ROI column...")
+    run_rotation_log_cleanup()
+
+    print("🧠 NovaTrade system is live.")
+    print("💥 run_presale_scorer() BOOTED")
+
+    # ✅ Binds Flask app to port 10000
+    print("🟢 Starting Flask app on port 10000...")
+    telegram_app.run(host="0.0.0.0", port=10000)
