@@ -84,6 +84,7 @@ if __name__ == "__main__":
     run_sentiment_radar()
 
     check_nova_trigger
+    
     print("⏰ Running presale scan every 60 min")
     run_presale_scorer()
     schedule.every(60).minutes.do(run_rotation_log_updater)
