@@ -1,50 +1,67 @@
 import os
 import gspread
-import requests
-import time
+import re
+from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
+from googleapiclient.discovery import build
+from telegram_notifier import send_alert  # Only if needed
+
+# Optional toggle
+ENABLE_YOUTUBE = False
 
 def run_sentiment_radar():
+    print("📡 Running Sentiment Radar...")
+
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
     client = gspread.authorize(creds)
-    sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
+    sheet = client.open_by_url(os.getenv("SHEET_URL"))
     radar_ws = sheet.worksheet("Sentiment_Radar")
     targets_ws = sheet.worksheet("Sentiment_Targets")
+
     targets = targets_ws.get_all_records()
-    time.sleep(2)
+    token_list = sorted(targets, key=lambda x: x.get("Priority", 0), reverse=True)[:3]  # Top 3 tokens
 
-    mentions = []
-    for t in targets:
-        token = t["Token"]
-        aliases = [t.get(f"Alias {i}", "") for i in range(1, 4)]
-        for term in [token] + aliases:
-            if not term:
+    sentiment_entries = []
+
+    # YouTube setup
+    if ENABLE_YOUTUBE:
+        try:
+            youtube = build("youtube", "v3", developerKey=os.getenv("YOUTUBE_API_KEY"))
+        except Exception as e:
+            print(f"⚠️ YouTube client failed: {e}")
+            youtube = None
+
+    for target in token_list:
+        token = target.get("Token", "").strip()
+        if not token:
+            continue
+
+        # Search YouTube
+        if ENABLE_YOUTUBE and youtube:
+            try:
+                request = youtube.search().list(
+                    q=token,
+                    part="snippet",
+                    maxResults=3,
+                    type="video"
+                )
+                response = request.execute()
+                mentions = len(response.get("items", []))
+                sentiment_entries.append([datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), token, "YouTube", mentions])
+                print(f"📺 YouTube: {token} → {mentions} mentions")
+            except Exception as e:
+                if "quotaExceeded" in str(e):
+                    print(f"⚠️ YouTube quota exceeded for token '{token}'")
+                else:
+                    print(f"⚠️ YouTube error for '{token}': {e}")
                 continue
-            # Simulate Reddit pull (replace with real)
-            mentions.append([token, term, "Sample Reddit Text", "Reddit"])
-            time.sleep(0.5)
 
-            # YouTube logic
-            yt_key = os.getenv("YOUTUBE_API_KEY")
-            if yt_key:
-                try:
-                    url = f"https://www.googleapis.com/youtube/v3/search?q={term}&key={yt_key}&part=snippet&maxResults=1"
-                    res = requests.get(url)
-                    if res.status_code == 200:
-                        yt_data = res.json()
-                        for item in yt_data.get("items", []):
-                            mentions.append([token, term, item["snippet"]["title"], "YouTube"])
-                    else:
-                        print(f"⚠️ YouTube error: {res.status_code} - {res.text}")
-                except Exception as e:
-                    print(f"⚠️ YouTube fetch failed for {term}: {e}")
-            time.sleep(1)
+        # You can expand this to Reddit/Twitter scraping as needed
 
-    radar_ws.clear()
-    radar_ws.append_row(["Date Detected", "Token", "Mentioned Term", "Sentiment Text", "Source"])
-    for m in mentions:
-        radar_ws.append_row([time.strftime("%Y-%m-%d %H:%M:%S")] + m)
-
-    print(f"✅ Sentiment Radar logged {len(mentions)} mentions.")
+    if sentiment_entries:
+        radar_ws.append_rows(sentiment_entries, value_input_option="USER_ENTERED")
+        print(f"✅ Sentiment Radar logged {len(sentiment_entries)} mentions.")
+    else:
+        print("⚠️ No sentiment entries written.")
