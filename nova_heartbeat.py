@@ -1,4 +1,5 @@
 # nova_heartbeat.py
+
 import os
 from datetime import datetime
 import gspread
@@ -15,12 +16,16 @@ def log_heartbeat(module="System", message="Heartbeat confirmed"):
         )
         client = gspread.authorize(creds)
 
-        sheet = client.open_by_url(os.environ["SHEET_URL"])
+        sheet_url = os.environ.get("SHEET_URL")
+        if not sheet_url:
+            raise ValueError("SHEET_URL environment variable is not set.")
+
+        sheet = client.open_by_url(sheet_url)
         heartbeat_tab = sheet.worksheet("NovaHeartbeat")
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        heartbeat_tab.append_row([now, module, message], value_input_option="USER_ENTERED")
 
-        heartbeat_tab.append_row([now, module, message])
         print(f"✅ NovaHeartbeat log: [{module}] {message}")
 
     except Exception as e:
