@@ -1,44 +1,53 @@
+# scout_to_planner_sync.py
+
 import gspread
 import os
 from oauth2client.service_account import ServiceAccountCredentials
 
 def sync_rotation_planner():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+        client = gspread.authorize(creds)
 
-    sheet = client.open_by_url(os.environ["SHEET_URL"])
-    scout_ws = sheet.worksheet("Scout Decisions")
-    planner_ws = sheet.worksheet("Rotation_Planner")
+        sheet_url = os.getenv("SHEET_URL")
+        if not sheet_url:
+            raise ValueError("SHEET_URL not set.")
 
-    scout = scout_ws.get_all_records()
-    planner_tokens = [r["Token"].strip().upper() for r in planner_ws.get_all_records() if r.get("Token")]
+        sheet = client.open_by_url(sheet_url)
+        scout_ws = sheet.worksheet("Scout Decisions")
+        planner_ws = sheet.worksheet("Rotation_Planner")
 
-    for row in scout:
-        token = row.get("Token", "").strip().upper()
-        decision = row.get("Decision", "").strip().upper()
+        scout = scout_ws.get_all_records()
+        planner_tokens = {r.get("Token", "").strip().upper() for r in planner_ws.get_all_records() if r.get("Token")}
 
-        if not token or decision != "YES" or token in planner_tokens:
-            continue
+        for row in scout:
+            token = row.get("Token", "").strip().upper()
+            decision = row.get("Decision", "").strip().upper()
 
-        # Safe get values or blank
-        timestamp = row.get("Timestamp", "")
-        source = row.get("Source", "")
-        score = row.get("Score", "")
-        sentiment = row.get("Sentiment", "")
-        market_cap = row.get("Market Cap", "")
-        scout_url = row.get("Scout URL", "")
+            if not token or decision != "YES" or token in planner_tokens:
+                continue
 
-        planner_ws.append_row([
-            token,
-            timestamp,
-            decision,
-            source,
-            score,
-            sentiment,
-            market_cap,
-            scout_url,
-            "NO"  # Confirmed = NO by default
-        ], value_input_option="USER_ENTERED")
+            timestamp = row.get("Timestamp", "")
+            source = row.get("Source", "")
+            score = row.get("Score", "")
+            sentiment = row.get("Sentiment", "")
+            market_cap = row.get("Market Cap", "")
+            scout_url = row.get("Scout URL", "")
 
-        print(f"✅ Synced to Rotation_Planner: {token}")
+            planner_ws.append_row([
+                token,
+                timestamp,
+                decision,
+                source,
+                score,
+                sentiment,
+                market_cap,
+                scout_url,
+                "NO"  # Confirmed
+            ], value_input_option="USER_ENTERED")
+
+            print(f"✅ Synced to Rotation_Planner: {token}")
+
+    except Exception as e:
+        print(f"❌ sync_rotation_planner error: {e}")
