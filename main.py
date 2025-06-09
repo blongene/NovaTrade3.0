@@ -23,7 +23,6 @@ from performance_dashboard import run_performance_dashboard
 from rebalance_scanner import run_rebalance_scanner
 from telegram_summaries import run_telegram_summaries
 from rotation_memory import run_rotation_memory
-from rotation_log_cleanup import run_rotation_log_cleanup  # ✅ NEW LINE
 
 import time
 import gspread
@@ -93,8 +92,16 @@ if __name__ == "__main__":
     check_claims()
     start_staking_yield_loop()
 
-    run_rotation_stats_sync()
+    print("🧹 Cleaning Rotation_Log ROI column...")
+    time.sleep(5)
+    run_rotation_log_cleanup()
+
+    time.sleep(5)
     run_rotation_log_updater()
+
+    time.sleep(5)
+    run_rotation_stats_sync()
+
     run_rotation_feedback_engine()
     print("📊 Running Performance Dashboard...")
     run_performance_dashboard()
