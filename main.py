@@ -19,7 +19,6 @@ from staking_yield_tracker import run_staking_yield_tracker
 from rotation_stats_sync import run_rotation_stats_sync
 from rotation_feedback_engine import run_rotation_feedback_engine
 from rotation_log_updater import run_rotation_log_updater
-from rotation_log_cleanup import run_rotation_log_cleanup
 from performance_dashboard import run_performance_dashboard
 from rebalance_scanner import run_rebalance_scanner
 from telegram_summaries import run_telegram_summaries
@@ -103,8 +102,7 @@ if __name__ == "__main__":
     # Delay-heavy operations to avoid 429s
     time.sleep(5)
     print("🧹 Cleaning Rotation_Log ROI column...")
-    run_rotation_log_cleanup()
-
+    
     time.sleep(5)
     print("🛠 Updating Rotation_Log with ROI_Review_Log data...")
     run_rotation_log_updater()
