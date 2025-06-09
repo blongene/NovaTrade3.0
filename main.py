@@ -93,9 +93,7 @@ if __name__ == "__main__":
     start_staking_yield_loop()
 
     print("🧹 Cleaning Rotation_Log ROI column...")
-    time.sleep(5)
-    run_rotation_log_cleanup()
-
+    
     time.sleep(5)
     run_rotation_log_updater()
 
