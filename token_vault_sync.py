@@ -1,3 +1,5 @@
+# token_vault_sync.py
+
 import gspread
 import pandas as pd
 from datetime import datetime
@@ -5,48 +7,56 @@ from oauth2client.service_account import ServiceAccountCredentials
 import os
 
 def sync_token_vault():
-    # Authenticate with Google Sheets
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("token_vault.json", scope)
-    client = gspread.authorize(creds)
+    print("📦 Syncing Token Vault...")
 
-    sheet = client.open_by_url(os.getenv("SHEET_URL"))
-    vault_ws = sheet.worksheet("Token_Vault")
-    scout_ws = sheet.worksheet("Scout Decisions")
+    try:
+        # Auth
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+        client = gspread.authorize(creds)
 
-    # Load data
-    vault_df = pd.DataFrame(vault_ws.get_all_records())
-    scout_df = pd.DataFrame(scout_ws.get_all_records())
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        vault_ws = sheet.worksheet("Token_Vault")
+        scout_ws = sheet.worksheet("Scout Decisions")
 
-    # Fallback columns if not present
-    for col in ["Decision", "Last Reviewed", "Source", "Score", "Sentiment", "Market Cap"]:
-        if col not in vault_df.columns:
-            vault_df[col] = ""
+        vault_df = pd.DataFrame(vault_ws.get_all_records())
+        scout_df = pd.DataFrame(scout_ws.get_all_records())
 
-    # Format and filter scout data
-    scout_df["Timestamp"] = pd.to_datetime(scout_df["Timestamp"], errors="coerce")
-    scout_latest = scout_df.sort_values("Timestamp").drop_duplicates("Token", keep="last")
+        # Ensure fallback columns exist
+        for col in ["Decision", "Last Reviewed", "Source", "Score", "Sentiment", "Market Cap"]:
+            if col not in vault_df.columns:
+                vault_df[col] = ""
 
-    # Sync loop
-    for idx, row in vault_df.iterrows():
-        token = row["Token"]
-        match = scout_latest[scout_latest["Token"] == token]
-        if not match.empty:
-            if vault_df.at[idx, "Decision"] == "":
-                vault_df.at[idx, "Decision"] = match["Decision"].values[0]
-            if vault_df.at[idx, "Last Reviewed"] == "":
-                vault_df.at[idx, "Last Reviewed"] = match["Timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S").values[0]
-            if vault_df.at[idx, "Source"] == "":
-                vault_df.at[idx, "Source"] = match["Source"].values[0]
-            if vault_df.at[idx, "Score"] == "":
-                vault_df.at[idx, "Score"] = match["Score"].values[0]
-            if vault_df.at[idx, "Sentiment"] == "":
-                vault_df.at[idx, "Sentiment"] = match["Sentiment"].values[0]
-            if vault_df.at[idx, "Market Cap"] == "":
-                vault_df.at[idx, "Market Cap"] = match["Market Cap"].values[0]
+        scout_df["Timestamp"] = pd.to_datetime(scout_df["Timestamp"], errors="coerce")
+        scout_latest = scout_df.sort_values("Timestamp").drop_duplicates("Token", keep="last")
 
-    # Push changes
-    vault_ws.clear()
-    vault_ws.update([vault_df.columns.values.tolist()] + vault_df.values.tolist())
+        # Sync matching scout info into vault
+        for idx, row in vault_df.iterrows():
+            token = row.get("Token", "").strip()
+            if not token:
+                continue
 
-    print("✅ Token Vault synced with latest Scout Decisions.")
+            match = scout_latest[scout_latest["Token"].str.strip() == token]
+            if not match.empty:
+                latest = match.iloc[0]
+                if not row["Decision"]:
+                    vault_df.at[idx, "Decision"] = latest.get("Decision", "")
+                if not row["Last Reviewed"]:
+                    vault_df.at[idx, "Last Reviewed"] = latest["Timestamp"].strftime("%Y-%m-%dT%H:%M:%S")
+                if not row["Source"]:
+                    vault_df.at[idx, "Source"] = latest.get("Source", "")
+                if not row["Score"]:
+                    vault_df.at[idx, "Score"] = latest.get("Score", "")
+                if not row["Sentiment"]:
+                    vault_df.at[idx, "Sentiment"] = latest.get("Sentiment", "")
+                if not row["Market Cap"]:
+                    vault_df.at[idx, "Market Cap"] = latest.get("Market Cap", "")
+
+        # Push back to sheet
+        vault_ws.clear()
+        vault_ws.update([vault_df.columns.tolist()] + vault_df.fillna("").astype(str).values.tolist())
+
+        print("✅ Token Vault synced with latest Scout Decisions.")
+
+    except Exception as e:
+        print(f"❌ Vault sync error: {e}")
