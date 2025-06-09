@@ -57,13 +57,15 @@ if __name__ == "__main__":
     threading.Thread(target=run_orion_voice_loop).start()
     print("🔍 Starting Watchdog...")
     run_watchdog()
-
+    time.sleep(5)
     print("🧠 Running Rotation Signal Engine...")
     rotation_ws = load_presale_stream()
 
     # ROI + Milestones
     scan_roi_tracking()
+    time.sleep(5)
     run_milestone_alerts()
+    time.sleep(5)
     log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
     # Vault + Planner + Feedback
