@@ -1,5 +1,3 @@
-# rebalance_scanner.py
-
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
@@ -9,7 +7,6 @@ def run_rebalance_scanner():
     print("🔁 Running Rebalance Scanner...")
 
     try:
-        # Auth
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
         client = gspread.authorize(creds)
@@ -56,5 +53,18 @@ def send_telegram_ping(message):
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
         bot = Bot(token=bot_token)
         bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
+        print("✅ Drift alert sent via Telegram")
+
+        try:
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+            client = gspread.authorize(creds)
+            sheet = client.open_by_url(os.getenv("SHEET_URL"))
+            trigger_ws = sheet.worksheet("NovaTrigger")
+            trigger_ws.update_acell("A1", "REBALANCE ALERT")
+            print("✅ NovaTrigger set to REBALANCE ALERT")
+        except Exception as e:
+            print(f"⚠️ Failed to update NovaTrigger: {e}")
+
     except Exception as e:
         print(f"❌ Telegram error: {e}")
