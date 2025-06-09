@@ -4,6 +4,8 @@ from utils import log_scout_decision, ping_webhook_debug
 from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from rebalance_scanner import run_rebalance_scanner
+from portfolio_weight_adjuster import run_portfolio_weight_adjuster
 
 telegram_app = Flask(__name__)
 PROMPT_MEMORY = {}
@@ -35,25 +37,19 @@ def webhook():
                     client = gspread.authorize(creds)
                     sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-                    # Update ROI_Review_Log
                     review_ws = sheet.worksheet("ROI_Review_Log")
-                    review_data = review_ws.get_all_records()
-                    for i, row in enumerate(review_data, start=2):
+                    for i, row in enumerate(review_ws.get_all_records(), start=2):
                         if row.get("Token", "").strip().upper() == token and int(row.get("Days Held", 0)) == days:
-                            review_ws.update_cell(i, 9, decision)  # Col 9 = "Would You Say YES Again?"
+                            review_ws.update_cell(i, 9, decision)
                             break
 
-                    # Update Rotation_Stats
                     stats_ws = sheet.worksheet("Rotation_Stats")
-                    stats_data = stats_ws.get_all_records()
-                    for i, row in enumerate(stats_data, start=2):
+                    for i, row in enumerate(stats_ws.get_all_records(), start=2):
                         if row.get("Token", "").strip().upper() == token and int(row.get("Days Held", 0)) == days:
-                            stats_ws.update_cell(i, 10, decision)  # Col 10 = "Feedback"
+                            stats_ws.update_cell(i, 10, decision)
                             break
 
-                    # Acknowledge re-vote
-                    bot_token = os.environ["BOT_TOKEN"]
-                    ack_url = f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery"
+                    ack_url = f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/answerCallbackQuery"
                     confirm_payload = {
                         "callback_query_id": callback_id,
                         "text": f"📝 Feedback recorded: {decision} for {token} @ {days}d.",
@@ -63,20 +59,18 @@ def webhook():
                     print(f"✅ Logged re-vote for {token} — {decision}")
                     return 'OK', 200
 
-            # Handle YES/NO/ROTATE original votes
             elif "|" in payload:
                 action, token = payload.split("|")
                 log_scout_decision(token, action)
 
                 try:
-                    bot_token = os.environ["BOT_TOKEN"]
-                    url = f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery"
+                    ack_url = f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/answerCallbackQuery"
                     confirm_payload = {
                         "callback_query_id": callback_id,
                         "text": "📝 Response logged. ROI tracking enabled.",
                         "show_alert": False
                     }
-                    requests.post(url, json=confirm_payload)
+                    requests.post(ack_url, json=confirm_payload)
                     print(f"✅ Acknowledged Telegram response for {token}")
                 except Exception as e:
                     print(f"⚠️ Failed to send Telegram acknowledgment: {e}")
@@ -94,6 +88,14 @@ def webhook():
             elif text in ["YES", "NO", "SKIP"] and user_id in PROMPT_MEMORY:
                 token = PROMPT_MEMORY[user_id]["token"]
                 log_scout_decision(token, text)
+
+            elif text == "/REBALANCE":
+                run_rebalance_scanner()
+                print("✅ Manual rebalance scan triggered via Telegram")
+
+            elif text == "/REWEIGHT":
+                run_portfolio_weight_adjuster()
+                print("✅ Portfolio weights adjusted via Telegram")
 
         return 'OK', 200
 
