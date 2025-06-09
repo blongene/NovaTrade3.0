@@ -8,15 +8,19 @@ PROMPT_MEMORY = {}
 
 def run_rotation_feedback_engine():
     try:
+        # Authenticate
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
         client = gspread.authorize(creds)
-
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
-        stats_ws = sheet.worksheet("Rotation_Stats")
-        rows = stats_ws.get_all_records()
 
-        for row in rows:
+        stats_ws = sheet.worksheet("Rotation_Stats")
+        review_ws = sheet.worksheet("ROI_Review_Log")
+
+        stats_rows = stats_ws.get_all_records()
+        review_rows = review_ws.get_all_records()
+
+        for i, row in enumerate(stats_rows, start=2):
             token = row.get("Token", "").strip()
             decision = row.get("Decision", "").strip().upper()
             roi = str(row.get("Follow-up ROI", "")).strip()
@@ -24,7 +28,6 @@ def run_rotation_feedback_engine():
             try:
                 days_held = int(row.get("Days Held", 0))
             except ValueError:
-                print(f"⚠️ Skipping row with invalid Days Held: {row.get('Days Held')}")
                 continue
 
             if decision != "YES" or days_held not in [7, 14, 30]:
@@ -34,11 +37,22 @@ def run_rotation_feedback_engine():
             if PROMPT_MEMORY.get(memory_key):
                 continue
 
+            # Check if already answered in ROI_Review_Log
+            already_answered = any(
+                r["Token"].strip().upper() == token.upper()
+                and int(r.get("Days Held", 0)) == days_held
+                and r.get("Would You Say YES Again?", "").strip() != ""
+                for r in review_rows
+            )
+            if already_answered:
+                continue
+
+            # 🔁 Prompt user via Telegram
             message = f"📊 *Feedback Request: {token}*\n– Days Held: {days_held}d\n– ROI: {roi}\n\nWould you vote YES again?"
             keyboard = {
                 "inline_keyboard": [[
-                    {"text": "✅ YES Again", "callback_data": f"REYES|{token}|{days_held}|{roi}"},
-                    {"text": "❌ NO", "callback_data": f"RENO|{token}|{days_held}|{roi}"}
+                    {"text": "✅ YES Again", "callback_data": f"REYES|{token}|{days_held}"},
+                    {"text": "❌ NO", "callback_data": f"RENO|{token}|{days_held}"}
                 ]]
             }
 
