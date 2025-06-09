@@ -23,34 +23,45 @@ def webhook():
             # Handle REYES/RENO (rotation feedback)
             if payload.startswith("REYES") or payload.startswith("RENO"):
                 parts = payload.split("|")
-                decision = "YES" if parts[0] == "REYES" else "NO"
-                token = parts[1]
-                days = parts[2]
-                roi = parts[3]
-                timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                if len(parts) == 4:
+                    decision = "YES" if parts[0] == "REYES" else "NO"
+                    token = parts[1].strip().upper()
+                    days = int(parts[2])
+                    roi = parts[3].strip()
+                    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-                # Log to ROI_Review_Log
-                scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-                creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-                client = gspread.authorize(creds)
-                sheet = client.open_by_url(os.getenv("SHEET_URL"))
-                review_ws = sheet.worksheet("ROI_Review_Log")
+                    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+                    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+                    client = gspread.authorize(creds)
+                    sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-                review_ws.append_row(
-                    [timestamp, token, days, "", roi, decision, ""],
-                    value_input_option="USER_ENTERED"
-                )
+                    # Update ROI_Review_Log
+                    review_ws = sheet.worksheet("ROI_Review_Log")
+                    review_data = review_ws.get_all_records()
+                    for i, row in enumerate(review_data, start=2):
+                        if row.get("Token", "").strip().upper() == token and int(row.get("Days Held", 0)) == days:
+                            review_ws.update_cell(i, 9, decision)  # Col 9 = "Would You Say YES Again?"
+                            break
 
-                # Acknowledge re-vote
-                bot_token = os.environ["BOT_TOKEN"]
-                ack_url = f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery"
-                confirm_payload = {
-                    "callback_query_id": callback_id,
-                    "text": f"📝 Feedback logged: {decision} for {token}.",
-                    "show_alert": False
-                }
-                requests.post(ack_url, json=confirm_payload)
-                print(f"✅ Logged re-vote for {token} — {decision}")
+                    # Update Rotation_Stats
+                    stats_ws = sheet.worksheet("Rotation_Stats")
+                    stats_data = stats_ws.get_all_records()
+                    for i, row in enumerate(stats_data, start=2):
+                        if row.get("Token", "").strip().upper() == token and int(row.get("Days Held", 0)) == days:
+                            stats_ws.update_cell(i, 10, decision)  # Col 10 = "Feedback"
+                            break
+
+                    # Acknowledge re-vote
+                    bot_token = os.environ["BOT_TOKEN"]
+                    ack_url = f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery"
+                    confirm_payload = {
+                        "callback_query_id": callback_id,
+                        "text": f"📝 Feedback recorded: {decision} for {token} @ {days}d.",
+                        "show_alert": False
+                    }
+                    requests.post(ack_url, json=confirm_payload)
+                    print(f"✅ Logged re-vote for {token} — {decision}")
+                    return 'OK', 200
 
             # Handle YES/NO/ROTATE original votes
             elif "|" in payload:
