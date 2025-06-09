@@ -15,7 +15,6 @@ from nova_heartbeat import log_heartbeat
 from stalled_asset_detector import run_stalled_asset_detector
 from claim_tracker import check_claims
 from sentiment_radar import run_sentiment_radar
-from staking_yield_tracker import run_staking_yield_loop
 from rotation_stats_sync import run_rotation_stats_sync
 from rotation_feedback_engine import run_rotation_feedback_engine
 from performance_dashboard import run_performance_dashboard
@@ -41,6 +40,15 @@ def load_presale_stream():
     print("✅ Loaded worksheet: Presale_Stream")
     return worksheet
 
+def start_staking_yield_loop():
+    def loop():
+        while True:
+            from staking_yield_tracker import run_staking_yield_tracker
+            print("🔁 Checking staking yield...")
+            run_staking_yield_tracker()
+            time.sleep(21600)  # 6 hours
+    threading.Thread(target=loop, daemon=True).start()
+
 if __name__ == "__main__":
     set_telegram_webhook()
     print("📡 Orion Cloud Boot Sequence Initiated")
@@ -54,7 +62,6 @@ if __name__ == "__main__":
     print("🧠 Running Rotation Signal Engine...")
     rotation_ws = load_presale_stream()
 
-    # ROI + Milestones
     scan_roi_tracking()
     run_milestone_alerts()
     log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
