@@ -24,7 +24,7 @@ from rotation_memory import run_rotation_memory
 from rotation_log_updater import run_rotation_log_updater
 from portfolio_weight_adjuster import run_portfolio_weight_adjuster
 from target_percent_updater import run_target_percent_updater
-from rebuy_engine import run_undersized_rebuy_alerts
+from rebuy_engine import run_undersized_rebuy
 
 import time
 import gspread
