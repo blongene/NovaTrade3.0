@@ -124,6 +124,12 @@ if __name__ == "__main__":
     print("🧠 Running Rotation Memory Sync...")
     run_rotation_memory()
 
+    from portfolio_weight_sync import run_portfolio_weight_sync
+
+    # ...inside the main execution section
+    print("🔁 Syncing Suggested → Target % in Portfolio_Targets...")
+    run_portfolio_weight_sync()
+
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
 
