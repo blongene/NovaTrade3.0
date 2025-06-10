@@ -25,6 +25,7 @@ from rotation_log_updater import run_rotation_log_updater
 from portfolio_weight_adjuster import run_portfolio_weight_adjuster
 from target_percent_updater import run_target_percent_updater
 from rebuy_engine import run_undersized_rebuy
+from rebuy_memory_engine import run_memory_rebuy_scan  # ✅ NEW
 
 import time
 import gspread
@@ -96,6 +97,7 @@ if __name__ == "__main__":
     schedule.every(60).minutes.do(run_rotation_log_updater)
     schedule.every(60).minutes.do(run_rebalance_scanner)
     schedule.every(60).minutes.do(run_rotation_memory)
+    schedule.every(3).hours.do(run_memory_rebuy_scan)  # ✅ NEW
 
     run_stalled_asset_detector()
     check_claims()
@@ -124,8 +126,12 @@ if __name__ == "__main__":
     run_rotation_memory()
 
     time.sleep(3)
-    print("🔁 Scanning for memory-aware rebuy opportunities...")
+    print("🔁 Running undersized rebuy engine...")
     run_undersized_rebuy()
+
+    time.sleep(5)
+    print("♻️ Running memory-aware rebuy engine...")  # ✅ NEW
+    run_memory_rebuy_scan()                         # ✅ NEW
 
     time.sleep(5)
     print("🧠 Running Suggested Target Calculator...")
