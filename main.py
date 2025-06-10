@@ -22,7 +22,8 @@ from rebalance_scanner import run_rebalance_scanner
 from telegram_summaries import run_telegram_summaries
 from rotation_memory import run_rotation_memory
 from rotation_log_updater import run_rotation_log_updater
-from portfolio_weight_sync import run_portfolio_weight_sync
+from portfolio_weight_adjuster import run_portfolio_weight_adjuster
+from target_percent_updater import run_target_percent_updater
 
 import time
 import gspread
@@ -43,8 +44,8 @@ def load_presale_stream():
 
 def start_staking_yield_loop():
     def loop():
+        from staking_yield_tracker import run_staking_yield_tracker
         while True:
-            from staking_yield_tracker import run_staking_yield_tracker
             print("🔁 Checking staking yield...")
             run_staking_yield_tracker()
             time.sleep(21600)  # 6 hours
@@ -64,6 +65,7 @@ if __name__ == "__main__":
     rotation_ws = load_presale_stream()
 
     scan_roi_tracking()
+    time.sleep(2)
     run_milestone_alerts()
     log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
@@ -71,23 +73,21 @@ if __name__ == "__main__":
         sync_token_vault()
     except Exception as e:
         print(f"⚠️ Vault sync error: {e}")
-    time.sleep(3)
 
+    time.sleep(5)
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
-    time.sleep(3)
 
+    time.sleep(5)
     print("📥 Syncing ROI feedback responses...")
     run_roi_feedback_sync()
-    time.sleep(3)
 
+    time.sleep(5)
     print("📡 Running Sentiment Radar...")
     run_sentiment_radar()
-    time.sleep(3)
 
     check_nova_trigger()
-    time.sleep(3)
-
+    time.sleep(5)
     trigger_nova_ping("NOVA UPDATE")
 
     print("⏰ Running presale scan every 60 min")
@@ -100,18 +100,14 @@ if __name__ == "__main__":
     check_claims()
     start_staking_yield_loop()
 
-    time.sleep(3)
+    time.sleep(5)
     print("🧹 Cleaning Rotation_Log ROI column...")
 
-    time.sleep(3)
-    print("🛠 Updating Rotation_Log with ROI_Review_Log data...")
-    run_rotation_log_updater()
-
-    time.sleep(3)
+    time.sleep(5)
     print("📊 Syncing Rotation_Stats...")
     run_rotation_stats_sync()
 
-    time.sleep(3)
+    time.sleep(5)
     run_rotation_feedback_engine()
 
     print("📊 Running Performance Dashboard...")
@@ -126,11 +122,15 @@ if __name__ == "__main__":
     print("🧠 Running Rotation Memory Sync...")
     run_rotation_memory()
 
-    print("🔁 Syncing Suggested → Target % in Portfolio_Targets...")
-    run_portfolio_weight_sync()
+    time.sleep(5)
+    print("🧠 Running Suggested Target Calculator...")
+    run_portfolio_weight_adjuster()
+
+    time.sleep(5)
+    print("📊 Syncing Suggested % → Target %...")
+    run_target_percent_updater()
 
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
-
     print("🟢 Starting Flask app on port 10000...")
     telegram_app.run(host="0.0.0.0", port=10000)
