@@ -24,6 +24,7 @@ from rotation_memory import run_rotation_memory
 from rotation_log_updater import run_rotation_log_updater
 from portfolio_weight_adjuster import run_portfolio_weight_adjuster
 from target_percent_updater import run_target_percent_updater
+from rebuy_engine import run_undersized_rebuy_alerts
 
 import time
 import gspread
@@ -121,6 +122,10 @@ if __name__ == "__main__":
 
     print("🧠 Running Rotation Memory Sync...")
     run_rotation_memory()
+
+    time.sleep(3)
+    print("🔁 Scanning for memory-aware rebuy opportunities...")
+    run_undersized_rebuy_alerts()
 
     time.sleep(5)
     print("🧠 Running Suggested Target Calculator...")
