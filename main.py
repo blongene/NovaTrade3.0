@@ -22,6 +22,7 @@ from rebalance_scanner import run_rebalance_scanner
 from telegram_summaries import run_telegram_summaries
 from rotation_memory import run_rotation_memory
 from rotation_log_updater import run_rotation_log_updater
+from portfolio_weight_sync import run_portfolio_weight_sync
 
 import time
 import gspread
@@ -70,22 +71,23 @@ if __name__ == "__main__":
         sync_token_vault()
     except Exception as e:
         print(f"⚠️ Vault sync error: {e}")
+    time.sleep(3)
 
-    time.sleep(5)
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
+    time.sleep(3)
 
-    time.sleep(5)
     print("📥 Syncing ROI feedback responses...")
     run_roi_feedback_sync()
+    time.sleep(3)
 
-    time.sleep(5)
     print("📡 Running Sentiment Radar...")
     run_sentiment_radar()
+    time.sleep(3)
 
     check_nova_trigger()
+    time.sleep(3)
 
-    time.sleep(5)
     trigger_nova_ping("NOVA UPDATE")
 
     print("⏰ Running presale scan every 60 min")
@@ -98,18 +100,18 @@ if __name__ == "__main__":
     check_claims()
     start_staking_yield_loop()
 
-    time.sleep(5)
+    time.sleep(3)
     print("🧹 Cleaning Rotation_Log ROI column...")
 
-    time.sleep(60)
+    time.sleep(3)
     print("🛠 Updating Rotation_Log with ROI_Review_Log data...")
     run_rotation_log_updater()
 
-    time.sleep(5)
+    time.sleep(3)
     print("📊 Syncing Rotation_Stats...")
     run_rotation_stats_sync()
 
-    time.sleep(5)
+    time.sleep(3)
     run_rotation_feedback_engine()
 
     print("📊 Running Performance Dashboard...")
@@ -124,9 +126,6 @@ if __name__ == "__main__":
     print("🧠 Running Rotation Memory Sync...")
     run_rotation_memory()
 
-    from portfolio_weight_sync import run_portfolio_weight_sync
-
-    # ...inside the main execution section
     print("🔁 Syncing Suggested → Target % in Portfolio_Targets...")
     run_portfolio_weight_sync()
 
