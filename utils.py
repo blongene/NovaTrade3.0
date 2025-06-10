@@ -101,3 +101,53 @@ def send_telegram_prompt(token, message, buttons=["YES", "NO"], prefix="REBALANC
             print(f"⚠️ Telegram error: {r.text}")
     except Exception as e:
         print(f"❌ Telegram prompt failed: {e}")
+
+# utils.py
+
+def log_rebuy_decision(token):
+    import os
+    import gspread
+    from datetime import datetime
+    from oauth2client.service_account import ServiceAccountCredentials
+
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_url(os.getenv("SHEET_URL"))
+
+    scout_ws = sheet.worksheet("Scout Decisions")
+    log_ws = sheet.worksheet("Rotation_Log")
+    radar_ws = sheet.worksheet("Sentiment_Radar")
+
+    # Normalize token
+    token = token.strip().upper()
+
+    # Get data from Rotation_Log
+    log_data = log_ws.get_all_records()
+    log_row = next((row for row in log_data if row.get("Token", "").strip().upper() == token), {})
+
+    score = log_row.get("Score", "")
+    sentiment = log_row.get("Sentiment", "")
+    market_cap = log_row.get("Market Cap", "")
+    scout_url = log_row.get("Scout URL", "")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Look up mentions from Sentiment_Radar if blank
+    if not sentiment:
+        radar = next((r for r in radar_ws.get_all_records() if r.get("Token", "").strip().upper() == token), {})
+        sentiment = radar.get("Mentions", "")
+
+    new_row = [
+        timestamp,   # Timestamp
+        token,       # Token
+        "YES",       # Decision
+        "Rebuy",     # Source
+        score,       # Score
+        sentiment,   # Sentiment
+        market_cap,  # Market Cap
+        scout_url,   # Scout URL
+        ""           # Follow-up ROI (blank for now)
+    ]
+
+    scout_ws.append_row(new_row)
+    print(f"✅ Rebuy for ${token} logged to Scout Decisions.")
