@@ -1,6 +1,6 @@
 from flask import Flask, request
-import os, requests
-from utils import log_scout_decision, ping_webhook_debug
+import os, requests, re
+from utils import log_scout_decision, ping_webhook_debug, log_rebuy_decision
 from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -21,6 +21,24 @@ def webhook():
             payload = callback['data']
             callback_id = callback['id']
             chat_id = callback['message']['chat']['id']
+            msg_text = callback['message']['text']
+
+            # ✅ Phase 14B: Handle Rebuy Confirmations
+            if "re-enter" in msg_text.lower() or "rebuy signal" in msg_text.lower():
+                token_match = re.search(r"\$(\w+)", msg_text)
+                if token_match:
+                    token = token_match.group(1)
+                    log_rebuy_decision(token)
+
+                    ack_url = f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/answerCallbackQuery"
+                    confirm_payload = {
+                        "callback_query_id": callback_id,
+                        "text": f"✅ Rebuy for ${token} logged.",
+                        "show_alert": False
+                    }
+                    requests.post(ack_url, json=confirm_payload)
+                    print(f"✅ Rebuy decision logged for {token}")
+                    return 'OK', 200
 
             # Handle REYES/RENO (rotation feedback)
             if payload.startswith("REYES") or payload.startswith("RENO"):
@@ -59,6 +77,7 @@ def webhook():
                     print(f"✅ Logged re-vote for {token} — {decision}")
                     return 'OK', 200
 
+            # Standard scout YES/NO buttons
             elif "|" in payload:
                 action, token = payload.split("|")
                 log_scout_decision(token, action)
