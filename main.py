@@ -125,7 +125,7 @@ if __name__ == "__main__":
 
     time.sleep(3)
     print("🔁 Scanning for memory-aware rebuy opportunities...")
-    run_undersized_rebuy_alerts()
+    run_undersized_rebuy()
 
     time.sleep(5)
     print("🧠 Running Suggested Target Calculator...")
