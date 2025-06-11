@@ -1,54 +1,52 @@
+# rotation_stats_sync.py
+
 import os
 import gspread
-import re
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
+import re
 
 def run_rotation_stats_sync():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
+    print("📊 Syncing Rotation_Stats...")
 
-    sheet = client.open_by_url(os.getenv("SHEET_URL"))
-    log_ws = sheet.worksheet("Rotation_Log")
-    stats_ws = sheet.worksheet("Rotation_Stats")
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-    log_data = log_ws.get_all_records()
-    stats_data = stats_ws.get_all_records()
-    stats_tokens = [(row["Token"], row["Date"]) for row in stats_data]
+        log_ws = sheet.worksheet("Rotation_Log")
+        stats_ws = sheet.worksheet("Rotation_Stats")
 
-    for row in log_data:
-        token = row.get("Token", "").strip()
-        entry_date = row.get("Timestamp", "").strip()
+        log_data = log_ws.get_all_records()
+        stats_data = stats_ws.get_all_records()
 
-        initial_roi_raw = row.get("Score", "")
-        initial_roi = str(initial_roi_raw).strip()
+        for i, row in enumerate(stats_data, start=2):  # Row index in stats_ws
+            token = row.get("Token", "").strip().upper()
+            status = row.get("Status", "").strip().lower()
+            decision = row.get("Decision", "").strip().upper()
+            followup_cell = stats_ws.find("Follow-up ROI").col
+            rebuy_cell = stats_ws.find("Rebuy ROI").col
 
-        followup_raw = row.get("Follow-up ROI", "")
-        followup = str(followup_raw).strip()
+            # Match against Rotation_Log
+            match = next((r for r in log_data if r.get("Token", "").strip().upper() == token), None)
+            if not match:
+                continue
 
-        if not token or not entry_date:
-            continue
+            roi_val = str(match.get("Follow-up ROI", "")).strip()
 
-        if (token, entry_date) in stats_tokens:
-            continue
+            if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", roi_val):
+                continue  # Skip blank or invalid ROI
 
-        def is_numeric(val):
-            return re.match(r"^-?\d+(\.\d+)?$", str(val))
+            roi = float(roi_val)
 
-        followup_roi = float(followup) if is_numeric(followup) else None
-        init_roi = float(initial_roi) if is_numeric(initial_roi) else None
+            # If it's a Rebuy entry → log to Rebuy ROI column
+            if decision == "REBUY":
+                stats_ws.update_cell(i, rebuy_cell, roi)
+                print(f"🔁 Logged Rebuy ROI for {token}: {roi}%")
+            else:
+                stats_ws.update_cell(i, followup_cell, roi)
+                print(f"📈 Updated Follow-up ROI for {token}: {roi}%")
 
-        if followup_roi is not None and init_roi:
-            performance = round(followup_roi / init_roi, 2)
-        else:
-            performance = "N/A"
-
-        stats_ws.append_row([
-            entry_date, token, "YES", init_roi if init_roi is not None else "N/A",
-            row.get("Sentiment", ""), row.get("Status", ""),
-            row.get("Days Held", ""), followup if followup_roi is not None else "N/A",
-            performance, "", ""
-        ])
-
-        print(f"✅ Synced {token} to Rotation_Stats")
+    except Exception as e:
+        print(f"❌ Error in run_rotation_stats_sync: {e}")
