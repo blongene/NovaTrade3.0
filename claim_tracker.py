@@ -14,6 +14,9 @@ def check_claims():
         tracker_ws = sheet.worksheet("Claim_Tracker")
         log_ws = sheet.worksheet("Rotation_Log")
 
+        log_headers = log_ws.row_values(1)
+        backend_col = log_headers.index("Backend Status") + 1  # 1-based index
+
         rows = tracker_ws.get_all_records()
         now = datetime.now()
 
@@ -36,14 +39,13 @@ def check_claims():
                     if not claimed:
                         tracker_ws.update_acell(f"J{i}", str(days_since_unlock))
                     else:
-                        tracker_ws.update_acell(f"J{i}", "")  # Clear if claimed
+                        tracker_ws.update_acell(f"J{i}", "")
                 except Exception as e:
                     print(f"⚠️ Could not parse unlock date for {token}: {e}")
                     tracker_ws.update_acell(f"J{i}", "❓")
             else:
-                tracker_ws.update_acell(f"J{i}", "")  # Clear if no date
+                tracker_ws.update_acell(f"J{i}", "")
 
-            # Set status based on claimability
             if claimable and not claimed:
                 tracker_ws.update_acell(f"I{i}", "⚠️ Claim Now")
                 print(f"⚠️ Claim reminder: {token} is unlocked and not claimed.")
@@ -52,7 +54,6 @@ def check_claims():
             else:
                 tracker_ws.update_acell(f"I{i}", "🕒 Pending")
 
-            # If claimed, log it into Rotation_Log if not already there
             if claimed:
                 log_data = log_ws.get_all_records()
                 exists = any(str(entry["Token"]).strip().upper() == token.upper() for entry in log_data)
@@ -67,12 +68,13 @@ def check_claims():
                         "0",             # Days Held
                         "0",             # Follow-up ROI
                         "", "", "",      # Staking Yield, Contract, Initial Claimed
-                        now.strftime("%Y-%m-%d %H:%M:%S"),  # Last Checked
-                        "✅ Healthy"
+                        now.strftime("%Y-%m-%d %H:%M:%S")  # Last Checked
                     ]
                     log_ws.append_row(new_row)
+                    row_index = len(log_data) + 2  # Add header + 1-based row offset
+                    log_ws.update_cell(row_index, backend_col, "✅ Healthy")  # ✅ FIXED: direct column update
 
-            time.sleep(1.5)  # Throttle to stay under quota
+            time.sleep(1.5)
 
         print("✅ Claim tracker complete.")
     except Exception as e:
