@@ -14,10 +14,11 @@ def check_claims():
         tracker_ws = sheet.worksheet("Claim_Tracker")
         log_ws = sheet.worksheet("Rotation_Log")
 
-        log_headers = log_ws.row_values(1)
-        backend_col = log_headers.index("Backend Status") + 1  # 1-based index
-
         rows = tracker_ws.get_all_records()
+        log_data = log_ws.get_all_records()
+        headers = log_ws.row_values(1)
+        backend_col = headers.index("Backend Status") + 1  # 1-indexed
+
         now = datetime.now()
 
         for i, row in enumerate(rows, start=2):
@@ -46,6 +47,7 @@ def check_claims():
             else:
                 tracker_ws.update_acell(f"J{i}", "")
 
+            # Set status
             if claimable and not claimed:
                 tracker_ws.update_acell(f"I{i}", "⚠️ Claim Now")
                 print(f"⚠️ Claim reminder: {token} is unlocked and not claimed.")
@@ -54,25 +56,28 @@ def check_claims():
             else:
                 tracker_ws.update_acell(f"I{i}", "🕒 Pending")
 
+            # Add to Rotation_Log if claimed
             if claimed:
-                log_data = log_ws.get_all_records()
                 exists = any(str(entry["Token"]).strip().upper() == token.upper() for entry in log_data)
                 if not exists:
                     print(f"✅ Logging claimed token {token} to Rotation_Log...")
                     new_row = [
-                        now.strftime("%Y-%m-%d %H:%M:%S"),
+                        now.strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
                         token,
                         "Active",
-                        "", "", "", "",  # Score, Sentiment, Market Cap, Scout URL
-                        "100%",          # Allocation
-                        "0",             # Days Held
-                        "0",             # Follow-up ROI
-                        "", "", "",      # Staking Yield, Contract, Initial Claimed
-                        now.strftime("%Y-%m-%d %H:%M:%S")  # Last Checked
+                        "", "", "", "",                   # Score, Sentiment, Market Cap, Scout URL
+                        "100%", "0", "0",                 # Allocation, Days Held, Follow-up ROI
+                        "", "", "",                       # Staking Yield, Contract, Initial Claimed
+                        now.strftime("%Y-%m-%d %H:%M:%S"),  # Last Checked
                     ]
                     log_ws.append_row(new_row)
-                    row_index = len(log_data) + 2  # Add header + 1-based row offset
-                    log_ws.update_cell(row_index, backend_col, "✅ Healthy")  # ✅ FIXED: direct column update
+                    log_data = log_ws.get_all_records()  # Refresh to include the new row
+
+            # ✅ Fixed column update (Backend Status)
+            for j, log_row in enumerate(log_data, start=2):
+                if log_row.get("Token", "").strip().upper() == token.upper():
+                    log_ws.update_cell(j, backend_col, "✅ Healthy")
+                    break
 
             time.sleep(1.5)
 
