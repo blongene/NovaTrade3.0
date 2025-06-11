@@ -36,7 +36,9 @@ from utils import get_gspread_client
 def load_presale_stream():
     print("⚙️ Attempting to load worksheet: Presale_Stream")
     try:
-        client = get_gspread_client()
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+        client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
         worksheet = sheet.worksheet("Presale_Stream")
         print("✅ Loaded worksheet: Presale_Stream")
@@ -87,15 +89,22 @@ if __name__ == "__main__":
     run_roi_feedback_sync()
 
     time.sleep(5)
-    print("📡 Running Sentiment Radar...")
-    run_sentiment_radar()
+    print("📡 Running Sentiment Radar (1x boot pass only)...")
+    try:
+        run_sentiment_radar()
+    except Exception as e:
+        print(f"⚠️ Radar scan skipped due to error: {e}")
+
 
     check_nova_trigger()
     time.sleep(5)
     trigger_nova_ping("NOVA UPDATE")
 
-    print("⏰ Running presale scan every 60 min")
-    run_presale_scorer()
+    if rotation_ws:
+        print("⏰ Running presale scan every 60 min")
+        run_presale_scorer()
+    else:
+        print("⛔️ Presale_Stream unavailable — presale scan skipped")
     schedule.every(60).minutes.do(run_rotation_log_updater)
     schedule.every(60).minutes.do(run_rebalance_scanner)
     schedule.every(60).minutes.do(run_rotation_memory)
