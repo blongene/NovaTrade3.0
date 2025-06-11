@@ -31,6 +31,7 @@ import os
 import time
 import threading
 import schedule
+import gspread
 from utils import get_gspread_client
 from oauth2client.service_account import ServiceAccountCredentials  # ✅ Needed for load_presale_stream()
 
