@@ -25,24 +25,24 @@ from rotation_log_updater import run_rotation_log_updater
 from portfolio_weight_adjuster import run_portfolio_weight_adjuster
 from target_percent_updater import run_target_percent_updater
 from rebuy_engine import run_undersized_rebuy
-from rebuy_memory_engine import run_memory_rebuy_scan  # ✅ NEW
+from rebuy_memory_engine import run_memory_rebuy_scan
 
 import time
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import os
 import threading
 import schedule
+from utils import get_gspread_client
 
 def load_presale_stream():
     print("⚙️ Attempting to load worksheet: Presale_Stream")
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_url(os.getenv("SHEET_URL"))
-    worksheet = sheet.worksheet("Presale_Stream")
-    print("✅ Loaded worksheet: Presale_Stream")
-    return worksheet
+    try:
+        client = get_gspread_client()
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        worksheet = sheet.worksheet("Presale_Stream")
+        print("✅ Loaded worksheet: Presale_Stream")
+        return worksheet
+    except Exception as e:
+        print(f"❌ Failed to load Presale_Stream: {e}")
+        return None
 
 def start_staking_yield_loop():
     def loop():
@@ -66,10 +66,11 @@ if __name__ == "__main__":
     print("🧠 Running Rotation Signal Engine...")
     rotation_ws = load_presale_stream()
 
-    scan_roi_tracking()
-    time.sleep(2)
-    run_milestone_alerts()
-    log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
+    if rotation_ws:
+        scan_roi_tracking()
+        time.sleep(2)
+        run_milestone_alerts()
+        log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
     try:
         sync_token_vault()
@@ -97,7 +98,7 @@ if __name__ == "__main__":
     schedule.every(60).minutes.do(run_rotation_log_updater)
     schedule.every(60).minutes.do(run_rebalance_scanner)
     schedule.every(60).minutes.do(run_rotation_memory)
-    schedule.every(3).hours.do(run_memory_rebuy_scan)  # ✅ NEW
+    schedule.every(3).hours.do(run_memory_rebuy_scan)
 
     run_stalled_asset_detector()
     check_claims()
@@ -130,8 +131,8 @@ if __name__ == "__main__":
     run_undersized_rebuy()
 
     time.sleep(5)
-    print("♻️ Running memory-aware rebuy engine...")  # ✅ NEW
-    run_memory_rebuy_scan()                         # ✅ NEW
+    print("♻️ Running memory-aware rebuy engine...")
+    run_memory_rebuy_scan()
 
     time.sleep(5)
     print("🧠 Running Suggested Target Calculator...")
