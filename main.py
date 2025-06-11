@@ -32,6 +32,7 @@ import time
 import threading
 import schedule
 from utils import get_gspread_client
+from oauth2client.service_account import ServiceAccountCredentials  # ✅ Needed for load_presale_stream()
 
 def load_presale_stream():
     print("⚙️ Attempting to load worksheet: Presale_Stream")
