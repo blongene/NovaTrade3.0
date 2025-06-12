@@ -27,6 +27,7 @@ from target_percent_updater import run_target_percent_updater
 from rebuy_engine import run_undersized_rebuy
 from rebuy_memory_engine import run_memory_rebuy_scan
 from rotation_memory_scoring import run_memory_scoring
+from vault_intelligence import run_vault_intelligence
 
 import os
 import time
@@ -83,6 +84,9 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"⚠️ Vault sync error: {e}")
 
+    time.sleep(5)
+    run_vault_intelligence()
+    
     time.sleep(5)
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
