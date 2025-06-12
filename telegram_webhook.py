@@ -116,6 +116,11 @@ def webhook():
                 run_portfolio_weight_adjuster()
                 print("✅ Portfolio weights adjusted via Telegram")
 
+            elif text == "/SCORE":
+                from rotation_memory_scoring import run_memory_scoring
+                run_memory_scoring()
+                print("✅ Manual memory scoring triggered via Telegram")
+
         return 'OK', 200
 
     except Exception as e:
