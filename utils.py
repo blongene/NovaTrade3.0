@@ -84,19 +84,30 @@ def send_telegram_message(message):
     try:
         bot_token = os.getenv("BOT_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+        # ✅ Debug logs added
+        print(f"📡 Attempting to send Telegram message...")
+        print(f"🆔 Chat ID: {chat_id}")
+        print(f"📝 Message (first 60 chars): {message[:60]}")
+
         if not bot_token or not chat_id:
             raise Exception("Missing BOT_TOKEN or TELEGRAM_CHAT_ID")
+
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
             "text": message,
             "parse_mode": "HTML"
         }
+
         response = requests.post(url, json=payload)
         if not response.ok:
             raise Exception(response.text)
+
         return response.json()
+
     except Exception as e:
+        print(f"❌ Telegram send error: {e}")  # ⬅️ Echo to console for clarity
         ping_webhook_debug(f"❌ Telegram send error: {e}")
 
 def send_telegram_prompt(token, message, buttons=["YES", "NO"], prefix="REBALANCE"):
