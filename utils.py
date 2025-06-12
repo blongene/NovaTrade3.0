@@ -5,15 +5,14 @@ from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 
 def get_sheet():
-    scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    return gspread.authorize(creds).open_by_url("https://docs.google.com/spreadsheets/d/1rE6rbUnCPiL8OgBj6hPWNppOV1uaII8im41nrv-x1xg/edit")
+    return gspread.authorize(creds).open_by_url(os.getenv("SHEET_URL"))
 
 def get_gspread_client():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
-    return client
+    return gspread.authorize(creds)
 
 def log_scout_decision(token, decision):
     print(f"📥 Logging decision: {decision} for token {token}")
@@ -84,30 +83,19 @@ def send_telegram_message(message):
     try:
         bot_token = os.getenv("BOT_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
-        # ✅ Debug logs added
-        print(f"📡 Attempting to send Telegram message...")
-        print(f"🆔 Chat ID: {chat_id}")
-        print(f"📝 Message (first 60 chars): {message[:60]}")
-
         if not bot_token or not chat_id:
             raise Exception("Missing BOT_TOKEN or TELEGRAM_CHAT_ID")
-
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
             "text": message,
             "parse_mode": "HTML"
         }
-
         response = requests.post(url, json=payload)
         if not response.ok:
             raise Exception(response.text)
-
         return response.json()
-
     except Exception as e:
-        print(f"❌ Telegram send error: {e}")  # ⬅️ Echo to console for clarity
         ping_webhook_debug(f"❌ Telegram send error: {e}")
 
 def send_telegram_prompt(token, message, buttons=["YES", "NO"], prefix="REBALANCE"):
@@ -135,3 +123,5 @@ def send_telegram_prompt(token, message, buttons=["YES", "NO"], prefix="REBALANC
             print(f"⚠️ Telegram error: {r.text}")
     except Exception as e:
         print(f"❌ Telegram prompt failed: {e}")
+
+Patch: add get_gspread_client and cleanup utilities
