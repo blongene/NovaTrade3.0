@@ -3,6 +3,26 @@ import gspread
 import requests
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
+import time
+import random
+from functools import wraps
+
+def throttle_retry(max_retries=3, delay=2, jitter=1):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    print(f"⚠️ Attempt {attempt+1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        sleep_time = delay + random.uniform(0, jitter)
+                        time.sleep(sleep_time)
+                    else:
+                        raise e
+        return wrapper
+    return decorator
 
 def get_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
