@@ -32,21 +32,20 @@ def run_rotation_stats_sync():
 
         for i, row in enumerate(stats_data, start=2):
             token = row.get("Token", "").strip().upper()
-            decision = row.get("Decision", "").strip().upper()
-            status = row.get("Status", "").strip().lower()
+            roi_source = "Rotation_Log"
 
-            # Match ROI from Rotation_Log
+            # Try getting ROI from Rotation_Log
             match = next((r for r in log_data if r.get("Token", "").strip().upper() == token), None)
-            if not match:
-                continue
+            roi_val = ""
+            if match:
+                roi_val = str(match.get("Follow-up ROI", "")).strip()
 
-            roi_val = str(match.get("Follow-up ROI", "")).strip()
-
-            # Use Follow-up ROI first, fallback to Rebuy ROI if empty
+            # If not valid, fallback to ROI from Rotation_Stats
             if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", roi_val):
-                roi_val = row.get("Rebuy ROI", "")
+                roi_val = str(row.get("Follow-up ROI", "")).strip()
+                roi_source = "Rotation_Stats"
 
-            if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", str(roi_val)):
+            if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", roi_val):
                 continue
 
             roi = float(roi_val)
@@ -66,7 +65,7 @@ def run_rotation_stats_sync():
                 tag = ""
 
             stats_ws.update_cell(i, memory_col, tag)
-            print(f"🧠 {token} tagged as {tag} based on ROI = {roi}")
+            print(f"🧠 {token} tagged as {tag} based on ROI = {roi} from {roi_source}")
 
     except Exception as e:
         print(f"❌ Error in run_rotation_stats_sync: {e}")
