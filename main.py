@@ -26,6 +26,7 @@ from portfolio_weight_adjuster import run_portfolio_weight_adjuster
 from target_percent_updater import run_target_percent_updater
 from rebuy_engine import run_undersized_rebuy
 from rebuy_memory_engine import run_memory_rebuy_scan
+from rotation_memory_scoring import run_memory_scoring
 
 import os
 import time
@@ -145,7 +146,10 @@ if __name__ == "__main__":
     time.sleep(5)
     print("♻️ Running memory-aware rebuy engine...")
     run_memory_rebuy_scan()
-
+    
+    time.sleep(5)
+    run_memory_scoring()
+    
     time.sleep(5)
     print("🧠 Running Suggested Target Calculator...")
     run_portfolio_weight_adjuster()
