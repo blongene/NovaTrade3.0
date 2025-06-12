@@ -20,33 +20,53 @@ def run_rotation_stats_sync():
 
         log_data = log_ws.get_all_records()
         stats_data = stats_ws.get_all_records()
+        headers = stats_ws.row_values(1)
 
-        for i, row in enumerate(stats_data, start=2):  # Row index in stats_ws
+        # Determine column positions
+        followup_col = headers.index("Follow-up ROI") + 1
+        rebuy_col = headers.index("Rebuy ROI") + 1 if "Rebuy ROI" in headers else None
+        memory_col = headers.index("Memory Tag") + 1 if "Memory Tag" in headers else len(headers) + 1
+
+        if "Memory Tag" not in headers:
+            stats_ws.update_cell(1, memory_col, "Memory Tag")
+
+        for i, row in enumerate(stats_data, start=2):
             token = row.get("Token", "").strip().upper()
-            status = row.get("Status", "").strip().lower()
             decision = row.get("Decision", "").strip().upper()
-            followup_cell = stats_ws.find("Follow-up ROI").col
-            rebuy_cell = stats_ws.find("Rebuy ROI").col
+            status = row.get("Status", "").strip().lower()
 
-            # Match against Rotation_Log
+            # Match ROI from Rotation_Log
             match = next((r for r in log_data if r.get("Token", "").strip().upper() == token), None)
             if not match:
                 continue
 
             roi_val = str(match.get("Follow-up ROI", "")).strip()
 
+            # Use Follow-up ROI first, fallback to Rebuy ROI if empty
             if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", roi_val):
-                continue  # Skip blank or invalid ROI
+                roi_val = row.get("Rebuy ROI", "")
+
+            if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", str(roi_val)):
+                continue
 
             roi = float(roi_val)
 
-            # If it's a Rebuy entry → log to Rebuy ROI column
-            if decision == "REBUY":
-                stats_ws.update_cell(i, rebuy_cell, roi)
-                print(f"🔁 Logged Rebuy ROI for {token}: {roi}%")
+            # Determine memory tag
+            if roi >= 200:
+                tag = "🟢 Big Win"
+            elif 25 <= roi < 200:
+                tag = "✅ Small Win"
+            elif -24 <= roi <= 24:
+                tag = "⚪ Break-Even"
+            elif -70 <= roi < -25:
+                tag = "🔻 Loss"
+            elif roi <= -71:
+                tag = "🔴 Big Loss"
             else:
-                stats_ws.update_cell(i, followup_cell, roi)
-                print(f"📈 Updated Follow-up ROI for {token}: {roi}%")
+                tag = ""
+
+            stats_ws.update_cell(i, memory_col, tag)
+            print(f"🧠 {token} tagged as {tag} based on ROI = {roi}")
 
     except Exception as e:
         print(f"❌ Error in run_rotation_stats_sync: {e}")
