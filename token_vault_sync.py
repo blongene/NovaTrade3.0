@@ -42,7 +42,11 @@ def sync_token_vault():
                 if not row["Decision"]:
                     vault_df.at[idx, "Decision"] = latest.get("Decision", "")
                 if not row["Last Reviewed"]:
-                    vault_df.at[idx, "Last Reviewed"] = latest["Timestamp"].strftime("%Y-%m-%dT%H:%M:%S")
+                    timestamp = latest["Timestamp"]
+                    if pd.notnull(timestamp):
+                        vault_df.at[idx, "Last Reviewed"] = timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+                    else:
+                        vault_df.at[idx, "Last Reviewed"] = ""
                 if not row["Source"]:
                     vault_df.at[idx, "Source"] = latest.get("Source", "")
                 if not row["Score"]:
