@@ -49,7 +49,7 @@ def scan_roi_tracking():
             continue
 
         sentiment = row.get("Sentiment", "").strip()
-        score = row.get("Score", "").strip()
+        score = str(row.get("Score", "")).strip()
 
         tracking_updates.append([
             token,
