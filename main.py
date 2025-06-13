@@ -33,13 +33,13 @@ from vault_alerts_phase15d import run_vault_alerts
 from vault_growth_sync import run_vault_growth_sync
 from vault_roi_tracker import run_vault_roi_tracker
 from vault_review_alerts import run_vault_review_alerts
+from utils import get_gspread_client, send_telegram_message
 
 import os
 import time
 import threading
 import schedule
 import gspread
-from utils import get_gspread_client
 from oauth2client.service_account import ServiceAccountCredentials
 
 def load_presale_stream():
@@ -117,9 +117,11 @@ if __name__ == "__main__":
     else:
         print("⛔️ Presale_Stream unavailable — presale scan skipped")
 
+    # Scheduled jobs
     schedule.every(60).minutes.do(run_rotation_log_updater)
     schedule.every(60).minutes.do(run_rebalance_scanner)
     schedule.every(60).minutes.do(run_rotation_memory)
+    schedule.every(6).hours.do(run_sentiment_radar)
     schedule.every(3).hours.do(run_memory_rebuy_scan)
     schedule.every().day.at("02:00").do(run_vault_roi_tracker)
 
@@ -150,7 +152,6 @@ if __name__ == "__main__":
         run_performance_dashboard()
     except Exception as e:
         print(f"⚠️ Skipped Dashboard due to quota: {e}")
-
 
     print("🔁 Running initial rebalance scan...")
     run_rebalance_scanner()
@@ -214,7 +215,9 @@ if __name__ == "__main__":
         run_vault_review_alerts()
     except Exception as e:
         print(f"❌ Error in run_vault_review_alerts: {e}")
-    
+
+    send_telegram_message("🟢 NovaTrade system booted and live.")  # Optional system confirmation ping
+
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
     print("🟢 Starting Flask app on port 10000...")
