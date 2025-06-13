@@ -28,6 +28,7 @@ from rebuy_engine import run_undersized_rebuy
 from rebuy_memory_engine import run_memory_rebuy_scan
 from rotation_memory_scoring import run_memory_scoring
 from vault_intelligence import run_vault_intelligence
+from vault_to_stats_sync import run_vault_to_stats_sync
 
 import os
 import time
@@ -162,6 +163,9 @@ if __name__ == "__main__":
     print("📊 Syncing Suggested % → Target %...")
     run_target_percent_updater()
 
+    time.sleep(5)
+    run_vault_to_stats_sync()
+    
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
     print("🟢 Starting Flask app on port 10000...")
