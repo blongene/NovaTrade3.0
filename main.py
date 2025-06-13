@@ -32,6 +32,7 @@ from vault_to_stats_sync import run_vault_to_stats_sync
 from vault_alerts_phase15d import run_vault_alerts
 from vault_growth_sync import run_vault_growth_sync
 from vault_roi_tracker import run_vault_roi_tracker
+from vault_review_alerts import run_vault_review_alerts
 
 import os
 import time
@@ -202,6 +203,13 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ vault_roi_tracker error: {e}")
 
+    time.sleep(5)
+    print("📬 Running Vault Review Alerts...")
+    try:
+        run_vault_review_alerts()
+    except Exception as e:
+        print(f"❌ vault_review_alerts error: {e}")
+    
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
     print("🟢 Starting Flask app on port 10000...")
