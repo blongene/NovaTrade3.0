@@ -1,76 +1,54 @@
-# vault_review_alerts.py
-
-import os
 import gspread
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
+from utils import send_rotation_alert
 from oauth2client.service_account import ServiceAccountCredentials
-from utils import send_telegram_prompt, get_gspread_client
 
 
 def run_vault_review_alerts():
-    print("🔔 Running Vault Review Alerts...")
-
+    print("📬 Running Vault Review Alerts...")
     try:
-        # Authenticate and open sheet
-        client = get_gspread_client()
+        # Auth
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+        client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-        vault_ws = sheet.worksheet("Token_Vault")
+        roi_ws = sheet.worksheet("Vault_ROI_Tracker")
         memory_ws = sheet.worksheet("Vault_Memory")
-        vault_data = vault_ws.get_all_records()
-        memory_data = memory_ws.get_all_records()
 
-        today = datetime.utcnow()
-        sent_count = 0
+        roi_rows = roi_ws.get_all_records()
+        memory_rows = memory_ws.get_all_records()
+        prompted_tokens = {row['Token'] for row in memory_rows if row.get('Decision')}
 
-        for row in vault_data:
-            token = row.get("Token", "").strip().upper()
-            roi_str = str(row.get("Vault ROI", "")).strip()
-            memory_tag = row.get("Memory Tag", "")
-            last_reviewed = row.get("Last Reviewed", "")
-            vault_tag = row.get("Vault Tag", "")
+        recent_rows = [row for row in roi_rows if row.get('Date')]
+        if not recent_rows:
+            print("⚠️ No recent vault ROI data found.")
+            return
 
-            if not token or not roi_str or not vault_tag:
+        latest_date = max(row['Date'] for row in recent_rows)
+        recent = [row for row in recent_rows if row['Date'] == latest_date]
+
+        for row in recent:
+            token = row.get("Token", "").strip()
+            roi = float(row.get("ROI", 0))
+
+            if not token or roi < 200 or token in prompted_tokens:
                 continue
 
-            # Must be Vaulted AND tagged Big Win
-            if vault_tag != "✅ Vaulted" or memory_tag != "🟢 Big Win":
-                continue
-
-            # Must have ROI >= 200
-            try:
-                roi = float(roi_str)
-            except:
-                continue
-
-            if roi < 200:
-                continue
-
-            # Must be unreviewed in past 7 days
-            days_since_review = 999
-            if last_reviewed:
-                try:
-                    dt = datetime.strptime(last_reviewed, "%Y-%m-%dT%H:%M:%S")
-                    days_since_review = (today - dt).days
-                except:
-                    pass
-
-            if days_since_review < 7:
-                continue
-
-            # Check if already logged in Vault_Memory
-            if any(m.get("Token", "").strip().upper() == token and m.get("Decision") for m in memory_data):
-                continue
-
-            # Send Telegram alert
+            # Prompt message
             message = (
-                f"🧠 *{token}* was vaulted and returned +{roi}% over {row.get('Days Held', '?')} days.\n"
-                f"Would you vault this token again today?"
+                f"📦 *{token}* is still vaulted after reaching ROI of {roi:.1f}%!\n\n"
+                f"Would you still vote YES to keep it vaulted, or rotate it out?"
             )
-            send_telegram_prompt(token, message, buttons=["YES", "NO"], prefix="VAULT REVIEW")
-            sent_count += 1
-
-        print(f"✅ Vault Review check complete. {sent_count} prompt(s) sent.")
+            send_rotation_alert(token, message, context="Vault Review")
+            memory_ws.append_row([
+                datetime.utcnow().isoformat(),
+                token,
+                "",  # Awaiting decision
+                "Prompt Sent"
+            ], value_input_option="USER_ENTERED")
+            print(f"🔔 Vault review alert sent for {token}")
 
     except Exception as e:
         print(f"❌ Error in run_vault_review_alerts: {e}")
