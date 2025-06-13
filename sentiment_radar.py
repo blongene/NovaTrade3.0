@@ -7,7 +7,7 @@ from googleapiclient.discovery import build
 # from telegram_notifier import send_alert  # Disabled to prevent module error
 
 # Optional toggle
-ENABLE_YOUTUBE = False
+ENABLE_YOUTUBE = True
 
 def run_sentiment_radar():
     print("📡 Running Sentiment Radar...")
