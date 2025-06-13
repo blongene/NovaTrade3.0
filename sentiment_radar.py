@@ -6,11 +6,11 @@ from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 
 # ===== CONFIG TOGGLES =====
-ENABLE_REDDIT = False  # Currently inactive, placeholder for future
+ENABLE_REDDIT = False  # Placeholder for future support
 ENABLE_YOUTUBE = True
-ENABLE_TWITTER = True  # Toggle Twitter scraping
+ENABLE_TWITTER = True
 
-# ===== SETUP GOOGLE SHEETS CLIENT =====
+# ===== SHEET SETUP =====
 def get_worksheet(name):
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
@@ -30,7 +30,11 @@ def fetch_twitter_mentions(token):
         query = f"{token} -is:retweet lang:en"
         url = f"https://api.twitter.com/2/tweets/search/recent?query={query}&max_results=10"
         response = requests.get(url, headers=headers)
-        if response.status_code != 200:
+
+        if response.status_code == 429:
+            print(f"⚠️ Twitter API error: 429 - Too Many Requests")
+            return 0
+        elif response.status_code != 200:
             print(f"⚠️ Twitter API error: {response.status_code} - {response.text}")
             return 0
 
@@ -57,38 +61,36 @@ def fetch_youtube_mentions(token):
         print(f"⚠️ YouTube error for '{token}': {e}")
         return 0
 
-# ===== MAIN RADAR ENGINE =====
+# ===== MAIN ENGINE =====
 def run_sentiment_radar():
     print("📡 Running Sentiment Radar...")
     radar_ws = get_worksheet("Sentiment_Radar")
     targets_ws = get_worksheet("Sentiment_Targets")
+
     targets = targets_ws.get_all_records()
-    token_list = sorted(targets, key=lambda x: x.get("Priority", 0), reverse=True)[:3]
+    top_tokens = sorted(targets, key=lambda x: x.get("Priority", 0), reverse=True)[:3]
 
     sentiment_entries = []
 
-    for row in token_list:
+    for row in top_tokens:
         token = row.get("Token", "").strip()
         if not token:
             continue
 
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-        # YouTube
         if ENABLE_YOUTUBE:
             yt_mentions = fetch_youtube_mentions(token)
             print(f"📺 YouTube: {token} → {yt_mentions} mentions")
             sentiment_entries.append([timestamp, token, "YouTube", yt_mentions])
 
-        # Twitter
         if ENABLE_TWITTER:
             tw_mentions = fetch_twitter_mentions(token)
             print(f"🐦 Twitter: {token} → {tw_mentions} mentions")
             sentiment_entries.append([timestamp, token, "Twitter", tw_mentions])
 
-        # Reddit stub (future support)
         if ENABLE_REDDIT:
-            sentiment_entries.append([timestamp, token, "Reddit", 0])
+            sentiment_entries.append([timestamp, token, "Reddit", 0])  # Stub
 
     if sentiment_entries:
         radar_ws.append_rows(sentiment_entries, value_input_option="USER_ENTERED")
