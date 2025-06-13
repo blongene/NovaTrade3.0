@@ -31,6 +31,7 @@ from vault_intelligence import run_vault_intelligence
 from vault_to_stats_sync import run_vault_to_stats_sync
 from vault_alerts_phase15d import run_vault_alerts
 from vault_growth_sync import run_vault_growth_sync
+from vault_roi_tracker import run_vault_roi_tracker
 
 import os
 import time
@@ -78,7 +79,7 @@ if __name__ == "__main__":
 
     if rotation_ws:
         scan_roi_tracking()
-        time.sleep(2)
+        time.sleep(5)
         run_milestone_alerts()
         log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
@@ -87,18 +88,18 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"⚠️ Vault sync error: {e}")
 
-    time.sleep(5)
+    time.sleep(10)
     run_vault_intelligence()
 
-    time.sleep(5)
+    time.sleep(10)
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
 
-    time.sleep(5)
+    time.sleep(10)
     print("📥 Syncing ROI feedback responses...")
     run_roi_feedback_sync()
 
-    time.sleep(5)
+    time.sleep(10)
     print("📡 Running Sentiment Radar (1x boot pass only)...")
     try:
         run_sentiment_radar()
@@ -106,7 +107,7 @@ if __name__ == "__main__":
         print(f"⚠️ Radar scan skipped due to error: {e}")
 
     check_nova_trigger()
-    time.sleep(5)
+    time.sleep(10)
     trigger_nova_ping("NOVA UPDATE")
 
     if rotation_ws:
@@ -119,22 +120,24 @@ if __name__ == "__main__":
     schedule.every(60).minutes.do(run_rebalance_scanner)
     schedule.every(60).minutes.do(run_rotation_memory)
     schedule.every(3).hours.do(run_memory_rebuy_scan)
+    schedule.every().day.at("02:00").do(run_vault_roi_tracker)
 
     run_stalled_asset_detector()
+    time.sleep(10)
     check_claims()
+    time.sleep(10)
     start_staking_yield_loop()
+    time.sleep(10)
 
-    time.sleep(5)
     print("🧹 Cleaning Rotation_Log ROI column...")
-
-    time.sleep(5)
+    time.sleep(10)
     print("📊 Syncing Rotation_Stats...")
     try:
         run_rotation_stats_sync()
     except Exception as e:
         print(f"❌ Error in run_rotation_stats_sync: {e}")
 
-    time.sleep(5)
+    time.sleep(10)
     try:
         run_rotation_feedback_engine()
     except Exception as e:
@@ -152,45 +155,52 @@ if __name__ == "__main__":
     print("🧠 Running Rotation Memory Sync...")
     run_rotation_memory()
 
-    time.sleep(3)
+    time.sleep(10)
     print("🔁 Running undersized rebuy engine...")
     run_undersized_rebuy()
 
-    time.sleep(5)
+    time.sleep(10)
     print("♻️ Running memory-aware rebuy engine...")
     run_memory_rebuy_scan()
 
-    time.sleep(5)
+    time.sleep(10)
     run_memory_scoring()
 
-    time.sleep(5)
+    time.sleep(10)
     print("🧠 Running Suggested Target Calculator...")
     run_portfolio_weight_adjuster()
 
-    time.sleep(5)
+    time.sleep(10)
     print("📊 Syncing Suggested % → Target %...")
     run_target_percent_updater()
 
-    time.sleep(10)
+    time.sleep(15)
     print("📊 Syncing Vault Tags → Rotation_Stats...")
     try:
         run_vault_to_stats_sync()
     except Exception as e:
         print(f"❌ vault_to_stats_sync error: {e}")
 
-    time.sleep(5)
+    time.sleep(10)
     print("🔔 Running Vault Intelligence Alerts...")
     try:
         run_vault_alerts()
     except Exception as e:
         print(f"❌ Error in run_vault_alerts: {e}")
 
-    time.sleep(5)
+    time.sleep(10)
     print("📦 Syncing Vault ROI + Memory Stats...")
     try:
         run_vault_growth_sync()
     except Exception as e:
         print(f"❌ vault_growth_sync error: {e}")
+
+    time.sleep(5)
+    print("📈 Writing daily snapshot to Vault ROI Tracker...")
+    try:
+        run_vault_roi_tracker()
+    except Exception as e:
+        print(f"❌ vault_roi_tracker error: {e}")
 
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
