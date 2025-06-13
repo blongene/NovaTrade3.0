@@ -1,7 +1,7 @@
 import gspread
 import os
 from datetime import datetime
-from utils import send_rotation_alert
+from utils import send_telegram_prompt
 from oauth2client.service_account import ServiceAccountCredentials
 
 
@@ -41,7 +41,7 @@ def run_vault_review_alerts():
                 f"📦 *{token}* is still vaulted after reaching ROI of {roi:.1f}%!\n\n"
                 f"Would you still vote YES to keep it vaulted, or rotate it out?"
             )
-            send_rotation_alert(token, message, context="Vault Review")
+            send_telegram_prompt(token, message, buttons=["YES", "NO"], prefix="VAULT REVIEW")
             memory_ws.append_row([
                 datetime.utcnow().isoformat(),
                 token,
