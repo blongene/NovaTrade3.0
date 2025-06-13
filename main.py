@@ -201,14 +201,14 @@ if __name__ == "__main__":
     try:
         run_vault_roi_tracker()
     except Exception as e:
-        print(f"❌ vault_roi_tracker error: {e}")
+        print(f"❌ Error in run_vault_roi_tracker: {e}")
 
     time.sleep(5)
     print("📬 Running Vault Review Alerts...")
     try:
         run_vault_review_alerts()
     except Exception as e:
-        print(f"❌ vault_review_alerts error: {e}")
+        print(f"❌ Error in run_vault_review_alerts: {e}")
     
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
