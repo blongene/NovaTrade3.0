@@ -29,6 +29,7 @@ from rebuy_memory_engine import run_memory_rebuy_scan
 from rotation_memory_scoring import run_memory_scoring
 from vault_intelligence import run_vault_intelligence
 from vault_to_stats_sync import run_vault_to_stats_sync
+from vault_alerts_phase15d import run_vault_alerts
 
 import os
 import time
@@ -165,6 +166,7 @@ if __name__ == "__main__":
 
     time.sleep(5)
     run_vault_to_stats_sync()
+    run_vault_alerts
     
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
