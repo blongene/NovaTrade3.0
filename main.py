@@ -60,7 +60,7 @@ def start_staking_yield_loop():
         while True:
             print("🔁 Checking staking yield...")
             run_staking_yield_tracker()
-            time.sleep(21600)  # 6 hours
+            time.sleep(21600)
     threading.Thread(target=loop, daemon=True).start()
 
 if __name__ == "__main__":
@@ -114,6 +114,7 @@ if __name__ == "__main__":
         run_presale_scorer()
     else:
         print("⛔️ Presale_Stream unavailable — presale scan skipped")
+
     schedule.every(60).minutes.do(run_rotation_log_updater)
     schedule.every(60).minutes.do(run_rebalance_scanner)
     schedule.every(60).minutes.do(run_rotation_memory)
@@ -128,10 +129,16 @@ if __name__ == "__main__":
 
     time.sleep(5)
     print("📊 Syncing Rotation_Stats...")
-    run_rotation_stats_sync()
+    try:
+        run_rotation_stats_sync()
+    except Exception as e:
+        print(f"❌ Error in run_rotation_stats_sync: {e}")
 
     time.sleep(5)
-    run_rotation_feedback_engine()
+    try:
+        run_rotation_feedback_engine()
+    except Exception as e:
+        print(f"❌ Error in run_rotation_feedback_engine: {e}")
 
     print("📊 Running Performance Dashboard...")
     run_performance_dashboard()
@@ -140,11 +147,9 @@ if __name__ == "__main__":
     run_rebalance_scanner()
 
     print("📢 Running Telegram Summary Layer...")
-    time.sleep(3)
     run_telegram_summaries()
 
     print("🧠 Running Rotation Memory Sync...")
-    time.sleep(3)
     run_rotation_memory()
 
     time.sleep(3)
@@ -166,12 +171,26 @@ if __name__ == "__main__":
     print("📊 Syncing Suggested % → Target %...")
     run_target_percent_updater()
 
-    time.sleep(5)
-    run_vault_to_stats_sync()
-    run_vault_alerts()
+    time.sleep(10)
+    print("📊 Syncing Vault Tags → Rotation_Stats...")
+    try:
+        run_vault_to_stats_sync()
+    except Exception as e:
+        print(f"❌ vault_to_stats_sync error: {e}")
 
     time.sleep(5)
-    run_vault_growth_sync()
+    print("🔔 Running Vault Intelligence Alerts...")
+    try:
+        run_vault_alerts()
+    except Exception as e:
+        print(f"❌ Error in run_vault_alerts: {e}")
+
+    time.sleep(5)
+    print("📦 Syncing Vault ROI + Memory Stats...")
+    try:
+        run_vault_growth_sync()
+    except Exception as e:
+        print(f"❌ vault_growth_sync error: {e}")
 
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
