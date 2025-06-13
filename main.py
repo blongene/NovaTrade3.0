@@ -30,6 +30,7 @@ from rotation_memory_scoring import run_memory_scoring
 from vault_intelligence import run_vault_intelligence
 from vault_to_stats_sync import run_vault_to_stats_sync
 from vault_alerts_phase15d import run_vault_alerts
+from vault_growth_sync import run_vault_growth_sync
 
 import os
 import time
@@ -37,7 +38,7 @@ import threading
 import schedule
 import gspread
 from utils import get_gspread_client
-from oauth2client.service_account import ServiceAccountCredentials  # ✅ Needed for load_presale_stream()
+from oauth2client.service_account import ServiceAccountCredentials
 
 def load_presale_stream():
     print("⚙️ Attempting to load worksheet: Presale_Stream")
@@ -88,7 +89,7 @@ if __name__ == "__main__":
 
     time.sleep(5)
     run_vault_intelligence()
-    
+
     time.sleep(5)
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
@@ -103,7 +104,6 @@ if __name__ == "__main__":
         run_sentiment_radar()
     except Exception as e:
         print(f"⚠️ Radar scan skipped due to error: {e}")
-
 
     check_nova_trigger()
     time.sleep(5)
@@ -140,9 +140,11 @@ if __name__ == "__main__":
     run_rebalance_scanner()
 
     print("📢 Running Telegram Summary Layer...")
+    time.sleep(3)
     run_telegram_summaries()
 
     print("🧠 Running Rotation Memory Sync...")
+    time.sleep(3)
     run_rotation_memory()
 
     time.sleep(3)
@@ -152,10 +154,10 @@ if __name__ == "__main__":
     time.sleep(5)
     print("♻️ Running memory-aware rebuy engine...")
     run_memory_rebuy_scan()
-    
+
     time.sleep(5)
     run_memory_scoring()
-    
+
     time.sleep(5)
     print("🧠 Running Suggested Target Calculator...")
     run_portfolio_weight_adjuster()
@@ -166,8 +168,11 @@ if __name__ == "__main__":
 
     time.sleep(5)
     run_vault_to_stats_sync()
-    run_vault_alerts
-    
+    run_vault_alerts()
+
+    time.sleep(5)
+    run_vault_growth_sync()
+
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
     print("🟢 Starting Flask app on port 10000...")
