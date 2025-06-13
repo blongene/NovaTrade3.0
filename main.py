@@ -144,8 +144,13 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Error in run_rotation_feedback_engine: {e}")
 
-    print("📊 Running Performance Dashboard...")
-    run_performance_dashboard()
+    try:
+        time.sleep(10)
+        print("📊 Running Performance Dashboard...")
+        run_performance_dashboard()
+    except Exception as e:
+        print(f"⚠️ Skipped Dashboard due to quota: {e}")
+
 
     print("🔁 Running initial rebalance scan...")
     run_rebalance_scanner()
