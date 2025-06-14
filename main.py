@@ -35,6 +35,7 @@ from vault_growth_sync import run_vault_growth_sync
 from vault_roi_tracker import run_vault_roi_tracker
 from vault_review_alerts import run_vault_review_alerts
 from utils import get_gspread_client, send_telegram_message
+from vault_rotation_scanner import run_vault_rotation_scanner  # 🆕 Phase 11A Scanner
 
 import os
 import time
@@ -130,6 +131,7 @@ if __name__ == "__main__":
     schedule.every(3).hours.do(run_memory_rebuy_scan)
     schedule.every(3).hours.do(run_sentiment_summary)
     schedule.every().day.at("02:00").do(run_vault_roi_tracker)
+    schedule.every().day.at("09:15").do(run_vault_rotation_scanner)  # 🆕 Phase 11 daily vault scan
 
     run_stalled_asset_detector()
     time.sleep(10)
@@ -221,6 +223,12 @@ if __name__ == "__main__":
         run_vault_review_alerts()
     except Exception as e:
         print(f"❌ Error in run_vault_review_alerts: {e}")
+
+    print("🔁 Scanning vaults for decay...")  # 🆕 Boot-time scan
+    try:
+        run_vault_rotation_scanner()
+    except Exception as e:
+        print(f"❌ Error in run_vault_rotation_scanner: {e}")
 
     send_telegram_message("🟢 NovaTrade system booted and live.")
 
