@@ -80,10 +80,14 @@ if __name__ == "__main__":
     rotation_ws = load_presale_stream()
 
     if rotation_ws:
-        scan_roi_tracking()
-        time.sleep(5)
-        run_milestone_alerts()
-        log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
+       scan_roi_tracking()
+       time.sleep(5)
+       try:
+           run_milestone_alerts()
+       except Exception as e:
+           print(f"❌ Error in run_milestone_alerts: {e}")
+       time.sleep(5)
+       log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
     try:
         sync_token_vault()
