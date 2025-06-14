@@ -35,6 +35,10 @@ def run_roi_feedback_sync():
     except ValueError as e:
         print("❌ Missing column in Rotation_Stats:", e)
         return
+    try:
+        performance_col = stats_headers.index("Performance") + 1
+    except ValueError:
+        performance_col = None
 
     updated = 0
     for i, row in enumerate(review_data):
