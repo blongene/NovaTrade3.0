@@ -21,9 +21,10 @@ def run_vault_alerts():
         vault_data = vault_ws.get_all_records()
 
         now = datetime.utcnow()
+        now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
         sent_count = 0
 
-        for stat in stats_data:
+        for i, stat in enumerate(stats_data, start=2):  # start=2 accounts for 1-based indexing + header row
             token = stat.get("Token", "").strip().upper()
             tag = stat.get("Vault Tag", "")
             last_seen = stat.get("Last Seen", "") or stat.get("Last Reviewed", "")
@@ -35,10 +36,11 @@ def run_vault_alerts():
                     if float(roi) >= 5:
                         send_telegram_prompt(
                             token,
-                            f"$${token} was previously vaulted, but is showing new signs of life (ROI {roi}%). Would you like to unvault it?",
+                            f"$$ {token} was previously vaulted, but is showing new signs of life (ROI {roi}%). Would you like to unvault it?",
                             buttons=["YES", "NO"],
                             prefix="UNVAULT"
                         )
+                        stats_ws.update_acell(f"K{i}", now_str)  # Last Reviewed
                         sent_count += 1
                         continue
                 except:
@@ -55,10 +57,11 @@ def run_vault_alerts():
                     if (now - dt).days >= 30:
                         send_telegram_prompt(
                             token,
-                            f"$${token} has been in the vault for 30+ days with no update. Still a long-term hold?",
+                            f"$$ {token} has been in the vault for 30+ days with no update. Still a long-term hold?",
                             buttons=["YES", "NO"],
                             prefix="VAULT CHECK"
                         )
+                        stats_ws.update_acell(f"K{i}", now_str)  # Last Reviewed
                         sent_count += 1
                 except Exception as e:
                     print(f"⚠️ Date parse error for {token}: {e}")
