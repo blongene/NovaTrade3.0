@@ -35,10 +35,19 @@ def run_roi_feedback_sync():
     except ValueError as e:
         print("❌ Missing column in Rotation_Stats:", e)
         return
+
+    # Optional: sync to Performance column
     try:
         performance_col = stats_headers.index("Performance") + 1
     except ValueError:
         performance_col = None
+
+    # Optional: log to NovaHeartbeat
+    try:
+        heartbeat_ws = sheet.worksheet("NovaHeartbeat")
+        heartbeat_ready = True
+    except:
+        heartbeat_ready = False
 
     updated = 0
     for i, row in enumerate(review_data):
@@ -55,9 +64,17 @@ def run_roi_feedback_sync():
                 stats_ws.update_cell(j + 2, revote_col, vote)
                 if feedback:
                     stats_ws.update_cell(j + 2, notes_col, feedback)
+                if performance_col:
+                    stats_ws.update_cell(j + 2, performance_col, vote)
                 review_ws.update_cell(i + 2, synced_idx + 1, "✅")
                 updated += 1
                 print(f"📥 Synced feedback for {token}: {vote}, Notes: {feedback}")
                 break
 
     print(f"✅ ROI feedback sync complete. {updated} row(s) updated.")
+
+    if heartbeat_ready:
+        heartbeat_ws.append_row([str(datetime.utcnow()), "roi_feedback_sync", f"{updated} rows synced"])
+
+if __name__ == "__main__":
+    run_roi_feedback_sync()
