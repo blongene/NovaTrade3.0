@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 from oauth2client.service_account import ServiceAccountCredentials
 from utils import send_telegram_prompt, ping_webhook_debug
 
-@staticmethod
 def run_vault_alerts():
     print("🔔 Running Vault Intelligence Alerts...")
     try:
@@ -48,7 +47,10 @@ def run_vault_alerts():
             # Alert: Vaulted too long with no update
             if tag == "✅ Vaulted":
                 try:
-                    dt = datetime.strptime(last_seen, "%Y-%m-%dT%H:%M:%S")
+                    if not last_seen:
+                        print(f"⚠️ No Last Seen value for {token}. Skipping.")
+                        continue
+                    dt = datetime.strptime(last_seen.strip(), "%Y-%m-%dT%H:%M:%S")
                     if (now - dt).days >= 30:
                         send_telegram_prompt(
                             token,
