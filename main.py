@@ -15,6 +15,7 @@ from nova_heartbeat import log_heartbeat
 from stalled_asset_detector import run_stalled_asset_detector
 from claim_tracker import check_claims
 from sentiment_radar import run_sentiment_radar
+from sentiment_summary import run_sentiment_summary
 from rotation_stats_sync import run_rotation_stats_sync
 from rotation_feedback_engine import run_rotation_feedback_engine
 from performance_dashboard import run_performance_dashboard
@@ -123,6 +124,7 @@ if __name__ == "__main__":
     schedule.every(60).minutes.do(run_rotation_memory)
     schedule.every(6).hours.do(run_sentiment_radar)
     schedule.every(3).hours.do(run_memory_rebuy_scan)
+    schedule.every(3).hours.do(run_sentiment_summary)
     schedule.every().day.at("02:00").do(run_vault_roi_tracker)
 
     run_stalled_asset_detector()
@@ -216,7 +218,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Error in run_vault_review_alerts: {e}")
 
-    send_telegram_message("🟢 NovaTrade system booted and live.")  # Optional system confirmation ping
+    send_telegram_message("🟢 NovaTrade system booted and live.")
 
     print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
