@@ -14,47 +14,52 @@ def run_telegram_summaries():
         bot = Bot(token=os.getenv("BOT_TOKEN"))
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-        # Load Performance Metrics
         stats = sheet.worksheet("Rotation_Stats").get_all_records()
         staking = sheet.worksheet("Rotation_Log").get_all_records()
 
-        # Determine Top ROI Performer
+        # --- Top ROI Token ---
         roi_dict = {}
         for row in stats:
             token = row.get("Token", "").strip()
-            perf = row.get("Performance", "")
+            perf = str(row.get("Performance", "")).replace("%", "")
             try:
                 roi = float(perf)
                 roi_dict[token] = roi
             except:
                 continue
-
         top_roi_token = max(roi_dict, key=roi_dict.get) if roi_dict else "N/A"
-        top_roi_value = roi_dict.get(top_roi_token, 0)
+        top_roi_value = roi_dict.get(top_roi_token, "N/A")
 
-        # Determine Top Yielder
+        # --- Top Yielding Token ---
         yield_dict = {}
         for row in staking:
             token = row.get("Token", "").strip()
-            yield_val = row.get("Staking Yield", "")
+            yield_val = str(row.get("Staking Yield (%)", "")).replace("%", "")
             try:
-                apr = float(str(yield_val).replace("%", "").strip())
+                apr = float(yield_val)
                 yield_dict[token] = apr
             except:
                 continue
-
         top_yield_token = max(yield_dict, key=yield_dict.get) if yield_dict else "N/A"
-        top_yield_value = yield_dict.get(top_yield_token, 0)
+        top_yield_value = yield_dict.get(top_yield_token, "N/A")
 
-        # Build summary message
+        # --- Compose Message ---
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        message = f"📊 *NovaTrade Daily Summary*\n\n"
-        message += f"🗓 *{now}*\n"
-        message += f"🏆 *Top ROI Token*: `{top_roi_token}` (+{top_roi_value}%)\n"
-        message += f"💰 *Top Yielder*: `{top_yield_token}` ({top_yield_value}%)\n"
-        message += f"\n🧠 _System is live and healthy._"
+        message = f"📊 <b>NovaTrade Daily Summary</b>\n"
+        message += f"🗓 <b>{now}</b>\n\n"
+        message += f"🏆 <b>Top ROI Token:</b> <code>{top_roi_token}</code> (+{top_roi_value}%)\n"
+        message += f"💰 <b>Top Yielder:</b> <code>{top_yield_token}</code> ({top_yield_value}%)\n"
+        message += f"\n🧠 System is live and healthy."
 
-        bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
-        print("✅ NovaHeartbeat log: [Telegram Summary] Sent summary with 0 votes")
+        bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML")
+        print("✅ Telegram Summary sent.")
+
+        # --- Log to NovaHeartbeat (optional) ---
+        try:
+            heartbeat = sheet.worksheet("NovaHeartbeat")
+            heartbeat.append_row([str(datetime.utcnow()), "telegram_summaries", f"Sent summary: ROI {top_roi_token}, Yield {top_yield_token}"])
+        except:
+            print("⚠️ Could not log to NovaHeartbeat.")
+
     except Exception as e:
-        print(f"⚠️ Telegram send error: {e}")
+        print(f"❌ Telegram summary error: {e}")
