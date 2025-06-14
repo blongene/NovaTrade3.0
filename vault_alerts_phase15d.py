@@ -45,6 +45,7 @@ def run_vault_alerts():
                     pass
 
             # Alert: Vaulted too long with no update
+            last_seen = stat.get("Last Reviewed", "") or stat.get("Last Seen", "")
             if tag == "✅ Vaulted":
                 try:
                     if not last_seen:
