@@ -145,7 +145,12 @@ def run_presale_scorer():
                 continue
 
             try:
+                from memory_score_booster import get_memory_boost
                 score = score_token(row)
+                boost = get_memory_boost(token)
+                score += boost
+                print(f"📈 Final score for {token} after memory = {score}/100")
+
                 print(f"📈 {token} scored {score}/100")
                 if score >= ALERT_THRESHOLD:
                     print(f"🚀 {token} passed threshold — sending alert...")
