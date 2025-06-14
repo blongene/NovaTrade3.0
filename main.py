@@ -36,6 +36,7 @@ from vault_roi_tracker import run_vault_roi_tracker
 from vault_review_alerts import run_vault_review_alerts
 from utils import get_gspread_client, send_telegram_message
 from vault_rotation_scanner import run_vault_rotation_scanner  # 🆕 Phase 11A Scanner
+from vault_rotation_executor import run_vault_rotation_executor
 
 import os
 import time
@@ -99,6 +100,10 @@ if __name__ == "__main__":
     run_vault_intelligence()
 
     time.sleep(10)
+    print("🚀 Executing any pending vault rotations...")
+    run_vault_rotation_executor()
+
+    time.sleep(10)
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
 
@@ -132,6 +137,7 @@ if __name__ == "__main__":
     schedule.every(3).hours.do(run_sentiment_summary)
     schedule.every().day.at("02:00").do(run_vault_roi_tracker)
     schedule.every().day.at("09:15").do(run_vault_rotation_scanner)  # 🆕 Phase 11 daily vault scan
+    schedule.every().day.at("09:25").do(run_vault_rotation_executor)
 
     run_stalled_asset_detector()
     time.sleep(10)
