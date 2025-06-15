@@ -41,6 +41,7 @@ from wallet_monitor import run_wallet_monitor
 from unlock_horizon_alerts import run_unlock_horizon_alerts
 from top_token_summary import run_top_token_summary
 from auto_confirm_planner import run_auto_confirm_planner
+from memory_weight_sync import run_memory_weight_sync
 
 import os
 import time
@@ -168,6 +169,10 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Error in run_rotation_stats_sync: {e}")
 
+    time.sleep(10)
+    print("📊 Running Memory Weight Sync...")
+    run_memory_weight_sync()
+    
     time.sleep(10)
     try:
         run_rotation_feedback_engine()
