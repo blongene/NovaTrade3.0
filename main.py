@@ -141,6 +141,8 @@ if __name__ == "__main__":
     schedule.every().day.at("09:15").do(run_vault_rotation_scanner)  # 🆕 Phase 11 daily vault scan
     schedule.every().day.at("09:25").do(run_vault_rotation_executor)
     schedule.every().day.at("09:45").do(run_wallet_monitor)
+    from sentiment_alerts import run_sentiment_alerts
+    schedule.every().day.at("13:00").do(run_sentiment_alerts)
 
     run_stalled_asset_detector()
     time.sleep(10)
