@@ -75,3 +75,21 @@ def handle_telegram():
         print(f"❌ Telegram webhook error: {e}")
         ping_webhook_debug(f"❌ Telegram webhook failure: {e}")
         return "Error", 500
+
+def set_telegram_webhook():
+    import os
+    import requests
+
+    bot_token = os.getenv("BOT_TOKEN")
+    webhook_url = os.getenv("RENDER_WEBHOOK_URL")  # Should be in your Render env vars
+
+    if not bot_token or not webhook_url:
+        print("❌ BOT_TOKEN or RENDER_WEBHOOK_URL missing.")
+        return
+
+    url = f"https://api.telegram.org/bot{bot_token}/setWebhook"
+    response = requests.post(url, data={"url": webhook_url})
+    if response.ok:
+        print("✅ Webhook set successfully.")
+    else:
+        print(f"❌ Failed to set webhook: {response.text}")
