@@ -40,6 +40,7 @@ from vault_rotation_executor import run_vault_rotation_executor
 from wallet_monitor import run_wallet_monitor
 from unlock_horizon_alerts import run_unlock_horizon_alerts
 from top_token_summary import run_top_token_summary
+from auto_confirm_planner import run_auto_confirm_planner
 
 import os
 import time
@@ -248,6 +249,10 @@ if __name__ == "__main__":
         run_vault_rotation_scanner()
     except Exception as e:
         print(f"❌ Error in run_vault_rotation_scanner: {e}")
+
+    print("📋 Running Auto-Confirm Planner...")
+    run_auto_confirm_planner()
+    print("✅ Auto-confirm check complete.")
     
     time.sleep(10)
     run_unlock_horizon_alerts()
