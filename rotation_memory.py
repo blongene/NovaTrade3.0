@@ -29,15 +29,19 @@ def run_rotation_memory():
             except:
                 continue
 
-        memory_ws.clear()
-        memory_ws.append_row(["Token", "Wins", "Losses", "Win Rate", "Memory Weight"])
+        # Wipe rows 2+ but keep headers
+        memory_ws.batch_clear(["A2:E1000"])
 
+        new_rows = []
         for token, stats in memory.items():
             wins = stats["wins"]
             losses = stats["losses"]
             total = wins + losses
             win_rate = f"{round((wins / total) * 100, 2)}%" if total > 0 else "0%"
-            memory_ws.append_row([token, wins, losses, win_rate, ""])  # Leave Memory Weight blank for now
+            new_rows.append([token, wins, losses, win_rate, ""])
+
+        if new_rows:
+            memory_ws.append_rows(new_rows, value_input_option="USER_ENTERED")
 
         print("✅ Rotation_Memory updated with win/loss stats.")
 
