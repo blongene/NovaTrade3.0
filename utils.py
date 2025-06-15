@@ -207,4 +207,6 @@ def log_unclaimed_alert(token):
     except Exception:
         pass
 
-log_rebuy_confirmation = log_rebuy_decision
+def log_rebuy_confirmation(token):
+    log_rebuy_decision(token)
+
