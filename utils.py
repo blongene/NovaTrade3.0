@@ -172,4 +172,37 @@ def log_roi_feedback(token, decision):
         print(f"❌ Failed to log ROI Feedback: {e}")
         ping_webhook_debug(f"❌ ROI Feedback log error: {e}")
 
-#Patch: add get_gspread_client and cleanup utilities
+def log_vault_review(token, decision):
+    try:
+        sheet = get_sheet()
+        ws = sheet.worksheet("Vault_Review_Log")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        new_row = [timestamp, token.upper(), decision.upper()]
+        ws.append_row(new_row)
+        print(f"✅ Vault Review logged: {token} → {decision}")
+    except Exception as e:
+        print(f"❌ Failed to log Vault Review: {e}")
+        ping_webhook_debug(f"❌ Vault Review log error: {e}")
+
+def log_token_unlock(token, date):
+    try:
+        sheet = get_sheet()
+        ws = sheet.worksheet("Claim_Tracker")
+        rows = ws.get_all_records()
+        for i, row in enumerate(rows, start=2):  # Start at row 2
+            if row.get("Token", "").strip().upper() == token.strip().upper():
+                ws.update_acell(f"H{i}", "Claimed")  # Claimed? column
+                ws.update_acell(f"I{i}", "Resolved")  # Status column
+                ws.update_acell(f"G{i}", date)  # Arrival Date
+                print(f"✅ Unlock logged for {token}")
+                return
+    except Exception as e:
+        print(f"❌ Failed to log unlock for {token}: {e}")
+
+def log_unclaimed_alert(token):
+    try:
+        sheet = get_sheet()
+        ws = sheet.worksheet("Webhook_Debug")
+        ws.update_acell("A1", f"{datetime.now().isoformat()} – ⚠️ {token} arrived in wallet but not marked claimed")
+    except Exception:
+        pass
