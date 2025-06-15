@@ -43,6 +43,7 @@ from top_token_summary import run_top_token_summary
 from auto_confirm_planner import run_auto_confirm_planner
 from memory_weight_sync import run_memory_weight_sync
 from sentiment_trigger_engine import run_sentiment_trigger_engine
+from rebuy_roi_tracker import run_rebuy_roi_tracker
 
 import os
 import time
@@ -176,6 +177,10 @@ if __name__ == "__main__":
     print("📊 Running Memory Weight Sync...")
     run_memory_weight_sync()
     
+    time.sleep(10)
+    print("📊 Syncing Rebuy ROI to Rotation_Stats...")
+    run_rebuy_roi_tracker()
+
     time.sleep(10)
     try:
         run_rotation_feedback_engine()
