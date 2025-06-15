@@ -39,22 +39,24 @@ def run_wallet_monitor():
         claim_ws = sheet.worksheet("Claim_Tracker")
         decisions_ws = sheet.worksheet("Scout Decisions")
 
-        # Load data
+        claim_data = claim_ws.get_all_records()
+        decision_data = decisions_ws.get_all_records()
+
         claimed_tokens = {
             row["Token"].strip().upper()
-            for row in claim_ws.get_all_records()
+            for row in claim_data
             if row.get("Claimed?", "").strip().lower() == "claimed"
         }
 
         pending_claims = {
             row["Token"].strip().upper()
-            for row in claim_ws.get_all_records()
+            for row in claim_data
             if row.get("Claimed?", "").strip().lower() != "claimed"
         }
 
         all_approved = {
             row["Token"].strip().upper()
-            for row in decisions_ws.get_all_records()
+            for row in decision_data
             if row.get("Decision", "").strip().upper() == "YES"
         }
 
@@ -65,6 +67,7 @@ def run_wallet_monitor():
         print(f"🧾 Wallet Tokens: {all_wallet_tokens}")
         print(f"📋 Pending Claim Tokens: {pending_claims}")
 
+        # Notify if wallet contains tokens not yet marked as claimed
         unknown_arrivals = [
             token for token in all_wallet_tokens
             if token in all_approved and token not in claimed_tokens
@@ -78,6 +81,12 @@ def run_wallet_monitor():
             )
             send_telegram_message(msg)
             print(f"🔔 Alert sent for token: {token}")
+
+            # Auto-mark as "Resolved" in Status column
+            for i, row in enumerate(claim_data, start=2):  # row 2 = first data row
+                if row.get("Token", "").strip().upper() == token:
+                    claim_ws.update_acell(f"I{i}", "Resolved")
+                    print(f"✅ Status for {token} set to Resolved")
 
         print("✅ Wallet monitor complete.")
 
