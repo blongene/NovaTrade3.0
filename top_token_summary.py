@@ -50,13 +50,13 @@ def run_top_token_summary():
             # Format and send Telegram
             msg = f"📈 ${token} just hit *{roi:.1f}% ROI* — milestone passed: {latest}%\n"
             if roi >= 100:
-                msg += "\n🟢 _Huge Win!_
+                msg += "\n🟢 _Huge Win!_"
 "
             elif roi >= 20:
-                msg += "\n💡 _Solid breakout_
+                msg += "\n💡 _Solid breakout_"
 "
             else:
-                msg += "\n📊 _Early growth_
+                msg += "\n📊 _Early growth_"
 "
 
             send_telegram_message(msg)
