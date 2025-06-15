@@ -42,6 +42,7 @@ from unlock_horizon_alerts import run_unlock_horizon_alerts
 from top_token_summary import run_top_token_summary
 from auto_confirm_planner import run_auto_confirm_planner
 from memory_weight_sync import run_memory_weight_sync
+from sentiment_trigger_engine import run_sentiment_trigger_engine
 
 import os
 import time
@@ -202,6 +203,13 @@ if __name__ == "__main__":
     time.sleep(10)
     print("♻️ Running memory-aware rebuy engine...")
     run_memory_rebuy_scan()
+
+    time.sleep(10)
+    print("🚨 Running Sentiment-Triggered Rebuy Scan...")
+    try:
+        run_sentiment_trigger_engine()
+    except Exception as e:
+        print(f"❌ Error in run_sentiment_trigger_engine: {e}")
 
     time.sleep(10)
     run_memory_scoring()
