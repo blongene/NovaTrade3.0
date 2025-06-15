@@ -11,35 +11,35 @@ def run_rotation_memory():
 
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
         stats_ws = sheet.worksheet("Rotation_Stats")
-        rows = stats_ws.get_all_records()
+        memory_ws = sheet.worksheet("Rotation_Memory")
 
+        rows = stats_ws.get_all_records()
         memory = defaultdict(lambda: {"wins": 0, "losses": 0})
 
         for row in rows:
-            token = row.get("Token", "").upper()
-            perf = str(row.get("Performance", "")).strip()
-
+            token = row.get("Token", "").strip().upper()
+            if row.get("Decision", "").strip().upper() != "YES":
+                continue
             try:
-                val = float(perf)
-                if val >= 1.0:
+                perf = float(row.get("Performance", ""))
+                if perf >= 1.0:
                     memory[token]["wins"] += 1
                 else:
                     memory[token]["losses"] += 1
-            except ValueError:
+            except:
                 continue
 
-        memory_tab = sheet.worksheet("Rotation_Memory")
-        memory_tab.clear()
-        memory_tab.append_row(["Token", "Wins", "Losses", "Win Rate"])
+        memory_ws.clear()
+        memory_ws.append_row(["Token", "Wins", "Losses", "Win Rate", "Memory Weight"])
 
-        for token, result in memory.items():
-            wins = result["wins"]
-            losses = result["losses"]
+        for token, stats in memory.items():
+            wins = stats["wins"]
+            losses = stats["losses"]
             total = wins + losses
-            win_rate = round(wins / total * 100, 2) if total > 0 else 0
-            memory_tab.append_row([token, wins, losses, f"{win_rate}%"])
+            win_rate = f"{round((wins / total) * 100, 2)}%" if total > 0 else "0%"
+            memory_ws.append_row([token, wins, losses, win_rate, ""])  # Leave Memory Weight blank for now
 
-        print("✅ Rotation_Memory tab updated.")
+        print("✅ Rotation_Memory updated with win/loss stats.")
 
     except Exception as e:
-        print(f"❌ run_rotation_memory error: {e}")
+        print(f"❌ Error in run_rotation_memory: {e}")
