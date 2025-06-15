@@ -22,13 +22,16 @@ def run_rotation_stats_sync():
         stats_data = stats_ws.get_all_records()
         headers = stats_ws.row_values(1)
 
-        # Determine column positions
+        # Column positions
         followup_col = headers.index("Follow-up ROI") + 1
-        rebuy_col = headers.index("Rebuy ROI") + 1 if "Rebuy ROI" in headers else None
         memory_col = headers.index("Memory Tag") + 1 if "Memory Tag" in headers else len(headers) + 1
+        perf_col = headers.index("Performance") + 1 if "Performance" in headers else len(headers) + 2
 
+        # Add missing columns if needed
         if "Memory Tag" not in headers:
             stats_ws.update_cell(1, memory_col, "Memory Tag")
+        if "Performance" not in headers:
+            stats_ws.update_cell(1, perf_col, "Performance")
 
         for i, row in enumerate(stats_data, start=2):
             token = row.get("Token", "").strip().upper()
@@ -40,7 +43,7 @@ def run_rotation_stats_sync():
             if match:
                 roi_val = str(match.get("Follow-up ROI", "")).strip()
 
-            # If not valid, fallback to ROI from Rotation_Stats
+            # Fallback to ROI from Rotation_Stats if invalid
             if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", roi_val):
                 roi_val = str(row.get("Follow-up ROI", "")).strip()
                 roi_source = "Rotation_Stats"
@@ -50,7 +53,7 @@ def run_rotation_stats_sync():
 
             roi = float(roi_val)
 
-            # Determine memory tag
+            # === MEMORY TAG ===
             if roi >= 200:
                 tag = "🟢 Big Win"
             elif 25 <= roi < 200:
@@ -66,6 +69,20 @@ def run_rotation_stats_sync():
 
             stats_ws.update_cell(i, memory_col, tag)
             print(f"🧠 {token} tagged as {tag} based on ROI = {roi} from {roi_source}")
+
+            # === PERFORMANCE PATCH ===
+            try:
+                initial_roi = str(row.get("Initial ROI", "")).replace("%", "").strip()
+                followup_roi = str(row.get("Follow-up ROI", "")).replace("%", "").strip()
+                if re.match(r"^-?\d+(\.\d+)?$", initial_roi) and re.match(r"^-?\d+(\.\d+)?$", followup_roi):
+                    initial = float(initial_roi)
+                    followup = float(followup_roi)
+                    if initial != 0:
+                        perf = round(followup / initial, 2)
+                        stats_ws.update_cell(i, perf_col, perf)
+                        print(f"📈 {token} performance = {perf}")
+            except Exception as e:
+                print(f"⚠️ Could not calculate performance for {token}: {e}")
 
     except Exception as e:
         print(f"❌ Error in run_rotation_stats_sync: {e}")
