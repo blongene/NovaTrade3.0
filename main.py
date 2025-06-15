@@ -37,6 +37,7 @@ from vault_review_alerts import run_vault_review_alerts
 from utils import get_gspread_client, send_telegram_message
 from vault_rotation_scanner import run_vault_rotation_scanner  # 🆕 Phase 11A Scanner
 from vault_rotation_executor import run_vault_rotation_executor
+from wallet_monitor import run_wallet_monitor
 
 import os
 import time
@@ -138,6 +139,7 @@ if __name__ == "__main__":
     schedule.every().day.at("02:00").do(run_vault_roi_tracker)
     schedule.every().day.at("09:15").do(run_vault_rotation_scanner)  # 🆕 Phase 11 daily vault scan
     schedule.every().day.at("09:25").do(run_vault_rotation_executor)
+    schedule.every().day.at("09:45").do(run_wallet_monitor)
 
     run_stalled_asset_detector()
     time.sleep(10)
