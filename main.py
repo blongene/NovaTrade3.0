@@ -39,6 +39,7 @@ from vault_rotation_scanner import run_vault_rotation_scanner  # 🆕 Phase 11A 
 from vault_rotation_executor import run_vault_rotation_executor
 from wallet_monitor import run_wallet_monitor
 from unlock_horizon_alerts import run_unlock_horizon_alerts
+from top_token_summary import run_top_token_summary
 
 import os
 import time
@@ -99,6 +100,12 @@ if __name__ == "__main__":
         print(f"⚠️ Vault sync error: {e}")
 
     time.sleep(10)
+    try:
+        run_top_token_summary()
+    except Exception as e:
+        print(f"❌ Error in run_top_token_summary: {e}")
+    
+    time.sleep(10)
     run_vault_intelligence()
 
     time.sleep(10)
@@ -143,7 +150,8 @@ if __name__ == "__main__":
     schedule.every().day.at("09:45").do(run_wallet_monitor)
     from sentiment_alerts import run_sentiment_alerts
     schedule.every().day.at("13:00").do(run_sentiment_alerts)
-
+    schedule.every().day.at("01:30").do(run_top_token_summary)
+    
     run_stalled_asset_detector()
     time.sleep(10)
     check_claims()
