@@ -10,6 +10,7 @@ def run_rotation_stats_sync():
     print("📊 Syncing Rotation_Stats...")
 
     try:
+        # === Setup ===
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
         client = gspread.authorize(creds)
@@ -22,12 +23,12 @@ def run_rotation_stats_sync():
         stats_data = stats_ws.get_all_records()
         headers = stats_ws.row_values(1)
 
-        # Column positions
+        # === Column Positions ===
         followup_col = headers.index("Follow-up ROI") + 1
         memory_col = headers.index("Memory Tag") + 1 if "Memory Tag" in headers else len(headers) + 1
         perf_col = headers.index("Performance") + 1 if "Performance" in headers else len(headers) + 2
 
-        # Add missing columns if needed
+        # Add missing headers if not found
         if "Memory Tag" not in headers:
             stats_ws.update_cell(1, memory_col, "Memory Tag")
         if "Performance" not in headers:
@@ -37,23 +38,19 @@ def run_rotation_stats_sync():
             token = row.get("Token", "").strip().upper()
             roi_source = "Rotation_Log"
 
-            # Try getting ROI from Rotation_Log
+            # === ROI Sync: Prefer Rotation_Log, fallback to Rotation_Stats
             match = next((r for r in log_data if r.get("Token", "").strip().upper() == token), None)
-            roi_val = ""
-            if match:
-                roi_val = str(match.get("Follow-up ROI", "")).strip()
-
-            # Fallback to ROI from Rotation_Stats if invalid
+            roi_val = str(match.get("Follow-up ROI", "")).strip() if match else ""
             if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", roi_val):
                 roi_val = str(row.get("Follow-up ROI", "")).strip()
                 roi_source = "Rotation_Stats"
 
             if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", roi_val):
-                continue
+                continue  # skip invalid entries
 
             roi = float(roi_val)
 
-            # === MEMORY TAG ===
+            # === MEMORY TAG
             if roi >= 200:
                 tag = "🟢 Big Win"
             elif 25 <= roi < 200:
@@ -70,13 +67,15 @@ def run_rotation_stats_sync():
             stats_ws.update_cell(i, memory_col, tag)
             print(f"🧠 {token} tagged as {tag} based on ROI = {roi} from {roi_source}")
 
-            # === PERFORMANCE PATCH ===
+            # === PERFORMANCE CALCULATION ===
             try:
                 initial_roi = str(row.get("Initial ROI", "")).replace("%", "").strip()
-                followup_roi = str(row.get("Follow-up ROI", "")).replace("%", "").strip()
+                followup_roi = roi_val  # use the synced value
+
                 if re.match(r"^-?\d+(\.\d+)?$", initial_roi) and re.match(r"^-?\d+(\.\d+)?$", followup_roi):
                     initial = float(initial_roi)
                     followup = float(followup_roi)
+
                     if initial != 0:
                         perf = round(followup / initial, 2)
                         stats_ws.update_cell(i, perf_col, perf)
