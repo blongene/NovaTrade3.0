@@ -160,4 +160,16 @@ def log_rotation_confirmation(token, decision):
     except Exception as e:
         print(f"❌ Error in log_rotation_confirmation: {e}")
 
+def log_roi_feedback(token, decision):
+    try:
+        sheet = get_sheet()
+        ws = sheet.worksheet("ROI_Review_Log")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        new_row = [timestamp, token.upper(), decision.upper()]
+        ws.append_row(new_row)
+        print(f"✅ ROI Feedback logged: {token} → {decision}")
+    except Exception as e:
+        print(f"❌ Failed to log ROI Feedback: {e}")
+        ping_webhook_debug(f"❌ ROI Feedback log error: {e}")
+
 #Patch: add get_gspread_client and cleanup utilities
