@@ -144,4 +144,20 @@ def send_telegram_prompt(token, message, buttons=["YES", "NO"], prefix="REBALANC
     except Exception as e:
         print(f"❌ Telegram prompt failed: {e}")
 
+def log_rotation_confirmation(token, decision):
+    try:
+        client = get_gspread_client()
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        planner_ws = sheet.worksheet("Rotation_Planner")
+
+        records = planner_ws.get_all_records()
+        for i, row in enumerate(records, start=2):  # Skip header
+            if row.get("Token", "").strip().upper() == token.strip().upper():
+                planner_ws.update_acell(f"C{i}", decision.upper())  # Column C = 'User Response'
+                print(f"✅ Rotation confirmation logged: {token} → {decision}")
+                return
+        print(f"⚠️ Token not found in Rotation_Planner: {token}")
+    except Exception as e:
+        print(f"❌ Error in log_rotation_confirmation: {e}")
+
 #Patch: add get_gspread_client and cleanup utilities
