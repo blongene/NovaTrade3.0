@@ -38,6 +38,7 @@ from utils import get_gspread_client, send_telegram_message
 from vault_rotation_scanner import run_vault_rotation_scanner  # 🆕 Phase 11A Scanner
 from vault_rotation_executor import run_vault_rotation_executor
 from wallet_monitor import run_wallet_monitor
+from unlock_horizon_alerts import run_unlock_horizon_alerts
 
 import os
 import time
@@ -237,7 +238,10 @@ if __name__ == "__main__":
         run_vault_rotation_scanner()
     except Exception as e:
         print(f"❌ Error in run_vault_rotation_scanner: {e}")
-
+    
+    time.sleep(10)
+    run_unlock_horizon_alerts()
+    
     send_telegram_message("🟢 NovaTrade system booted and live.")
 
     print("🧠 NovaTrade system is live.")
