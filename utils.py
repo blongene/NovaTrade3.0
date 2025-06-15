@@ -206,3 +206,5 @@ def log_unclaimed_alert(token):
         ws.update_acell("A1", f"{datetime.now().isoformat()} – ⚠️ {token} arrived in wallet but not marked claimed")
     except Exception:
         pass
+
+log_rebuy_confirmation = log_rebuy_decision
