@@ -154,7 +154,9 @@ if __name__ == "__main__":
     from sentiment_alerts import run_sentiment_alerts
     schedule.every().day.at("13:00").do(run_sentiment_alerts)
     schedule.every().day.at("01:30").do(run_top_token_summary)
-    
+    from roi_threshold_validator import run_roi_threshold_validator
+    schedule.every().day.at("01:00").do(run_roi_threshold_validator)
+
     run_stalled_asset_detector()
     time.sleep(10)
     check_claims()
