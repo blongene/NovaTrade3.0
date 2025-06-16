@@ -78,9 +78,14 @@ def start_staking_yield_loop():
 
 if __name__ == "__main__":
     set_telegram_webhook()
+    threading.Thread(target=start_flask_app).start()
     print("📡 Orion Cloud Boot Sequence Initiated")
     print("✅ Webhook armed. Launching modules...")
 
+    def start_flask_app():
+    print("🟢 Starting Flask app on port 10000...")
+    telegram_app.run(host="0.0.0.0", port=10000)
+    
     threading.Thread(target=run_orion_voice_loop).start()
 
     print("🔍 Starting Watchdog...")
@@ -285,10 +290,7 @@ if __name__ == "__main__":
     
     time.sleep(10)
     run_unlock_horizon_alerts()
-    
-    send_telegram_message("🟢 NovaTrade system booted and live.")
-
-    print("🧠 NovaTrade system is live.")
     print("💥 run_presale_scorer() BOOTED")
-    print("🟢 Starting Flask app on port 10000...")
-    telegram_app.run(host="0.0.0.0", port=10000)
+    send_telegram_message("🟢 NovaTrade system booted and live.")
+    print("🧠 NovaTrade system is live.")
+   
