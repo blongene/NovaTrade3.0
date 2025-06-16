@@ -54,7 +54,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-RENDER_WEBHOOK_URL = os.getenv("RENDER_WEBHOOK_URL")
+RENDER_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 def load_presale_stream():
     print("⚙️ Attempting to load worksheet: Presale_Stream")
