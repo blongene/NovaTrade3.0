@@ -7,7 +7,7 @@ from nova_heartbeat import log_heartbeat
 
 # === Setup ===
 TOKEN = "MIND"
-WALLET_BALANCE = 296139.94  # Manually updated, or pulled from wallet monitor in future
+WALLET_BALANCE = 296139.94  # Manually updated or pulled from wallet monitor in future
 SHEET_NAME = "Rotation_Log"
 SHEET_URL = os.getenv("SHEET_URL")
 
@@ -28,7 +28,14 @@ def run_staking_yield_tracker():
             if token != TOKEN:
                 continue
 
-            initial_claimed = float(row.get("Initial Claimed", 0))
+            claimed_str = str(row.get("Initial Claimed", "")).strip()
+            try:
+                initial_claimed = float(claimed_str)
+            except ValueError:
+                print(f"⚠️ Skipping {token} – invalid Initial Claimed value: {claimed_str}")
+                ping_webhook_debug(f"⚠️ Skipping {token} – invalid Initial Claimed value: {claimed_str}")
+                continue
+
             last_balance = WALLET_BALANCE
             yield_percent = round(((last_balance - initial_claimed) / initial_claimed) * 100, 4)
             timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -38,7 +45,6 @@ def run_staking_yield_tracker():
             ws.update_acell(f'N{i}', timestamp)            # Last Checked
             log_heartbeat("Staking Tracker", f"{token} Yield = {yield_percent}%")
 
-            # Optional alert if yield is 0
             if yield_percent == 0:
                 ping_webhook_debug(f"⚠️ {token} staking yield is 0%. Verify staking is active.")
 
