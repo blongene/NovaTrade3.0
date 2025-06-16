@@ -1,4 +1,11 @@
 # === memory_weight_sync.py (patched to ensure write to Rotation_Memory) ===
+from datetime import datetime
+import re
+import statistics
+import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
 
 def run_memory_weight_sync():
     print("🔁 Syncing Memory Weights...")
