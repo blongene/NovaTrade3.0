@@ -1,8 +1,9 @@
-# rebuy_roi_tracker.py
+# === rebuy_roi_tracker.py (patched with count, max, avg) ===
 
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+
 
 def run_rebuy_roi_tracker():
     print("🔁 Syncing Rebuy ROI → Rotation_Stats...")
@@ -20,29 +21,52 @@ def run_rebuy_roi_tracker():
         stats_data = stats_ws.get_all_records()
         headers = stats_ws.row_values(1)
 
-        # Ensure column exists
-        rebuy_roi_col = headers.index("Rebuy ROI") + 1 if "Rebuy ROI" in headers else len(headers) + 1
-        if "Rebuy ROI" not in headers:
-            stats_ws.update_cell(1, rebuy_roi_col, "Rebuy ROI")
+        # Ensure columns exist
+        def ensure_col(col_name):
+            if col_name not in headers:
+                stats_ws.update_cell(1, len(headers) + 1, col_name)
+                headers.append(col_name)
+            return headers.index(col_name) + 1
+
+        rebuy_roi_col = ensure_col("Rebuy ROI")
+        rebuy_count_col = ensure_col("Rebuy Count")
+        max_roi_col = ensure_col("Max Rebuy ROI")
+        avg_roi_col = ensure_col("Avg Rebuy ROI")
 
         updated_count = 0
-
-        for i, row in enumerate(stats_data, start=2):  # Row 2 = first data row
-            token = str(row.get("Token", "")).strip().upper()
+        for i, row in enumerate(stats_data, start=2):
+            token = row.get("Token", "").strip().upper()
             if not token:
                 continue
 
-            match = next((r for r in log_data if str(r.get("Token", "")).strip().upper() == token), None)
-            if not match:
+            # Gather all matching rows in Rotation_Log
+            matching = [r for r in log_data if r.get("Token", "").strip().upper() == token]
+            rebuy_values = []
+            for m in matching:
+                roi_val = m.get("Rebuy ROI", "")
+                try:
+                    roi = float(str(roi_val).replace("%", "").strip())
+                    rebuy_values.append(roi)
+                except:
+                    continue
+
+            if not rebuy_values:
                 continue
 
-            rebuy_roi = str(match.get("Rebuy ROI", "")).strip()
-            if rebuy_roi.replace('%', '').replace('.', '', 1).lstrip('-').isdigit():
-                stats_ws.update_cell(i, rebuy_roi_col, rebuy_roi)
-                print(f"✅ {token} → Rebuy ROI = {rebuy_roi}")
-                updated_count += 1
+            rebuy_count = len(rebuy_values)
+            max_roi = max(rebuy_values)
+            avg_roi = round(sum(rebuy_values) / rebuy_count, 2)
+
+            # Update all columns
+            stats_ws.update_cell(i, rebuy_roi_col, rebuy_values[-1])  # last rebuy ROI
+            stats_ws.update_cell(i, rebuy_count_col, rebuy_count)
+            stats_ws.update_cell(i, max_roi_col, max_roi)
+            stats_ws.update_cell(i, avg_roi_col, avg_roi)
+            print(f"✅ {token} → Rebuy ROI = {rebuy_values[-1]}, Count = {rebuy_count}, Max = {max_roi}, Avg = {avg_roi}")
+            updated_count += 1
 
         print(f"✅ Rebuy ROI sync complete: {updated_count} tokens updated.")
 
     except Exception as e:
         print(f"❌ Error in run_rebuy_roi_tracker: {e}")
+
