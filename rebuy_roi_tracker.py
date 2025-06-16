@@ -2,18 +2,13 @@
 
 import os
 import gspread
-from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 
-
 def run_rebuy_roi_tracker():
-    print("📈 Running Rebuy ROI Tracker...")
+    print("🔁 Syncing Rebuy ROI → Rotation_Stats...")
 
     try:
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ]
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
         client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
@@ -23,31 +18,30 @@ def run_rebuy_roi_tracker():
 
         log_data = log_ws.get_all_records()
         stats_data = stats_ws.get_all_records()
-        stats_headers = stats_ws.row_values(1)
+        headers = stats_ws.row_values(1)
 
-        rebuy_col = stats_headers.index("Rebuy ROI") + 1 if "Rebuy ROI" in stats_headers else len(stats_headers) + 1
-        if "Rebuy ROI" not in stats_headers:
-            stats_ws.update_cell(1, rebuy_col, "Rebuy ROI")
+        # Column indexes
+        rebuy_roi_col = headers.index("Rebuy ROI") + 1 if "Rebuy ROI" in headers else len(headers) + 1
+        if "Rebuy ROI" not in headers:
+            stats_ws.update_cell(1, rebuy_roi_col, "Rebuy ROI")
 
-        for i, row in enumerate(stats_data, start=2):
+        updated_count = 0
+        for i, row in enumerate(stats_data, start=2):  # start=2 to skip header
             token = row.get("Token", "").strip().upper()
             if not token:
                 continue
 
-            # Match to Rotation_Log for rebuy ROI value
-            log_entry = next(
-                (r for r in log_data if r.get("Token", "").strip().upper() == token),
-                None
-            )
-            if not log_entry:
+            match = next((r for r in log_data if r.get("Token", "").strip().upper() == token), None)
+            if not match:
                 continue
 
-            rebuy_roi = log_entry.get("Rebuy ROI", "").strip()
-            if rebuy_roi and rebuy_roi not in ["N/A", "", None]:
-                stats_ws.update_cell(i, rebuy_col, rebuy_roi)
-                print(f"🔁 {token} → Rebuy ROI = {rebuy_roi}")
+            rebuy_roi = match.get("Follow-up ROI", "")
+            if rebuy_roi and str(rebuy_roi).strip().replace('%', '').replace('.', '', 1).lstrip('-').isdigit():
+                stats_ws.update_cell(i, rebuy_roi_col, rebuy_roi)
+                print(f"✅ {token} → Rebuy ROI = {rebuy_roi}")
+                updated_count += 1
 
-        print("✅ Rebuy ROI sync complete.")
+        print(f"✅ Rebuy ROI sync complete: {updated_count} tokens updated.")
 
     except Exception as e:
         print(f"❌ Error in run_rebuy_roi_tracker: {e}")
