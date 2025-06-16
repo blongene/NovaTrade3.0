@@ -66,10 +66,6 @@ def load_presale_stream():
         print(f"❌ Failed to load Presale_Stream: {e}")
         return None
 
-def start_flask_app():
-    print("🟢 Starting Flask app on port 10000...")
-    telegram_app.run(host="0.0.0.0", port=10000)
-
 def start_staking_yield_loop():
     def loop():
         from staking_yield_tracker import run_staking_yield_tracker
@@ -79,12 +75,16 @@ def start_staking_yield_loop():
             time.sleep(21600)
     threading.Thread(target=loop, daemon=True).start()
 
+def start_flask_app():
+    print("🟢 Starting Flask app on port 10000...")
+    telegram_app.run(host="0.0.0.0", port=10000)
+    
 if __name__ == "__main__":
     set_telegram_webhook()
-    threading.Thread(target=start_flask_app).start()
     print("📱 Orion Cloud Boot Sequence Initiated")
     print("✅ Webhook armed. Launching modules...")
 
+    threading.Thread(target=start_flask_app).start()
     threading.Thread(target=run_orion_voice_loop).start()
 
     print("🔍 Starting Watchdog...")
