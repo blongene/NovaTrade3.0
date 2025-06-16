@@ -158,6 +158,7 @@ if __name__ == "__main__":
     schedule.every().day.at("01:30").do(run_top_token_summary)
     from roi_threshold_validator import run_roi_threshold_validator
     schedule.every().day.at("01:00").do(run_roi_threshold_validator)
+    schedule.every().day.at("12:45").do(run_rebuy_roi_tracker)
 
     run_stalled_asset_detector()
     time.sleep(10)
