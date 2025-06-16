@@ -27,6 +27,7 @@ from portfolio_weight_adjuster import run_portfolio_weight_adjuster
 from target_percent_updater import run_target_percent_updater
 from rebuy_engine import run_undersized_rebuy
 from rebuy_memory_engine import run_memory_rebuy_scan
+from rebuy_roi_tracker import run_rebuy_roi_tracker
 from rotation_memory_scoring import run_memory_scoring
 from vault_intelligence import run_vault_intelligence
 from vault_to_stats_sync import run_vault_to_stats_sync
@@ -43,7 +44,7 @@ from top_token_summary import run_top_token_summary
 from auto_confirm_planner import run_auto_confirm_planner
 from memory_weight_sync import run_memory_weight_sync
 from sentiment_trigger_engine import run_sentiment_trigger_engine
-from rebuy_roi_tracker import run_rebuy_roi_tracker
+
 
 import os
 import time
@@ -220,6 +221,13 @@ if __name__ == "__main__":
 
     time.sleep(10)
     run_memory_scoring()
+
+    time.sleep(10)
+    print("📊 Syncing Rebuy ROI → Rotation_Stats...")
+    try:
+        run_rebuy_roi_tracker()
+    except Exception as e:
+        print(f"❌ Error in run_rebuy_roi_tracker: {e}")
 
     time.sleep(10)
     print("🧠 Running Suggested Target Calculator...")
