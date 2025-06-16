@@ -36,7 +36,7 @@ from vault_growth_sync import run_vault_growth_sync
 from vault_roi_tracker import run_vault_roi_tracker
 from vault_review_alerts import run_vault_review_alerts
 from utils import get_gspread_client, send_telegram_message
-from vault_rotation_scanner import run_vault_rotation_scanner  # 🆕 Phase 11A Scanner
+from vault_rotation_scanner import run_vault_rotation_scanner  # 🆒 Phase 11A Scanner
 from vault_rotation_executor import run_vault_rotation_executor
 from wallet_monitor import run_wallet_monitor
 from unlock_horizon_alerts import run_unlock_horizon_alerts
@@ -44,7 +44,6 @@ from top_token_summary import run_top_token_summary
 from auto_confirm_planner import run_auto_confirm_planner
 from memory_weight_sync import run_memory_weight_sync
 from sentiment_trigger_engine import run_sentiment_trigger_engine
-
 
 import os
 import time
@@ -67,6 +66,10 @@ def load_presale_stream():
         print(f"❌ Failed to load Presale_Stream: {e}")
         return None
 
+def start_flask_app():
+    print("🟢 Starting Flask app on port 10000...")
+    telegram_app.run(host="0.0.0.0", port=10000)
+
 def start_staking_yield_loop():
     def loop():
         from staking_yield_tracker import run_staking_yield_tracker
@@ -79,13 +82,9 @@ def start_staking_yield_loop():
 if __name__ == "__main__":
     set_telegram_webhook()
     threading.Thread(target=start_flask_app).start()
-    print("📡 Orion Cloud Boot Sequence Initiated")
+    print("📱 Orion Cloud Boot Sequence Initiated")
     print("✅ Webhook armed. Launching modules...")
 
-    def start_flask_app():
-    print("🟢 Starting Flask app on port 10000...")
-    telegram_app.run(host="0.0.0.0", port=10000)
-    
     threading.Thread(target=run_orion_voice_loop).start()
 
     print("🔍 Starting Watchdog...")
@@ -114,7 +113,7 @@ if __name__ == "__main__":
         run_top_token_summary()
     except Exception as e:
         print(f"❌ Error in run_top_token_summary: {e}")
-    
+
     time.sleep(10)
     run_vault_intelligence()
 
@@ -127,11 +126,11 @@ if __name__ == "__main__":
     sync_rotation_planner()
 
     time.sleep(10)
-    print("📥 Syncing ROI feedback responses...")
+    print("📅 Syncing ROI feedback responses...")
     run_roi_feedback_sync()
 
     time.sleep(10)
-    print("📡 Running Sentiment Radar (1x boot pass only)...")
+    print("📰 Running Sentiment Radar (1x boot pass only)...")
     try:
         run_sentiment_radar()
     except Exception as e:
@@ -147,6 +146,9 @@ if __name__ == "__main__":
     else:
         print("⛔️ Presale_Stream unavailable — presale scan skipped")
 
+    from sentiment_alerts import run_sentiment_alerts
+    from roi_threshold_validator import run_roi_threshold_validator
+
     # Scheduled jobs
     schedule.every(60).minutes.do(run_rotation_log_updater)
     schedule.every(60).minutes.do(run_rebalance_scanner)
@@ -155,13 +157,11 @@ if __name__ == "__main__":
     schedule.every(3).hours.do(run_memory_rebuy_scan)
     schedule.every(3).hours.do(run_sentiment_summary)
     schedule.every().day.at("02:00").do(run_vault_roi_tracker)
-    schedule.every().day.at("09:15").do(run_vault_rotation_scanner)  # 🆕 Phase 11 daily vault scan
+    schedule.every().day.at("09:15").do(run_vault_rotation_scanner)
     schedule.every().day.at("09:25").do(run_vault_rotation_executor)
     schedule.every().day.at("09:45").do(run_wallet_monitor)
-    from sentiment_alerts import run_sentiment_alerts
     schedule.every().day.at("13:00").do(run_sentiment_alerts)
     schedule.every().day.at("01:30").do(run_top_token_summary)
-    from roi_threshold_validator import run_roi_threshold_validator
     schedule.every().day.at("01:00").do(run_roi_threshold_validator)
     schedule.every().day.at("12:45").do(run_rebuy_roi_tracker)
 
@@ -172,7 +172,7 @@ if __name__ == "__main__":
     start_staking_yield_loop()
     time.sleep(10)
 
-    print("🧹 Cleaning Rotation_Log ROI column...")
+    print("🪚 Cleaning Rotation_Log ROI column...")
     time.sleep(10)
     print("📊 Syncing Rotation_Stats...")
     try:
@@ -183,7 +183,7 @@ if __name__ == "__main__":
     time.sleep(10)
     print("📊 Running Memory Weight Sync...")
     run_memory_weight_sync()
-    
+
     time.sleep(10)
     print("📊 Syncing Rebuy ROI to Rotation_Stats...")
     run_rebuy_roi_tracker()
@@ -278,7 +278,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Error in run_vault_review_alerts: {e}")
 
-    print("🔁 Scanning vaults for decay...")  # 🆕 Boot-time scan
+    print("🔁 Scanning vaults for decay...")
     try:
         run_vault_rotation_scanner()
     except Exception as e:
@@ -287,10 +287,9 @@ if __name__ == "__main__":
     print("📋 Running Auto-Confirm Planner...")
     run_auto_confirm_planner()
     print("✅ Auto-confirm check complete.")
-    
+
     time.sleep(10)
     run_unlock_horizon_alerts()
     print("💥 run_presale_scorer() BOOTED")
     send_telegram_message("🟢 NovaTrade system booted and live.")
     print("🧠 NovaTrade system is live.")
-   
