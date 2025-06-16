@@ -36,7 +36,7 @@ from vault_growth_sync import run_vault_growth_sync
 from vault_roi_tracker import run_vault_roi_tracker
 from vault_review_alerts import run_vault_review_alerts
 from utils import get_gspread_client, send_telegram_message
-from vault_rotation_scanner import run_vault_rotation_scanner  # 🆒 Phase 11A Scanner
+from vault_rotation_scanner import run_vault_rotation_scanner
 from vault_rotation_executor import run_vault_rotation_executor
 from wallet_monitor import run_wallet_monitor
 from unlock_horizon_alerts import run_unlock_horizon_alerts
@@ -44,7 +44,8 @@ from top_token_summary import run_top_token_summary
 from auto_confirm_planner import run_auto_confirm_planner
 from memory_weight_sync import run_memory_weight_sync
 from sentiment_trigger_engine import run_sentiment_trigger_engine
-
+from roi_threshold_validator import run_roi_threshold_validator
+from sentiment_alerts import run_sentiment_alerts
 import os
 import time
 import threading
@@ -78,13 +79,17 @@ def start_staking_yield_loop():
 def start_flask_app():
     print("🟢 Starting Flask app on port 10000...")
     telegram_app.run(host="0.0.0.0", port=10000)
-    
+
+def run_scheduler_loop():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
 if __name__ == "__main__":
     set_telegram_webhook()
+    threading.Thread(target=start_flask_app).start()
     print("📱 Orion Cloud Boot Sequence Initiated")
     print("✅ Webhook armed. Launching modules...")
-
-    threading.Thread(target=start_flask_app).start()
     threading.Thread(target=run_orion_voice_loop).start()
 
     print("🔍 Starting Watchdog...")
@@ -94,14 +99,14 @@ if __name__ == "__main__":
     rotation_ws = load_presale_stream()
 
     if rotation_ws:
-       scan_roi_tracking()
-       time.sleep(5)
-       try:
-           run_milestone_alerts()
-       except Exception as e:
-           print(f"❌ Error in run_milestone_alerts: {e}")
-       time.sleep(5)
-       log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
+        scan_roi_tracking()
+        time.sleep(5)
+        try:
+            run_milestone_alerts()
+        except Exception as e:
+            print(f"❌ Error in run_milestone_alerts: {e}")
+        time.sleep(5)
+        log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
     try:
         sync_token_vault()
@@ -146,10 +151,6 @@ if __name__ == "__main__":
     else:
         print("⛔️ Presale_Stream unavailable — presale scan skipped")
 
-    from sentiment_alerts import run_sentiment_alerts
-    from roi_threshold_validator import run_roi_threshold_validator
-
-    # Scheduled jobs
     schedule.every(60).minutes.do(run_rotation_log_updater)
     schedule.every(60).minutes.do(run_rebalance_scanner)
     schedule.every(60).minutes.do(run_rotation_memory)
@@ -165,6 +166,7 @@ if __name__ == "__main__":
     schedule.every().day.at("01:00").do(run_roi_threshold_validator)
     schedule.every().day.at("12:45").do(run_rebuy_roi_tracker)
 
+    threading.Thread(target=run_scheduler_loop, daemon=True).start()
     run_stalled_asset_detector()
     time.sleep(10)
     check_claims()
@@ -182,11 +184,17 @@ if __name__ == "__main__":
 
     time.sleep(10)
     print("📊 Running Memory Weight Sync...")
-    run_memory_weight_sync()
+    try:
+        run_memory_weight_sync()
+    except Exception as e:
+        print(f"❌ Error in run_memory_weight_sync: {e}")
 
     time.sleep(10)
     print("📊 Syncing Rebuy ROI to Rotation_Stats...")
-    run_rebuy_roi_tracker()
+    try:
+        run_rebuy_roi_tracker()
+    except Exception as e:
+        print(f"❌ Error in run_rebuy_roi_tracker: {e}")
 
     time.sleep(10)
     try:
@@ -227,13 +235,6 @@ if __name__ == "__main__":
 
     time.sleep(10)
     run_memory_scoring()
-
-    time.sleep(10)
-    print("📊 Syncing Rebuy ROI → Rotation_Stats...")
-    try:
-        run_rebuy_roi_tracker()
-    except Exception as e:
-        print(f"❌ Error in run_rebuy_roi_tracker: {e}")
 
     time.sleep(10)
     print("🧠 Running Suggested Target Calculator...")
