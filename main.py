@@ -46,15 +46,13 @@ from memory_weight_sync import run_memory_weight_sync
 from sentiment_trigger_engine import run_sentiment_trigger_engine
 from roi_threshold_validator import run_roi_threshold_validator
 from sentiment_alerts import run_sentiment_alerts
+
 import os
 import time
 import threading
 import schedule
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-RENDER_WEBHOOK_URL = os.getenv("RENDER_WEBHOOK_URL")
 
 def load_presale_stream():
     print("⚙️ Attempting to load worksheet: Presale_Stream")
