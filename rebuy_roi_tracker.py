@@ -20,23 +20,24 @@ def run_rebuy_roi_tracker():
         stats_data = stats_ws.get_all_records()
         headers = stats_ws.row_values(1)
 
-        # Column indexes
+        # Ensure column exists
         rebuy_roi_col = headers.index("Rebuy ROI") + 1 if "Rebuy ROI" in headers else len(headers) + 1
         if "Rebuy ROI" not in headers:
             stats_ws.update_cell(1, rebuy_roi_col, "Rebuy ROI")
 
         updated_count = 0
-        for i, row in enumerate(stats_data, start=2):  # start=2 to skip header
-            token = row.get("Token", "").strip().upper()
+
+        for i, row in enumerate(stats_data, start=2):  # Row 2 = first data row
+            token = str(row.get("Token", "")).strip().upper()
             if not token:
                 continue
 
-            match = next((r for r in log_data if r.get("Token", "").strip().upper() == token), None)
+            match = next((r for r in log_data if str(r.get("Token", "")).strip().upper() == token), None)
             if not match:
                 continue
 
-            rebuy_roi = match.get("Follow-up ROI", "")
-            if rebuy_roi and str(rebuy_roi).strip().replace('%', '').replace('.', '', 1).lstrip('-').isdigit():
+            rebuy_roi = str(match.get("Rebuy ROI", "")).strip()
+            if rebuy_roi.replace('%', '').replace('.', '', 1).lstrip('-').isdigit():
                 stats_ws.update_cell(i, rebuy_roi_col, rebuy_roi)
                 print(f"✅ {token} → Rebuy ROI = {rebuy_roi}")
                 updated_count += 1
