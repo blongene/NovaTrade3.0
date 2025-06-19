@@ -171,7 +171,7 @@ if __name__ == "__main__":
     schedule.every().day.at("01:30").do(run_top_token_summary)
     schedule.every().day.at("01:00").do(run_roi_threshold_validator)
     schedule.every().day.at("12:45").do(run_rebuy_roi_tracker)
-    schedule.every().day.at("01:15").do(run_rebuy_weight_calculator)
+    schedule.every().day.at("01:10").do(run_rebuy_weight_calculator)
     schedule.every().day.at("01:15").do(run_memory_score_sync)
 
     threading.Thread(target=run_scheduler_loop, daemon=True).start()
