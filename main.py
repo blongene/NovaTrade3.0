@@ -46,6 +46,8 @@ from memory_weight_sync import run_memory_weight_sync
 from sentiment_trigger_engine import run_sentiment_trigger_engine
 from roi_threshold_validator import run_roi_threshold_validator
 from sentiment_alerts import run_sentiment_alerts
+from rebuy_weight_calculator import run_rebuy_weight_calculator
+
 import os
 import time
 import threading
@@ -168,6 +170,7 @@ if __name__ == "__main__":
     schedule.every().day.at("01:30").do(run_top_token_summary)
     schedule.every().day.at("01:00").do(run_roi_threshold_validator)
     schedule.every().day.at("12:45").do(run_rebuy_roi_tracker)
+    schedule.every().day.at("01:15").do(run_rebuy_weight_calculator)
 
     threading.Thread(target=run_scheduler_loop, daemon=True).start()
     run_stalled_asset_detector()
@@ -229,6 +232,10 @@ if __name__ == "__main__":
     print("♻️ Running memory-aware rebuy engine...")
     run_memory_rebuy_scan()
 
+    time.sleep(10)
+    print("🧠 Calculating Rebuy Weights...")
+    run_rebuy_weight_calculator()
+    
     time.sleep(10)
     print("🚨 Running Sentiment-Triggered Rebuy Scan...")
     try:
