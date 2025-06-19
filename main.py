@@ -49,13 +49,10 @@ from sentiment_alerts import run_sentiment_alerts
 from rebuy_weight_calculator import run_rebuy_weight_calculator
 from memory_score_sync import run_memory_score_sync
 
-import os
-import time
-import threading
-import schedule
-import gspread
+import os, time, threading, schedule, gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
+# === Boot Configuration ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 RENDER_WEBHOOK_URL = os.getenv("RENDER_WEBHOOK_URL")
 
@@ -91,6 +88,9 @@ def run_scheduler_loop():
         schedule.run_pending()
         time.sleep(1)
 
+def threaded(func):
+    threading.Thread(target=func).start()
+    
 if __name__ == "__main__":
     set_telegram_webhook()
     threading.Thread(target=start_flask_app).start()
@@ -114,28 +114,21 @@ if __name__ == "__main__":
         time.sleep(5)
         log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
 
-    try:
-        sync_token_vault()
-    except Exception as e:
-        print(f"⚠️ Vault sync error: {e}")
+    try: sync_token_vault()
+    except Exception as e: print(f"⚠️ Vault sync error: {e}")
 
     time.sleep(10)
-    try:
-        run_top_token_summary()
-    except Exception as e:
-        print(f"❌ Error in run_top_token_summary: {e}")
+    try: run_top_token_summary()
+    except Exception as e: print(f"❌ Error in run_top_token_summary: {e}")
 
     time.sleep(10)
     run_vault_intelligence()
-
     time.sleep(10)
     print("🚀 Executing any pending vault rotations...")
     run_vault_rotation_executor()
-
     time.sleep(10)
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
     sync_rotation_planner()
-
     time.sleep(10)
     print("📅 Syncing ROI feedback responses...")
     run_roi_feedback_sync()
@@ -184,38 +177,25 @@ if __name__ == "__main__":
 
     print("🪚 Cleaning Rotation_Log ROI column...")
     time.sleep(10)
-    print("📊 Syncing Rotation_Stats...")
-    try:
-        run_rotation_stats_sync()
-    except Exception as e:
-        print(f"❌ Error in run_rotation_stats_sync: {e}")
 
+    threaded(run_rotation_stats_sync)
     time.sleep(10)
-    print("📊 Running Memory Weight Sync...")
-    try:
-        run_memory_weight_sync()
-    except Exception as e:
-        print(f"❌ Error in run_memory_weight_sync: {e}")
 
+    threaded(run_memory_weight_sync)
     time.sleep(10)
+    
     print("🧠 Calculating Total Memory Score...")
     run_memory_score_sync()
+    time.sleep(10)
     
+    threaded(run_rebuy_roi_tracker)
     time.sleep(10)
-    print("📊 Syncing Rebuy ROI to Rotation_Stats...")
-    try:
-        run_rebuy_roi_tracker()
-    except Exception as e:
-        print(f"❌ Error in run_rebuy_roi_tracker: {e}")
+
+    try: run_rotation_feedback_engine()
+    except Exception as e: print(f"❌ Error in run_rotation_feedback_engine: {e}")
 
     time.sleep(10)
     try:
-        run_rotation_feedback_engine()
-    except Exception as e:
-        print(f"❌ Error in run_rotation_feedback_engine: {e}")
-
-    try:
-        time.sleep(10)
         print("📊 Running Performance Dashboard...")
         run_performance_dashboard()
     except Exception as e:
@@ -229,15 +209,12 @@ if __name__ == "__main__":
 
     print("🧠 Running Rotation Memory Sync...")
     run_rotation_memory()
-
     time.sleep(10)
     print("🔁 Running undersized rebuy engine...")
     run_undersized_rebuy()
-
     time.sleep(10)
     print("♻️ Running memory-aware rebuy engine...")
     run_memory_rebuy_scan()
-
     time.sleep(10)
     print("🧠 Calculating Rebuy Weights...")
     run_rebuy_weight_calculator()
@@ -251,21 +228,20 @@ if __name__ == "__main__":
 
     time.sleep(10)
     run_memory_scoring()
-
     time.sleep(10)
     print("🧠 Running Suggested Target Calculator...")
     run_portfolio_weight_adjuster()
-
     time.sleep(10)
     print("📊 Syncing Suggested % → Target %...")
     run_target_percent_updater()
-
     time.sleep(15)
+
     print("📊 Syncing Vault Tags → Rotation_Stats...")
-    try:
-        run_vault_to_stats_sync()
-    except Exception as e:
-        print(f"❌ vault_to_stats_sync error: {e}")
+    threaded(run_vault_to_stats_sync)
+    time.sleep(10)
+
+    try: run_vault_alerts()
+    except Exception as e: print(f"❌ Error in run_vault_alerts: {e}")
 
     time.sleep(10)
     print("🔔 Running Vault Intelligence Alerts...")
