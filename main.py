@@ -47,6 +47,7 @@ from sentiment_trigger_engine import run_sentiment_trigger_engine
 from roi_threshold_validator import run_roi_threshold_validator
 from sentiment_alerts import run_sentiment_alerts
 from rebuy_weight_calculator import run_rebuy_weight_calculator
+from memory_score_sync import run_memory_score_sync
 
 import os
 import time
@@ -171,6 +172,7 @@ if __name__ == "__main__":
     schedule.every().day.at("01:00").do(run_roi_threshold_validator)
     schedule.every().day.at("12:45").do(run_rebuy_roi_tracker)
     schedule.every().day.at("01:15").do(run_rebuy_weight_calculator)
+    schedule.every().day.at("01:15").do(run_memory_score_sync)
 
     threading.Thread(target=run_scheduler_loop, daemon=True).start()
     run_stalled_asset_detector()
@@ -195,6 +197,10 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Error in run_memory_weight_sync: {e}")
 
+    time.sleep(10)
+    print("🧠 Calculating Total Memory Score...")
+    run_memory_score_sync()
+    
     time.sleep(10)
     print("📊 Syncing Rebuy ROI to Rotation_Stats...")
     try:
