@@ -27,13 +27,15 @@ def get_sheet():
 def parse_button_response(data):
     try:
         callback = data["callback_query"]
+        print("📬 Raw callback received:")
+        print(json.dumps(callback, indent=2))  # NEW DEBUG LINE
+
         raw_data = callback["data"].strip()
         user_response, token = map(lambda x: x.strip().upper(), raw_data.split("|", 1))
         message_text = callback["message"]["text"]
 
-        print(f"📨 Telegram reply received: {token} → {user_response}")
+        print(f"📨 Telegram reply parsed: {token} → {user_response}")
 
-        # Route based on prefix
         if "UNVAULT" in user_response or "VAULT CHECK" in message_text or "VAULT REVIEW" in message_text:
             log_vault_review(token, user_response)
         elif "REBUY" in message_text:
@@ -48,6 +50,7 @@ def parse_button_response(data):
                 log_scout_decision(token, clean_response)
             except Exception as e:
                 print(f"❌ Failed to log CLAIMED ACTION response: {e}")
+                ping_webhook_debug(f"❌ CLAIMED ACTION error: {e}")
         else:
             log_scout_decision(token, user_response)
 
