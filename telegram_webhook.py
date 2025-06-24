@@ -27,9 +27,9 @@ def get_sheet():
 def parse_button_response(data):
     try:
         callback = data["callback_query"]
-        user_response = callback["data"].upper().strip()
+        raw_data = callback["data"].strip()
+        user_response, token = map(lambda x: x.strip().upper(), raw_data.split("|", 1))
         message_text = callback["message"]["text"]
-        token = message_text.split()[0].replace("$", "").strip().upper()
 
         print(f"📨 Telegram reply received: {token} → {user_response}")
 
@@ -44,12 +44,10 @@ def parse_button_response(data):
             log_rotation_confirmation(token, user_response)
         elif "CLAIMED ACTION" in message_text:
             try:
-                # Normalize button to just VAULT / ROTATE / IGNORE
                 clean_response = user_response.replace("📦", "").replace("🔁", "").replace("🔕", "").replace("IT", "").strip().upper()
                 log_scout_decision(token, clean_response)
             except Exception as e:
                 print(f"❌ Failed to log CLAIMED ACTION response: {e}")
-
         else:
             log_scout_decision(token, user_response)
 
