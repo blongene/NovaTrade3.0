@@ -48,6 +48,7 @@ from roi_threshold_validator import run_roi_threshold_validator
 from sentiment_alerts import run_sentiment_alerts
 from rebuy_weight_calculator import run_rebuy_weight_calculator
 from memory_score_sync import run_memory_score_sync
+from claim_post_prompt import run_claim_decision_prompt
 
 import os, time, threading, schedule, gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -143,7 +144,9 @@ if __name__ == "__main__":
     check_nova_trigger()
     time.sleep(10)
     trigger_nova_ping("NOVA UPDATE")
-
+    check_claims()
+    run_claim_decision_prompt()
+    
     if rotation_ws:
         print("⏰ Running presale scan every 60 min")
         run_presale_scorer()
