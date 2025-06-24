@@ -42,6 +42,8 @@ def parse_button_response(data):
             log_roi_feedback(token, user_response)
         elif "CONFIRM" in user_response or "ROTATE" in user_response:
             log_rotation_confirmation(token, user_response)
+        elif "CLAIMED ACTION" in message_text:
+            log_scout_decision(token, user_response)
         else:
             log_scout_decision(token, user_response)
 
