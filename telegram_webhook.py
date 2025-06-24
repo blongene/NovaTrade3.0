@@ -43,7 +43,13 @@ def parse_button_response(data):
         elif "CONFIRM" in user_response or "ROTATE" in user_response:
             log_rotation_confirmation(token, user_response)
         elif "CLAIMED ACTION" in message_text:
-            log_scout_decision(token, user_response)
+            try:
+                # Normalize button to just VAULT / ROTATE / IGNORE
+                clean_response = user_response.replace("📦", "").replace("🔁", "").replace("🔕", "").replace("IT", "").strip().upper()
+                log_scout_decision(token, clean_response)
+            except Exception as e:
+                print(f"❌ Failed to log CLAIMED ACTION response: {e}")
+
         else:
             log_scout_decision(token, user_response)
 
