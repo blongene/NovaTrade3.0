@@ -26,8 +26,7 @@ def run_claim_decision_prompt():
                 continue
 
             if "CLAIMED" in status:
-                message = f"*{token}* has just been marked as ✅ *Claimed*.
-What would you like to do next?"
+                message = f"*{token}* has just been marked as ✅ *Claimed*.\nWhat would you like to do next?"
                 send_telegram_prompt(
                     token=token,
                     message=message,
