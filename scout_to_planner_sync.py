@@ -25,7 +25,8 @@ def sync_rotation_planner():
             token = row.get("Token", "").strip().upper()
             decision = row.get("Decision", "").strip().upper()
 
-            if not token or decision != "YES" or token in planner_tokens:
+            valid_decisions = {"YES", "VAULT", "ROTATE"}
+            if not token or decision not in valid_decisions or token in planner_tokens:
                 continue
 
             timestamp = row.get("Timestamp", "")
