@@ -128,6 +128,7 @@ if __name__ == "__main__":
     run_vault_intelligence()
     time.sleep(10)
     print("🚀 Executing any pending vault rotations...")
+    gate_vault_rotation("MIND")
     run_vault_rotation_executor()
     time.sleep(10)
     print("📋 Syncing Scout Decisions → Rotation_Planner...")
