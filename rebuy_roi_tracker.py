@@ -35,7 +35,7 @@ def run_rebuy_roi_tracker():
 
         updated_count = 0
         for i, row in enumerate(stats_data, start=2):
-            token = str(row.get("Token", "")).strip().upper()
+            token = row.get("Token", "").strip().upper()
             if not token:
                 continue
 
