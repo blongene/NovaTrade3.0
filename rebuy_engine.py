@@ -5,7 +5,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from utils import safe_float, send_telegram_prompt
 
-def run_rebuy_engine():
+def run_undersized_rebuy():
     print("🔁 Running undersized rebuy engine...")
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
