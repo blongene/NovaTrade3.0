@@ -4,7 +4,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from utils import safe_float
 
-def run_rebuy_memory_engine():
+def run_memory_rebuy_scan():
     print("🔁 Running Memory-Aware Rebuy Scan...")
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
