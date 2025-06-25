@@ -52,6 +52,7 @@ from claim_post_prompt import run_claim_decision_prompt
 from dormant_claim_pinger import run_dormant_claim_alert
 from vault_rotation_gatekeeper import gate_vault_rotation
 from total_memory_score_sync import sync_total_memory_score
+from vault_memory_evaluator import run_vault_memory_evaluator
 
 import os, time, threading, schedule, gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -288,7 +289,8 @@ if __name__ == "__main__":
     print("📋 Running Auto-Confirm Planner...")
     run_auto_confirm_planner()
     print("✅ Auto-confirm check complete.")
-
+    run_vault_memory_evaluator()
+    
     time.sleep(10)
     run_unlock_horizon_alerts()
     print("💥 run_presale_scorer() BOOTED")
