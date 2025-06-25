@@ -213,7 +213,7 @@ if __name__ == "__main__":
     run_rebalance_scanner()
 
     print("📢 Running Telegram Summary Layer...")
-    run_telegram_summaries()
+    run_telegram_summary()
 
     print("🧠 Running Rotation Memory Sync...")
     run_rotation_memory()
