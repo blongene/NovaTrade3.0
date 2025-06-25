@@ -49,6 +49,7 @@ from sentiment_alerts import run_sentiment_alerts
 from rebuy_weight_calculator import run_rebuy_weight_calculator
 from memory_score_sync import run_memory_score_sync
 from claim_post_prompt import run_claim_decision_prompt
+from dormant_claim_pinger import run_dormant_claim_alert
 
 import os, time, threading, schedule, gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -169,7 +170,8 @@ if __name__ == "__main__":
     schedule.every().day.at("12:45").do(run_rebuy_roi_tracker)
     schedule.every().day.at("01:10").do(run_rebuy_weight_calculator)
     schedule.every().day.at("01:15").do(run_memory_score_sync)
-
+    schedule.every(6).hours.do(run_dormant_claim_alert)
+    
     threading.Thread(target=run_scheduler_loop, daemon=True).start()
     run_stalled_asset_detector()
     time.sleep(10)
