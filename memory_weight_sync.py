@@ -1,11 +1,14 @@
 # === memory_weight_sync.py (patched to ensure write to Rotation_Memory) ===
 from datetime import datetime
-import re
-import statistics
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
+def safe_int(value):
+    try:
+        return int(value)
+    except:
+        return 0
 
 def run_memory_weight_sync():
     print("🔁 Syncing Memory Weights...")
@@ -24,8 +27,8 @@ def run_memory_weight_sync():
             memory_ws.update_cell(1, weight_col, "Memory Weight")
 
         for i, row in enumerate(data, start=2):
-            wins = int(row.get("Wins", 0))
-            losses = int(row.get("Losses", 0))
+            wins = safe_int(row.get("Wins", 0))
+            losses = safe_int(row.get("Losses", 0))
             total = wins + losses
             weight = round(wins / total, 2) if total > 0 else ""
             memory_ws.update_cell(i, weight_col, weight)
