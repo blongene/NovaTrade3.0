@@ -35,7 +35,7 @@ def run_rotation_stats_sync():
             stats_ws.update_cell(1, perf_col, "Performance")
 
         for i, row in enumerate(stats_data, start=2):
-            token = row.get("Token", "").strip().upper()
+            token = str(row.get("Token", "")).strip().upper()
             roi_source = "Rotation_Log"
 
             # === ROI Sync: Prefer Rotation_Log, fallback to Rotation_Stats

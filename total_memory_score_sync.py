@@ -30,7 +30,7 @@ def sync_total_memory_score():
             total_col = len(headers)+1
 
         for i, row in enumerate(data, start=2):
-            token = row.get("Token", "").strip().upper()
+            token = str(row.get("Token", "")).strip().upper()
             memory = row.get("Memory Score", "")
             rebuy = row.get("Rebuy Weight", "")
 

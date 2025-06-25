@@ -17,8 +17,8 @@ def run_rotation_memory():
         memory = defaultdict(lambda: {"wins": 0, "losses": 0})
 
         for row in rows:
-            token = row.get("Token", "").strip().upper()
-            if row.get("Decision", "").strip().upper() != "YES":
+            token = str(row.get("Token", "")).strip().upper()
+            if str(row.get("Decision", "")).strip().upper() != "YES":
                 continue
             try:
                 perf = float(row.get("Performance", ""))

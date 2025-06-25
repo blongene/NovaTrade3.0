@@ -33,8 +33,8 @@ def run_vault_intelligence():
         historical_vault = set()
 
         for row in vault_data:
-            token = row.get("Token", "").strip().upper()
-            status = row.get("Status", "").strip().lower()
+            token = str(row.get("Token", "")).strip().upper()
+            status = str(row.get("Status", "")).strip().lower()
             if not token:
                 continue
             historical_vault.add(token)
@@ -43,7 +43,7 @@ def run_vault_intelligence():
 
         # Tag each token in Rotation_Stats
         for i, row in enumerate(stats_data, start=2):
-            token = row.get("Token", "").strip().upper()
+            token = str(row.get("Token", "")).strip().upper()
             if not token:
                 continue
 

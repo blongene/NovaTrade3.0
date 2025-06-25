@@ -28,7 +28,7 @@ def run_portfolio_weight_adjuster():
 
         rows = targets_ws.get_all_records()
         for i, row in enumerate(rows, start=2):
-            token = row.get("Token", "").strip().upper()
+            token = str(row.get("Token", "")).strip().upper()
             if not token:
                 continue
 

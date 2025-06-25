@@ -21,8 +21,8 @@ def run_rotation_feedback_engine():
         review_rows = review_ws.get_all_records()
 
         for i, row in enumerate(stats_rows, start=2):
-            token = row.get("Token", "").strip()
-            decision = row.get("Decision", "").strip().upper()
+            token = str(row.get("Token", "")).strip()
+            decision = str(row.get("Decision", "")).strip().upper()
             roi = str(row.get("Follow-up ROI", "")).strip()
 
             try:

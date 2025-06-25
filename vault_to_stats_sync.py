@@ -23,7 +23,7 @@ def run_vault_to_stats_sync():
         vault_data = vault_ws.get_all_records()
         stats_data = stats_ws.get_all_records()
 
-        vault_dict = {row["Token"].strip().upper(): row.get("Vault Tag", "").strip() for row in vault_data if row.get("Token")}
+        vault_dict = {row["Token"].strip().upper(): str(row.get("Vault Tag", "")).strip() for row in vault_data if row.get("Token")}
         headers = stats_ws.row_values(1)
         vault_tag_col = headers.index("Vault Tag") + 1 if "Vault Tag" in headers else len(headers) + 1
 
@@ -32,9 +32,9 @@ def run_vault_to_stats_sync():
 
         updates = 0
         for i, row in enumerate(stats_data, start=2):
-            token = row.get("Token", "").strip().upper()
+            token = str(row.get("Token", "")).strip().upper()
             tag = vault_dict.get(token, "")
-            if tag and row.get("Vault Tag", "").strip() != tag:
+            if tag and str(row.get("Vault Tag", "")).strip() != tag:
                 stats_ws.update_cell(i, vault_tag_col, tag)
                 updates += 1
                 print(f"✅ {token} → {tag}")

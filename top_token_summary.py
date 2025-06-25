@@ -29,7 +29,7 @@ def run_top_token_summary():
         alerts_sent = 0
 
         for i, row in enumerate(rows, start=2):
-            token = row.get("Token", "").strip().upper()
+            token = str(row.get("Token", "")).strip().upper()
             roi_str = row.get("Follow-up ROI", "")
             alerted = row.get("Last Alerted", "")
 
