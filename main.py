@@ -20,7 +20,7 @@ from rotation_stats_sync import run_rotation_stats_sync
 from rotation_feedback_engine import run_rotation_feedback_engine
 from performance_dashboard import run_performance_dashboard
 from rebalance_scanner import run_rebalance_scanner
-from telegram_summaries import run_telegram_summaries
+from telegram_summaries import run_telegram_summary
 from rotation_memory import run_rotation_memory
 from rotation_log_updater import run_rotation_log_updater
 from portfolio_weight_adjuster import run_portfolio_weight_adjuster
