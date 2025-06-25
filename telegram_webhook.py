@@ -26,13 +26,19 @@ def get_sheet():
 
 def parse_button_response(data):
     try:
+        if "callback_query" not in data:
+            print("❌ No callback_query in incoming data.")
+            print(json.dumps(data, indent=2))
+            return False
+
         callback = data["callback_query"]
         print("📬 Raw callback received:")
-        print(json.dumps(callback, indent=2))  # NEW DEBUG LINE
+        print(json.dumps(callback, indent=2))
 
-        raw_data = callback["data"].strip()
+        # Safe fallback values just in case
+        raw_data = callback.get("data", "").strip()
+        message_text = callback.get("message", {}).get("text", "")
         user_response, token = map(lambda x: x.strip().upper(), raw_data.split("|", 1))
-        message_text = callback["message"]["text"]
 
         print(f"📨 Telegram reply parsed: {token} → {user_response}")
 
