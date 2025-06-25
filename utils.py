@@ -47,7 +47,7 @@ def log_scout_decision(token, decision):
         ws.append_row(new_row)
         print("✅ Decision logged to Scout Decisions")
 
-        if decision.upper() == "YES":
+        if decision.upper() in ["YES", "VAULT", "ROTATE"]:
             planner_data = planner_ws.get_all_values()
             headers = planner_data[0]
             token_idx = headers.index("Token")
