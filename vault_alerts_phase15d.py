@@ -25,9 +25,9 @@ def run_vault_alerts():
         sent_count = 0
 
         for i, stat in enumerate(stats_data, start=2):  # start=2 accounts for 1-based indexing + header row
-            token = stat.get("Token", "").strip().upper()
-            tag = stat.get("Vault Tag", "")
-            last_seen = stat.get("Last Seen", "") or stat.get("Last Reviewed", "")
+            token = str(stat.get("Token", "")).strip().upper()
+            tag = str(stat.get("Vault Tag", "")).strip()
+            last_seen = str(stat.get("Last Seen", "") or stat.get("Last Reviewed", "")).strip()
 
             # Alert: Previously Vaulted but has ROI or new mention
             if "Previously" in tag:
@@ -43,17 +43,17 @@ def run_vault_alerts():
                         stats_ws.update_acell(f"K{i}", now_str)  # Last Reviewed
                         sent_count += 1
                         continue
-                except:
-                    pass
+                except Exception as e:
+                    print(f"⚠️ ROI parse error for {token}: {e}")
+                    continue
 
             # Alert: Vaulted too long with no update
-            last_seen = stat.get("Last Reviewed", "") or stat.get("Last Seen", "")
             if tag == "✅ Vaulted":
                 try:
                     if not last_seen:
                         print(f"⚠️ No Last Seen value for {token}. Skipping.")
                         continue
-                    dt = datetime.strptime(last_seen.strip(), "%Y-%m-%dT%H:%M:%S")
+                    dt = datetime.strptime(last_seen, "%Y-%m-%dT%H:%M:%S")
                     if (now - dt).days >= 30:
                         send_telegram_prompt(
                             token,
