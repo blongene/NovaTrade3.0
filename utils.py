@@ -99,10 +99,11 @@ def ping_webhook_debug(msg):
     except:
         pass
 
-def send_telegram_message(message):
+def send_telegram_message(message, chat_id=None):
     try:
         bot_token = os.getenv("BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        if not chat_id:
+            chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if not bot_token or not chat_id:
             raise Exception("Missing BOT_TOKEN or TELEGRAM_CHAT_ID")
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
