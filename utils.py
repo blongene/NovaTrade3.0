@@ -211,3 +211,9 @@ def log_unclaimed_alert(token):
 def log_rebuy_confirmation(token):
     log_rebuy_decision(token)
 
+# === safe_float helper ===
+def safe_float(value, default=0.0):
+    try:
+        return float(str(value).strip())
+    except (ValueError, TypeError, AttributeError):
+        return default
