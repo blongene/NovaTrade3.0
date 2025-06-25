@@ -1,10 +1,9 @@
-# rebuy_engine.py
+# rebuy_engine.py (patched)
 
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from utils import send_telegram_prompt, ping_webhook_debug
-from datetime import datetime
+from utils import send_telegram_prompt, is_valid_token
 
 def run_rebuy_engine():
     print("🔁 Running undersized rebuy engine...")
@@ -14,41 +13,26 @@ def run_rebuy_engine():
         client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-        vault_ws = sheet.worksheet("Token_Vault")
-        data = vault_ws.get_all_records()
-
-        def safe_str(val):
-            return str(val).strip() if val is not None else ""
-
-        rebuy_count = 0
-        now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        ws = sheet.worksheet("Rotation_Stats")
+        data = ws.get_all_records()
 
         for i, row in enumerate(data, start=2):
-            token = safe_str(row.get("Token", "")).upper()
-            weight = safe_str(row.get("Target %", ""))
-            rebuy = safe_str(row.get("Last Rebuy", ""))
-            confirm = safe_str(row.get("Auto Rebuy", "")).upper()
-
-            try:
-                weight_val = float(weight)
-            except:
-                weight_val = 0.0
-
-            if not token or weight_val >= 5 or confirm == "NO":
+            token = str(row.get("Token", "")).strip().upper()
+            if not is_valid_token(token):
                 continue
 
-            send_telegram_prompt(
-                token,
-                f"$$ {token} target weight is only {weight_val}%. Undersized holding. Want to rebuy?",
-                buttons=["YES", "NO"],
-                prefix="REBUY"
-            )
+            weight = row.get("Rebuy Weight", 0)
+            if isinstance(weight, str):
+                try:
+                    weight = float(weight.strip())
+                except:
+                    weight = 0
 
-            vault_ws.update_acell(f"D{i}", now_str)  # Last Rebuy
-            rebuy_count += 1
+            if weight < 0.3:  # rebuy weight threshold
+                prompt = f"💸 {token} has a low Rebuy Weight ({weight}). Should we rebuy while it's cheap?"
+                send_telegram_prompt(token, prompt, buttons=["YES", "NO"], prefix="REBUY")
 
-        print(f"✅ Rebuy engine complete. {rebuy_count} prompts sent.")
+        print("✅ Rebuy engine scan complete.")
 
     except Exception as e:
         print(f"❌ Rebuy engine error: {e}")
-        ping_webhook_debug(f"❌ rebuy_engine error: {e}")
