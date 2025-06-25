@@ -5,7 +5,7 @@ from datetime import datetime
 def evaluate_vault_memory(token):
     sheet = get_sheet()
     roi_ws = sheet.worksheet("Vault_ROI_Tracker")
-    feedback_ws = sheet.worksheet("Vault_Review_Log")
+    feedback_ws = sheet.worksheet(os.getenv("VAULT_REVIEW_SHEET", "ROI_Review_Log"))
 
     roi_data = roi_ws.get_all_records()
     feedback_data = feedback_ws.get_all_records()
