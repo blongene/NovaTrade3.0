@@ -1,44 +1,44 @@
-import gspread
+# vault_memory_evaluator.py
+
 import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from utils import safe_float
 
-from utils import get_sheet
-from datetime import datetime
+def run_vault_memory_evaluator():
+    print("🧠 Evaluating Vault Memory Scores...")
 
-def evaluate_vault_memory(token):
-    sheet = get_sheet()
-    roi_ws = sheet.worksheet("Vault_ROI_Tracker")
-    feedback_ws = sheet.worksheet(os.getenv("VAULT_REVIEW_SHEET", "ROI_Review_Log"))
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        stats_ws = sheet.worksheet("Rotation_Stats")
 
-    roi_data = roi_ws.get_all_records()
-    feedback_data = feedback_ws.get_all_records()
+        headers = stats_ws.row_values(1)
+        data = stats_ws.get_all_records()
 
-    token_records = [row for row in roi_data if row.get("Token", "").upper() == token.upper()]
-    feedback_records = [row for row in feedback_data if row.get("Token", "").upper() == token.upper()]
+        # Ensure the column exists
+        vault_score_col = headers.index("Memory Vault Score") + 1 if "Memory Vault Score" in headers else len(headers) + 1
+        if "Memory Vault Score" not in headers:
+            stats_ws.update_cell(1, vault_score_col, "Memory Vault Score")
 
-    if not token_records:
-        return {"token": token, "avg_roi": 0, "max_roi": 0, "rebuy_roi": 0, "memory_score": 0}
+        for i, row in enumerate(data, start=2):
+            token = str(row.get("Token", "")).strip().upper()
+            vault_tag = str(row.get("Vault Tag", "")).strip()
+            if vault_tag != "✅ Vaulted":
+                stats_ws.update_cell(i, vault_score_col, "")
+                continue
 
-    roi_values = [float(row.get("Vault ROI", 0)) for row in token_records if row.get("Vault ROI")]
-    rebuy_roi = sum([float(row.get("Rebuy ROI", 0)) for row in token_records if row.get("Rebuy ROI")]) / max(len(token_records),1)
+            mem_score = safe_float(row.get("Memory Score", 0))
+            rebuy_roi = safe_float(row.get("Avg Rebuy ROI", 0))
+            rebuy_count = safe_float(row.get("Rebuy Count", 0))
 
-    max_roi = max(roi_values)
-    avg_roi = sum(roi_values) / len(roi_values)
+            score = round(mem_score + (rebuy_roi / 50.0) + (rebuy_count * 0.2), 2)
+            stats_ws.update_cell(i, vault_score_col, score)
+            print(f"✅ {token} → Memory Vault Score = {score}")
 
-    feedback_weight = 0
-    for row in feedback_records:
-        val = row.get("Decision", "").strip().lower()
-        if val == "smart":
-            feedback_weight += 2
-        elif val == "too soon":
-            feedback_weight -= 1
-        elif val == "should’ve held":
-            feedback_weight += 1
+        print("✅ Vault Memory Evaluation complete.")
 
-    memory_score = (avg_roi + max_roi + rebuy_roi + feedback_weight) / 4
-    return {
-        "token": token,
-        "avg_roi": round(avg_roi, 2),
-        "max_roi": round(max_roi, 2),
-        "rebuy_roi": round(rebuy_roi, 2),
-        "memory_score": round(memory_score, 2)
-    }
+    except Exception as e:
+        print(f"❌ Error in run_vault_memory_evaluator: {e}")
