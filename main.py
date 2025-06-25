@@ -50,6 +50,7 @@ from rebuy_weight_calculator import run_rebuy_weight_calculator
 from memory_score_sync import run_memory_score_sync
 from claim_post_prompt import run_claim_decision_prompt
 from dormant_claim_pinger import run_dormant_claim_alert
+from vault_rotation_gatekeeper import gate_vault_rotation
 
 import os, time, threading, schedule, gspread
 from oauth2client.service_account import ServiceAccountCredentials
