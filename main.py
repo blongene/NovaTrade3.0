@@ -289,3 +289,12 @@ if __name__ == "__main__":
     print("💥 run_presale_scorer() BOOTED")
     send_telegram_message("🟢 NovaTrade system booted and live.")
     print("🧠 NovaTrade system is live.")
+
+# === Manual CLAIMED ACTION Prompt Test ===
+from utils import send_telegram_prompt
+
+token = "MIND"
+message = f"*{token}* has just been marked as ✅ *Claimed*.\n\nHow should we handle it?"
+buttons = ["📦 Vault It", "🔁 Rotate It", "🔕 Ignore It"]
+send_telegram_prompt(token, message, buttons, prefix="CLAIMED ACTION")
+
