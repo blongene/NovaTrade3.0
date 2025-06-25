@@ -4,7 +4,7 @@ import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-def run_target_weight_sync():
+def run_portfolio_weight_adjuster():
     print("📊 Syncing Suggested % → Target %...")
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
