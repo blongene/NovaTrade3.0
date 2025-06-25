@@ -12,47 +12,32 @@ def run_rebuy_roi_tracker():
         client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-        roi_ws = sheet.worksheet("ROI_Review_Log")
         stats_ws = sheet.worksheet("Rotation_Stats")
-
-        roi_data = roi_ws.get_all_records()
         stats_data = stats_ws.get_all_records()
+        token_index = {str(row.get("Token", "")).strip().upper(): i+2 for i, row in enumerate(stats_data)}
 
-        updated = 0
+        memory_ws = sheet.worksheet("Rotation_Memory")
+        memory_data = memory_ws.get_all_records()
 
-        for stat_row in stats_data:
-            token = str(stat_row.get("Token", "")).strip().upper()
-            rebuy_entries = [r for r in roi_data if str(r.get("Token", "")).strip().upper() == token and str(r.get("Type", "")).strip().upper() == "REBUY"]
+        for row in memory_data:
+            token = str(row.get("Token", "")).strip().upper()
+            roi = row.get("Rebuy ROI", "")
+            count = row.get("Rebuy Count", "")
+            max_roi = row.get("Max Rebuy ROI", "")
+            avg_roi = row.get("Avg Rebuy ROI", "")
 
-            if not rebuy_entries:
+            if token not in token_index:
                 continue
 
-            rois = []
-            for entry in rebuy_entries:
-                try:
-                    roi = float(entry.get("ROI", 0))
-                    rois.append(roi)
-                except:
-                    continue
+            row_num = token_index[token]
+            stats_ws.update_acell(f"N{row_num}", roi)
+            stats_ws.update_acell(f"O{row_num}", count)
+            stats_ws.update_acell(f"P{row_num}", max_roi)
+            stats_ws.update_acell(f"Q{row_num}", avg_roi)
 
-            if not rois:
-                continue
+            print(f"✅ {token} → Rebuy ROI = {roi}, Count = {count}, Max = {max_roi}, Avg = {avg_roi}")
 
-            avg_roi = round(sum(rois) / len(rois), 2)
-            max_roi = max(rois)
-            count = len(rois)
-
-            row_index = stats_data.index(stat_row) + 2  # Adjust for header row
-
-            stats_ws.update_acell(f"N{row_index}", max_roi)
-            stats_ws.update_acell(f"O{row_index}", count)
-            stats_ws.update_acell(f"P{row_index}", max_roi)
-            stats_ws.update_acell(f"Q{row_index}", avg_roi)
-
-            print(f"✅ {token} → Rebuy ROI = {avg_roi}, Count = {count}, Max = {max_roi}")
-            updated += 1
-
-        print(f"✅ Rebuy ROI sync complete: {updated} tokens updated.")
+        print(f"✅ Rebuy ROI sync complete: {len(token_index)} tokens updated.")
 
     except Exception as e:
         print(f"❌ Error in run_rebuy_roi_tracker: {e}")
