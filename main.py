@@ -51,6 +51,7 @@ from memory_score_sync import run_memory_score_sync
 from claim_post_prompt import run_claim_decision_prompt
 from dormant_claim_pinger import run_dormant_claim_alert
 from vault_rotation_gatekeeper import gate_vault_rotation
+from total_memory_score_sync import sync_total_memory_score
 
 import os, time, threading, schedule, gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -242,7 +243,7 @@ if __name__ == "__main__":
     print("📊 Syncing Suggested % → Target %...")
     run_target_percent_updater()
     time.sleep(15)
-
+    sync_total_memory_score()
     print("📊 Syncing Vault Tags → Rotation_Stats...")
     threaded(run_vault_to_stats_sync)
     time.sleep(10)
