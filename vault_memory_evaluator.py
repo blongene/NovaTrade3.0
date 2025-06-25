@@ -1,4 +1,6 @@
 import gspread
+import os
+
 from utils import get_sheet
 from datetime import datetime
 
