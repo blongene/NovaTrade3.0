@@ -52,7 +52,7 @@ from claim_post_prompt import run_claim_decision_prompt
 from dormant_claim_pinger import run_dormant_claim_alert
 from vault_rotation_gatekeeper import gate_vault_rotation
 from total_memory_score_sync import sync_total_memory_score
-from vault_memory_evaluator import vault_memory_evaluator
+from vault_memory_evaluator import evaluate_vault_memory
 from vault_memory_importer import run_vault_memory_importer
 
 import os, time, threading, schedule, gspread
@@ -290,7 +290,7 @@ if __name__ == "__main__":
     print("📋 Running Auto-Confirm Planner...")
     run_auto_confirm_planner()
     print("✅ Auto-confirm check complete.")
-    vault_memory_evaluator()
+    evaluate_vault_memory()
     run_vault_memory_importer()
     
     time.sleep(10)
