@@ -1,7 +1,10 @@
+# rotation_log_updater.py
+
 import gspread
 import re
 import os
 from oauth2client.service_account import ServiceAccountCredentials
+
 
 def run_rotation_log_updater():
     print("🛠 Updating Rotation_Log with ROI_Review_Log data...")
@@ -28,14 +31,18 @@ def run_rotation_log_updater():
     token_idx_review = review_header.index("Token")
     roi_idx_review = review_header.index("Follow-up ROI")
 
-    review_map = {row[token_idx_review]: row[roi_idx_review] for row in review_rows}
+    review_map = {}
+    for row in review_rows:
+        token = row[token_idx_review].strip().upper()
+        roi = row[roi_idx_review].strip()
+        if token and re.match(r"^-?\d+(\.\d+)?$", roi):
+            review_map[token] = roi
 
     for i, row in enumerate(log_rows):
-        token = row[token_idx_log]
+        token = row[token_idx_log].strip().upper()
         current_val = row[roi_idx_log].strip()
-        new_val = review_map.get(token, "").strip()
+        new_val = review_map.get(token, "")
 
-        if new_val and re.match(r"^-?\d+(\.\d+)?$", new_val):
-            if current_val != new_val:
-                log_ws.update_cell(i + 2, roi_idx_log + 1, new_val)
-                print(f"✅ Updated {token} ROI → {new_val}")
+        if new_val and current_val != new_val:
+            log_ws.update_cell(i + 2, roi_idx_log + 1, new_val)
+            print(f"✅ Updated {token} ROI → {new_val}")
