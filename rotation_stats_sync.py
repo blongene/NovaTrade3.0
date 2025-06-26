@@ -36,7 +36,8 @@ def run_rotation_stats_sync():
 
         for i, row in enumerate(stats_data, start=2):
             token = str(row.get("Token", "")).strip().upper()
-            roi_source = "Rotation_Log"
+            if not token or token in ["", "N/A", "-", "NONE"] or not token.isalpha():
+                continue
 
             # === ROI Sync: Prefer Rotation_Log, fallback to Rotation_Stats
             match = next((r for r in log_data if r.get("Token", "").strip().upper() == token), None)
