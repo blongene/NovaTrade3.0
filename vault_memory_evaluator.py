@@ -5,7 +5,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from utils import safe_float
 
-def run_vault_memory_evaluator():
+def evaluate_vault_memory():
     print("🧠 Evaluating Vault Memory Scores...")
 
     try:
