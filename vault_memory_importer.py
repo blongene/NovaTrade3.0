@@ -3,12 +3,13 @@
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from vault_memory_evaluator import run_vault_memory_evaluator
+from vault_memory_evaluator import evaluate_vault_memory
 
 def run_vault_memory_importer():
     print("📥 Importing Vault Memory Scores...")
 
     try:
+        # Google Sheets auth
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
         client = gspread.authorize(creds)
@@ -21,7 +22,7 @@ def run_vault_memory_importer():
         token_col = headers.index("Token") + 1
         score_col = headers.index("Memory Vault Score") + 1 if "Memory Vault Score" in headers else len(headers) + 1
 
-        # If column doesn't exist, add it
+        # Add header if needed
         if "Memory Vault Score" not in headers:
             stats_ws.update_cell(1, score_col, "Memory Vault Score")
 
@@ -30,7 +31,9 @@ def run_vault_memory_importer():
             if not token:
                 continue
 
-            score = run_vault_memory_evaluator(token)["memory_score"]
+            result = evaluate_vault_memory(token)
+            score = result.get("memory_score", 0)
+
             stats_ws.update_cell(i, score_col, score)
             print(f"✅ {token} → Memory Vault Score = {score}")
 
