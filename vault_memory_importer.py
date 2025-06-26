@@ -4,7 +4,7 @@ import os
 import gspread
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
-from vault_memory_evaluator import evaluate_vault_memory
+from vault_memory_evaluator import run_vault_memory_evaluator
 from vault_confidence_score import calculate_confidence
 
 def run_vault_memory_importer():
@@ -25,7 +25,7 @@ def run_vault_memory_importer():
 
         new_rows = []
         for token in sorted(vault_tokens - existing_tokens):
-            memory = evaluate_vault_memory(token)
+            memory = run_vault_memory_evaluator(token)
             confidence = calculate_confidence(token)
 
             new_rows.append([
