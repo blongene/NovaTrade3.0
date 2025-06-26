@@ -2,48 +2,39 @@
 
 import os
 import gspread
-from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
-from vault_memory_evaluator import run_vault_memory_evaluator
-from vault_confidence_score import calculate_confidence
+from vault_memory_evaluator import evaluate_vault_memory
 
 def run_vault_memory_importer():
     print("📥 Importing Vault Memory Scores...")
 
     try:
-        # Auth
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
         client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-        vault_ws = sheet.worksheet("Token_Vault")
-        memory_ws = sheet.worksheet("Vault_Memory")
+        stats_ws = sheet.worksheet("Rotation_Stats")
+        rows = stats_ws.get_all_records()
+        headers = stats_ws.row_values(1)
 
-        vault_tokens = {row["Token"].strip().upper() for row in vault_ws.get_all_records() if row.get("Token")}
-        existing_tokens = {row["Token"].strip().upper() for row in memory_ws.get_all_records() if row.get("Token")}
+        token_col = headers.index("Token") + 1
+        score_col = headers.index("Memory Vault Score") + 1 if "Memory Vault Score" in headers else len(headers) + 1
 
-        new_rows = []
-        for token in sorted(vault_tokens - existing_tokens):
-            memory = run_vault_memory_evaluator(token)
-            confidence = calculate_confidence(token)
+        # If column doesn't exist, add it
+        if "Memory Vault Score" not in headers:
+            stats_ws.update_cell(1, score_col, "Memory Vault Score")
 
-            new_rows.append([
-                datetime.utcnow().isoformat(),
-                token,
-                confidence,
-                memory["avg_roi"],
-                memory["max_roi"],
-                memory["rebuy_roi"],
-                memory["memory_score"],
-                "Imported"
-            ])
+        for i, row in enumerate(rows, start=2):
+            token = row.get("Token", "").strip()
+            if not token:
+                continue
 
-        if new_rows:
-            memory_ws.append_rows(new_rows, value_input_option="USER_ENTERED")
-            print(f"✅ Imported {len(new_rows)} memory entries to Vault_Memory.")
-        else:
-            print("ℹ️ No new vault tokens to import.")
+            score = evaluate_vault_memory(token)["memory_score"]
+            stats_ws.update_cell(i, score_col, score)
+            print(f"✅ {token} → Memory Vault Score = {score}")
+
+        print("✅ Vault Memory Evaluation complete.")
 
     except Exception as e:
         print(f"❌ Error in run_vault_memory_importer: {e}")
