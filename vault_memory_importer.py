@@ -3,7 +3,7 @@
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from vault_memory_evaluator import evaluate_vault_memory
+from vault_memory_evaluator import run_vault_memory_evaluator
 
 def run_vault_memory_importer():
     print("📥 Importing Vault Memory Scores...")
