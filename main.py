@@ -54,6 +54,7 @@ from vault_rotation_gatekeeper import gate_vault_rotation
 from total_memory_score_sync import sync_total_memory_score
 from vault_memory_evaluator import evaluate_vault_memory
 from vault_memory_importer import run_vault_memory_importer
+from rotation_binance_executor import run_rotation_binance_executor
 
 import os, time, threading, schedule, gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -187,6 +188,9 @@ if __name__ == "__main__":
 
     print("🪚 Cleaning Rotation_Log ROI column...")
     time.sleep(10)
+
+    print("💰 Executing any unfilled trades from Rotation_Log...")
+    run_rotation_binance_executor()
 
     threaded(run_rotation_stats_sync)
     time.sleep(10)
