@@ -30,7 +30,7 @@ def run_vault_memory_importer():
             if not token:
                 continue
 
-            score = evaluate_vault_memory(token)["memory_score"]
+            score = run_vault_memory_evaluator(token)["memory_score"]
             stats_ws.update_cell(i, score_col, score)
             print(f"✅ {token} → Memory Vault Score = {score}")
 
