@@ -24,6 +24,10 @@ def throttle_retry(max_retries=3, delay=2, jitter=1):
         return wrapper
     return decorator
 
+import gspread
+from datetime import datetime
+from oauth2client.service_account import ServiceAccountCredentials
+
 def get_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
@@ -91,6 +95,21 @@ def log_rebuy_decision(token):
         print(f"✅ Rebuy for ${token} logged to Scout Decisions.")
     except Exception as e:
         print(f"❌ Failed to log rebuy decision for {token}: {e}")
+    client = gspread.authorize(creds)
+    return client.open_by_url("https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID_HERE/edit")
+
+def log_scout_decision(token, action):
+    try:
+        sheet = get_sheet()
+        ws = sheet.worksheet("Scout Decisions")
+        rows = ws.get_all_values()
+        for row in rows[1:]:
+            if row[1].strip().upper() == token.upper() and row[3].strip().upper() == "TELEGRAM":
+                return
+        timestamp = datetime.now().isoformat()
+        ws.append_row([timestamp, token, action, "Telegram", "", "", "", "", "", ""])
+    except Exception as e:
+        ping_webhook_debug(f"❌ Log decision error: {e}")
 
 def ping_webhook_debug(msg):
     try:
@@ -217,3 +236,6 @@ def safe_float(value, default=0.0):
         return float(str(value).strip())
     except (ValueError, TypeError, AttributeError):
         return default
+    except Exception as e:
+        print(f"⚠️ Failed Webhook_Debug ping: {e}")
+

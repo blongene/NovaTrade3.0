@@ -27,4 +27,17 @@ def run_watchdog():
 
             time.sleep(300)  # Check every 5 minutes
 
+import threading, time
+from utils import get_sheet, detect_stalled_tokens
+
+def start_watchdog():
+    def loop():
+        print("🔁 Starting watchdog loop...")
+        while True:
+            try:
+                sheet = get_sheet()
+                detect_stalled_tokens(sheet)
+            except Exception as e:
+                print(f"❌ Watchdog loop error: {e}")
+            time.sleep(180)
     threading.Thread(target=loop, daemon=True).start()
