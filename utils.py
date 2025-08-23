@@ -1,13 +1,14 @@
 # utils.py
 import os
 import time
-import random
 import json
+import random
+import pathlib
 import hashlib
 import requests
 import gspread
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timezone
 from oauth2client.service_account import ServiceAccountCredentials
 
 # =============================================================================
@@ -110,65 +111,28 @@ def ping_webhook_debug(msg):
         # Silent on purpose to avoid loops
         pass
 
+def _tg_creds():
+    bot_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        raise RuntimeError("Missing BOT_TOKEN/TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+    return bot_token, chat_id
+
 @throttle_retry(max_retries=3, delay=2, jitter=1)
-def send_telegram_message(message, chat_id=None, dedupe_key=None, ttl_minutes=None):
-    """
-    Sends a Telegram message with built-in de-duplication by content (or a custom key).
-    If the same message/key was sent recently (within ttl), it will be skipped.
-
-    ENV:
-      TELEGRAM_DEDUP_TTL_MIN  -> default 10 minutes
-      BOT_TOKEN / TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-    """
-    try:
-        bot_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-        if not bot_token or not chat_id:
-            raise Exception("Missing BOT_TOKEN/TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-
-        # --- de-dupe cache ---
-        cache_path = "/tmp/telegram_dedupe.json"
-        ttl = int(os.getenv("TELEGRAM_DEDUP_TTL_MIN", "10"))
-        if ttl_minutes is not None:
-            ttl = int(ttl_minutes)
-
-        key_src = dedupe_key if dedupe_key else str(message)
-        msg_key = hashlib.sha1(key_src.encode("utf-8")).hexdigest()
-
-        cache = {}
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, "r") as f:
-                    cache = json.load(f)
-            except Exception:
-                cache = {}
-
-        now = time.time()
-        last = cache.get(msg_key, 0)
-        if now - last < ttl * 60:
-            print(f"⏭️ Telegram dedupe: skipped resend within {ttl}m for key={msg_key[:8]}")
-            return {"skipped": True, "reason": "dedupe", "ttl_minutes": ttl}
-
-        # actually send
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-        resp = requests.post(url, json=payload, timeout=10)
-        if not resp.ok:
-            raise Exception(resp.text)
-
-        # update cache
-        cache[msg_key] = now
-        try:
-            with open(cache_path, "w") as f:
-                json.dump(cache, f)
-        except Exception:
-            pass
-
-        return resp.json()
-
-    except Exception as e:
-        ping_webhook_debug(f"❌ Telegram send error: {e}")
-        raise
+def send_telegram_message(message, chat_id=None):
+    """Raw Telegram send (no dedupe)."""
+    bot_token = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN"))
+    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        ping_webhook_debug("❌ Telegram creds missing")
+        raise RuntimeError("Missing BOT_TOKEN/TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    resp = requests.post(url, json=payload, timeout=10)
+    if not resp.ok:
+        ping_webhook_debug(f"❌ Telegram send error: {resp.text}")
+        raise RuntimeError(resp.text)
+    return resp.json()
 
 def send_telegram_prompt(token, message, buttons=None, prefix="REBALANCE"):
     bot_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -195,31 +159,144 @@ def send_telegram_prompt(token, message, buttons=None, prefix="REBALANCE"):
     except Exception as e:
         print(f"❌ Telegram prompt failed: {e}")
 
-# ---- Convenience wrappers (throttled banners) -------------------------------
+# -----------------------------------------------------------------------------
+# Global Telegram de-dupe (file-based, no Sheets calls)
+# -----------------------------------------------------------------------------
 
-def notify_system_online():
-    """At most once every 6h."""
-    return send_telegram_message(
-        "📡 NovaTrade System Online\nAll modules are active.\nYou will be notified if input is needed or a token stalls.",
-        dedupe_key="system_online_banner",
-        ttl_minutes=360
-    )
+_TG_DEDUP_DIR = pathlib.Path("/tmp/nova_tg")
+_TG_DEDUP_DIR.mkdir(parents=True, exist_ok=True)
+# default dedupe interval (minutes) – configurable via env
+_TG_DEDUP_TTL_MIN_DEFAULT = 15
 
-def notify_sync_required():
-    """At most once every 30m."""
-    return send_telegram_message(
-        "🧠 Sync Required\nNew decisions are pending rotation. Please review the planner tab.",
-        dedupe_key="sync_required_banner",
-        ttl_minutes=30
-    )
+def _hash_text(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
-def notify_sync_needed():
-    """At most once every 30m."""
-    return send_telegram_message(
-        "🧩 NovaTrade Sync Needed\nPlease review the latest responses or re-run the sync loop.",
-        dedupe_key="sync_needed_banner",
-        ttl_minutes=30
-    )
+def _dedup_file(key: str) -> pathlib.Path:
+    # key can be "global", "boot", "daily:summary", etc
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ":", ".") else "_" for ch in (key or "global"))
+    return _TG_DEDUP_DIR / f"{safe}.json"
+
+def _read_json(path: pathlib.Path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+def _write_json(path: pathlib.Path, data: dict):
+    try:
+        path.write_text(json.dumps(data))
+    except Exception:
+        pass
+
+def tg_should_send(message: str, key: str = "global", ttl_min: int | None = None) -> bool:
+    """
+    Returns True if we should send the message now (i.e., it's not a duplicate
+    within the TTL window for the provided key).
+    """
+    ttl = int(os.getenv("TG_DEDUP_TTL_MIN", str(_TG_DEDUP_TTL_MIN_DEFAULT)))
+    if ttl_min is not None:
+        ttl = int(ttl_min)
+
+    f = _dedup_file(key)
+    state = _read_json(f)
+    last_hash = state.get("hash")
+    last_ts = state.get("ts", 0)
+    now = time.time()
+    msg_hash = _hash_text(message)
+
+    if last_hash == msg_hash and (now - last_ts) < ttl * 60:
+        # duplicate within window
+        return False
+    return True
+
+def tg_mark_sent(message: str, key: str = "global"):
+    f = _dedup_file(key)
+    _write_json(f, {"hash": _hash_text(message), "ts": time.time()})
+
+def send_telegram_message_dedup(message: str, key: str = "global", ttl_min: int | None = None, chat_id: str | None = None):
+    """
+    Telegram send with global de-duplication by key.
+    - key groups messages; same message+key won't be resent within ttl_min.
+    - ttl_min defaults to env TG_DEDUP_TTL_MIN (default 15).
+    """
+    if tg_should_send(message, key=key, ttl_min=ttl_min):
+        resp = send_telegram_message(message, chat_id=chat_id)
+        tg_mark_sent(message, key=key)
+        return resp
+    else:
+        print(f"🛑 Telegram de-dupe suppressed for key='{key}'")
+        return None
+
+# -----------------------------------------------------------------------------
+# Once-per-day / Once-per-boot convenience wrappers
+# -----------------------------------------------------------------------------
+
+def _utc_yyyymmdd():
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+def send_once_per_day(key: str, message: str, chat_id: str | None = None):
+    """
+    Ensures message is sent at most once per UTC day for the provided key.
+    Uses a /tmp flag file (no Sheets traffic).
+    """
+    per_day_key = f"daily:{key}:{_utc_yyyymmdd()}"
+    # Use dedupe TTL of 24h for safety
+    return send_telegram_message_dedup(message, key=per_day_key, ttl_min=24*60, chat_id=chat_id)
+
+# --- Boot announce gate ------------------------------------------------------
+_BOOT_FLAG_FILE = "/tmp/nova_boot.flag"  # reset on container restart
+
+def _write_boot_flag():
+    try:
+        pathlib.Path(_BOOT_FLAG_FILE).write_text(str(int(time.time())))
+    except Exception:
+        pass
+
+def _read_boot_flag_ts():
+    try:
+        return int(pathlib.Path(_BOOT_FLAG_FILE).read_text().strip())
+    except Exception:
+        return 0
+
+def is_boot_announced(cooldown_min: int = 120) -> bool:
+    """
+    Returns True if we've already announced this boot (or if the last
+    announce was within `cooldown_min` minutes). Uses /tmp flag so no
+    Sheets calls needed; also mirrors to Webhook_Debug as FYI if available.
+    """
+    ts = _read_boot_flag_ts()
+    if ts and (time.time() - ts) < cooldown_min * 60:
+        return True
+    return False
+
+def mark_boot_announced() -> None:
+    _write_boot_flag()
+    # Best‑effort FYI in the sheet (non‑blocking)
+    try:
+        sh = _open_sheet()
+        sh.worksheet("Webhook_Debug").append_row(
+            [datetime.now().isoformat(), "Boot notice sent"], value_input_option="RAW"
+        )
+    except Exception:
+        pass
+
+def send_boot_notice_once(message: str = "🟢 NovaTrade system booted and live.", chat_id: str | None = None, cooldown_min: int = 120):
+    """
+    Sends boot notice once per container boot (or if previous boot notice was
+    older than `cooldown_min`). Uses /tmp boot flag + de-dup guard.
+    """
+    key = "boot_notice"
+    if not is_boot_announced(cooldown_min=cooldown_min):
+        resp = send_telegram_message_dedup(message, key=key, ttl_min=cooldown_min, chat_id=chat_id)
+        mark_boot_announced()
+        return resp
+    else:
+        print("🔇 Boot notice suppressed (already announced).")
+        return None
+
+def send_system_online_once(chat_id: str | None = None):
+    """Handy alias for your 'System Online' heartbeat, once per boot."""
+    return send_boot_notice_once("📡 NovaTrade System Online\nAll modules are active.\nYou will be notified if input is needed or a token stalls.", chat_id=chat_id)
 
 # =============================================================================
 # Rotation / Scout Logging Utilities
@@ -370,42 +447,3 @@ def safe_float(value, default=0.0):
 def detect_stalled_tokens(*args, **kwargs):
     """Return a list of stalled tokens; stubbed to empty to keep watchdog non-blocking."""
     return []
-
-# --- Boot announce gate ------------------------------------------------------
-import pathlib
-
-_BOOT_FLAG_FILE = "/tmp/nova_boot.flag"  # reset on container restart
-
-def _write_boot_flag():
-    try:
-        pathlib.Path(_BOOT_FLAG_FILE).write_text(str(int(time.time())))
-    except Exception:
-        pass
-
-def _read_boot_flag_ts():
-    try:
-        return int(pathlib.Path(_BOOT_FLAG_FILE).read_text().strip())
-    except Exception:
-        return 0
-
-def is_boot_announced(cooldown_min:int = 120) -> bool:
-    """
-    Returns True if we've already announced this boot (or if the last
-    announce was within `cooldown_min` minutes). Uses /tmp flag so no
-    Sheets calls needed; also mirrors to Webhook_Debug as FYI if available.
-    """
-    ts = _read_boot_flag_ts()
-    if ts and (time.time() - ts) < cooldown_min * 60:
-        return True
-    return False
-
-def mark_boot_announced() -> None:
-    _write_boot_flag()
-    # Best‑effort FYI in the sheet (non‑blocking)
-    try:
-        sh = get_sheet()
-        sh.worksheet("Webhook_Debug").append_row(
-            [datetime.now().isoformat(), "Boot notice sent"], value_input_option="RAW"
-        )
-    except Exception:
-        pass
