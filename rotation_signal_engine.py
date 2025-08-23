@@ -9,8 +9,19 @@ from send_telegram import send_rotation_alert
 PROMPT_MEMORY = {}
 MILESTONES = [3, 7, 14, 30]
 
-def scan_rotation_candidates():
-    print("🧠 scan_rotation_candidates stub is active.")
+def scan_rotation_candidates(token_override=None, *args, **kwargs):
+    """
+    If token_override is given, restrict the scan to that token/symbol.
+    Other args/kwargs are accepted for backward compatibility.
+    """
+    # ... your current code that builds candidates list ...
+    candidates = _load_candidates_somehow()
+
+    if token_override:
+        token_u = str(token_override).strip().upper()
+        candidates = [c for c in candidates if str(c.get("Token","")).upper() == token_u]
+
+    return candidates
 
 def run_milestone_alerts():
     print("\U0001F6A7 Scanning for milestone alerts...")
