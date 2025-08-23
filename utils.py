@@ -2,6 +2,8 @@
 import os
 import time
 import random
+import json
+import hashlib
 import requests
 import gspread
 from functools import wraps
@@ -109,18 +111,61 @@ def ping_webhook_debug(msg):
         pass
 
 @throttle_retry(max_retries=3, delay=2, jitter=1)
-def send_telegram_message(message, chat_id=None):
+def send_telegram_message(message, chat_id=None, dedupe_key=None, ttl_minutes=None):
+    """
+    Sends a Telegram message with built-in de-duplication by content (or a custom key).
+    If the same message/key was sent recently (within ttl), it will be skipped.
+
+    ENV:
+      TELEGRAM_DEDUP_TTL_MIN  -> default 10 minutes
+      BOT_TOKEN / TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    """
     try:
         bot_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
         chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
         if not bot_token or not chat_id:
             raise Exception("Missing BOT_TOKEN/TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+
+        # --- de-dupe cache ---
+        cache_path = "/tmp/telegram_dedupe.json"
+        ttl = int(os.getenv("TELEGRAM_DEDUP_TTL_MIN", "10"))
+        if ttl_minutes is not None:
+            ttl = int(ttl_minutes)
+
+        key_src = dedupe_key if dedupe_key else str(message)
+        msg_key = hashlib.sha1(key_src.encode("utf-8")).hexdigest()
+
+        cache = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r") as f:
+                    cache = json.load(f)
+            except Exception:
+                cache = {}
+
+        now = time.time()
+        last = cache.get(msg_key, 0)
+        if now - last < ttl * 60:
+            print(f"⏭️ Telegram dedupe: skipped resend within {ttl}m for key={msg_key[:8]}")
+            return {"skipped": True, "reason": "dedupe", "ttl_minutes": ttl}
+
+        # actually send
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
         resp = requests.post(url, json=payload, timeout=10)
         if not resp.ok:
             raise Exception(resp.text)
+
+        # update cache
+        cache[msg_key] = now
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(cache, f)
+        except Exception:
+            pass
+
         return resp.json()
+
     except Exception as e:
         ping_webhook_debug(f"❌ Telegram send error: {e}")
         raise
@@ -149,6 +194,32 @@ def send_telegram_prompt(token, message, buttons=None, prefix="REBALANCE"):
             print(f"⚠️ Telegram error: {r.text}")
     except Exception as e:
         print(f"❌ Telegram prompt failed: {e}")
+
+# ---- Convenience wrappers (throttled banners) -------------------------------
+
+def notify_system_online():
+    """At most once every 6h."""
+    return send_telegram_message(
+        "📡 NovaTrade System Online\nAll modules are active.\nYou will be notified if input is needed or a token stalls.",
+        dedupe_key="system_online_banner",
+        ttl_minutes=360
+    )
+
+def notify_sync_required():
+    """At most once every 30m."""
+    return send_telegram_message(
+        "🧠 Sync Required\nNew decisions are pending rotation. Please review the planner tab.",
+        dedupe_key="sync_required_banner",
+        ttl_minutes=30
+    )
+
+def notify_sync_needed():
+    """At most once every 30m."""
+    return send_telegram_message(
+        "🧩 NovaTrade Sync Needed\nPlease review the latest responses or re-run the sync loop.",
+        dedupe_key="sync_needed_banner",
+        ttl_minutes=30
+    )
 
 # =============================================================================
 # Rotation / Scout Logging Utilities
@@ -301,7 +372,7 @@ def detect_stalled_tokens(*args, **kwargs):
     return []
 
 # --- Boot announce gate ------------------------------------------------------
-import os, json, time, pathlib
+import pathlib
 
 _BOOT_FLAG_FILE = "/tmp/nova_boot.flag"  # reset on container restart
 
