@@ -2,6 +2,15 @@ import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+from utils import with_sheet_backoff
+
+@with_sheet_backoff
+def _read_rotation_stats(ws):
+    return ws.get_all_values()
+
+@with_sheet_backoff
+def _read_planner(ws):
+    return ws.get_all_records()
 
 def run_performance_dashboard():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
