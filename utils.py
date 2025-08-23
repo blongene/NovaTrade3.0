@@ -1,15 +1,19 @@
+# utils.py
 import os
-import gspread
+import time
+import random
 import requests
+import gspread
+from functools import wraps
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
-import random
 
-# === Google Sheets quota backoff (429-safe) ===
-import time
-from functools import wraps
+# =============================================================================
+# Backoff / Retry Utilities
+# =============================================================================
 
 def with_sheet_backoff(fn):
+    """Retry wrapper for Google Sheets 429/quota errors."""
     @wraps(fn)
     def _inner(*a, **k):
         delays = [2, 5, 15, 40]  # ~1 minute total
@@ -28,6 +32,7 @@ def with_sheet_backoff(fn):
     return _inner
 
 def throttle_retry(max_retries=3, delay=2, jitter=1):
+    """Generic retry with jitter for non-Sheets calls (e.g., HTTP)."""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -35,148 +40,109 @@ def throttle_retry(max_retries=3, delay=2, jitter=1):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
-                    print(f"⚠️ Attempt {attempt+1} failed: {e}")
+                    print(f"⚠️ Attempt {attempt+1} failed in {func.__name__}: {e}")
                     if attempt < max_retries - 1:
                         sleep_time = delay + random.uniform(0, jitter)
                         time.sleep(sleep_time)
                     else:
-                        raise e
+                        raise
         return wrapper
     return decorator
 
-import gspread
-from datetime import datetime
-from oauth2client.service_account import ServiceAccountCredentials
+# =============================================================================
+# GSpread Helpers
+# =============================================================================
 
-def get_sheet():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    return gspread.authorize(creds).open_by_url(os.getenv("SHEET_URL"))
+SHEET_URL = os.getenv("SHEET_URL")
+
+def _gspread_creds():
+    scope = ["https://spreadsheets.google.com/feeds",
+             "https://www.googleapis.com/auth/drive"]
+    return ServiceAccountCredentials.from_json_keyfile_name(
+        "sentiment-log-service.json", scope
+    )
 
 def get_gspread_client():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+    creds = _gspread_creds()
     return gspread.authorize(creds)
 
-def log_scout_decision(token, decision):
-    print(f"📥 Logging decision: {decision} for token {token}")
-    try:
-        client = get_gspread_client()
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
-        ws = sheet.worksheet("Scout Decisions")
-        planner_ws = sheet.worksheet("Rotation_Planner")
+@with_sheet_backoff
+def _open_sheet():
+    return get_gspread_client().open_by_url(SHEET_URL)
 
-        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
-        new_row = [now, token.upper(), decision.upper(), "Telegram"]
-        ws.append_row(new_row)
-        print("✅ Decision logged to Scout Decisions")
+# Generic backoff-wrapped actions
+@with_sheet_backoff
+def _ws_get_all_values(ws):
+    return ws.get_all_values()
 
-        if decision.upper() in ["YES", "VAULT", "ROTATE"]:
-            planner_data = planner_ws.get_all_values()
-            headers = planner_data[0]
-            token_idx = headers.index("Token")
-            confirm_idx = headers.index("Confirmed")
-            for i, row in enumerate(planner_data[1:], start=2):
-                if row[token_idx].strip().upper() == token.upper():
-                    planner_ws.update_cell(i, confirm_idx + 1, "YES")
-                    print(f"✅ Auto-confirmed token {token} in Rotation_Planner")
-                    break
-    except Exception as e:
-        print(f"❌ Failed to log decision for {token}: {e}")
-        ping_webhook_debug(f"❌ Log Scout Decision error: {e}")
+@with_sheet_backoff
+def _ws_get_all_records(ws):
+    return ws.get_all_records()
 
-def log_rebuy_decision(token):
-    try:
-        client = get_gspread_client()
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+@with_sheet_backoff
+def _ws_append_row(ws, row):
+    return ws.append_row(row, value_input_option="USER_ENTERED")
 
-        scout_ws = sheet.worksheet("Scout Decisions")
-        log_ws = sheet.worksheet("Rotation_Log")
-        radar_ws = sheet.worksheet("Sentiment_Radar")
+@with_sheet_backoff
+def _ws_update_cell(ws, r, c, v):
+    return ws.update_cell(r, c, v)
 
-        token = token.strip().upper()
-        log_data = log_ws.get_all_records()
-        log_row = next((row for row in log_data if row.get("Token", "").strip().upper() == token), {})
+@with_sheet_backoff
+def _ws_update_acell(ws, a1, v):
+    return ws.update_acell(a1, v)
 
-        score = log_row.get("Score", "")
-        sentiment = log_row.get("Sentiment", "")
-        market_cap = log_row.get("Market Cap", "")
-        scout_url = log_row.get("Scout URL", "")
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+@with_sheet_backoff
+def _ws_update(ws, rng, rows):
+    return ws.update(rng, rows, value_input_option="USER_ENTERED")
 
-        if not sentiment:
-            radar = next((r for r in radar_ws.get_all_records() if r.get("Token", "").strip().upper() == token), {})
-            sentiment = radar.get("Mentions", "")
-
-        new_row = [
-            timestamp, token, "YES", "Rebuy", score, sentiment, market_cap, scout_url, ""
-        ]
-        scout_ws.append_row(new_row)
-        print(f"✅ Rebuy for ${token} logged to Scout Decisions.")
-    except Exception as e:
-        print(f"❌ Failed to log rebuy decision for {token}: {e}")
-    client = gspread.authorize(creds)
-    return client.open_by_url("https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID_HERE/edit")
-
-def log_scout_decision(token, action):
-    try:
-        sheet = get_sheet()
-        ws = sheet.worksheet("Scout Decisions")
-        rows = ws.get_all_values()
-        for row in rows[1:]:
-            if row[1].strip().upper() == token.upper() and row[3].strip().upper() == "TELEGRAM":
-                return
-        timestamp = datetime.now().isoformat()
-        ws.append_row([timestamp, token, action, "Telegram", "", "", "", "", "", ""])
-    except Exception as e:
-        ping_webhook_debug(f"❌ Log decision error: {e}")
+# =============================================================================
+# Telegram + Debug
+# =============================================================================
 
 def ping_webhook_debug(msg):
     try:
-        sheet = get_sheet()
-        sheet.worksheet("Webhook_Debug").update_acell("A1", f"{datetime.now().isoformat()} - {msg}")
-    except:
+        sh = _open_sheet()
+        ws = sh.worksheet("Webhook_Debug")
+        _ws_update_acell(ws, "A1", f"{datetime.now().isoformat()} - {msg}")
+    except Exception:
+        # Silent on purpose to avoid loops
         pass
 
+@throttle_retry(max_retries=3, delay=2, jitter=1)
 def send_telegram_message(message, chat_id=None):
     try:
-        bot_token = os.getenv("BOT_TOKEN")
-        if not chat_id:
-            chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        bot_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+        chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
         if not bot_token or not chat_id:
-            raise Exception("Missing BOT_TOKEN or TELEGRAM_CHAT_ID")
+            raise Exception("Missing BOT_TOKEN/TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        response = requests.post(url, json=payload)
-        if not response.ok:
-            raise Exception(response.text)
-        return response.json()
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        resp = requests.post(url, json=payload, timeout=10)
+        if not resp.ok:
+            raise Exception(resp.text)
+        return resp.json()
     except Exception as e:
         ping_webhook_debug(f"❌ Telegram send error: {e}")
+        raise
 
-def send_telegram_prompt(token, message, buttons=["YES", "NO"], prefix="REBALANCE"):
-    bot_token = os.environ.get("BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
+def send_telegram_prompt(token, message, buttons=None, prefix="REBALANCE"):
+    bot_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not bot_token or not chat_id:
-        print("❌ BOT_TOKEN or TELEGRAM_CHAT_ID not found.")
+        print("❌ BOT_TOKEN/TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found.")
         return
 
-    button_data = [[{"text": btn, "callback_data": f"{btn}|{token}"}] for btn in buttons]
+    buttons = buttons or ["YES", "NO"]
+    inline = [[{"text": btn, "callback_data": f"{btn}|{token}"}] for btn in buttons]
     payload = {
         "chat_id": chat_id,
         "text": f"🔁 *{prefix} ALERT*\n\n{message}",
         "parse_mode": "Markdown",
-        "reply_markup": {"inline_keyboard": button_data}
+        "reply_markup": {"inline_keyboard": inline},
     }
-
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        r = requests.post(url, json=payload)
+        r = requests.post(url, json=payload, timeout=10)
         if r.ok:
             print(f"✅ Telegram prompt sent for {token}")
         else:
@@ -184,16 +150,85 @@ def send_telegram_prompt(token, message, buttons=["YES", "NO"], prefix="REBALANC
     except Exception as e:
         print(f"❌ Telegram prompt failed: {e}")
 
-def log_rotation_confirmation(token, decision):
-    try:
-        client = get_gspread_client()
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
-        planner_ws = sheet.worksheet("Rotation_Planner")
+# =============================================================================
+# Rotation / Scout Logging Utilities
+# =============================================================================
 
-        records = planner_ws.get_all_records()
+def get_sheet():
+    """Kept for backward-compat: returns the Spreadsheet object."""
+    return _open_sheet()
+
+def log_scout_decision(token, decision):
+    """Log a YES/NO/SKIP to Scout Decisions; auto-confirm in Rotation_Planner on YES/VAULT/ROTATE."""
+    token_u = (token or "").strip().upper()
+    print(f"📥 Logging decision: {decision} for token {token_u}")
+    try:
+        sh = _open_sheet()
+        ws = sh.worksheet("Scout Decisions")
+        planner_ws = sh.worksheet("Rotation_Planner")
+
+        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        _ws_append_row(ws, [now, token_u, (decision or '').upper(), "Telegram"])
+        print("✅ Decision logged to Scout Decisions")
+
+        if (decision or "").strip().upper() in {"YES", "VAULT", "ROTATE"}:
+            planner_vals = _ws_get_all_values(planner_ws)
+            if not planner_vals:
+                return
+            headers = planner_vals[0]
+            try:
+                token_idx = headers.index("Token")
+                confirm_idx = headers.index("Confirmed")
+            except ValueError:
+                print("⚠️ Rotation_Planner missing 'Token' or 'Confirmed' headers.")
+                return
+            for i, row in enumerate(planner_vals[1:], start=2):
+                if token_idx < len(row) and row[token_idx].strip().upper() == token_u:
+                    _ws_update_cell(planner_ws, i, confirm_idx + 1, "YES")
+                    print(f"✅ Auto-confirmed {token_u} in Rotation_Planner")
+                    break
+    except Exception as e:
+        print(f"❌ Failed to log decision for {token_u}: {e}")
+        ping_webhook_debug(f"❌ Log Scout Decision error: {e}")
+
+def log_rebuy_decision(token):
+    """Append a YES Rebuy row to Scout Decisions using context from Rotation_Log/Sentiment_Radar."""
+    try:
+        sh = _open_sheet()
+        scout_ws = sh.worksheet("Scout Decisions")
+        log_ws = sh.worksheet("Rotation_Log")
+        radar_ws = sh.worksheet("Sentiment_Radar")
+
+        token_u = (token or "").strip().upper()
+        log_data = _ws_get_all_records(log_ws)
+        log_row = next((r for r in log_data if (r.get("Token", "") or "").strip().upper() == token_u), {})
+
+        score = log_row.get("Score", "")
+        sentiment = log_row.get("Sentiment", "")
+        market_cap = log_row.get("Market Cap", "")
+        scout_url = log_row.get("Scout URL", "")
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        if not sentiment:
+            radar = _ws_get_all_records(radar_ws)
+            rrow = next((r for r in radar if (r.get("Token", "") or "").strip().upper() == token_u), {})
+            sentiment = rrow.get("Mentions", "")
+
+        new_row = [timestamp, token_u, "YES", "Rebuy", score, sentiment, market_cap, scout_url, ""]
+        _ws_append_row(scout_ws, new_row)
+        print(f"✅ Rebuy for ${token_u} logged to Scout Decisions.")
+    except Exception as e:
+        print(f"❌ Failed to log rebuy decision for {token}: {e}")
+
+def log_rotation_confirmation(token, decision):
+    """Set 'User Response' in Rotation_Planner for a token."""
+    try:
+        sh = _open_sheet()
+        planner_ws = sh.worksheet("Rotation_Planner")
+        records = _ws_get_all_records(planner_ws)
         for i, row in enumerate(records, start=2):  # Skip header
-            if row.get("Token", "").strip().upper() == token.strip().upper():
-                planner_ws.update_acell(f"C{i}", decision.upper())  # Column C = 'User Response'
+            if (row.get("Token", "") or "").strip().upper() == (token or "").strip().upper():
+                _ws_update_acell(planner_ws, f"C{i}", (decision or "").upper())  # Column C = 'User Response'
                 print(f"✅ Rotation confirmation logged: {token} → {decision}")
                 return
         print(f"⚠️ Token not found in Rotation_Planner: {token}")
@@ -202,11 +237,10 @@ def log_rotation_confirmation(token, decision):
 
 def log_roi_feedback(token, decision):
     try:
-        sheet = get_sheet()
-        ws = sheet.worksheet("ROI_Review_Log")
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        new_row = [timestamp, token.upper(), decision.upper()]
-        ws.append_row(new_row)
+        sh = _open_sheet()
+        ws = sh.worksheet("ROI_Review_Log")
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        _ws_append_row(ws, [timestamp, (token or "").upper(), (decision or "").upper()])
         print(f"✅ ROI Feedback logged: {token} → {decision}")
     except Exception as e:
         print(f"❌ Failed to log ROI Feedback: {e}")
@@ -214,52 +248,54 @@ def log_roi_feedback(token, decision):
 
 def log_vault_review(token, decision):
     try:
-        sheet = get_sheet()
-        ws = sheet.worksheet("Vault_Review_Log")
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        new_row = [timestamp, token.upper(), decision.upper()]
-        ws.append_row(new_row)
+        sh = _open_sheet()
+        ws = sh.worksheet("Vault_Review_Log")
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        _ws_append_row(ws, [timestamp, (token or "").upper(), (decision or "").upper()])
         print(f"✅ Vault Review logged: {token} → {decision}")
     except Exception as e:
         print(f"❌ Failed to log Vault Review: {e}")
         ping_webhook_debug(f"❌ Vault Review log error: {e}")
 
 def log_token_unlock(token, date):
+    """Mark a token as Claimed/Resolved in Claim_Tracker and set Arrival Date."""
     try:
-        sheet = get_sheet()
-        ws = sheet.worksheet("Claim_Tracker")
-        rows = ws.get_all_records()
+        sh = _open_sheet()
+        ws = sh.worksheet("Claim_Tracker")
+        rows = _ws_get_all_records(ws)
+        token_u = (token or "").strip().upper()
         for i, row in enumerate(rows, start=2):  # Start at row 2
-            if row.get("Token", "").strip().upper() == token.strip().upper():
-                ws.update_acell(f"H{i}", "Claimed")  # Claimed? column
-                ws.update_acell(f"I{i}", "Resolved")  # Status column
-                ws.update_acell(f"G{i}", date)  # Arrival Date
-                print(f"✅ Unlock logged for {token}")
+            if (row.get("Token", "") or "").strip().upper() == token_u:
+                _ws_update_acell(ws, f"H{i}", "Claimed")   # Claimed?
+                _ws_update_acell(ws, f"I{i}", "Resolved")  # Status
+                _ws_update_acell(ws, f"G{i}", date)        # Arrival Date
+                print(f"✅ Unlock logged for {token_u}")
                 return
     except Exception as e:
         print(f"❌ Failed to log unlock for {token}: {e}")
 
 def log_unclaimed_alert(token):
     try:
-        sheet = get_sheet()
-        ws = sheet.worksheet("Webhook_Debug")
-        ws.update_acell("A1", f"{datetime.now().isoformat()} – ⚠️ {token} arrived in wallet but not marked claimed")
+        sh = _open_sheet()
+        ws = sh.worksheet("Webhook_Debug")
+        _ws_update_acell(ws, "A1", f"{datetime.now().isoformat()} – ⚠️ {token} arrived in wallet but not marked claimed")
     except Exception:
         pass
 
 def log_rebuy_confirmation(token):
     log_rebuy_decision(token)
 
-# === safe_float helper ===
+# =============================================================================
+# Utilities
+# =============================================================================
+
 def safe_float(value, default=0.0):
     try:
-        return float(str(value).strip())
+        return float(str(value).strip().replace("%", ""))
     except (ValueError, TypeError, AttributeError):
         return default
-    except Exception as e:
-        print(f"⚠️ Failed Webhook_Debug ping: {e}")
 
-# --- compatibility stub to avoid boot crash ---
+# --- compatibility stub to avoid boot crash (watchdog) ---
 def detect_stalled_tokens(*args, **kwargs):
     """Return a list of stalled tokens; stubbed to empty to keep watchdog non-blocking."""
     return []
