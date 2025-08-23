@@ -5,6 +5,15 @@ import gspread
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 import re
+from utils import with_sheet_backoff
+
+@with_sheet_backoff
+def _read_rotation_stats(ws):
+    return ws.get_all_values()
+
+@with_sheet_backoff
+def _read_planner(ws):
+    return ws.get_all_records()
 
 def run_rotation_stats_sync():
     print("📊 Syncing Rotation_Stats...")
