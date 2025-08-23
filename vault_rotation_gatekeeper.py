@@ -23,3 +23,5 @@ def gate_vault_rotation(token):
             )
     except Exception as e:
         print(f"❌ Error in gate_vault_rotation for {token}: {e}")
+
+cands = scan_rotation_candidates(token_override=token)
