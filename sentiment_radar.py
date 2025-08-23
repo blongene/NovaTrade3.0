@@ -115,3 +115,23 @@ def run_sentiment_radar():
         print(f"✅ Sentiment Radar logged {len(sentiment_entries)} mentions.")
     else:
         print("⚠️ No sentiment entries written.")
+
+TW_COOLDOWN_MIN = int(os.getenv("TW_COOLDOWN_MIN", "30"))
+_last_tw_fail_ts = 0
+
+def fetch_twitter_mentions(token: str) -> int:
+    global _last_tw_fail_ts
+    if time.time() - _last_tw_fail_ts < TW_COOLDOWN_MIN * 60:
+        print("🐦 Twitter on cooldown.")
+        return 0
+    try:
+        # ... existing request ...
+        if response.status_code == 429:
+            print("⚠️ Twitter 429; cooling down.")
+            _last_tw_fail_ts = time.time()
+            return 0
+        # ...
+    except Exception as e:
+        print(f"⚠️ Twitter error: {e}")
+        _last_tw_fail_ts = time.time()
+        return 0
