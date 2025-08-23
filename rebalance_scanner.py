@@ -2,6 +2,15 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
 from telegram import Bot
+from utils import with_sheet_backoff
+
+@with_sheet_backoff
+def _read_rotation_stats(ws):
+    return ws.get_all_values()
+
+@with_sheet_backoff
+def _read_planner(ws):
+    return ws.get_all_records()
 
 def run_rebalance_scanner():
     print("🔁 Running Rebalance Scanner...")
