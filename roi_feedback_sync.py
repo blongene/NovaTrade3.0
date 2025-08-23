@@ -1,80 +1,128 @@
+# roi_feedback_sync.py
+import os
+from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-import os
+from utils import with_sheet_backoff, get_gspread_client, send_telegram_message, ping_webhook_debug
+
+SHEET_URL = os.getenv("SHEET_URL")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def _open_sheet():
+    client = get_gspread_client()
+    return client.open_by_url(SHEET_URL)
+
+@with_sheet_backoff
+def _get_all(ws):
+    return ws.get_all_values()
+
+@with_sheet_backoff
+def _append(ws, row):
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+@with_sheet_backoff
+def _update_cell(ws, r, c, v):
+    ws.update_cell(r, c, v)
+
+def _header_index_map(headers):
+    return {h.strip(): i for i, h in enumerate(headers)}
+
+def _normalize(s):
+    return (s or "").strip().upper()
+
+def _safe_float(x, default=None):
+    try:
+        return float(str(x).replace("%", "").strip())
+    except Exception:
+        return default
 
 def run_roi_feedback_sync():
-    print("🔄 Syncing ROI feedback from ROI_Review_Log...")
-
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
-
-    sheet = client.open_by_url(os.getenv("SHEET_URL"))
-    review_ws = sheet.worksheet("ROI_Review_Log")
-    stats_ws = sheet.worksheet("Rotation_Stats")
-
-    review_data = review_ws.get_all_records()
-    stats_data = stats_ws.get_all_records()
-    review_headers = review_ws.row_values(1)
-    stats_headers = stats_ws.row_values(1)
-
+    """
+    Syncs 'Would you vote YES again?' feedback from ROI_Review_Log into Rotation_Stats.
+    - Writes 'Last Feedback' (YES/NO/SKIP)
+    - Writes 'Last Feedback At' (UTC)
+    - Optionally updates 'Performance Note' column if present
+    Skips rows without valid token or feedback. Backoff protects against 429s.
+    """
     try:
-        token_idx = review_headers.index("Token")
-        vote_idx = review_headers.index("Would You Say YES Again?")
-        feedback_idx = review_headers.index("Feedback")
-        synced_idx = review_headers.index("Synced?")
-    except ValueError as e:
-        print("❌ Missing column in ROI_Review_Log:", e)
-        return
+        print("🔄 Syncing ROI feedback from ROI_Review_Log → Rotation_Stats ...")
+        sh = _open_sheet()
 
-    try:
-        stats_token_idx = stats_headers.index("Token")
-        revote_col = stats_headers.index("Re-Vote") + 1
-        notes_col = stats_headers.index("Feedback Notes") + 1
-    except ValueError as e:
-        print("❌ Missing column in Rotation_Stats:", e)
-        return
+        log_ws = sh.worksheet("ROI_Review_Log")
+        stats_ws = sh.worksheet("Rotation_Stats")
 
-    # Optional: sync to Performance column
-    try:
-        performance_col = stats_headers.index("Performance") + 1
-    except ValueError:
-        performance_col = None
+        log_vals = _get_all(log_ws)
+        stats_vals = _get_all(stats_ws)
 
-    # Optional: log to NovaHeartbeat
-    try:
-        heartbeat_ws = sheet.worksheet("NovaHeartbeat")
-        heartbeat_ready = True
-    except:
-        heartbeat_ready = False
+        if not log_vals or not stats_vals:
+            print("⚠️ Missing sheet values; aborting feedback sync.")
+            return
 
-    updated = 0
-    for i, row in enumerate(review_data):
-        token = row.get("Token", "").strip().upper()
-        vote = row.get("Would You Say YES Again?", "").strip().upper()
-        feedback = row.get("Feedback", "").strip()
-        synced = row.get("Synced?", "").strip()
+        log_headers = log_vals[0]
+        stats_headers = stats_vals[0]
+        log_idx = _header_index_map(log_headers)
+        stats_idx = _header_index_map(stats_headers)
 
-        if synced in ["✅", "TRUE", "YES"] or not token or not vote:
-            continue
+        # Required columns
+        t_col = log_idx.get("Token", 1)
+        d_col = log_idx.get("Decision", 2)
 
-        for j, stat in enumerate(stats_data):
-            if stat.get("Token", "").strip().upper() == token:
-                stats_ws.update_cell(j + 2, revote_col, vote)
-                if feedback:
-                    stats_ws.update_cell(j + 2, notes_col, feedback)
-                if performance_col:
-                    stats_ws.update_cell(j + 2, performance_col, vote)
-                review_ws.update_cell(i + 2, synced_idx + 1, "✅")
-                updated += 1
-                print(f"📥 Synced feedback for {token}: {vote}, Notes: {feedback}")
-                break
+        # Stats columns (create if missing)
+        if "Last Feedback" not in stats_idx:
+            stats_headers.append("Last Feedback")
+            stats_idx["Last Feedback"] = len(stats_headers) - 1
+        if "Last Feedback At" not in stats_idx:
+            stats_headers.append("Last Feedback At")
+            stats_idx["Last Feedback At"] = len(stats_headers) - 1
+        if stats_headers != stats_vals[0]:
+            # write updated header row
+            _update_cell(stats_ws, 1, 1, stats_headers[0])  # touch to ensure worksheet is “dirty”
+            stats_ws.update("A1", [stats_headers])
 
-    print(f"✅ ROI feedback sync complete. {updated} row(s) updated.")
+        # Build a token → row mapping for Rotation_Stats for fast lookup
+        token_col = stats_idx.get("Token")
+        if token_col is None:
+            print("⛔️ Rotation_Stats requires a 'Token' column. Aborting.")
+            return
 
-    if heartbeat_ready:
-        heartbeat_ws.append_row([str(datetime.utcnow()), "roi_feedback_sync", f"{updated} rows synced"])
+        stats_map = {}  # TOKEN -> (row_num, row_list)
+        for r_i, row in enumerate(stats_vals[1:], start=2):
+            tok = _normalize(row[token_col]) if token_col < len(row) else ""
+            if tok:
+                stats_map[tok] = (r_i, row)
 
-if __name__ == "__main__":
-    run_roi_feedback_sync()
+        updates = 0
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        for log_row in log_vals[1:]:
+            token = _normalize(log_row[t_col] if t_col < len(log_row) else "")
+            decision = _normalize(log_row[d_col] if d_col < len(log_row) else "")
+            if not token or decision not in {"YES", "NO", "SKIP"}:
+                continue
+
+            if token not in stats_map:
+                # Not all tokens must be in Rotation_Stats—skip silently
+                continue
+
+            # Prepare row to update
+            row_num, current = stats_map[token]
+            # Ensure row length >= required columns
+            need_len = max(stats_idx["Last Feedback"], stats_idx["Last Feedback At"]) + 1
+            if len(current) < need_len:
+                current += [""] * (need_len - len(current))
+
+            last_fb_val = current[stats_idx["Last Feedback"]]
+            last_at_val = current[stats_idx["Last Feedback At"]]
+
+            # Update if different (idempotent)
+            if (last_fb_val or "").strip().upper() != decision or not last_at_val:
+                _update_cell(stats_ws, row_num, stats_idx["Last Feedback"] + 1, decision)
+                _update_cell(stats_ws, row_num, stats_idx["Last Feedback At"] + 1, now)
+                updates += 1
+
+        print(f"✅ ROI Feedback sync complete. {updates} row(s) updated.")
+        if updates and TELEGRAM_CHAT_ID:
+            send_telegram_message(f"🧠 ROI feedback sync complete • {updates} stats row(s) updated.")
+    except Exception as e:
+        print(f"❌ roi_feedback_sync error: {e}")
+        ping_webhook_debug(f"roi_feedback_sync error: {e}")
