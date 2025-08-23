@@ -7,8 +7,8 @@ from googleapiclient.discovery import build
 
 # ===== CONFIG TOGGLES =====
 ENABLE_REDDIT = False  # Placeholder for future support
-ENABLE_YOUTUBE = True
 ENABLE_TWITTER = True
+YOUTUBE_ENABLED = os.getenv("YOUTUBE_ENABLED", "false").lower() == "true"
 
 # ===== SHEET SETUP =====
 def get_worksheet(name):
@@ -47,7 +47,8 @@ def fetch_twitter_mentions(token):
 
 # ===== YOUTUBE SCRAPER =====
 def fetch_youtube_mentions(token):
-    try:
+    if YOUTUBE_ENABLED:
+        try:
         youtube = build("youtube", "v3", developerKey=os.getenv("YOUTUBE_API_KEY"))
         request = youtube.search().list(
             q=token,
