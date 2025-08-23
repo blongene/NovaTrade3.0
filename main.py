@@ -1,6 +1,12 @@
+import os, time, threading, schedule, gspread
 from flask import Flask
+from oauth2client.service_account import ServiceAccountCredentials
+
+# Telegram webhook / Flask app
 from telegram_webhook import telegram_app, set_telegram_webhook
-from nova_watchdog import run_watchdog
+
+# Keep imports for modules that are known‑good for you today.
+# (We’ll lazy‑import nova_watchdog to avoid the previous ImportError at boot.)
 from rotation_signal_engine import scan_rotation_candidates
 from roi_tracker import scan_roi_tracking
 from milestone_alerts import run_milestone_alerts
@@ -55,13 +61,23 @@ from total_memory_score_sync import sync_total_memory_score
 from vault_memory_evaluator import evaluate_vault_memory
 from vault_memory_importer import run_vault_memory_importer
 
-import os, time, threading, schedule, gspread
-from oauth2client.service_account import ServiceAccountCredentials
+# ===== Helpers =====
+def safe_call(label, fn, *args, sleep_after=0, **kwargs):
+    try:
+        print(f"▶️ {label} …")
+        out = fn(*args, **kwargs)
+        if sleep_after:
+            time.sleep(sleep_after)
+        return out
+    except Exception as e:
+        print(f"❌ {label} error: {e}")
 
-# === Boot Configuration ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-RENDER_WEBHOOK_URL = os.getenv("RENDER_WEBHOOK_URL")
+def threaded(fn, *args, **kwargs):
+    t = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
+    t.start()
+    return t
 
+# ===== Sheet boot check =====
 def load_presale_stream():
     print("⚙️ Attempting to load worksheet: Presale_Stream")
     try:
@@ -76,89 +92,83 @@ def load_presale_stream():
         print(f"❌ Failed to load Presale_Stream: {e}")
         return None
 
+# ===== Background loops =====
 def start_staking_yield_loop():
     def loop():
         from staking_yield_tracker import run_staking_yield_tracker
         while True:
-            print("🔁 Checking staking yield...")
-            run_staking_yield_tracker()
-            time.sleep(21600)
-    threading.Thread(target=loop, daemon=True).start()
+            print("🔁 Checking staking yield…")
+            safe_call("staking_yield_tracker", run_staking_yield_tracker)
+            time.sleep(21600)  # 6h
+    threaded(loop)
 
 def start_flask_app():
-    print("🟢 Starting Flask app on port 10000...")
-    telegram_app.run(host="0.0.0.0", port=10000)
+    port = int(os.getenv("PORT", "10000"))
+    print(f"🟢 Starting Flask app on port {port} …")
+    telegram_app.run(host="0.0.0.0", port=port, debug=False)
 
 def run_scheduler_loop():
     while True:
         schedule.run_pending()
         time.sleep(1)
 
-def threaded(func):
-    threading.Thread(target=func).start()
-    
-if __name__ == "__main__":
-    set_telegram_webhook()
-    threading.Thread(target=start_flask_app).start()
-    print("📱 Orion Cloud Boot Sequence Initiated")
-    print("✅ Webhook armed. Launching modules...")
-    threading.Thread(target=run_orion_voice_loop).start()
-
-    print("🔍 Starting Watchdog...")
-    run_watchdog()
-
-    print("🧠 Running Rotation Signal Engine...")
-    rotation_ws = load_presale_stream()
-
-    if rotation_ws:
-        scan_roi_tracking()
-        time.sleep(5)
-        try:
-            run_milestone_alerts()
-        except Exception as e:
-            print(f"❌ Error in run_milestone_alerts: {e}")
-        time.sleep(5)
-        log_heartbeat("ROI Tracker", "Updated Days Held for 4 tokens")
-
-    try: sync_token_vault()
-    except Exception as e: print(f"⚠️ Vault sync error: {e}")
-
-    time.sleep(10)
-    try: run_top_token_summary()
-    except Exception as e: print(f"❌ Error in run_top_token_summary: {e}")
-
-    time.sleep(10)
-    run_vault_intelligence()
-    time.sleep(10)
-    print("🚀 Executing any pending vault rotations...")
-    gate_vault_rotation("MIND")
-    run_vault_rotation_executor()
-    time.sleep(10)
-    print("📋 Syncing Scout Decisions → Rotation_Planner...")
-    sync_rotation_planner()
-    time.sleep(10)
-    print("📅 Syncing ROI feedback responses...")
-    run_roi_feedback_sync()
-
-    time.sleep(10)
-    print("📰 Running Sentiment Radar (1x boot pass only)...")
+def start_watchdog_lazy():
+    # Avoid early ImportError from nova_watchdog (detect_stalled_tokens missing)
     try:
-        run_sentiment_radar()
+        from nova_watchdog import run_watchdog
+        print("🔍 Starting Watchdog…")
+        run_watchdog()
     except Exception as e:
-        print(f"⚠️ Radar scan skipped due to error: {e}")
+        print(f"⚠️ Watchdog start skipped: {e}")
 
-    check_nova_trigger()
-    time.sleep(10)
-    trigger_nova_ping("NOVA UPDATE")
-    check_claims()
-    run_claim_decision_prompt()
-    
+# ===== Main boot =====
+if __name__ == "__main__":
+    print("📡 Orion Cloud Boot Sequence Initiated")
+    safe_call("Set Telegram webhook", set_telegram_webhook)
+    threaded(start_flask_app)
+    threaded(run_scheduler_loop)
+    threaded(run_orion_voice_loop)
+
+    start_watchdog_lazy()
+
+    rotation_ws = load_presale_stream()
     if rotation_ws:
-        print("⏰ Running presale scan every 60 min")
-        run_presale_scorer()
+        safe_call("ROI tracker boot pass", scan_roi_tracking, sleep_after=3)
+        safe_call("Milestone alerts", run_milestone_alerts, sleep_after=3)
+        log_heartbeat("ROI Tracker", "Updated Days Held seed")
     else:
         print("⛔️ Presale_Stream unavailable — presale scan skipped")
 
+    # Vault & summaries
+    safe_call("Token vault sync", sync_token_vault, sleep_after=3)
+    safe_call("Top token summary", run_top_token_summary, sleep_after=3)
+    safe_call("Vault intelligence", run_vault_intelligence, sleep_after=3)
+
+    print("🚀 Executing any pending vault rotations…")
+    safe_call("Vault rotation gate (MIND)", gate_vault_rotation, "MIND", sleep_after=1)
+    safe_call("Vault rotation executor", run_vault_rotation_executor, sleep_after=3)
+
+    print("📋 Syncing Scout Decisions → Rotation_Planner…")
+    safe_call("Scout→Planner sync", sync_rotation_planner, sleep_after=3)
+
+    print("📅 Syncing ROI feedback responses…")
+    safe_call("ROI feedback sync", run_roi_feedback_sync, sleep_after=3)
+
+    print("📰 Sentiment Radar (boot pass)…")
+    safe_call("Sentiment radar", run_sentiment_radar, sleep_after=3)
+
+    safe_call("Nova trigger check", check_nova_trigger, sleep_after=1)
+    safe_call("Nova ping", trigger_nova_ping, "NOVA UPDATE", sleep_after=1)
+    safe_call("Claim tracker", check_claims, sleep_after=3)
+    safe_call("Claim decision prompt", run_claim_decision_prompt, sleep_after=3)
+
+    if rotation_ws:
+        print("⏰ Running presale scan every 60 min")
+        safe_call("Presale scorer", run_presale_scorer, sleep_after=1)
+    else:
+        print("⛔️ Presale_Stream unavailable — presale scan skipped")
+
+    # Scheduled jobs (kept as-is)
     schedule.every(60).minutes.do(run_rotation_log_updater)
     schedule.every(60).minutes.do(run_rebalance_scanner)
     schedule.every(60).minutes.do(run_rotation_memory)
@@ -176,148 +186,103 @@ if __name__ == "__main__":
     schedule.every().day.at("01:10").do(run_rebuy_weight_calculator)
     schedule.every().day.at("01:15").do(run_memory_score_sync)
     schedule.every(6).hours.do(run_dormant_claim_alert)
-    
-    threading.Thread(target=run_scheduler_loop, daemon=True).start()
-    run_stalled_asset_detector()
-    time.sleep(10)
-    check_claims()
-    time.sleep(10)
-    start_staking_yield_loop()
-    time.sleep(10)
 
-    print("🪚 Cleaning Rotation_Log ROI column...")
-    time.sleep(10)
+    # Start continuous workers that aren’t purely scheduled
+    threaded(run_stalled_asset_detector)
+    time.sleep(3)
+    safe_call("Claim tracker (2nd pass)", check_claims, sleep_after=3)
+    start_staking_yield_loop()
+    time.sleep(3)
+
+    print("🪚 Cleaning Rotation_Log ROI column…")
+    time.sleep(3)
 
     threaded(run_rotation_stats_sync)
-    time.sleep(10)
+    time.sleep(3)
 
     threaded(run_memory_weight_sync)
-    time.sleep(10)
-    
-    print("🧠 Calculating Total Memory Score...")
-    run_memory_score_sync()
-    time.sleep(10)
-    
+    time.sleep(3)
+
+    print("🧠 Calculating Total Memory Score…")
+    safe_call("Total memory score sync", run_memory_score_sync, sleep_after=3)
+
     threaded(run_rebuy_roi_tracker)
-    time.sleep(10)
+    time.sleep(3)
 
-    try: run_rotation_feedback_engine()
-    except Exception as e: print(f"❌ Error in run_rotation_feedback_engine: {e}")
+    safe_call("Rotation feedback engine", run_rotation_feedback_engine, sleep_after=3)
 
-    time.sleep(10)
-    try:
-        print("📊 Running Performance Dashboard...")
-        run_performance_dashboard()
-    except Exception as e:
-        print(f"⚠️ Skipped Dashboard due to quota: {e}")
+    print("📊 Running Performance Dashboard…")
+    safe_call("Performance dashboard", run_performance_dashboard, sleep_after=3)
 
-    print("🔁 Running initial rebalance scan...")
-    run_rebalance_scanner()
+    print("🔁 Initial rebalance scan…")
+    safe_call("Rebalance scanner", run_rebalance_scanner, sleep_after=3)
 
-    print("📢 Running Telegram Summary Layer...")
-    run_telegram_summary()
+    print("📢 Telegram Summary Layer…")
+    safe_call("Telegram summary", run_telegram_summary, sleep_after=3)
 
-    print("🧠 Running Rotation Memory Sync...")
-    run_rotation_memory()
-    time.sleep(10)
-    print("🔁 Running undersized rebuy engine...")
-    run_undersized_rebuy()
-    time.sleep(10)
-    print("♻️ Running memory-aware rebuy engine...")
-    run_memory_rebuy_scan()
-    time.sleep(10)
-    print("🧠 Calculating Rebuy Weights...")
-    run_rebuy_weight_calculator()
-    
-    time.sleep(10)
-    print("🚨 Running Sentiment-Triggered Rebuy Scan...")
-    try:
-        run_sentiment_trigger_engine()
-    except Exception as e:
-        print(f"❌ Error in run_sentiment_trigger_engine: {e}")
+    print("🧠 Rotation Memory Sync…")
+    safe_call("Rotation memory sync", run_rotation_memory, sleep_after=3)
 
-    time.sleep(10)
-    run_memory_scoring()
-    time.sleep(10)
-    print("🧠 Running Suggested Target Calculator...")
-    run_portfolio_weight_adjuster()
-    time.sleep(10)
-    print("📊 Syncing Suggested % → Target %...")
-    run_target_percent_updater()
-    time.sleep(15)
-    sync_total_memory_score()
-    print("📊 Syncing Vault Tags → Rotation_Stats...")
+    print("🔁 Undersized rebuy engine…")
+    safe_call("Undersized rebuy", run_undersized_rebuy, sleep_after=3)
+
+    print("♻️ Memory‑aware rebuy engine…")
+    safe_call("Memory rebuy scan", run_memory_rebuy_scan, sleep_after=3)
+
+    print("🧠 Rebuy Weights…")
+    safe_call("Rebuy weight calc", run_rebuy_weight_calculator, sleep_after=3)
+
+    print("🚨 Sentiment‑Triggered Rebuy Scan…")
+    safe_call("Sentiment trigger engine", run_sentiment_trigger_engine, sleep_after=3)
+
+    safe_call("Memory scoring", run_memory_scoring, sleep_after=3)
+
+    print("🧠 Suggested Target Calculator…")
+    safe_call("Portfolio weight adjuster", run_portfolio_weight_adjuster, sleep_after=3)
+
+    print("📊 Sync Suggested % → Target %…")
+    safe_call("Target % updater", run_target_percent_updater, sleep_after=3)
+
+    safe_call("Total memory score sync (final)", sync_total_memory_score, sleep_after=3)
+
+    print("📊 Syncing Vault Tags → Rotation_Stats…")
     threaded(run_vault_to_stats_sync)
-    time.sleep(10)
+    time.sleep(3)
 
-    try: run_vault_alerts()
-    except Exception as e: print(f"❌ Error in run_vault_alerts: {e}")
+    safe_call("Vault alerts", run_vault_alerts, sleep_after=3)
 
-    time.sleep(10)
-    print("🔔 Running Vault Intelligence Alerts...")
-    try:
-        run_vault_alerts()
-    except Exception as e:
-        print(f"❌ Error in run_vault_alerts: {e}")
+    print("🔔 Vault Intelligence Alerts…")
+    safe_call("Vault alerts (2nd pass)", run_vault_alerts, sleep_after=3)
 
-    time.sleep(10)
-    print("📦 Syncing Vault ROI + Memory Stats...")
-    try:
-        run_vault_growth_sync()
-    except Exception as e:
-        print(f"❌ vault_growth_sync error: {e}")
+    print("📦 Syncing Vault ROI + Memory Stats…")
+    safe_call("Vault growth sync", run_vault_growth_sync, sleep_after=3)
 
-    time.sleep(5)
-    print("📈 Writing daily snapshot to Vault ROI Tracker...")
-    try:
-        run_vault_roi_tracker()
-    except Exception as e:
-        print(f"❌ Error in run_vault_roi_tracker: {e}")
+    print("📈 Writing daily snapshot to Vault ROI Tracker…")
+    safe_call("Vault ROI tracker", run_vault_roi_tracker, sleep_after=3)
 
-    time.sleep(5)
-    print("📬 Running Vault Review Alerts...")
-    try:
-        run_vault_review_alerts()
-    except Exception as e:
-        print(f"❌ Error in run_vault_review_alerts: {e}")
+    print("📬 Vault Review Alerts…")
+    safe_call("Vault review alerts", run_vault_review_alerts, sleep_after=3)
 
-    print("🔁 Scanning vaults for decay...")
-    try:
-        run_vault_rotation_scanner()
-    except Exception as e:
-        print(f"❌ Error in run_vault_rotation_scanner: {e}")
+    print("🔁 Scanning vaults for decay…")
+    safe_call("Vault rotation scanner", run_vault_rotation_scanner, sleep_after=3)
 
-# ✅ Conditionally run Binance executor if allowed
-if os.getenv("ENABLE_CLOUD_BINANCE", "false").lower() == "true":
-    try:
-        from rotation_binance_executor import run_rotation_binance_executor
-        run_rotation_binance_executor()
-    except Exception as e:
-        print(f"⚠️ Skipping Binance executor: {e}")
-else:
-    print("⚠️ Binance executor skipped (ENABLE_CLOUD_BINANCE is false)")
-    print("📋 Running Auto-Confirm Planner...")
-    run_auto_confirm_planner()
-    print("✅ Auto-confirm check complete.")
-    evaluate_vault_memory()
-    run_vault_memory_importer()
-    
-    time.sleep(10)
-    run_unlock_horizon_alerts()
-    print("💥 run_presale_scorer() BOOTED")
-    send_telegram_message("🟢 NovaTrade system booted and live.")
-    print("🧠 NovaTrade system is live.")
+    # Binance executor: opt-in
+    if os.getenv("ENABLE_CLOUD_BINANCE", "false").lower() == "true":
+        try:
+            from rotation_binance_executor import run_rotation_binance_executor
+            safe_call("Binance executor", run_rotation_binance_executor)
+        except Exception as e:
+            print(f"⚠️ Skipping Binance executor: {e}")
+    else:
+        print("⚠️ Binance executor skipped (ENABLE_CLOUD_BINANCE is false)")
+        print("📋 Auto‑Confirm Planner…")
+        safe_call("Auto‑confirm planner", run_auto_confirm_planner)
+        safe_call("Vault memory evaluate", evaluate_vault_memory)
+        safe_call("Vault memory importer", run_vault_memory_importer)
 
+        time.sleep(3)
+        safe_call("Unlock horizon alerts", run_unlock_horizon_alerts)
 
-
-import os
-from telegram_webhook import telegram_app, set_telegram_webhook
-from nova_watchdog import run_watchdog
-
-if __name__ == "__main__":
-    print("📡 Orion Cloud Boot Sequence Initiated")
-    set_telegram_webhook()
-    run_watchdog()
-    port = int(os.getenv("PORT", "10000"))
-    telegram_app.run(host="0.0.0.0", port=port)
-
+        print("💥 run_presale_scorer() BOOTED")
+        safe_call("Boot notice", send_telegram_message, "🟢 NovaTrade system booted and live.")
+        print("🧠 NovaTrade system is live.")
