@@ -60,7 +60,18 @@ from vault_rotation_gatekeeper import gate_vault_rotation
 from total_memory_score_sync import sync_total_memory_score
 from vault_memory_evaluator import evaluate_vault_memory
 from vault_memory_importer import run_vault_memory_importer
+import hashlib, json
 
+def send_boot_notice_once():
+    """Send 'booted & live' only once per deploy/instance."""
+    flag = "/tmp/nova_boot_notice_sent"
+    if os.path.exists(flag):
+        print("ℹ️ Boot notice already sent on this instance; skipping.")
+        return
+    send_telegram_message("🟢 NovaTrade system booted and live.")
+    open(flag, "w").write(str(time.time()))
+    print("✅ Boot notice sent (one‑time).")
+    
 # ===== Helpers =====
 def safe_call(label, fn, *args, sleep_after=0, **kwargs):
     try:
@@ -282,7 +293,7 @@ if __name__ == "__main__":
 
         time.sleep(3)
         safe_call("Unlock horizon alerts", run_unlock_horizon_alerts)
-
+        
         print("💥 run_presale_scorer() BOOTED")
-        safe_call("Boot notice", send_telegram_message, "🟢 NovaTrade system booted and live.")
+        send_boot_notice_once()
         print("🧠 NovaTrade system is live.")
