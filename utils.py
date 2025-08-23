@@ -244,20 +244,23 @@ def detect_stalled_tokens(*args, **kwargs):
     """Return a list of stalled tokens; stubbed to empty to keep watchdog non-blocking."""
     return []
 
+# utils.py
+import time
+from functools import wraps
+
 def with_sheet_backoff(fn):
     @wraps(fn)
     def _inner(*a, **k):
-        for i in range(4):  # up to ~1m total
+        delays = [2, 5, 15, 40]  # ~1m total
+        for i, d in enumerate(delays):
             try:
                 return fn(*a, **k)
             except Exception as e:
-                msg = str(e)
-                if "quota" in msg.lower() or "429" in msg:
-                    sleep_s = [2, 5, 15, 40][i]
-                    print(f"⏳ Sheets 429/backoff ({sleep_s}s) in {fn.__name__}: {e}")
-                    time.sleep(sleep_s)
+                msg = str(e).lower()
+                if "quota" in msg or "429" in msg:
+                    print(f"⏳ Sheets 429/backoff ({d}s) in {fn.__name__}: {e}")
+                    time.sleep(d)
                 else:
                     raise
-        # last attempt if still failing
         return fn(*a, **k)
     return _inner
