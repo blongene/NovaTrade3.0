@@ -299,3 +299,42 @@ def safe_float(value, default=0.0):
 def detect_stalled_tokens(*args, **kwargs):
     """Return a list of stalled tokens; stubbed to empty to keep watchdog non-blocking."""
     return []
+
+# --- Boot announce gate ------------------------------------------------------
+import os, json, time, pathlib
+
+_BOOT_FLAG_FILE = "/tmp/nova_boot.flag"  # reset on container restart
+
+def _write_boot_flag():
+    try:
+        pathlib.Path(_BOOT_FLAG_FILE).write_text(str(int(time.time())))
+    except Exception:
+        pass
+
+def _read_boot_flag_ts():
+    try:
+        return int(pathlib.Path(_BOOT_FLAG_FILE).read_text().strip())
+    except Exception:
+        return 0
+
+def is_boot_announced(cooldown_min:int = 120) -> bool:
+    """
+    Returns True if we've already announced this boot (or if the last
+    announce was within `cooldown_min` minutes). Uses /tmp flag so no
+    Sheets calls needed; also mirrors to Webhook_Debug as FYI if available.
+    """
+    ts = _read_boot_flag_ts()
+    if ts and (time.time() - ts) < cooldown_min * 60:
+        return True
+    return False
+
+def mark_boot_announced() -> None:
+    _write_boot_flag()
+    # Best‑effort FYI in the sheet (non‑blocking)
+    try:
+        sh = get_sheet()
+        sh.worksheet("Webhook_Debug").append_row(
+            [datetime.now().isoformat(), "Boot notice sent"], value_input_option="RAW"
+        )
+    except Exception:
+        pass
