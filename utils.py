@@ -239,3 +239,7 @@ def safe_float(value, default=0.0):
     except Exception as e:
         print(f"⚠️ Failed Webhook_Debug ping: {e}")
 
+# --- compatibility stub to avoid boot crash ---
+def detect_stalled_tokens(*args, **kwargs):
+    """Return a list of stalled tokens; stubbed to empty to keep watchdog non-blocking."""
+    return []
