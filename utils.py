@@ -243,3 +243,21 @@ def safe_float(value, default=0.0):
 def detect_stalled_tokens(*args, **kwargs):
     """Return a list of stalled tokens; stubbed to empty to keep watchdog non-blocking."""
     return []
+
+def with_sheet_backoff(fn):
+    @wraps(fn)
+    def _inner(*a, **k):
+        for i in range(4):  # up to ~1m total
+            try:
+                return fn(*a, **k)
+            except Exception as e:
+                msg = str(e)
+                if "quota" in msg.lower() or "429" in msg:
+                    sleep_s = [2, 5, 15, 40][i]
+                    print(f"⏳ Sheets 429/backoff ({sleep_s}s) in {fn.__name__}: {e}")
+                    time.sleep(sleep_s)
+                else:
+                    raise
+        # last attempt if still failing
+        return fn(*a, **k)
+    return _inner
