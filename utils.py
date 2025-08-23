@@ -3,9 +3,29 @@ import gspread
 import requests
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
-import time
 import random
+
+# === Google Sheets quota backoff (429-safe) ===
+import time
 from functools import wraps
+
+def with_sheet_backoff(fn):
+    @wraps(fn)
+    def _inner(*a, **k):
+        delays = [2, 5, 15, 40]  # ~1 minute total
+        for d in delays:
+            try:
+                return fn(*a, **k)
+            except Exception as e:
+                msg = str(e).lower()
+                if "quota" in msg or "429" in msg or "rate limit" in msg:
+                    print(f"⏳ Sheets 429/backoff ({d}s) in {fn.__name__}: {e}")
+                    time.sleep(d)
+                else:
+                    raise
+        # final attempt (let error bubble if it still fails)
+        return fn(*a, **k)
+    return _inner
 
 def throttle_retry(max_retries=3, delay=2, jitter=1):
     def decorator(func):
@@ -243,24 +263,3 @@ def safe_float(value, default=0.0):
 def detect_stalled_tokens(*args, **kwargs):
     """Return a list of stalled tokens; stubbed to empty to keep watchdog non-blocking."""
     return []
-
-# utils.py
-import time
-from functools import wraps
-
-def with_sheet_backoff(fn):
-    @wraps(fn)
-    def _inner(*a, **k):
-        delays = [2, 5, 15, 40]  # ~1m total
-        for i, d in enumerate(delays):
-            try:
-                return fn(*a, **k)
-            except Exception as e:
-                msg = str(e).lower()
-                if "quota" in msg or "429" in msg:
-                    print(f"⏳ Sheets 429/backoff ({d}s) in {fn.__name__}: {e}")
-                    time.sleep(d)
-                else:
-                    raise
-        return fn(*a, **k)
-    return _inner
