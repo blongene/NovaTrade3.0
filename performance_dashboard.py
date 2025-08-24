@@ -12,6 +12,17 @@ def _read_rotation_stats(ws):
 def _read_planner(ws):
     return ws.get_all_records()
 
+def to_float_or_none(v):
+    try:
+        return float(str(v).replace('%','').strip())
+    except:
+        return None
+
+# later when iterating rows:
+roi = to_float_or_none(row.get("Follow-up ROI"))
+if roi is None:
+    continue  # skip non-numeric like 'N/A' or '0d since vote'
+
 def run_performance_dashboard():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
