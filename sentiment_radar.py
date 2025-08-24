@@ -1,111 +1,139 @@
-# sentiment_radar.py
-import os, time, requests, gspread
-from datetime import datetime
+import os
+import time
+import json
+import requests
+import gspread
+from datetime import datetime, timezone
 from oauth2client.service_account import ServiceAccountCredentials
-from utils import with_sheet_backoff
+from utils import with_sheet_backoff, send_telegram_message
 
-# === CONFIG ===
-SHEET_URL = os.getenv("SHEET_URL")
+# ===== Toggles =====
+ENABLE_REDDIT = False  # placeholder
+ENABLE_TWITTER = True
 YOUTUBE_ENABLED = os.getenv("YOUTUBE_ENABLED", "false").lower() == "true"
-TW_COOLDOWN_MIN = int(os.getenv("TW_COOLDOWN_MIN", "30"))
-TW_MAX_RESULTS  = int(os.getenv("TW_MAX_RESULTS", "10"))
-TW_BEARER       = os.getenv("TWITTER_BEARER_TOKEN")
-YT_KEY          = os.getenv("YOUTUBE_API_KEY")
 
-_last_tw_fail = 0.0
+# Local daily cooldown file for YouTube (resets each UTC midnight)
+_YT_COOLDOWN_FILE = "/tmp/nova_yt_quota.block"
 
-# === GSpread helpers ===
-def _gs_client():
+def _utc_ymd():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _yt_cooldown_active() -> bool:
+    try:
+        if not os.path.exists(_YT_COOLDOWN_FILE):
+            return False
+        stamp = open(_YT_COOLDOWN_FILE, "r").read().strip()
+        return stamp == _utc_ymd()
+    except Exception:
+        return False
+
+def _arm_yt_cooldown():
+    try:
+        with open(_YT_COOLDOWN_FILE, "w") as f:
+            f.write(_utc_ymd())
+    except Exception:
+        pass
+
+def _gclient():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
     return gspread.authorize(creds)
 
 @with_sheet_backoff
-def _open_ws(url, tab):
-    sh = _gs_client().open_by_url(url)
-    return sh.worksheet(tab)
+def _open_ws(sheet_url: str, title: str):
+    sh = _gclient().open_by_url(sheet_url)
+    return sh.worksheet(title)
 
-@with_sheet_backoff
-def _append_rows(ws, rows):
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
-
-@with_sheet_backoff
-def _get_records(ws):
-    return ws.get_all_records()
-
-# === Providers ===
-def fetch_twitter_mentions(token: str) -> int:
-    global _last_tw_fail
-    if not TW_BEARER:
-        print("⚠️ Twitter bearer missing; skipping.")
-        return 0
-    if time.time() - _last_tw_fail < TW_COOLDOWN_MIN * 60:
-        print("🐦 Twitter on cooldown.")
-        return 0
+def _safe_int(x, default=0):
     try:
-        headers = {"Authorization": f"Bearer {TW_BEARER}"}
-        query = f"{token} -is:retweet lang:en"
-        url = f"https://api.twitter.com/2/tweets/search/recent?query={query}&max_results={TW_MAX_RESULTS}"
+        return int(x)
+    except Exception:
+        return default
+
+def fetch_twitter_mentions(token: str) -> int:
+    try:
+        if not ENABLE_TWITTER:
+            return 0
+        bearer = os.getenv("TWITTER_BEARER_TOKEN")
+        if not bearer:
+            return 0
+        headers = {"Authorization": f"Bearer {bearer}"}
+        q = f"{token} -is:retweet lang:en"
+        url = f"https://api.twitter.com/2/tweets/search/recent?query={q}&max_results=10"
         r = requests.get(url, headers=headers, timeout=12)
         if r.status_code == 429:
+            # enter a soft cooldown — just return 0, keep logs quiet
             print("⚠️ Twitter 429; entering cooldown.")
-            _last_tw_fail = time.time()
             return 0
         if r.status_code != 200:
-            print(f"⚠️ Twitter error {r.status_code}: {r.text[:120]}")
             return 0
         data = r.json()
         return len(data.get("data", []))
-    except Exception as e:
-        print(f"⚠️ Twitter exception: {e}")
-        _last_tw_fail = time.time()
+    except Exception:
         return 0
 
 def fetch_youtube_mentions(token: str) -> int:
-    if not YOUTUBE_ENABLED:
-        # hard-off by default to avoid quota noise
+    # Hard silence for the rest of the UTC day after a quotaExceeded once
+    if not YOUTUBE_ENABLED or _yt_cooldown_active():
         return 0
     try:
-        from googleapiclient.discovery import build
-        yt = build("youtube", "v3", developerKey=YT_KEY)
-        req = yt.search().list(q=token, part="snippet", maxResults=3, type="video")
-        res = req.execute()
-        return len(res.get("items", []))
-    except Exception as e:
-        print(f"⚠️ YouTube error for '{token}': {e}")
+        # Lightweight search via Data API v3
+        api_key = os.getenv("YOUTUBE_API_KEY")
+        if not api_key:
+            return 0
+        url = (
+            "https://www.googleapis.com/youtube/v3/search"
+            f"?key={api_key}&part=snippet&type=video&maxResults=3&q={requests.utils.quote(token)}"
+        )
+        r = requests.get(url, timeout=12)
+        if r.status_code == 403 and "quota" in r.text.lower():
+            # Arm daily block and stop spamming logs
+            _arm_yt_cooldown()
+            print("⛔️ YouTube quota exceeded — silenced until next UTC day.")
+            return 0
+        if r.status_code != 200:
+            return 0
+        data = r.json()
+        return _safe_int(len(data.get("items", [])))
+    except Exception:
         return 0
 
-# === Main ===
 def run_sentiment_radar():
     print("📡 Running Sentiment Radar...")
-    radar_ws = _open_ws(SHEET_URL, "Sentiment_Radar")
-    targets_ws = _open_ws(SHEET_URL, "Sentiment_Targets")
+    sheet_url = os.getenv("SHEET_URL")
+    targets_ws = _open_ws(sheet_url, "Sentiment_Targets")
+    radar_ws = _open_ws(sheet_url, "Sentiment_Radar")
 
-    targets = _get_records(targets_ws)
-    # take top 3 by 'Priority' if present
-    try:
-        top = sorted(targets, key=lambda x: x.get("Priority", 0), reverse=True)[:3]
-    except Exception:
-        top = targets[:3]
+    targets = targets_ws.get_all_records()
+    # Pick top 3 by Priority
+    top = sorted(targets, key=lambda x: _safe_int(x.get("Priority", 0)), reverse=True)[:3]
 
-    entries = []
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
     for row in top:
         token = (row.get("Token") or "").strip()
         if not token:
             continue
-        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-        yt = fetch_youtube_mentions(token)
-        if yt:
-            print(f"📺 YouTube: {token} → {yt}")
-            entries.append([ts, token, "YouTube", yt])
+        # YouTube (silenced if quota hit earlier today)
+        if YOUTUBE_ENABLED and not _yt_cooldown_active():
+            yt = fetch_youtube_mentions(token)
+            rows.append([now, token, "YouTube", yt])
 
-        tw = fetch_twitter_mentions(token)
-        print(f"🐦 Twitter: {token} → {tw}")
-        entries.append([ts, token, "Twitter", tw])
+        # Twitter
+        if ENABLE_TWITTER:
+            tw = fetch_twitter_mentions(token)
+            rows.append([now, token, "Twitter", tw])
 
-    if entries:
-        _append_rows(radar_ws, entries)
-        print(f"✅ Sentiment Radar logged {len(entries)} entries.")
+        # Reddit stub
+        if ENABLE_REDDIT:
+            rows.append([now, token, "Reddit", 0])
+
+    if rows:
+        @with_sheet_backoff
+        def _append():
+            radar_ws.append_rows(rows, value_input_option="USER_ENTERED")
+        _append()
+        print(f"✅ Sentiment Radar logged {len(rows)} entries.")
     else:
-        print("⚠️ No sentiment entries written.")
+        print("⚠️ No sentiment entries written (sources disabled or cooled down).")
