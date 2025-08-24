@@ -1,88 +1,98 @@
 import os
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+from oauth2client.service_account import ServiceAccountCredentials
 from utils import with_sheet_backoff
 
-def _gclient():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    return gspread.authorize(creds)
+DEBUG = os.getenv("DEBUG", "0") == "1"
+def _log(msg: str): 
+    if DEBUG: 
+        print(msg)
 
 @with_sheet_backoff
-def _open_ws(sheet_url: str, title: str):
-    sh = _gclient().open_by_url(sheet_url)
-    return sh.worksheet(title)
+def _get_all_records(ws):
+    return ws.get_all_records()
 
-def _to_float(v, default=None):
+@with_sheet_backoff
+def _get_value(ws, a1):
+    return ws.acell(a1).value
+
+@with_sheet_backoff
+def _update_range(ws, a1, rows):
+    return ws.update(a1, rows, value_input_option="USER_ENTERED")
+
+def _to_float(value, default=None):
     try:
-        s = str(v).strip().replace("%", "")
-        if s == "" or s.lower() in {"n/a", "na", "none"}:
-            return default
+        s = str(value).strip().replace("%", "")
         return float(s)
     except Exception:
         return default
 
 def run_performance_dashboard():
-    sheet_url = os.getenv("SHEET_URL")
-    stats_ws = _open_ws(sheet_url, "Rotation_Stats")
-    dash_ws  = _open_ws(sheet_url, "Performance_Dashboard")
+    """
+    Reads Rotation_Stats (low calls), computes summary,
+    and writes a compact block to Performance_Dashboard!A2:B9.
+    All operations are wrapped with Sheets backoff.
+    """
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
-    # Pull as records once (cheaper than multiple calls)
-    @with_sheet_backoff
-    def _stats():
-        return stats_ws.get_all_records()
-    stats = _stats()
+    stats_ws = sheet.worksheet("Rotation_Stats")
+    dash_ws  = sheet.worksheet("Performance_Dashboard")
 
-    # Totals / aggregates
+    # single read of records
+    stats = _get_all_records(stats_ws)
+    _log(f"stats rows: {len(stats)}")
+
+    # collect ROI from column "Performance" or "Follow-up ROI"/"ROI" fallbacks
+    roi_vals = []
+    token_rois = {}
     total_yes = 0
-    roi_values = []
-    per_token = {}
 
     for row in stats:
-        # Defensive header access
-        decision = (row.get("Decision") or "").strip().upper()
-        token    = (row.get("Token") or "").strip()
-        perf     = row.get("Performance", "")
-
+        decision = (row.get("Decision", "") or "").strip().upper()
         if decision == "YES":
             total_yes += 1
 
-        val = _to_float(perf)
-        if val is not None and token:
-            roi_values.append(val)
-            per_token[token] = val
+        perf = row.get("Performance", "")
+        if perf in (None, ""):
+            # fallbacks commonly seen in earlier sheets
+            perf = row.get("Follow-up ROI", row.get("ROI", ""))
 
-    avg_roi = round(sum(roi_values) / len(roi_values), 2) if roi_values else 0.0
-    top_token = max(per_token, key=per_token.get, default="N/A")
-    bottom_token = min(per_token, key=per_token.get, default="N/A")
-    unique_rotated = len(per_token)
+        roi = _to_float(perf)
+        if roi is not None:
+            token = (row.get("Token", "") or "").strip()
+            roi_vals.append(roi)
+            if token:
+                token_rois[token] = roi
 
-    # Low‑quota heartbeat grab: only A2
+    avg_roi = round(sum(roi_vals) / len(roi_vals), 2) if roi_vals else 0.0
+    top_token = max(token_rois, key=token_rois.get, default="N/A")
+    bottom_token = min(token_rois, key=token_rois.get, default="N/A")
+
+    # Low‑quota heartbeat: one cell read only
     try:
-        @with_sheet_backoff
-        def _hb():
-            hb_ws = _open_ws(sheet_url, "NovaHeartbeat")
-            return hb_ws.acell("A2").value
-        last_update = _hb() or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        last_update_val = _get_value(sheet.worksheet("NovaHeartbeat"), "A2")
+        last_update = last_update_val or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         last_update = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Write in a single batch update (A2:B9 area expected by your layout)
-    values = [
+    # Static placeholders you can wire later
+    projected_value = "$5,000.00"
+    progress_to_goal = "2.0%"
+    unique_tokens = len(set(k for k in token_rois.keys() if k))
+
+    rows = [
         ["Total YES Votes", total_yes],
         ["Average ROI (YES)", f"{avg_roi}%"],
         ["Top Performer", top_token],
         ["Worst Performer", bottom_token],
-        ["Projected Portfolio Value", "$5,000.00"],   # placeholder you can wire later
-        ["% Progress to $250K Goal", "2.0%"],         # placeholder you can wire later
-        ["Unique Tokens Rotated", unique_rotated],
+        ["Projected Portfolio Value", projected_value],
+        ["% Progress to $250K Goal", progress_to_goal],
+        ["Unique Tokens Rotated", unique_tokens],
         ["Last Updated", last_update],
     ]
-
-    @with_sheet_backoff
-    def _update():
-        dash_ws.update("A2:B9", values, value_input_option="USER_ENTERED")
-    _update()
-
-    print("✅ Performance Dashboard updated.")
+    _update_range(dash_ws, "A2:B9", rows)
+    _log("performance_dashboard: update complete")
