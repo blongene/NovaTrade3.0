@@ -1,6 +1,7 @@
 import os, time, threading, schedule, gspread
 from flask import Flask
 from oauth2client.service_account import ServiceAccountCredentials
+from utils import send_boot_notice_once, send_system_online_once, send_telegram_message_dedup
 
 # Telegram webhook / Flask app
 from telegram_webhook import telegram_app, set_telegram_webhook
@@ -41,7 +42,7 @@ from vault_alerts_phase15d import run_vault_alerts
 from vault_growth_sync import run_vault_growth_sync
 from vault_roi_tracker import run_vault_roi_tracker
 from vault_review_alerts import run_vault_review_alerts
-from utils import get_gspread_client, send_telegram_message
+from utils import get_gspread_client
 from vault_rotation_scanner import run_vault_rotation_scanner
 from vault_rotation_executor import run_vault_rotation_executor
 from wallet_monitor import run_wallet_monitor
@@ -62,15 +63,10 @@ from vault_memory_evaluator import evaluate_vault_memory
 from vault_memory_importer import run_vault_memory_importer
 import hashlib, json
 
-def send_boot_notice_once():
-    """Send 'booted & live' only once per deploy/instance."""
-    flag = "/tmp/nova_boot_notice_sent"
-    if os.path.exists(flag):
-        print("ℹ️ Boot notice already sent on this instance; skipping.")
-        return
-    send_telegram_message("🟢 NovaTrade system booted and live.")
-    open(flag, "w").write(str(time.time()))
-    print("✅ Boot notice sent (one‑time).")
+# one-time boot announce (per container boot)
+send_boot_notice_once("🟢 NovaTrade system booted and live.")  # replaces send_telegram_message(...)
+# optional: also one-time "system online"
+send_system_online_once()
     
 # ===== Helpers =====
 def safe_call(label, fn, *args, sleep_after=0, **kwargs):
