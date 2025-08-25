@@ -447,3 +447,87 @@ def safe_float(value, default=0.0):
 def detect_stalled_tokens(*args, **kwargs):
     """Return a list of stalled tokens; stubbed to empty to keep watchdog non-blocking."""
     return []
+    
+# === Sheets global gate + TTL caching + batch helpers ========================
+import threading
+
+# Single-file global concurrency gate for Sheets (default 1: fully serialized)
+_SHEETS_MAX_CONCURRENCY = int(os.getenv("SHEETS_MAX_CONCURRENCY", "1"))
+_SHEETS_GATE = threading.BoundedSemaphore(value=max(1, _SHEETS_MAX_CONCURRENCY))
+
+def with_sheets_gate(fn):
+    @wraps(fn)
+    def _inner(*a, **k):
+        with _SHEETS_GATE:
+            return fn(*a, **k)
+    return _inner
+
+# In‑memory TTL cache: {("values", sheet_name): {"ts": epoch, "data": ...}, ...}
+_SHEETS_CACHE = {}
+def _cache_get(kind: str, key: str, ttl_s: int):
+    now = time.time()
+    entry = _SHEETS_CACHE.get((kind, key))
+    if entry and (now - entry["ts"]) < ttl_s:
+        return entry["data"]
+    return None
+
+def _cache_put(kind: str, key: str, data):
+    _SHEETS_CACHE[(kind, key)] = {"ts": time.time(), "data": data}
+
+@with_sheets_gate
+@with_sheet_backoff
+def _open_ws(sheet_name: str):
+    sh = _open_sheet()
+    return sh.worksheet(sheet_name)
+
+def get_ws(sheet_name: str):
+    """Worksheet object (NOT cached by API call count, but guarded+backed off)."""
+    return _open_ws(sheet_name)
+
+def get_values_cached(sheet_name: str, ttl_s: int = 120):
+    """
+    Cached 'get_all_values' for a worksheet. Multiple modules in the same
+    run will reuse the same payload (dramatically reduces reads).
+    """
+    cached = _cache_get("values", sheet_name, ttl_s)
+    if cached is not None:
+        return cached
+    ws = get_ws(sheet_name)
+    vals = _ws_get_all_values(ws)  # already gate+backoff
+    _cache_put("values", sheet_name, vals)
+    return vals
+
+def get_records_cached(sheet_name: str, ttl_s: int = 120):
+    """
+    Cached 'get_all_records' for a worksheet.
+    """
+    cached = _cache_get("records", sheet_name, ttl_s)
+    if cached is not None:
+        return cached
+    ws = get_ws(sheet_name)
+    recs = _ws_get_all_records(ws)  # already gate+backoff
+    _cache_put("records", sheet_name, recs)
+    return recs
+
+# Batch update helpers (coalesce writes)
+@with_sheets_gate
+@with_sheet_backoff
+def ws_batch_update(ws, updates):
+    """
+    updates = [
+      {"range": "A2", "values": [[val1, val2, ...]]},
+      {"range": "C5:D5", "values": [[x, y]]},
+      ...
+    ]
+    """
+    if not updates:
+        return None
+    # gspread expects a list of {range, values}
+    return ws.batch_update(updates, value_input_option="USER_ENTERED")
+
+def batch_update_cells(sheet_name: str, updates):
+    """
+    Convenience to get ws + call ws_batch_update.
+    """
+    ws = get_ws(sheet_name)
+    return ws_batch_update(ws, updates)
