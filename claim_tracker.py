@@ -3,6 +3,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import os
 import time
+from utils import get_records_cached
 
 def check_claims():
     try:
@@ -14,8 +15,8 @@ def check_claims():
         tracker_ws = sheet.worksheet("Claim_Tracker")
         log_ws = sheet.worksheet("Rotation_Log")
 
-        rows = tracker_ws.get_all_records()
-        log_data = log_ws.get_all_records()
+        rows = tracker_ws.get_records_cached()
+        log_data = log_ws.get_records_cached()
         headers = log_ws.row_values(1)
         backend_col = headers.index("Backend Status") + 1  # 1-indexed
 
@@ -71,7 +72,7 @@ def check_claims():
                         now.strftime("%Y-%m-%d %H:%M:%S"),  # Last Checked
                     ]
                     log_ws.append_row(new_row)
-                    log_data = log_ws.get_all_records()  # Refresh to include the new row
+                    log_data = log_ws.get_records_cached()  # Refresh to include the new row
 
             # ✅ Fixed column update (Backend Status)
             for j, log_row in enumerate(log_data, start=2):
