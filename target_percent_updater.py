@@ -12,7 +12,7 @@ def run_target_percent_updater():
         client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
         ws = sheet.worksheet("Portfolio_Targets")
-        rows = get_records_cached("Some_Tab", ttl_s=180)  # 3‑minute cache
+        rows = get_records_cached("Portfolio_Targets", ttl_s=180)  # 3‑minute cache
         updated = 0
 
         for i, row in enumerate(rows, start=2):
