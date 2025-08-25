@@ -1,7 +1,7 @@
 # telegram_summaries.py
 import os
 from datetime import datetime
-from utils import with_sheet_backoff, get_gspread_client, send_telegram_message, ping_webhook_debug
+from utils import with_sheet_backoff, get_gspread_client, send_telegram_message, ping_webhook_debug, send_once_per_day
 
 SHEET_URL = os.getenv("SHEET_URL")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -112,3 +112,5 @@ def run_telegram_summary():
     except Exception as e:
         print(f"❌ telegram summary error: {e}")
         ping_webhook_debug(f"telegram_summaries error: {e}")
+
+send_once_per_day("daily_summary", summary_message_html)
