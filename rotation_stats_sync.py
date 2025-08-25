@@ -5,15 +5,15 @@ import gspread
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 import re
-from utils import with_sheet_backoff
+from utils import with_sheet_backoff, get_records_cached, get_values_cached
 
 @with_sheet_backoff
 def _read_rotation_stats(ws):
-    return ws.get_all_values()
+    return ws.get_values_cached()
 
 @with_sheet_backoff
 def _read_planner(ws):
-    return ws.get_all_records()
+    return ws.get_records_cached()
 
 def run_rotation_stats_sync():
     print("📊 Syncing Rotation_Stats...")
@@ -28,8 +28,8 @@ def run_rotation_stats_sync():
         log_ws = sheet.worksheet("Rotation_Log")
         stats_ws = sheet.worksheet("Rotation_Stats")
 
-        log_data = log_ws.get_all_records()
-        stats_data = stats_ws.get_all_records()
+        log_data = log_ws.get_records_cached()
+        stats_data = stats_ws.get_records_cached()
         headers = stats_ws.row_values(1)
 
         # === Column Positions ===
