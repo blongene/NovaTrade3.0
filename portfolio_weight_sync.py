@@ -1,6 +1,7 @@
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
+from utils import get_records_cached
 
 def run_portfolio_weight_sync():
     print("🔁 Syncing Suggested Target Weights to Portfolio Targets...")
@@ -12,7 +13,7 @@ def run_portfolio_weight_sync():
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
         ws = sheet.worksheet("Portfolio_Targets")
 
-        rows = ws.get_all_records()
+        rows = get_records_cached("Some_Tab", ttl_s=180)  # 3‑minute cache
         updated = 0
 
         for i, row in enumerate(rows, start=2):
