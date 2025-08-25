@@ -5,6 +5,7 @@ import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from utils import throttle_retry
+from utils import get_records_cached
 
 @throttle_retry()
 def run_vault_to_stats_sync():
@@ -20,8 +21,8 @@ def run_vault_to_stats_sync():
         vault_ws = sheet.worksheet("Token_Vault")
         stats_ws = sheet.worksheet("Rotation_Stats")
 
-        vault_data = vault_ws.get_all_records()
-        stats_data = stats_ws.get_all_records()
+        vault_data = vault_ws.get_records_cached()
+        stats_data = stats_ws.get_records_cached()
 
         vault_dict = {row["Token"].strip().upper(): str(row.get("Vault Tag", "")).strip() for row in vault_data if row.get("Token")}
         headers = stats_ws.row_values(1)
