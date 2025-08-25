@@ -3,7 +3,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import os
 from send_telegram import send_rotation_alert
-
+from utils import get_records_cached
 
 def run_milestone_alerts():
     print("🚀 Running Milestone Alerts...")
@@ -16,7 +16,7 @@ def run_milestone_alerts():
 
     log_ws = sheet.worksheet("Rotation_Log")
     review_ws = sheet.worksheet("ROI_Review_Log")
-    rows = log_ws.get_all_records()
+    rows = get_records_cached("Some_Tab", ttl_s=180)  # 3‑minute cache
 
     milestone_days = [3, 7, 14, 30]
     today = datetime.utcnow()
