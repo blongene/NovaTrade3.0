@@ -28,8 +28,8 @@ def run_rotation_stats_sync():
         log_ws = sheet.worksheet("Rotation_Log")
         stats_ws = sheet.worksheet("Rotation_Stats")
 
-        log_data = log_ws.get_records_cached()
-        stats_data = stats_ws.get_records_cached()
+        log_data = log_ws.get_records_cached("Rotation_Log", ttl_s=180)  # 3‑minute cache
+        stats_data = stats_ws.get_records_cached("Rotation_Stats", ttl_s=180)  # 3‑minute cache
         headers = stats_ws.row_values(1)
 
         # === Column Positions ===
