@@ -1,91 +1,79 @@
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from utils import with_sheet_backoff, send_telegram_message_dedup
 
-DEBUG = os.getenv("DEBUG", "0") == "1"
-def _log(msg: str):
-    if DEBUG:
-        print(msg)
+from utils import with_sheet_backoff, get_sheet, safe_float, send_telegram_message_dedup
 
+# ---------- sheet helpers ----------
 @with_sheet_backoff
 def _ws_get_all_records(ws):
     return ws.get_all_records()
 
 @with_sheet_backoff
-def _ws_update_acell(ws, a1, v):
-    return ws.update_acell(a1, v)
+def _ws_update_range(ws, a1_range, values_2d):
+    ws.update(a1_range, values_2d, value_input_option="USER_ENTERED")
 
 @with_sheet_backoff
-def _ws_batch_update(ws, updates):
-    """
-    updates: list of (a1, value) to write; we coalesce into a single request.
-    """
-    data = [{"range": a1, "values": [[value]]} for a1, value in updates]
-    return ws.spreadsheet.values_batch_update(
-        ws.spreadsheet.id,
-        body={"valueInputOption": "USER_ENTERED", "data": data}
-    )
+def _ws_update_acell(ws, a1, v):
+    ws.update_acell(a1, v)
 
-def _to_float(v, default=0.0):
+def _fmt_pct(x):
     try:
-        return float(str(v).strip().replace("%", ""))
+        return f"{float(x):g}%"
     except Exception:
-        return default
+        return str(x)
 
 def run_rebalance_scanner():
-    """
-    Scans Portfolio_Targets for drift and updates 'Drift Status' (col H).
-    Sends ONE de‑duplicated Telegram alert if any drift is found.
-    Quiet logs unless DEBUG=1.
-    """
-    _log("rebalance_scanner: start")
+    print("🔁 Running Rebalance Scanner...")
 
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_url(os.getenv("SHEET_URL"))
-    ws = sheet.worksheet("Portfolio_Targets")
+    try:
+        sh = get_sheet()
+        ws = sh.worksheet("Portfolio_Targets")
 
-    rows = _ws_get_all_records(ws)
+        records = _ws_get_all_records(ws)  # single read
+        if not records:
+            print("ℹ️ Portfolio_Targets empty; nothing to scan.")
+            return
 
-    drift_alerts = []
-    batch_updates = []  # list of (a1, value)
+        # column H = Drift Status (assumed by your sheet)
+        start_row = 2
+        end_row = start_row + len(records) - 1
+        drift_col = "H"
+        out_rows = []        # for batch write
+        drift_alerts = []    # for Telegram
 
-    # Determine column H row A1 target for each record (header is on row 1)
-    for idx, row in enumerate(rows, start=2):
-        token = (row.get("Token", "") or "").strip()
-        target = _to_float(row.get("Target %", 0))
-        min_pct = _to_float(row.get("Min %", 0))
-        max_pct = _to_float(row.get("Max %", 100))
-        current = _to_float(row.get("Current %", 0))
+        for i, row in enumerate(records, start=start_row):
+            token  = (row.get("Token") or "").strip()
+            target = safe_float(row.get("Target %"), 0.0)
+            min_p  = safe_float(row.get("Min %"), 0.0)
+            max_p  = safe_float(row.get("Max %"), 100.0)
+            curr   = safe_float(row.get("Current %"), 0.0)
 
-        status = "On target"
-        if current < min_pct:
-            status = "Undersized"
-            drift_alerts.append(f"🔽 {token}: {current}% (Target {target}%)")
-        elif current > max_pct:
-            status = "Overweight"
-            drift_alerts.append(f"🔼 {token}: {current}% (Target {target}%)")
+            status = "On target"
+            if curr < min_p:
+                status = "Undersized"
+                drift_alerts.append(f"🔽 {token}: {curr}% (Target {target}%)")
+            elif curr > max_p:
+                status = "Overweight"
+                drift_alerts.append(f"🔼 {token}: {curr}% (Target {target}%)")
 
-        a1 = f"H{idx}"  # Drift Status column
-        batch_updates.append((a1, status))
+            out_rows.append([status])
 
-    # batch write drift statuses (single API call)
-    if batch_updates:
-        try:
-            _ws_batch_update(ws, batch_updates)
-        except AttributeError:
-            # Fallback for older gspread; do per‑cell with backoff as last resort
-            for a1, v in batch_updates:
-                _ws_update_acell(ws, a1, v)
+        # single batch write for H2:H{end}
+        rng = f"{drift_col}{start_row}:{drift_col}{end_row}"
+        _ws_update_range(ws, rng, out_rows)
 
-    if drift_alerts:
-        text = "📊 <b>Portfolio Drift Detected</b>\n\n" + "\n".join(drift_alerts) + "\n\nReply YES to rebalance or SKIP to ignore."
-        # de‑dupe key keeps spam away if the scanner runs frequently
-        send_telegram_message_dedup(text, key="rebalance_alerts", ttl_min=30)
-        _log("rebalance_scanner: alert sent")
-    else:
-        _log("rebalance_scanner: no drift")
+        if drift_alerts:
+            msg = "📊 <b>Portfolio Drift Detected</b>\n\n" + "\n".join(drift_alerts) + "\n\nReply YES to rebalance or SKIP to ignore."
+            # de-dupe for 30 minutes under a stable key
+            send_telegram_message_dedup(msg, key="rebalance:drift", ttl_min=30)
+            # nudge NovaTrigger (cheap, single cell)
+            try:
+                _ws_update_acell(sh.worksheet("NovaTrigger"), "A1", "REBALANCE ALERT")
+            except Exception as e:
+                print(f"⚠️ NovaTrigger update skipped: {e}")
 
-    _log("rebalance_scanner: done")
+        print("✅ Rebalance check complete.")
+
+    except Exception as e:
+        print(f"❌ Rebalance scanner error: {e}")
