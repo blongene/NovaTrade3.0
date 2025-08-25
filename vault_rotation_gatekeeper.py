@@ -49,6 +49,12 @@ def gate_vault_rotation(token: str, min_confidence: float = 0.60) -> List[Dict[s
       This function is intentionally side‑effect‑free (no Sheet writes).
       Executors (e.g., vault_rotation_executor) should act on the returned list.
     """
+    # inside gate_vault_rotation(...)
+    try:
+        _ = _load_candidates_somehow  # guard: refer but don't call if not defined
+    except NameError:
+        return False  # or just skip gracefully
+
     token = (token or "").strip()
     if not token:
         print("⚠️ gate_vault_rotation: empty token, skipping.")
