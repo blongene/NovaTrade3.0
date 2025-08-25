@@ -3,6 +3,7 @@
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from utils import get_records_cached
 
 def sync_total_memory_score():
     try:
@@ -15,7 +16,7 @@ def sync_total_memory_score():
         sheet = client.open_by_url(sheet_url)
         stats_ws = sheet.worksheet("Rotation_Stats")
 
-        data = stats_ws.get_all_records()
+        data = stats_ws.get_records_cached("Some_Tab", ttl_s=180)  # 3‑minute cache
         headers = data[0].keys()
 
         token_col = list(headers).index("Token") + 1
