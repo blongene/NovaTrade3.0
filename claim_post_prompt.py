@@ -3,6 +3,8 @@ import os
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 from utils import send_telegram_prompt
+from utils import get_records_cached
+
 
 def run_claim_decision_prompt():
     try:
@@ -14,8 +16,8 @@ def run_claim_decision_prompt():
         claim_ws = sheet.worksheet("Claim_Tracker")
         scout_ws = sheet.worksheet("Scout Decisions")
 
-        claimed_rows = claim_ws.get_all_records()
-        decisions = scout_ws.get_all_records()
+        claimed_rows = claim_ws.get_records_cached()
+        decisions = scout_ws.get_records_cached()
         decided_tokens = [r["Token"].strip().upper() for r in decisions if r.get("Decision", "").strip().upper() in ["VAULT", "ROTATE", "IGNORE"]]
 
         for i, row in enumerate(claimed_rows, start=2):
