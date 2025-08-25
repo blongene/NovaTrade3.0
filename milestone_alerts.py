@@ -16,7 +16,7 @@ def run_milestone_alerts():
 
     log_ws = sheet.worksheet("Rotation_Log")
     review_ws = sheet.worksheet("ROI_Review_Log")
-    rows = get_records_cached("Some_Tab", ttl_s=180)  # 3‑minute cache
+    rows = get_records_cached("ROI_Review_Log", ttl_s=180)  # 3‑minute cache
 
     milestone_days = [3, 7, 14, 30]
     today = datetime.utcnow()
