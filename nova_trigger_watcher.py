@@ -1,8 +1,10 @@
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
-from utils import send_telegram_message
+from utils import send_telegram_message_dedup
 
+send_telegram_message_dedup("🧠 Sync Required\nNew decisions are pending rotation. Please review the planner tab.",
+                            key="sync_required", ttl_min=30)
 def check_nova_trigger():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
