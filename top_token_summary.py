@@ -2,7 +2,7 @@ import os
 import gspread
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
-from utils import send_telegram_message, ping_webhook_debug
+from utils import send_telegram_message, ping_webhook_debug, get_records_cached
 
 MILESTONES = [10, 20, 50, 100, 200, 500]
 
@@ -18,7 +18,7 @@ def run_top_token_summary():
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
 
         stats_ws = sheet.worksheet("Rotation_Stats")
-        rows = stats_ws.get_all_records()
+        rows = stats_ws.get_records_cached()
         headers = stats_ws.row_values(1)
 
         milestone_col = headers.index("Last Alerted") + 1 if "Last Alerted" in headers else len(headers) + 1
