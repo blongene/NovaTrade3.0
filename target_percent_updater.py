@@ -1,6 +1,7 @@
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
+from utils import get_records_cached
 
 def run_target_percent_updater():
     print("🔁 Updating Target % from Suggested % in Portfolio_Targets...")
@@ -11,8 +12,7 @@ def run_target_percent_updater():
         client = gspread.authorize(creds)
         sheet = client.open_by_url(os.getenv("SHEET_URL"))
         ws = sheet.worksheet("Portfolio_Targets")
-
-        rows = ws.get_all_records()
+        rows = get_records_cached("Some_Tab", ttl_s=180)  # 3‑minute cache
         updated = 0
 
         for i, row in enumerate(rows, start=2):
