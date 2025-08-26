@@ -26,7 +26,7 @@ def check_nova_trigger():
 
     msg = alert_map.get(raw)
     if msg:
-        send_telegram_message(msg)
+        send_telegram_message_dedup(msg, key="nova_trigger", ttl_min=10)
         print(f"✅ NovaTrigger sent: {raw}")
     else:
         print(f"⚠️ Unknown NovaTrigger value: {raw}")
