@@ -3,6 +3,7 @@ import time
 import gspread
 import requests
 from oauth2client.service_account import ServiceAccountCredentials
+from utils import send_telegram_message_dedup
 
 def listen_for_nova_trigger():
     print("🎯 NovaTrigger listener started...")
@@ -27,7 +28,7 @@ def listen_for_nova_trigger():
             if value != "READY":
                 message = get_trigger_message(value)
                 if message:
-                    send_telegram_message(bot_token, chat_id, message)
+                    send_telegram_message_dedup(bot_token, chat_id, message, key="nova_trigger", ttl_min=10))
                     print(f"✅ NovaTrigger sent: {value}")
                     trigger_ws.update_acell("A1", "READY")
                 else:
