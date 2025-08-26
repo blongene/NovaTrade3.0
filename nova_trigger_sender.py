@@ -1,5 +1,6 @@
 import os
 import requests
+from utils import send_telegram_message_dedup
 
 def trigger_nova_ping(trigger_type="SOS"):
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
