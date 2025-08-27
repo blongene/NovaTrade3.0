@@ -110,36 +110,54 @@ def get_gspread_client():
 
 @with_sheet_backoff
 def _open_sheet():
-    return get_gspread_client().open_by_url(SHEET_URL)
+    return _cached_open_by_url(SHEET_URL)
 
 # Generic backoff-wrapped actions
 @with_sheet_backoff
 def _ws_get_all_values(ws):
+    _sheet_read_gate()
     return ws.get_all_values()
 
 @with_sheet_backoff
 def _ws_get_all_records(ws):
+    _sheet_read_gate()
     return ws.get_all_records()
 
 @with_sheet_backoff
 def _ws_append_row(ws, row):
+    _sheet_write_gate()
     return ws.append_row(row, value_input_option="USER_ENTERED")
 
 @with_sheet_backoff
 def _ws_update_cell(ws, r, c, v):
+    _sheet_write_gate()
     return ws.update_cell(r, c, v)
 
 @with_sheet_backoff
 def _ws_update_acell(ws, a1, v):
+    _sheet_write_gate()
     return ws.update_acell(a1, v)
 
 @with_sheet_backoff
 def _ws_update(ws, rng, rows):
+    _sheet_write_gate()
     return ws.update(rng, rows, value_input_option="USER_ENTERED")
 
 # =============================================================================
 # Telegram + Debug
 # =============================================================================
+
+# Add near the bottom of utils.py (after helpers are defined)
+try:
+    import gspread.models as _gmodels
+    if not hasattr(_gmodels.Worksheet, "get_records_cached"):
+        def _ws_get_records_cached(self):
+            # just delegate to our gated wrapper
+            return _ws_get_all_records(self)
+        setattr(_gmodels.Worksheet, "get_records_cached", _ws_get_records_cached)
+except Exception:
+    # ignore; worst case the old callers will still raise visibly
+    pass
 
 def ping_webhook_debug(msg):
     try:
