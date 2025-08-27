@@ -11,6 +11,45 @@ from functools import wraps
 from datetime import datetime, timezone
 from oauth2client.service_account import ServiceAccountCredentials
 
+# ===== Sheets global rate limit + cache (paste into utils.py) =====
+from collections import deque
+
+# Token-bucket-ish limiter: aim under 50 read calls/min and 30 write calls/min.
+_SHEETS_READ_TIMES  = deque(maxlen=60)
+_SHEETS_WRITE_TIMES = deque(maxlen=60)
+_READ_MAX_PER_MIN   = int(os.getenv("SHEETS_READ_MAX_PER_MIN", "50"))
+_WRITE_MAX_PER_MIN  = int(os.getenv("SHEETS_WRITE_MAX_PER_MIN", "30"))
+
+def _ratelimit(bucket: deque, max_per_min: int):
+    now = time.time()
+    # prune older than 60s
+    while bucket and now - bucket[0] > 60:
+        bucket.popleft()
+    if len(bucket) >= max_per_min:
+        # sleep until we drop under the window
+        wait = 60 - (now - bucket[0]) + 0.01
+        if wait > 0:
+            time.sleep(wait)
+    bucket.append(time.time())
+
+# Wrap low-level sheet ops
+def _sheet_read_gate():  _ratelimit(_SHEETS_READ_TIMES,  _READ_MAX_PER_MIN)
+def _sheet_write_gate(): _ratelimit(_SHEETS_WRITE_TIMES, _WRITE_MAX_PER_MIN)
+
+# Cache the Spreadsheet object ~90s to avoid repeated open_by_url calls
+_SHEET_CACHE = {"obj": None, "ts": 0.0}
+_SHEET_TTL_S = int(os.getenv("SHEET_CACHE_TTL_SEC", "90"))
+
+def _cached_open_by_url(url: str):
+    now = time.time()
+    if _SHEET_CACHE["obj"] and (now - _SHEET_CACHE["ts"] < _SHEET_TTL_S):
+        return _SHEET_CACHE["obj"]
+    _sheet_read_gate()
+    sh = get_gspread_client().open_by_url(url)
+    _SHEET_CACHE["obj"] = sh
+    _SHEET_CACHE["ts"] = now
+    return sh
+
 # =============================================================================
 # Backoff / Retry Utilities
 # =============================================================================
