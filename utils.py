@@ -107,6 +107,9 @@ def _gspread_creds():
 def get_gspread_client():
     creds = _gspread_creds()
     return gspread.authorize(creds)
+# e.g., in any module after client = gspread.authorize(creds)
+from utils import install_ws_compat_cache
+install_ws_compat_cache()
 
 @with_sheet_backoff
 def _open_sheet():
