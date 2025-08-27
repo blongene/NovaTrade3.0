@@ -4,6 +4,7 @@ import time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import requests
+from utils import send_telegram_message_dedup
 
 def check_nova_trigger_and_ping():
     try:
@@ -24,7 +25,7 @@ def check_nova_trigger_and_ping():
 
         if value and value != "READY":
             message = build_message_from_trigger(value)
-            send_telegram_message(message)
+            send_telegram_message_dedup(message, key="nova_trigger", ttl_min=10)
 
             # Reset trigger after firing
             trigger_tab.update_acell("A1", "READY")
@@ -52,7 +53,7 @@ def build_message_from_trigger(trigger_value):
         return f"🔔 *NovaTrade Alert*\nTrigger: `{trigger_value}` received.\nCheck the system dashboard for details."
 
 
-def send_telegram_message(text):
+def send_telegram_message_dedup(text, key="nova_trigger", ttl_min=10):
     token = os.environ["BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
