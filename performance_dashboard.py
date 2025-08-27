@@ -1,101 +1,98 @@
 # performance_dashboard.py
 import os
+from statistics import median
 from datetime import datetime
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-from utils import with_sheet_backoff, safe_float
+try:
+    from utils import with_sheet_backoff, str_or_empty, to_float
+except Exception:
+    def with_sheet_backoff(fn):
+        def wrapper(*a, **k):
+            return fn(*a, **k)
+        return wrapper
+    def str_or_empty(v):
+        return str(v).strip() if v is not None else ""
+    def to_float(v):
+        s = str_or_empty(v).replace("%", "").replace(",", "")
+        try:
+            return float(s) if s != "" else None
+        except Exception:
+            return None
 
-# --- tiny wrappers to keep all Sheets calls 429-safe -------------------------
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+
+def _get_sheet():
+    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", SCOPE)
+    client = gspread.authorize(creds)
+    return client.open_by_url(os.getenv("SHEET_URL"))
+
 @with_sheet_backoff
-def _open_sheet(url: str):
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    return gspread.authorize(creds).open_by_url(url)
+def _ws(sheet, name):
+    return sheet.worksheet(name)
 
-@with_sheet_backoff
-def _get_all_records(ws):
-    return ws.get_all_records()
-
-@with_sheet_backoff
-def _get_acell(ws, a1):
-    return ws.acell(a1).value
-
-@with_sheet_backoff
-def _update_range(ws, a1, rows):
-    # single batch update to minimize quota
-    return ws.update(a1, rows, value_input_option="USER_ENTERED")
-
-# --- helpers -----------------------------------------------------------------
-def _to_float_or_none(v):
-    """
-    Parse numbers like '12.3', '12.3%', '', 'N/A' safely.
-    Returns float or None.
-    """
-    s = str(v).strip()
-    if not s or s.upper() in {"N/A", "NA", "NONE", "NULL", "—", "-"}:
-        return None
-    # prefer utils.safe_float but allow None detection
-    try:
-        s = s.replace("%", "").strip()
-        return float(s)
-    except Exception:
-        # fall back to utils.safe_float defaulting to 0.0, then treat 0.0-from-empty as None
-        val = safe_float(v, 0.0)
-        return val if str(v).strip() not in {"", "N/A", "NA"} else None
+def _safe_records(ws):
+    hdr = ws.row_values(1)
+    rows = ws.get_all_records()
+    return hdr, rows
 
 def run_performance_dashboard():
-    sheet_url = os.getenv("SHEET_URL")
-    if not sheet_url:
-        print("⚠️ SHEET_URL not set; skipping Performance Dashboard.")
-        return
+    sheet = _get_sheet()
+    stats_ws = _ws(sheet, "Rotation_Stats")
+    dash_ws  = _ws(sheet, "Performance_Dashboard")
+    hb_ws    = _ws(sheet, "NovaHeartbeat")
 
-    sh = _open_sheet(sheet_url)
-    stats_ws = sh.worksheet("Rotation_Stats")
-    dash_ws = sh.worksheet("Performance_Dashboard")
+    _, stats = _safe_records(stats_ws)
 
-    # Read Rotation_Stats once
-    stats = _get_all_records(stats_ws)
+    total = 0
+    yes_count = 0
+    yes_perf = []  # numeric performance for YES only
+    wins_yes = 0
 
-    # 1) Totals
-    total_yes = sum(1 for r in stats if str(r.get("Decision", "")).strip().upper() == "YES")
-
-    # 2) Collect numeric performance values
-    roi_values = []
-    token_rois = {}
     for r in stats:
-        token = str(r.get("Token", "")).strip()
-        perf_raw = r.get("Performance", "")
-        perf = _to_float_or_none(perf_raw)
-        if perf is None:
+        token = str_or_empty(r.get("Token"))
+        if not token:
             continue
-        roi_values.append(perf)
-        if token:
-            token_rois[token] = perf
+        total += 1
 
-    avg_roi = round(sum(roi_values) / len(roi_values), 2) if roi_values else 0.0
-    top_token = max(token_rois, key=token_rois.get, default="N/A")
-    bottom_token = min(token_rois, key=token_rois.get, default="N/A")
-    unique_tokens = len(token_rois)
+        decision = str_or_empty(r.get("Decision")).upper()
+        perf_val = to_float(r.get("Performance"))
 
-    # 3) Low-quota heartbeat fetch (single cell)
+        if decision == "YES":
+            yes_count += 1
+            if perf_val is not None:
+                yes_perf.append(perf_val)
+                if perf_val > 0:
+                    wins_yes += 1
+
+    win_rate = (wins_yes / yes_count * 100.0) if yes_count > 0 else 0.0
+    med_yes  = median(yes_perf) if yes_perf else 0.0
+
+    # Heartbeat cell A2
     try:
-        last_update_val = _get_acell(sh.worksheet("NovaHeartbeat"), "A2")
-        last_update = last_update_val if str(last_update_val).strip() else datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        last_hb = str_or_empty(hb_ws.acell("A2").value)
     except Exception:
-        last_update = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        last_hb = ""
 
-    # 4) Prepare rows (A2:B9) – keep these placeholders for now; replace later if you wire real calc
-    rows = [
-        ["Total YES Votes", total_yes],
-        ["Average ROI (YES)", f"{avg_roi}%"],
-        ["Top Performer", top_token],
-        ["Worst Performer", bottom_token],
-        ["Projected Portfolio Value", "$5,000.00"],
-        ["% Progress to $250K Goal", "2.0%"],
-        ["Unique Tokens Rotated", unique_tokens],
-        ["Last Updated", last_update],
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # Compose a compact dashboard block; one atomic update
+    values = [
+        ["NovaTrade Performance Dashboard", ""],
+        ["Last Dashboard Refresh", now_str],
+        ["Last Heartbeat (A2)", last_hb],
+        ["" , ""],
+        ["Total Tokens", total],
+        ["YES Count", yes_count],
+        ["Win Rate (YES, %positive Performance)", f"{win_rate:.2f}%"],
+        ["Median Performance (YES)", f"{med_yes:.2f}"],
     ]
 
-    # Single batch write
-    _update_range(dash_ws, "A2:B9", rows)
+    # Write starting at A1 (atomic)
+    dash_ws.update("A1:B8", values, value_input_option="RAW")
+    print("performance_dashboard: updated successfully (atomic write).")
+
+if __name__ == "__main__":
+    run_performance_dashboard()
