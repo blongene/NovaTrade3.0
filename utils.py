@@ -108,8 +108,6 @@ def get_gspread_client():
     creds = _gspread_creds()
     return gspread.authorize(creds)
 # e.g., in any module after client = gspread.authorize(creds)
-from utils import install_ws_compat_cache
-install_ws_compat_cache()
 
 @with_sheet_backoff
 def _open_sheet():
@@ -711,3 +709,9 @@ def batch_update_cells(sheet_name: str, updates):
     """
     ws = get_ws(sheet_name)
     return ws_batch_update(ws, updates)
+
+# ---- Finalize compat shims on import (idempotent) ---------------------------
+try:
+    install_ws_compat_cache()
+except Exception as _e:
+    print(f"[utils] Worksheet compat install skipped: {_e}")
