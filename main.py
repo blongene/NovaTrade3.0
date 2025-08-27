@@ -2,6 +2,10 @@ import os, time, threading, schedule, gspread
 from flask import Flask
 from oauth2client.service_account import ServiceAccountCredentials
 from utils import send_boot_notice_once, send_system_online_once, send_telegram_message_dedup
+import random, time
+
+def jitter(min_s=0.2, max_s=0.7):
+    time.sleep(random.uniform(min_s, max_s))
 
 # Telegram webhook / Flask app
 from telegram_webhook import telegram_app, set_telegram_webhook
@@ -140,38 +144,38 @@ if __name__ == "__main__":
 
     rotation_ws = load_presale_stream()
     if rotation_ws:
-        safe_call("ROI tracker boot pass", scan_roi_tracking, sleep_after=3)
-        safe_call("Milestone alerts", run_milestone_alerts, sleep_after=3)
+        jitter(); safe_call("ROI tracker boot pass", scan_roi_tracking, sleep_after=3)
+        jitter(); safe_call("Milestone alerts", run_milestone_alerts, sleep_after=3)
         log_heartbeat("ROI Tracker", "Updated Days Held seed")
     else:
         print("⛔️ Presale_Stream unavailable — presale scan skipped")
 
     # Vault & summaries
-    safe_call("Token vault sync", sync_token_vault, sleep_after=3)
-    safe_call("Top token summary", run_top_token_summary, sleep_after=3)
-    safe_call("Vault intelligence", run_vault_intelligence, sleep_after=3)
+    jitter(); safe_call("Token vault sync", sync_token_vault, sleep_after=3)
+    jitter(); safe_call("Top token summary", run_top_token_summary, sleep_after=3)
+    jitter(); safe_call("Vault intelligence", run_vault_intelligence, sleep_after=3)
 
     print("🚀 Executing any pending vault rotations…")
-    safe_call("Vault rotation gate (MIND)", gate_vault_rotation, "MIND", sleep_after=1)
-    safe_call("Vault rotation executor", run_vault_rotation_executor, sleep_after=3)
+    jitter(); safe_call("Vault rotation gate (MIND)", gate_vault_rotation, "MIND", sleep_after=1)
+    jitter(); safe_call("Vault rotation executor", run_vault_rotation_executor, sleep_after=3)
 
     print("📋 Syncing Scout Decisions → Rotation_Planner…")
-    safe_call("Scout→Planner sync", sync_rotation_planner, sleep_after=3)
+    jitter(); safe_call("Scout→Planner sync", sync_rotation_planner, sleep_after=3)
 
     print("📅 Syncing ROI feedback responses…")
-    safe_call("ROI feedback sync", run_roi_feedback_sync, sleep_after=3)
+    jitter(); safe_call("ROI feedback sync", run_roi_feedback_sync, sleep_after=3)
 
     print("📰 Sentiment Radar (boot pass)…")
-    safe_call("Sentiment radar", run_sentiment_radar, sleep_after=3)
+    jitter(); safe_call("Sentiment radar", run_sentiment_radar, sleep_after=3)
 
-    safe_call("Nova trigger check", check_nova_trigger, sleep_after=1)
-    safe_call("Nova ping", trigger_nova_ping, "NOVA UPDATE", sleep_after=1)
-    safe_call("Claim tracker", check_claims, sleep_after=3)
-    safe_call("Claim decision prompt", run_claim_decision_prompt, sleep_after=3)
+    jitter(); safe_call("Nova trigger check", check_nova_trigger, sleep_after=1)
+    jitter(); safe_call("Nova ping", trigger_nova_ping, "NOVA UPDATE", sleep_after=1)
+    jitter(); safe_call("Claim tracker", check_claims, sleep_after=3)
+    jitter(); safe_call("Claim decision prompt", run_claim_decision_prompt, sleep_after=3)
 
     if rotation_ws:
         print("⏰ Running presale scan every 60 min")
-        safe_call("Presale scorer", run_presale_scorer, sleep_after=1)
+        jitter(); safe_call("Presale scorer", run_presale_scorer, sleep_after=1)
     else:
         print("⛔️ Presale_Stream unavailable — presale scan skipped")
 
@@ -197,7 +201,7 @@ if __name__ == "__main__":
     # Start continuous workers that aren’t purely scheduled
     threaded(run_stalled_asset_detector)
     time.sleep(3)
-    safe_call("Claim tracker (2nd pass)", check_claims, sleep_after=3)
+    jitter(); safe_call("Claim tracker (2nd pass)", check_claims, sleep_after=3)
     start_staking_yield_loop()
     time.sleep(3)
 
@@ -211,67 +215,67 @@ if __name__ == "__main__":
     time.sleep(3)
 
     print("🧠 Calculating Total Memory Score…")
-    safe_call("Total memory score sync", run_memory_score_sync, sleep_after=3)
+    jitter(); safe_call("Total memory score sync", run_memory_score_sync, sleep_after=3)
 
     threaded(run_rebuy_roi_tracker)
     time.sleep(3)
 
-    safe_call("Rotation feedback engine", run_rotation_feedback_engine, sleep_after=3)
+    jitter(); safe_call("Rotation feedback engine", run_rotation_feedback_engine, sleep_after=3)
 
     print("📊 Running Performance Dashboard…")
-    safe_call("Performance dashboard", run_performance_dashboard, sleep_after=3)
+    jitter(); safe_call("Performance dashboard", run_performance_dashboard, sleep_after=3)
 
     print("🔁 Initial rebalance scan…")
-    safe_call("Rebalance scanner", run_rebalance_scanner, sleep_after=3)
+    jitter(); safe_call("Rebalance scanner", run_rebalance_scanner, sleep_after=3)
 
     print("📢 Telegram Summary Layer…")
-    safe_call("Telegram summary", run_telegram_summary, sleep_after=3)
+    jitter(); safe_call("Telegram summary", run_telegram_summary, sleep_after=3)
 
     print("🧠 Rotation Memory Sync…")
-    safe_call("Rotation memory sync", run_rotation_memory, sleep_after=3)
+    jitter(); safe_call("Rotation memory sync", run_rotation_memory, sleep_after=3)
 
     print("🔁 Undersized rebuy engine…")
-    safe_call("Undersized rebuy", run_undersized_rebuy, sleep_after=3)
+    jitter(); safe_call("Undersized rebuy", run_undersized_rebuy, sleep_after=3)
 
     print("♻️ Memory‑aware rebuy engine…")
-    safe_call("Memory rebuy scan", run_memory_rebuy_scan, sleep_after=3)
+    jitter(); safe_call("Memory rebuy scan", run_memory_rebuy_scan, sleep_after=3)
 
     print("🧠 Rebuy Weights…")
-    safe_call("Rebuy weight calc", run_rebuy_weight_calculator, sleep_after=3)
+    jitter(); safe_call("Rebuy weight calc", run_rebuy_weight_calculator, sleep_after=3)
 
     print("🚨 Sentiment‑Triggered Rebuy Scan…")
-    safe_call("Sentiment trigger engine", run_sentiment_trigger_engine, sleep_after=3)
+    jitter(); safe_call("Sentiment trigger engine", run_sentiment_trigger_engine, sleep_after=3)
 
-    safe_call("Memory scoring", run_memory_scoring, sleep_after=3)
+    jitter(); safe_call("Memory scoring", run_memory_scoring, sleep_after=3)
 
     print("🧠 Suggested Target Calculator…")
-    safe_call("Portfolio weight adjuster", run_portfolio_weight_adjuster, sleep_after=3)
+    jitter(); safe_call("Portfolio weight adjuster", run_portfolio_weight_adjuster, sleep_after=3)
 
     print("📊 Sync Suggested % → Target %…")
-    safe_call("Target % updater", run_target_percent_updater, sleep_after=3)
+    jitter(); safe_call("Target % updater", run_target_percent_updater, sleep_after=3)
 
-    safe_call("Total memory score sync (final)", sync_total_memory_score, sleep_after=3)
+    jitter(); safe_call("Total memory score sync (final)", sync_total_memory_score, sleep_after=3)
 
     print("📊 Syncing Vault Tags → Rotation_Stats…")
     threaded(run_vault_to_stats_sync)
     time.sleep(3)
 
-    safe_call("Vault alerts", run_vault_alerts, sleep_after=3)
+    jitter(); safe_call("Vault alerts", run_vault_alerts, sleep_after=3)
 
     print("🔔 Vault Intelligence Alerts…")
-    safe_call("Vault alerts (2nd pass)", run_vault_alerts, sleep_after=3)
+    jitter(); safe_call("Vault alerts (2nd pass)", run_vault_alerts, sleep_after=3)
 
     print("📦 Syncing Vault ROI + Memory Stats…")
-    safe_call("Vault growth sync", run_vault_growth_sync, sleep_after=3)
+    jitter(); safe_call("Vault growth sync", run_vault_growth_sync, sleep_after=3)
 
     print("📈 Writing daily snapshot to Vault ROI Tracker…")
-    safe_call("Vault ROI tracker", run_vault_roi_tracker, sleep_after=3)
+    jitter(); safe_call("Vault ROI tracker", run_vault_roi_tracker, sleep_after=3)
 
     print("📬 Vault Review Alerts…")
-    safe_call("Vault review alerts", run_vault_review_alerts, sleep_after=3)
+    jitter(); safe_call("Vault review alerts", run_vault_review_alerts, sleep_after=3)
 
     print("🔁 Scanning vaults for decay…")
-    safe_call("Vault rotation scanner", run_vault_rotation_scanner, sleep_after=3)
+    jitter(); safe_call("Vault rotation scanner", run_vault_rotation_scanner, sleep_after=3)
 
     # Binance executor: opt-in
     if os.getenv("ENABLE_CLOUD_BINANCE", "false").lower() == "true":
@@ -288,7 +292,7 @@ if __name__ == "__main__":
         safe_call("Vault memory importer", run_vault_memory_importer)
 
         time.sleep(3)
-        safe_call("Unlock horizon alerts", run_unlock_horizon_alerts)
+        jitter(); safe_call("Unlock horizon alerts", run_unlock_horizon_alerts)
         
         print("💥 run_presale_scorer() BOOTED")
         send_boot_notice_once()
