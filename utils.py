@@ -468,6 +468,73 @@ def send_system_online_once(chat_id: str | None = None):
         chat_id=chat_id
     )
 
+# === Inline-button prompt sender (for approvals / rebuy etc.) ===============
+def send_telegram_prompt(
+    token_or_title: str,
+    message: str,
+    buttons=None,
+    prefix: str | None = "REBALANCE",
+    dedupe_key: str | None = None,
+    ttl_min: int | None = None,
+    chat_id: str | None = None,
+):
+    """
+    Send a Telegram message with inline buttons.
+    - token_or_title: used in callback_data and in the prompt header
+    - message: body text (Markdown)
+    - buttons: list[str] or list[list[str]]; defaults to ["YES", "NO"]
+    - prefix: header prefix (e.g., "REBALANCE", "CONFIRM", etc.)
+    - dedupe_key: optional de-dupe key; if provided, suppress identical prompt within ttl_min
+    - ttl_min: override dedupe window in minutes
+    """
+    bot_token = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN"))
+    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        print("❌ BOT_TOKEN/TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found.")
+        return None
+
+    # Optional de-dupe
+    if dedupe_key:
+        # include the header+body so a different message bypasses the window
+        composed = f"{prefix or ''}|{token_or_title}|{message}"
+        if not tg_should_send(composed, key=dedupe_key, ttl_min=ttl_min):
+            print(f"🛑 Telegram de-dupe suppressed for key='{dedupe_key}'")
+            return None
+
+    # Normalize buttons: allow ["YES","NO"] or [["YES","NO"],["HOLD"]]
+    if not buttons:
+        buttons = ["YES", "NO"]
+    if all(isinstance(b, str) for b in buttons):
+        layout = [[{"text": b, "callback_data": f"{b}|{token_or_title}"}] for b in buttons]
+    else:
+        # list[list[str]]
+        layout = [
+            [{"text": b, "callback_data": f"{b}|{token_or_title}"} for b in row]
+            for row in buttons
+        ]
+
+    header = f"🔁 *{prefix} ALERT*\n\n" if prefix else ""
+    payload = {
+        "chat_id": chat_id,
+        "text": f"{header}{message}",
+        "parse_mode": "Markdown",
+        "reply_markup": {"inline_keyboard": layout},
+    }
+
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        r = requests.post(url, json=payload, timeout=10)
+        if r.ok:
+            if dedupe_key:
+                tg_mark_sent(f"{prefix or ''}|{token_or_title}|{message}", key=dedupe_key)
+            return r.json()
+        else:
+            print(f"⚠️ Telegram prompt error: {r.text}")
+            return None
+    except Exception as e:
+        print(f"❌ Telegram prompt failed: {e}")
+        return None
+
 # =============================================================================
 # Rotation / Scout Logging Utilities (kept for backward-compat)
 # =============================================================================
