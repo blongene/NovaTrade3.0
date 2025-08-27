@@ -1,6 +1,6 @@
 import time, threading
 from utils import get_sheet, ping_webhook_debug
-from send_telegram import send_message
+from utils import send_telegram_message_dedup
 
 def run_watchdog():
     def loop():
@@ -20,7 +20,7 @@ def run_watchdog():
                 # Step 4: Send alert if any missing
                 if missing:
                     msg = f"🐕 NovaWatchdog Alert:\n{len(missing)} presale(s) have no decision logged.\nWould you like to review?"
-                    send_message(msg)
+                    send_telegram_message_dedup(msg, key="nova_trigger", ttl_min=10)
 
             except Exception as e:
                 ping_webhook_debug(f"❌ Watchdog Error: {e}")
