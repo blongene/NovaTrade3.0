@@ -92,4 +92,70 @@ def fetch_twitter_mentions(token: str) -> int:
 
 
 def fetch_youtube_mentions(token: str) -> int:
-    # Hard silence for the rest of the UTC
+    # Hard silence for the rest of the UTC day after a quotaExceeded once
+    if not YOUTUBE_ENABLED or _yt_cooldown_active():
+        return 0
+    try:
+        api_key = os.getenv("YOUTUBE_API_KEY")
+        if not api_key:
+            return 0
+        url = (
+            "https://www.googleapis.com/youtube/v3/search"
+            f"?key={api_key}&part=snippet&type=video&maxResults=3&q={requests.utils.quote(token)}"
+        )
+        r = requests.get(url, timeout=12)
+        if r.status_code == 403 and "quota" in (r.text or "").lower():
+            _arm_yt_cooldown()
+            print("⛔️ YouTube quota exceeded — silenced until next UTC day.")
+            return 0
+        if r.status_code != 200:
+            return 0
+        data = r.json()
+        return _safe_int(len(data.get("items", [])))
+    except Exception:
+        return 0
+
+
+def run_sentiment_radar():
+    print("📡 Running Sentiment Radar...")
+    sheet_url = os.getenv("SHEET_URL")
+    targets_ws = _open_ws(sheet_url, "Sentiment_Targets")
+    radar_ws = _open_ws(sheet_url, "Sentiment_Radar")
+
+    targets = targets_ws.get_all_records()
+    # Pick top 3 by Priority
+    top = sorted(targets, key=lambda x: _safe_int(x.get("Priority", 0)), reverse=True)[:3]
+
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for row in top:
+        token = (row.get("Token") or "").strip()
+        if not token:
+            continue
+
+        # YouTube (silenced if quota hit earlier today)
+        if YOUTUBE_ENABLED and not _yt_cooldown_active():
+            yt = fetch_youtube_mentions(token)
+            rows.append([now, token, "YouTube", yt])
+
+        # Twitter (soft cooldown on 429)
+        if ENABLE_TWITTER:
+            tw = fetch_twitter_mentions(token)
+            rows.append([now, token, "Twitter", tw])
+
+        # Reddit stub (disabled)
+        if ENABLE_REDDIT:
+            rows.append([now, token, "Reddit", 0])
+
+    if rows:
+        @with_sheet_backoff
+        def _append():
+            radar_ws.append_rows(rows, value_input_option="USER_ENTERED")
+        _append()
+        print(f"✅ Sentiment Radar logged {len(rows)} entries.")
+    else:
+        print("⚠️ No sentiment entries written (sources disabled/cooldowns).")
+
+
+if __name__ == "__main__":
+    run_sentiment_radar()
