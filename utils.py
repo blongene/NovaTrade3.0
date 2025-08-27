@@ -671,3 +671,105 @@ def log_rebuy_confirmation(token):
 def detect_stalled_tokens(*args, **kwargs):
     """Return a list of stalled tokens; stubbed to empty to keep watchdog non-blocking."""
     return []
+
+# =============================================================================
+# Backward-compat exports & aliases (append-only, safe to keep)
+# =============================================================================
+
+# --- Sheet client / open helpers ---
+# Already defined: get_gspread_client, _open_sheet, get_sheet (alias), get_ws
+# Make sure legacy names resolve (some modules import these)
+open_sheet = _open_sheet  # legacy alias
+
+# --- Read/write wrappers (legacy names kept for modules that import them) ---
+ws_get_all_values = _ws_get_all_values
+ws_get_all_records = _ws_get_all_records
+ws_append_row = _ws_append_row
+ws_update_cell = _ws_update_cell
+ws_update_acell = _ws_update_acell
+ws_update = _ws_update
+
+# Provide old camelCase variants if any module referenced them
+_wsGetAllValues = _ws_get_all_values
+_wsGetAllRecords = _ws_get_all_records
+
+# --- Cached helpers (module-friendly) ---
+safe_get_all_records = safe_get_all_records if 'safe_get_all_records' in globals() else ws_get_all_records
+safe_update = safe_update if 'safe_update' in globals() else ws_update
+safe_batch_update = safe_batch_update if 'safe_batch_update' in globals() else ws_batch_update
+
+# --- Headers & parsing ---
+# Already defined: header_index_map, pick_col, str_or_empty, to_float, safe_float
+
+# --- Telegram layer (raw + dedupe + prompt) ---
+# Already defined: send_telegram_message, send_telegram_message_dedup, send_telegram_prompt
+# Also expose daily/boot convenience
+system_online_once = send_system_online_once
+once_per_day = send_once_per_day
+
+# --- Dedupe helpers (sometimes imported directly) ---
+tg_dedupe_should_send = tg_should_send
+tg_dedupe_mark_sent = tg_mark_sent
+
+# --- Compat shims for rarely-used legacy helpers (no-ops but safe) ---
+def get_records_cached_ws(ws, ttl_s: int = 120):
+    """Compat: some modules call get_records_cached(ws, ttl) vs by title."""
+    try:
+        return ws_get_all_records_cached(ws, ttl_s=ttl_s)
+    except Exception:
+        return _ws_get_all_records(ws)
+
+def get_values_cached_ws(ws, ttl_s: int = 120):
+    """Compat: values cache by Worksheet object."""
+    try:
+        # We don't maintain a values cache per title; do a gated read.
+        return _ws_get_all_values(ws)
+    except Exception:
+        return []
+
+def get_records_cached_safe(sheet_name: str, ttl_s: int = 120):
+    """Compat alias for get_records_cached(sheet_name, ttl)."""
+    return get_records_cached(sheet_name, ttl_s=ttl_s)
+
+def get_values_cached_safe(sheet_name: str, ttl_s: int = 120):
+    """Compat alias for get_values_cached(sheet_name, ttl)."""
+    return get_values_cached(sheet_name, ttl_s=ttl_s)
+
+# Some modules used these placeholders; keep harmless stubs so imports never break.
+def with_sheet_budget(*args, **kwargs):
+    """Legacy stub: previously enforced budgets; superseded by token buckets."""
+    return True
+
+def ws_get_records_cached(ws, ttl_s: int = 120):
+    """Alias to the monkey-patched method for explicit calls."""
+    return ws_get_all_records_cached(ws, ttl_s=ttl_s)
+
+# --- Explicit __all__ to make exported surface obvious ---
+__all__ = [
+    # Parsing & headers
+    "str_or_empty", "to_float", "safe_float", "header_index_map", "pick_col",
+    # Sheets: auth/open
+    "get_gspread_client", "get_sheet", "get_ws", "open_sheet",
+    # Sheets: cached reads
+    "get_records_cached", "get_values_cached",
+    "get_records_cached_safe", "get_values_cached_safe",
+    "get_records_cached_ws", "get_values_cached_ws",
+    "ws_get_all_records_cached",
+    # Sheets: raw ops (gated/backoff)
+    "ws_get_all_values", "ws_get_all_records", "ws_update", "ws_update_cell",
+    "ws_update_acell", "ws_append_row", "ws_batch_update", "batch_update_cells",
+    # Safe ops
+    "safe_get_all_records", "safe_update", "safe_batch_update",
+    # Budget/gates/backoff
+    "with_sheet_backoff", "with_sheets_gate",
+    # Telegram
+    "send_telegram_message", "send_telegram_message_dedup", "send_telegram_prompt",
+    "send_once_per_day", "send_boot_notice_once", "send_system_online_once",
+    "system_online_once",
+    # Dedupe extras
+    "tg_should_send", "tg_mark_sent", "tg_dedupe_should_send", "tg_dedupe_mark_sent",
+    # Debug
+    "ping_webhook_debug",
+    # Stubs
+    "with_sheet_budget", "ws_get_records_cached",
+]
