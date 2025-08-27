@@ -143,6 +143,126 @@ def _ws_update(ws, rng, rows):
     _sheet_write_gate()
     return ws.update(rng, rows, value_input_option="USER_ENTERED")
 
+# === utils.py (add below your existing imports/helpers) ======================
+import time
+import threading
+from collections import deque
+
+# ---- Simple global token bucket for Sheets calls ----------------------------
+# default budget ~50 reads/min, ~30 writes/min (tweak via env or setters)
+_SHEETS_BUDGET = {
+    "reads_per_min": int(os.getenv("SHEETS_READS_PER_MIN", "50")),
+    "writes_per_min": int(os.getenv("SHEETS_WRITES_PER_MIN", "30")),
+}
+_tokens = {
+    "read": deque(),   # timestamps of read calls
+    "write": deque(),  # timestamps of write calls
+}
+_tokens_lock = threading.Lock()
+
+def _check_token(kind: str):
+    """Rate-limit sheets calls by minute window."""
+    now = time.time()
+    window = 60.0
+    limit = _SHEETS_BUDGET["reads_per_min"] if kind == "read" else _SHEETS_BUDGET["writes_per_min"]
+    with _tokens_lock:
+        dq = _tokens["read" if kind == "read" else "write"]
+        # drop old timestamps
+        while dq and now - dq[0] > window:
+            dq.popleft()
+        if len(dq) >= limit:
+            # sleep until first token expires
+            sleep_for = window - (now - dq[0]) + 0.05
+            time.sleep(max(0.05, sleep_for))
+            # after sleep, clean again
+            now = time.time()
+            while dq and now - dq[0] > window:
+                dq.popleft()
+        dq.append(now)
+
+def set_sheets_budget(reads_per_min=None, writes_per_min=None):
+    if reads_per_min:
+        _SHEETS_BUDGET["reads_per_min"] = int(reads_per_min)
+    if writes_per_min:
+        _SHEETS_BUDGET["writes_per_min"] = int(writes_per_min)
+
+# ---- Read cache keyed by worksheet title -----------------------------------
+_SHEET_CACHE = {}  # { title: (ts, records) }
+_SHEET_CACHE_LOCK = threading.Lock()
+
+def get_records_cached_by_title(sheet, title: str, ttl_s: int = 120):
+    """
+    Return list of dicts for given worksheet title with TTL caching.
+    """
+    now = time.time()
+    with _SHEET_CACHE_LOCK:
+        hit = _SHEET_CACHE.get(title)
+        if hit and (now - hit[0] <= ttl_s):
+            return hit[1]
+
+    # cache miss -> live read
+    _check_token("read")
+    ws = sheet.worksheet(title)
+    records = ws.get_all_records()  # one shot read
+    with _SHEET_CACHE_LOCK:
+        _SHEET_CACHE[title] = (now, records)
+    return records
+
+# Convenience (common pattern): direct by Worksheet object
+def ws_get_all_records_cached(ws, ttl_s: int = 120):
+    """
+    Cached version for a gspread Worksheet object.
+    """
+    title = getattr(ws, "title", None) or ""
+    sheet = ws.spreadsheet
+    return get_records_cached_by_title(sheet, title, ttl_s)
+
+# ---- Compat shim so ws.get_records_cached(...) won't crash ------------------
+# Call this once after auth; or we can lazy-install the first time utils is imported.
+def install_ws_compat_cache():
+    """
+    Monkey-patch gspread.Worksheet to add get_records_cached(ttl_s=120),
+    delegating to our cache above. This lets legacy calls keep working.
+    """
+    try:
+        import gspread
+        if not hasattr(gspread.models.Worksheet, "get_records_cached"):
+            def _shim(self, ttl_s=120):
+                return ws_get_all_records_cached(self, ttl_s=ttl_s)
+            gspread.models.Worksheet.get_records_cached = _shim
+    except Exception as e:
+        print(f"[utils] install_ws_compat_cache failed (non-fatal): {e}")
+
+# ---- Safer header helpers ---------------------------------------------------
+def header_index_map(header_row):
+    return {str_or_empty(h): i for i, h in enumerate(header_row, start=1)}
+
+def pick_col(rec: dict, names):
+    """Return the first present key from names (case sensitive list)."""
+    for n in names:
+        if n in rec:
+            return rec[n]
+    return None
+
+# ---- Wrap gspread reads/writes with budget ----------------------------------
+# If you already have with_sheet_backoff, you can nest _check_token calls inside
+# your read/write points (acell/get_all_records/update/batch_update), e.g.:
+
+def safe_get_all_records(ws, ttl_s: int = 0):
+    """Optional helper: cache if ttl_s>0, else live read with rate-limit."""
+    if ttl_s and ttl_s > 0:
+        return ws_get_all_records_cached(ws, ttl_s=ttl_s)
+    _check_token("read")
+    return ws.get_all_records()
+
+def safe_batch_update(ws, payload, **kwargs):
+    _check_token("write")
+    return ws.batch_update(payload, **kwargs)
+
+def safe_update(ws, range_a1, values, **kwargs):
+    _check_token("write")
+    return ws.update(range_a1, values, **kwargs)
+
 # =============================================================================
 # Telegram + Debug
 # =============================================================================
