@@ -16,7 +16,7 @@ def sync_total_memory_score():
         sheet = client.open_by_url(sheet_url)
         stats_ws = sheet.worksheet("Rotation_Stats")
 
-        data = stats_ws.get_records_cached("Rotation_Stats", ttl_s)  # 3‑minute cache
+        data = stats_ws.get_records_cached("Rotation_Stats")  # 3‑minute cache
         headers = data[0].keys()
 
         token_col = list(headers).index("Token") + 1
