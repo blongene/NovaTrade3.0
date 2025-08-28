@@ -3,7 +3,7 @@ import os
 import gspread
 from datetime import datetime, timezone
 from oauth2client.service_account import ServiceAccountCredentials
-from utils import with_sheet_backoff, send_once_per_day
+from utils import send_telegram_message_dedup, with_sheet_backoff, send_once_per_day
 
 SHEET_URL = os.getenv("SHEET_URL")
 
