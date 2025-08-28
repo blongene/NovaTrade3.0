@@ -2,7 +2,7 @@
 from utils import get_ws, ws_batch_update, to_float, send_telegram_message_dedup, with_sheet_backoff
 
 @with_sheet_backoff
-def run_rebalance_scan():
+def run_rebalance_scanner():
     ws = get_ws("Portfolio_Targets")
     rows = ws.get_all_records()
 
