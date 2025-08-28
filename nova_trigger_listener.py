@@ -3,7 +3,7 @@ import time
 import gspread
 import requests
 from oauth2client.service_account import ServiceAccountCredentials
-from utils import send_telegram_message_dedup
+from utils import send_telegram_message_dedup, with_sheet_backoff, get_ws, str_or_empty
 
 def listen_for_nova_trigger():
     print("🎯 NovaTrigger listener started...")
@@ -48,7 +48,7 @@ def get_trigger_message(trigger_type):
     }
     return messages.get(trigger_type)
 
-def send_telegram_message(token, chat_id, text):
+def send_telegram_message_dedup(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     response = requests.post(url, json=payload)
