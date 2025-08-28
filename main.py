@@ -201,7 +201,7 @@ if __name__ == "__main__":
     # Start continuous workers that aren’t purely scheduled
     threaded(run_stalled_asset_detector)
     time.sleep(3)
-    jitter(); safe_call("Claim tracker (2nd pass)", check_claims, sleep_after=3)
+    jitter(); safe_call("Claim tracker (2nd pass)", run_claim_tracker, sleep_after=3)
     start_staking_yield_loop()
     time.sleep(3)
 
