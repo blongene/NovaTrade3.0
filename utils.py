@@ -279,34 +279,51 @@ def ws_get_all_records_cached(ws, ttl_s: int = 120):
 
 def install_ws_compat_cache():
     """
-    Adds Worksheet.get_records_cached(ttl_s=120) compat even if gspread.models is absent.
+    Add Worksheet.get_records_cached(ttl_s=120) compat method.
+
+    - Accepts positional or keyword ttl_s without double-binding.
+    - Does NOT open live sheets at import time (no 429 risk).
+    - Works across gspread variants (models/worksheet module names).
     """
     try:
         Worksheet = None
+
+        # Try common class locations across gspread versions
         try:
             from gspread.models import Worksheet as _W
             Worksheet = _W
         except Exception:
-            # Fallback: obtain class from a live Worksheet if models isn't exposed
             try:
-                sh = _open_sheet()
-                ws0 = sh.sheet1
-                Worksheet = ws0.__class__
+                from gspread.worksheet import Worksheet as _W  # some versions
+                Worksheet = _W
             except Exception:
-                Worksheet = None
+                try:
+                    import gspread
+                    # Last resort: reflect from any Worksheet instance type if present
+                    # If not resolvable safely, we just skip patching.
+                    Worksheet = getattr(gspread, "Worksheet", None)
+                except Exception:
+                    Worksheet = None
 
-        if Worksheet is not None and not hasattr(Worksheet, "get_records_cached"):
-            def _shim(self, ttl_s=120):
-                return ws_get_all_records_cached(self, ttl_s=ttl_s)
+        if Worksheet is None:
+            return  # can't patch; harmless to skip
+
+        if not hasattr(Worksheet, "get_records_cached"):
+            def _shim(self, *args, **kwargs):
+                # Support both get_records_cached(ttl_s=...) and get_records_cached(120)
+                ttl = kwargs.pop("ttl_s", 120)
+                if args:
+                    # If a positional ttl was passed, prefer it
+                    try:
+                        ttl = int(args[0])
+                    except Exception:
+                        pass
+                return ws_get_all_records_cached(self, ttl_s=ttl)
+
             setattr(Worksheet, "get_records_cached", _shim)
+
     except Exception as e:
         print(f"[utils] install_ws_compat_cache failed (non-fatal): {e}")
-
-# Call once on import (idempotent)
-try:
-    install_ws_compat_cache()
-except Exception as _e:
-    print(f"[utils] Worksheet compat install skipped: {_e}")
 
 # =============================================================================
 # Headers + misc helpers (exported)
