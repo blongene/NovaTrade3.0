@@ -170,7 +170,7 @@ if __name__ == "__main__":
 
     jitter(); safe_call("Nova trigger check", check_nova_trigger, sleep_after=1)
     jitter(); safe_call("Nova ping", trigger_nova_ping, "NOVA UPDATE", sleep_after=1)
-    jitter(); safe_call("Claim tracker", check_claims, sleep_after=3)
+    jitter(); safe_call("Claim tracker", run_claim_tracker, sleep_after=3)
     jitter(); safe_call("Claim decision prompt", run_claim_decision_prompt, sleep_after=3)
 
     if rotation_ws:
