@@ -1,7 +1,7 @@
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
-from utils import send_telegram_message_dedup
+from utils import send_telegram_message_dedup, with_sheet_backoff, get_ws, str_or_empty
 
 send_telegram_message_dedup("🧠 Sync Required\nNew decisions are pending rotation. Please review the planner tab.",
                             key="sync_required", ttl_min=30)
@@ -26,7 +26,7 @@ def check_nova_trigger():
 
     msg = alert_map.get(raw)
     if msg:
-        send_telegram_message_dedup(msg, key="nova_trigger", ttl_min=10)
+        send_telegram_message_dedup(msg, key="nova_trigger_watch", ttl_min=10)
         print(f"✅ NovaTrigger sent: {raw}")
     else:
         print(f"⚠️ Unknown NovaTrigger value: {raw}")
