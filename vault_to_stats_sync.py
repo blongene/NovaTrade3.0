@@ -21,8 +21,8 @@ def run_vault_to_stats_sync():
         vault_ws = sheet.worksheet("Token_Vault")
         stats_ws = sheet.worksheet("Rotation_Stats")
 
-        vault_data = vault_ws.get_records_cached("Token_Vault", ttl_s=180)  # 3‑minute cache
-        stats_data = stats_ws.get_records_cached("Rotation_Stats", ttl_s=180)  # 3‑minute cache
+        vault_data = vault_ws.get_records_cached("Token_Vault", ttl_s)  # 3‑minute cache
+        stats_data = stats_ws.get_records_cached("Rotation_Stats", ttl_s)  # 3‑minute cache
 
         vault_dict = {row["Token"].strip().upper(): str(row.get("Vault Tag", "")).strip() for row in vault_data if row.get("Token")}
         headers = stats_ws.row_values(1)
