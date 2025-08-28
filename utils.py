@@ -279,7 +279,8 @@ def ws_get_all_records_cached(ws, ttl_s: int = 120):
 
 def install_ws_compat_cache():
     """
-    Adds Worksheet.get_records_cached(ttl_s=120) compat even if gspread.models is absent.
+    Adds Worksheet.get_records_cached(...) compat even if gspread.models is absent.
+    Accepts legacy positional arg (e.g., sheet name) without breaking.
     """
     try:
         Worksheet = None
@@ -287,6 +288,7 @@ def install_ws_compat_cache():
             from gspread.models import Worksheet as _W
             Worksheet = _W
         except Exception:
+            # Fallback: get the actual class from a live worksheet if models isn't exposed
             try:
                 sh = _open_sheet()
                 ws0 = sh.sheet1
@@ -295,9 +297,29 @@ def install_ws_compat_cache():
                 Worksheet = None
 
         if Worksheet is not None and not hasattr(Worksheet, "get_records_cached"):
-            def _shim(self, ttl_s=120, *args, **kwargs):
-                # delegate to our cached reader; extra args are ignored
-                return ws_get_all_records_cached(self, ttl_s=ttl_s)
+            def _shim(self, *args, **kwargs):
+                """
+                Compatible signature:
+                - Correct usage: ws.get_records_cached(ttl_s=180)
+                - Legacy misuse: ws.get_records_cached("Rotation_Stats", ttl_s=180)
+                  (we ignore positional sheet name and only honor ttl_s)
+                """
+                # Pull ttl from kwargs first; if missing and a positional is present AND
+                # it's numeric, treat it as ttl; otherwise default to 120.
+                if "ttl_s" in kwargs:
+                    ttl = kwargs["ttl_s"]
+                elif args:
+                    # if they passed a single positional (often a mistaken title),
+                    # only treat it as ttl if it's a number
+                    a0 = args[0]
+                    try:
+                        ttl = int(a0)
+                    except Exception:
+                        ttl = 120
+                else:
+                    ttl = 120
+                return ws_get_all_records_cached(self, ttl_s=ttl)
+
             setattr(Worksheet, "get_records_cached", _shim)
     except Exception as e:
         print(f"[utils] install_ws_compat_cache failed (non-fatal): {e}")
