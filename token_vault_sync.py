@@ -1,66 +1,110 @@
 # token_vault_sync.py
 
-import gspread
 import pandas as pd
-from datetime import datetime
-from oauth2client.service_account import ServiceAccountCredentials
-import os
+from datetime import datetime, timezone
+from utils import (
+    get_ws,
+    safe_get_all_records,
+    ws_batch_update,
+    with_sheet_backoff,
+    str_or_empty,
+)
 
+SHEET_VAULT = "Token_Vault"
+SHEET_SCOUT = "Scout Decisions"
+
+def _utc_ts():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+def _col_letter(idx_1b: int) -> str:
+    n = idx_1b
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+@with_sheet_backoff
 def sync_token_vault():
     print("📦 Syncing Token Vault...")
-
     try:
-        # Auth
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-        client = gspread.authorize(creds)
+        vault_ws = get_ws(SHEET_VAULT)
+        scout_ws = get_ws(SHEET_SCOUT)
 
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
-        vault_ws = sheet.worksheet("Token_Vault")
-        scout_ws = sheet.worksheet("Scout Decisions")
+        # Read once, cached
+        vault_rows = safe_get_all_records(vault_ws, ttl_s=120)
+        scout_rows = safe_get_all_records(scout_ws, ttl_s=120)
 
-        vault_df = pd.DataFrame(vault_ws.get_all_records())
-        scout_df = pd.DataFrame(scout_ws.get_all_records())
+        # Ensure Vault headers
+        headers = vault_ws.row_values(1) or []
+        hidx = {h: i + 1 for i, h in enumerate(headers)}
+        needed = ["Decision", "Last Reviewed", "Source", "Score", "Sentiment", "Market Cap"]
+        header_changed = False
+        for col in needed:
+            if col not in hidx:
+                headers.append(col)
+                hidx[col] = len(headers)
+                header_changed = True
+        if header_changed:
+            vault_ws.update("A1", [headers])
 
-        # Ensure fallback columns exist
-        for col in ["Decision", "Last Reviewed", "Source", "Score", "Sentiment", "Market Cap"]:
-            if col not in vault_df.columns:
-                vault_df[col] = ""
+        # Build DataFrames
+        vdf = pd.DataFrame(vault_rows)
+        sdf = pd.DataFrame(scout_rows)
 
-        scout_df["Timestamp"] = pd.to_datetime(scout_df["Timestamp"], errors="coerce")
-        scout_latest = scout_df.sort_values("Timestamp").drop_duplicates("Token", keep="last")
+        # Defensive: ensure required columns exist
+        for c in ["Token"] + needed:
+            if c not in vdf.columns:
+                vdf[c] = ""
+        for c in ["Timestamp", "Token", "Decision", "Source", "Score", "Sentiment", "Market Cap"]:
+            if c not in sdf.columns:
+                sdf[c] = ""
 
-        # Sync matching scout info into vault
-        for idx, row in vault_df.iterrows():
-            token = row.get("Token", "").strip()
-            if not token:
+        # Latest scout decision per token
+        if "Timestamp" in sdf.columns:
+            sdf["Timestamp"] = pd.to_datetime(sdf["Timestamp"], errors="coerce")
+            sdf = sdf.sort_values("Timestamp").drop_duplicates("Token", keep="last")
+
+        # Map token -> latest scout row (as dict)
+        def _tok(x): return str_or_empty(x).upper()
+        latest = { _tok(r.get("Token")): r for r in sdf.to_dict(orient="records") }
+
+        # Prepare batched updates (only for changed cells)
+        updates = []
+        for i, row in enumerate(vdf.to_dict(orient="records"), start=2):
+            t = _tok(row.get("Token"))
+            if not t:
+                continue
+            srow = latest.get(t)
+            if not srow:
                 continue
 
-            match = scout_latest[scout_latest["Token"].str.strip() == token]
-            if not match.empty:
-                latest = match.iloc[0]
-                if not row["Decision"]:
-                    vault_df.at[idx, "Decision"] = latest.get("Decision", "")
-                if not row["Last Reviewed"]:
-                    timestamp = latest["Timestamp"]
-                    if pd.notnull(timestamp):
-                        vault_df.at[idx, "Last Reviewed"] = timestamp.strftime("%Y-%m-%dT%H:%M:%S")
-                    else:
-                        vault_df.at[idx, "Last Reviewed"] = ""
-                if not row["Source"]:
-                    vault_df.at[idx, "Source"] = latest.get("Source", "")
-                if not row["Score"]:
-                    vault_df.at[idx, "Score"] = latest.get("Score", "")
-                if not row["Sentiment"]:
-                    vault_df.at[idx, "Sentiment"] = latest.get("Sentiment", "")
-                if not row["Market Cap"]:
-                    vault_df.at[idx, "Market Cap"] = latest.get("Market Cap", "")
+            # Decide what to fill if empty
+            pairs = {
+                "Decision": str_or_empty(srow.get("Decision")),
+                "Source": str_or_empty(srow.get("Source")),
+                "Score": str_or_empty(srow.get("Score")),
+                "Sentiment": str_or_empty(srow.get("Sentiment")),
+                "Market Cap": str_or_empty(srow.get("Market Cap")),
+            }
+            # Last Reviewed from Timestamp
+            ts = srow.get("Timestamp")
+            ts_str = ""
+            if isinstance(ts, pd.Timestamp) and pd.notnull(ts):
+                ts_str = ts.strftime("%Y-%m-%dT%H:%M:%S")
+            pairs["Last Reviewed"] = ts_str
 
-        # Push back to sheet
-        vault_ws.clear()
-        vault_ws.update([vault_df.columns.tolist()] + vault_df.fillna("").astype(str).values.tolist())
+            for col, new_val in pairs.items():
+                cur = str_or_empty(row.get(col))
+                if not cur and new_val:
+                    a1 = f"{SHEET_VAULT}!{_col_letter(hidx[col])}{i}"
+                    updates.append({"range": a1, "values": [[new_val]]})
 
-        print("✅ Token Vault synced with latest Scout Decisions.")
+        if updates:
+            ws_batch_update(vault_ws, updates)
+            print(f"✅ Token Vault synced with latest Scout Decisions. {len(updates)} cell(s) updated (batched).")
+        else:
+            print("ℹ️ Token Vault already up to date.")
 
     except Exception as e:
         print(f"❌ Vault sync error: {e}")
