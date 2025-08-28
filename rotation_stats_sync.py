@@ -98,7 +98,8 @@ def run_rotation_stats_sync():
             else:
                 tag = ""
 
-            a1_tag = f"{STATS_SHEET}!{_col_letter(memory_col)}{i}"
+            # --- Tag write
+            a1_tag = f"{_col_letter(memory_col)}{i}"
             updates.append({"range": a1_tag, "values": [[tag]]})
             print(f"🧠 {token} tagged as {tag} (ROI={roi} from {roi_src})")
 
@@ -108,7 +109,7 @@ def run_rotation_stats_sync():
                 initial = float(initial_roi_str)
                 if initial != 0:
                     perf = round(roi / initial, 2)
-                    a1_perf = f"{STATS_SHEET}!{_col_letter(perf_col)}{i}"
+                    a1_perf = f"{_col_letter(perf_col)}{i}"   # no sheet name here
                     updates.append({"range": a1_perf, "values": [[perf]]})
                     print(f"📈 {token} performance = {perf}")
 
