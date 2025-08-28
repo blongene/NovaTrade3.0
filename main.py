@@ -24,7 +24,7 @@ from nova_trigger import trigger_nova_ping
 from orion_voice_loop import run_orion_voice_loop
 from nova_heartbeat import log_heartbeat
 from stalled_asset_detector import run_stalled_asset_detector
-from claim_tracker import check_claims
+from claim_tracker import run_claim_tracker
 from sentiment_radar import run_sentiment_radar
 from sentiment_summary import run_sentiment_summary
 from rotation_stats_sync import run_rotation_stats_sync
