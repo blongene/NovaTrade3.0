@@ -2,6 +2,7 @@
 import os
 import requests
 from flask import Flask, request
+from utils import send_telegram_message_dedup
 
 app = Flask(__name__)
 
