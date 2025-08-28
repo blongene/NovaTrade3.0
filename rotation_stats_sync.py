@@ -1,70 +1,90 @@
 # rotation_stats_sync.py
 
-import os
-import gspread
-from datetime import datetime
-from oauth2client.service_account import ServiceAccountCredentials
 import re
-from utils import with_sheet_backoff, get_records_cached, get_values_cached
+from utils import (
+    get_ws,
+    safe_get_all_records,
+    ws_batch_update,
+    with_sheet_backoff,
+    safe_float,        # parses "12.3%" -> 12.3, "" -> 0.0
+)
+
+STATS_SHEET = "Rotation_Stats"
+LOG_SHEET = "Rotation_Log"
+
+def _col_letter(idx_1b: int) -> str:
+    n = idx_1b
+    out = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+def _is_number_str(s: str) -> bool:
+    return bool(re.match(r"^-?\d+(\.\d+)?$", (s or "").strip()))
 
 @with_sheet_backoff
-def _read_rotation_stats(ws):
-    return ws.get_values_cached()
-
-@with_sheet_backoff
-def _read_planner(ws):
-    return ws.get_records_cached()
-
 def run_rotation_stats_sync():
     print("📊 Syncing Rotation_Stats...")
-
     try:
-        # === Setup ===
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        stats_ws = get_ws(STATS_SHEET)
+        log_ws = get_ws(LOG_SHEET)
 
-        log_ws = sheet.worksheet("Rotation_Log")
-        stats_ws = sheet.worksheet("Rotation_Stats")
+        # Read all once (cached + rate-limited)
+        stats_rows = safe_get_all_records(stats_ws, ttl_s=180)  # list[dict]
+        log_rows = safe_get_all_records(log_ws, ttl_s=180)      # list[dict]
+        headers = stats_ws.row_values(1) or []
+        hidx = {h: i + 1 for i, h in enumerate(headers)}  # 1-based indices
 
-        log_data = log_ws.get_records_cached("Rotation_Log", ttl_s=180)  # 3‑minute cache
-        stats_data = stats_ws.get_records_cached("Rotation_Stats", ttl_s=180)  # 3‑minute cache
-        headers = stats_ws.row_values(1)
+        # Ensure required headers exist
+        changed_header = False
+        if "Memory Tag" not in hidx:
+            headers.append("Memory Tag")
+            hidx["Memory Tag"] = len(headers)
+            changed_header = True
+        if "Performance" not in hidx:
+            headers.append("Performance")
+            hidx["Performance"] = len(headers)
+            changed_header = True
 
-        # === Column Positions ===
-        followup_col = headers.index("Follow-up ROI") + 1
-        memory_col = headers.index("Memory Tag") + 1 if "Memory Tag" in headers else len(headers) + 1
-        perf_col = headers.index("Performance") + 1 if "Performance" in headers else len(headers) + 2
+        if changed_header:
+            # single atomic header write
+            stats_ws.update("A1", [headers])
 
-        # Add missing headers if not found
-        if "Memory Tag" not in headers:
-            stats_ws.update_cell(1, memory_col, "Memory Tag")
-        if "Performance" not in headers:
-            stats_ws.update_cell(1, perf_col, "Performance")
+        memory_col = hidx["Memory Tag"]
+        perf_col = hidx["Performance"]
 
-        for i, row in enumerate(stats_data, start=2):
-            token = str(row.get("Token", "")).strip().upper()
+        # Build a quick lookup for Rotation_Log by token
+        def _tok(s): return (s or "").strip().upper()
+        log_by_token = {}
+        for r in log_rows:
+            t = _tok(r.get("Token"))
+            if t:
+                log_by_token[t] = r
 
-            # ✅ SKIP if no valid token
-            if not token or token in ["", "N/A", "-", "NONE"] or not token.isalpha():
+        updates = []  # for ws_batch_update
+        for i, row in enumerate(stats_rows, start=2):  # data starts at row 2
+            token = _tok(row.get("Token"))
+            if not token:
                 continue
 
-            roi_source = "Rotation_Log"
+            # --- ROI source preference: Rotation_Log -> fallback own column
+            roi_src = "Rotation_Log"
+            roi_val = ""
+            log_match = log_by_token.get(token)
+            if log_match:
+                roi_val = str(log_match.get("Follow-up ROI", "")).replace("%", "").strip()
+            if not _is_number_str(roi_val):
+                roi_val = str(row.get("Follow-up ROI", "")).replace("%", "").strip()
+                roi_src = "Rotation_Stats"
 
-            # === ROI Sync: Prefer Rotation_Log, fallback to Rotation_Stats
-            match = next((r for r in log_data if r.get("Token", "").strip().upper() == token), None)
-            roi_val = str(match.get("Follow-up ROI", "")).strip() if match else ""
-            if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", roi_val):
-                roi_val = str(row.get("Follow-up ROI", "")).strip()
-                roi_source = "Rotation_Stats"
-
-            if not roi_val or not re.match(r"^-?\d+(\.\d+)?$", roi_val):
-                continue  # skip invalid entries
+            if not _is_number_str(roi_val):
+                # nothing to do for this token
+                continue
 
             roi = float(roi_val)
 
-            # === MEMORY TAG
+            # --- Memory Tag classification
             if roi >= 200:
                 tag = "🟢 Big Win"
             elif 25 <= roi < 200:
@@ -78,24 +98,25 @@ def run_rotation_stats_sync():
             else:
                 tag = ""
 
-            stats_ws.update_cell(i, memory_col, tag)
-            print(f"🧠 {token} tagged as {tag} based on ROI = {roi} from {roi_source}")
+            a1_tag = f"{STATS_SHEET}!{_col_letter(memory_col)}{i}"
+            updates.append({"range": a1_tag, "values": [[tag]]})
+            print(f"🧠 {token} tagged as {tag} (ROI={roi} from {roi_src})")
 
-            # === PERFORMANCE CALCULATION ===
-            try:
-                initial_roi = str(row.get("Initial ROI", "")).replace("%", "").strip()
-                followup_roi = roi_val  # use the synced value
+            # --- Performance = followup / initial (if initial present)
+            initial_roi_str = str(row.get("Initial ROI", "")).replace("%", "").strip()
+            if _is_number_str(initial_roi_str):
+                initial = float(initial_roi_str)
+                if initial != 0:
+                    perf = round(roi / initial, 2)
+                    a1_perf = f"{STATS_SHEET}!{_col_letter(perf_col)}{i}"
+                    updates.append({"range": a1_perf, "values": [[perf]]})
+                    print(f"📈 {token} performance = {perf}")
 
-                if re.match(r"^-?\d+(\.\d+)?$", initial_roi) and re.match(r"^-?\d+(\.\d+)?$", followup_roi):
-                    initial = float(initial_roi)
-                    followup = float(followup_roi)
-
-                    if initial != 0:
-                        perf = round(followup / initial, 2)
-                        stats_ws.update_cell(i, perf_col, perf)
-                        print(f"📈 {token} performance = {perf}")
-            except Exception as e:
-                print(f"⚠️ Could not calculate performance for {token}: {e}")
+        if updates:
+            ws_batch_update(stats_ws, updates)
+            print(f"✅ Rotation_Stats sync complete: {len(updates)} cell(s) updated (batched).")
+        else:
+            print("ℹ️ Rotation_Stats: nothing to update.")
 
     except Exception as e:
         print(f"❌ Error in run_rotation_stats_sync: {e}")
