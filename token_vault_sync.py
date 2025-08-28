@@ -97,7 +97,7 @@ def sync_token_vault():
             for col, new_val in pairs.items():
                 cur = str_or_empty(row.get(col))
                 if not cur and new_val:
-                    a1 = f"{SHEET_VAULT}!{_col_letter(hidx[col])}{i}"
+                    a1 = f"{_col_letter(hidx[col])}{i}"
                     updates.append({"range": a1, "values": [[new_val]]})
 
         if updates:
