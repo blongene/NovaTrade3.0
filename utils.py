@@ -165,12 +165,12 @@ def with_sheets_gate(fn):
 # =============================================================================
 
 @with_sheet_backoff
-def _ws_get_all_values(ws):
+def _ws_get_all_values(ws, *_, **__):
     _sheet_read_gate()
     return ws.get_all_values()
 
 @with_sheet_backoff
-def _ws_get_all_records(ws):
+def _ws_get_all_records(ws, *_, **__):
     _sheet_read_gate()
     return ws.get_all_records()
 
@@ -279,51 +279,35 @@ def ws_get_all_records_cached(ws, ttl_s: int = 120):
 
 def install_ws_compat_cache():
     """
-    Add Worksheet.get_records_cached(ttl_s=120) compat method.
-
-    - Accepts positional or keyword ttl_s without double-binding.
-    - Does NOT open live sheets at import time (no 429 risk).
-    - Works across gspread variants (models/worksheet module names).
+    Adds Worksheet.get_records_cached(ttl_s=120) compat even if gspread.models is absent.
     """
     try:
         Worksheet = None
-
-        # Try common class locations across gspread versions
         try:
             from gspread.models import Worksheet as _W
             Worksheet = _W
         except Exception:
             try:
-                from gspread.worksheet import Worksheet as _W  # some versions
-                Worksheet = _W
+                sh = _open_sheet()
+                ws0 = sh.sheet1
+                Worksheet = ws0.__class__
             except Exception:
-                try:
-                    import gspread
-                    # Last resort: reflect from any Worksheet instance type if present
-                    # If not resolvable safely, we just skip patching.
-                    Worksheet = getattr(gspread, "Worksheet", None)
-                except Exception:
-                    Worksheet = None
+                Worksheet = None
 
-        if Worksheet is None:
-            return  # can't patch; harmless to skip
-
-        if not hasattr(Worksheet, "get_records_cached"):
-            def _shim(self, *args, **kwargs):
-                # Support both get_records_cached(ttl_s=...) and get_records_cached(120)
-                ttl = kwargs.pop("ttl_s", 120)
-                if args:
-                    # If a positional ttl was passed, prefer it
-                    try:
-                        ttl = int(args[0])
-                    except Exception:
-                        pass
-                return ws_get_all_records_cached(self, ttl_s=ttl_s or 120)
-
+        if Worksheet is not None and not hasattr(Worksheet, "get_records_cached"):
+            def _shim(self, ttl_s=120, *args, **kwargs):
+                # delegate to our cached reader; extra args are ignored
+                return ws_get_all_records_cached(self, ttl_s=ttl_s)
             setattr(Worksheet, "get_records_cached", _shim)
-
     except Exception as e:
         print(f"[utils] install_ws_compat_cache failed (non-fatal): {e}")
+
+# Call once on import (idempotent)
+try:
+    install_ws_compat_cache()
+except Exception as _e:
+    print(f"[utils] Worksheet compat install skipped: {_e}")
+
 
 # =============================================================================
 # Headers + misc helpers (exported)
