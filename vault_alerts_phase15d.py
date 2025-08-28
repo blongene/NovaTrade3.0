@@ -70,5 +70,5 @@ def run_vault_alerts():
         print(f"✅ Vault alert check complete. {sent_count} Telegram(s) sent.")
 
     except Exception as e:
-        print(f"❌ Error in run_vault_alerts: {e}")
-        ping_webhook_debug(f"❌ vault_alerts error: {e}")
+        print(f"Error in run_vault_alerts: {e}")
+        ping_webhook_debug(f"vault_alerts error: {e}")
