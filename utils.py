@@ -318,7 +318,7 @@ def install_ws_compat_cache():
                         ttl = int(args[0])
                     except Exception:
                         pass
-                return ws_get_all_records_cached(self, ttl_s=ttl)
+                return ws_get_all_records_cached(self, ttl_s=ttl_s or 120)
 
             setattr(Worksheet, "get_records_cached", _shim)
 
