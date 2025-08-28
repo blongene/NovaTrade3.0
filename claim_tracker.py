@@ -1,87 +1,87 @@
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-import os
-import time
-from utils import get_records_cached
+# claim_tracker.py
+import datetime as _dt
 
-def check_claims():
+from utils import (
+    get_ws,
+    safe_get_all_records,
+    ws_batch_update,
+    with_sheet_backoff,
+    str_or_empty,
+)
+
+SHEET_NAME = "Claim_Tracker"
+
+def _col_letter(idx_1b: int) -> str:
+    n = idx_1b
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def _parse_dt(s: str):
+    s = str_or_empty(s)
+    if not s:
+        return None
+    # try common formats; keep lightweight
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%m/%d/%Y %H:%M"):
+        try:
+            return _dt.datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    # last resort: isoformat-ish
     try:
-        print("📦 Checking claim tracker...")
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
-        tracker_ws = sheet.worksheet("Claim_Tracker")
-        log_ws = sheet.worksheet("Rotation_Log")
+        return _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
-        rows = tracker_ws.get_records_cached()
-        log_data = log_ws.get_records_cached()
-        headers = log_ws.row_values(1)
-        backend_col = headers.index("Backend Status") + 1  # 1-indexed
+@with_sheet_backoff
+def run_claim_tracker():
+    """
+    Updates 'Days Since Unlock' (if that column exists) based on 'Arrival Date'.
+    Does a single batch update to minimize writes.
+    Gracefully no-ops if headers are missing.
+    """
+    ws = get_ws(SHEET_NAME)
 
-        now = datetime.now()
+    header = ws.row_values(1) or []
+    idx = {h: i + 1 for i, h in enumerate(header)}  # 1-based
+    arrival_col = idx.get("Arrival Date")
+    days_col = idx.get("Days Since Unlock") or idx.get("Days Since") or idx.get("Days")
 
-        for i, row in enumerate(rows, start=2):
-            token = str(row.get("Token", "")).strip()
-            if not token:
-                continue
+    if arrival_col is None:
+        print("ℹ️ Claim Tracker: no 'Arrival Date' column; skipping.")
+        return
 
-            claimable = str(row.get("Claimable", "")).strip().upper() == "TRUE"
-            claimed_str = str(row.get("Claimed?", "")).strip().lower()
-            claimed = claimed_str in ["claimed", "yes", "✅"]
-            unlock_date_str = row.get("Unlock Date", "")
-            wallet = row.get("Wallet", "").strip()
-            contract = row.get("Contract", "").strip()
+    # If Days column is missing, create 'Days Since Unlock'
+    if days_col is None:
+        header.append("Days Since Unlock")
+        ws.update("A1", [header])  # atomic header write
+        days_col = len(header)
 
-            if unlock_date_str:
-                try:
-                    unlock_date = datetime.strptime(unlock_date_str, "%Y-%m-%d")
-                    days_since_unlock = (now - unlock_date).days
-                    if not claimed:
-                        tracker_ws.update_acell(f"J{i}", str(days_since_unlock))
-                    else:
-                        tracker_ws.update_acell(f"J{i}", "")
-                except Exception as e:
-                    print(f"⚠️ Could not parse unlock date for {token}: {e}")
-                    tracker_ws.update_acell(f"J{i}", "❓")
-            else:
-                tracker_ws.update_acell(f"J{i}", "")
+    rows = safe_get_all_records(ws, ttl_s=120)
+    now = _dt.datetime.utcnow()
+    updates = []
 
-            # Set status
-            if claimable and not claimed:
-                tracker_ws.update_acell(f"I{i}", "⚠️ Claim Now")
-                print(f"⚠️ Claim reminder: {token} is unlocked and not claimed.")
-            elif claimed:
-                tracker_ws.update_acell(f"I{i}", "✅ Claimed")
-            else:
-                tracker_ws.update_acell(f"I{i}", "🕒 Pending")
+    for r_idx, rec in enumerate(rows, start=2):
+        arrival_raw = rec.get("Arrival Date", "")
+        dt = _parse_dt(arrival_raw)
+        a1 = f"{SHEET_NAME}!{_col_letter(days_col)}{r_idx}"
 
-            # Add to Rotation_Log if claimed
-            if claimed:
-                exists = any(str(entry["Token"]).strip().upper() == token.upper() for entry in log_data)
-                if not exists:
-                    print(f"✅ Logging claimed token {token} to Rotation_Log...")
-                    new_row = [
-                        now.strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
-                        token,
-                        "Active",
-                        "", "", "", "",                   # Score, Sentiment, Market Cap, Scout URL
-                        "100%", "0", "0",                 # Allocation, Days Held, Follow-up ROI
-                        "", "", "",                       # Staking Yield, Contract, Initial Claimed
-                        now.strftime("%Y-%m-%d %H:%M:%S"),  # Last Checked
-                    ]
-                    log_ws.append_row(new_row)
-                    log_data = log_ws.get_records_cached()  # Refresh to include the new row
+        if not dt:
+            # clear the days cell if unparsable/empty
+            updates.append({"range": a1, "values": [[""]]})
+            continue
 
-            # ✅ Fixed column update (Backend Status)
-            for j, log_row in enumerate(log_data, start=2):
-                if log_row.get("Token", "").strip().upper() == token.upper():
-                    log_ws.update_cell(j, backend_col, "✅ Healthy")
-                    break
+        # If parsed as timezone-aware, convert to naive UTC for subtraction
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(_dt.timezone.utc).replace(tzinfo=None)
 
-            time.sleep(1.5)
+        days = max(0, (now - dt).days)
+        updates.append({"range": a1, "values": [[str(days)]]})
 
-        print("✅ Claim tracker complete.")
-    except Exception as e:
-        print(f"❌ Claim tracker error: {e}")
+    if updates:
+        ws_batch_update(ws, updates)
+        print(f"✅ Claim tracker complete: {len(updates)} cell(s) updated.")
+    else:
+        print("ℹ️ Claim tracker: nothing to update.")
