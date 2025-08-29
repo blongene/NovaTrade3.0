@@ -1,63 +1,108 @@
-
 # vault_intelligence.py
-
 import os
+from datetime import datetime
 import gspread
+from gspread.exceptions import APIError
 from oauth2client.service_account import ServiceAccountCredentials
+
+from utils import (
+    with_sheet_backoff,
+    str_or_empty,
+    to_float,
+)
+
+SHEET_URL = os.getenv("SHEET_URL")
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+
+def _col_letter(idx1: int) -> str:
+    # 1-based column index -> letters
+    n = idx1
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+@with_sheet_backoff
+def _open_sheet():
+    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", SCOPE)
+    client = gspread.authorize(creds)
+    return client.open_by_url(SHEET_URL)
+
+@with_sheet_backoff
+def _get_ws(title: str):
+    sh = _open_sheet()
+    return sh.worksheet(title)
 
 def run_vault_intelligence():
     print("📦 Running Vault Intelligence Sync...")
-
     try:
-        # Auth
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        vault_ws = _get_ws("Token_Vault")
+        stats_ws = _get_ws("Rotation_Stats")
 
-        # Load vault + rotation stats
-        vault_ws = sheet.worksheet("Token_Vault")
-        stats_ws = sheet.worksheet("Rotation_Stats")
+        # Read once
+        vault_rows = vault_ws.get_all_records()
+        stats_vals = stats_ws.get_all_values()
+        if not stats_vals:
+            print("⚠️ Rotation_Stats is empty; nothing to tag.")
+            return
+        header = stats_vals[0]
+        rows   = stats_vals[1:]
+        # Locate columns (Rotation_Stats)
+        def _hidx(name, default=None):
+            try:
+                return header.index(name) + 1  # 1-based
+            except ValueError:
+                return default
 
-        vault_data = vault_ws.get_all_records()
-        stats_data = stats_ws.get_all_records()
-        headers = stats_ws.row_values(1)
+        token_col   = _hidx("Token")
+        memory_col  = _hidx("Memory Tag")
+        roi_col     = _hidx("Follow-up ROI") or _hidx("Follow-up ROI (%)")
 
-        # Determine or create Vault Tag column
-        vault_col = headers.index("Vault Tag") + 1 if "Vault Tag" in headers else len(headers) + 1
-        if "Vault Tag" not in headers:
-            stats_ws.update_cell(1, vault_col, "Vault Tag")
+        # Create missing Memory Tag header once if absent
+        updates = []
+        if memory_col is None:
+            header.append("Memory Tag")
+            stats_ws.update("A1", [header])
+            memory_col = len(header)
 
-        # Build sets of known tokens
-        current_vault = set()
-        historical_vault = set()
-
-        for row in vault_data:
-            token = str(row.get("Token", "")).strip().upper()
-            status = str(row.get("Status", "")).strip().lower()
-            if not token:
+        # Build quick dict from vault: token -> tag (✅ Vaulted / ⚠️ Never Vaulted)
+        vault_map = {}
+        for r in vault_rows:
+            t = str_or_empty(r.get("Token")).strip().upper()
+            if not t:
                 continue
-            historical_vault.add(token)
-            if status in ["active", "held", "staked"]:
-                current_vault.add(token)
+            decision = str_or_empty(r.get("Decision")).strip().upper()
+            if decision == "VAULT":
+                vault_map[t] = "✅ Vaulted"
+            elif decision in ("IGNORE", "ROTATE", ""):
+                # keep as unknown unless we want to mark “Never Vaulted”
+                vault_map.setdefault(t, "⚠️ Never Vaulted")
 
-        # Tag each token in Rotation_Stats
-        for i, row in enumerate(stats_data, start=2):
-            token = str(row.get("Token", "")).strip().upper()
-            if not token:
+        # Prepare batch updates (A1 ranges WITHOUT duplicating the sheet name)
+        for i, row in enumerate(rows, start=2):
+            t = str_or_empty(row[token_col - 1] if token_col else "").strip().upper()
+            if not t:
                 continue
 
-            if token in current_vault:
-                tag = "✅ Vaulted"
-            elif token in historical_vault:
-                tag = "🔁 Previously Vaulted"
-            else:
-                tag = "⚠️ Never Vaulted"
+            tag = vault_map.get(t, "")
+            if not tag:
+                continue
 
-            stats_ws.update_cell(i, vault_col, tag)
-            print(f"📦 {token} tagged as: {tag}")
+            a1 = f"{_col_letter(memory_col)}{i}"
+            updates.append({"range": a1, "values": [[tag]]})
+            print(f"📦 {t} tagged as: {tag}")
+
+        if updates:
+            stats_ws.batch_update(updates, value_input_option="USER_ENTERED")
 
         print("✅ Vault intelligence sync complete.")
 
+    except APIError as e:
+        # Soft-fail on quota; main loop will call us again later
+        if "429" in str(e):
+            print("❌ Vault sync error: APIError 429 (quota) — skipping this cycle.")
+            return
+        raise
     except Exception as e:
         print(f"❌ Vault sync error: {e}")
