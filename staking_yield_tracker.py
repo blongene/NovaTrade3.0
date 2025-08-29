@@ -124,8 +124,8 @@ def run_staking_yield_tracker():
             # Queue two single-cell updates (batched)
             a1_yield = _cell_address(yield_col, r_idx)
             a1_last  = _cell_address(lastchk_col, r_idx)
-            batch.append({"range": f"{SHEET_NAME}!{a1_yield}", "values": [[f"{yield_pct}%"]]})
-            batch.append({"range": f"{SHEET_NAME}!{a1_last}",  "values": [[now_ts]]})
+            batch.append({"range": a1_yield, "values": [[f"{yield_pct}%"]]})
+            batch.append({"range": a1_last,  "values": [[now_ts]]})
 
             # Heartbeat + zero-yield nudge
             log_heartbeat("Staking Tracker", f"{token} Yield = {yield_pct}%")
