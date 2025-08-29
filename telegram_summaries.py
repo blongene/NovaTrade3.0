@@ -1,38 +1,41 @@
-# telegram_summaries.py
+# telegram_summaries.py — NT3.0 Phase-1 Polish
+# Lightweight periodic summary → Telegram (de-duped). Zero per-cell writes.
+
 import os
-import gspread
-from datetime import datetime, timezone
-from oauth2client.service_account import ServiceAccountCredentials
-from utils import send_telegram_message_dedup, with_sheet_backoff, send_once_per_day
+from datetime import datetime
+from utils import (
+    get_records_cached, str_or_empty, to_float,
+    send_telegram_message_dedup,
+)
 
-SHEET_URL = os.getenv("SHEET_URL")
+MAX_LINES = int(os.getenv("TG_SUMMARY_MAX_LINES", "10"))
+DEDUP_TTL_MIN = int(os.getenv("TG_SUMMARY_TTL_MIN", "90"))  # quiet window
 
-def _gspread():
-    scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    return gspread.authorize(creds).open_by_url(SHEET_URL)
-
-@with_sheet_backoff
-def _get_all_records(ws):
-    return ws.get_all_records()
-
-def _fmt_summary(pending:int, yes:int, no:int, skip:int) -> str:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return (
-        f"🧾 <b>Daily Summary — {today} (UTC)</b>\n"
-        f"⏳ Pending Rotations: <b>{pending}</b>\n"
-        f"🗳 Feedback — YES:{yes}  NO:{no}  SKIP:{skip}"
-    )
+def _top_yes(stats, n=5):
+    yes = []
+    for r in stats:
+        if str_or_empty(r.get("Decision")).upper() == "YES":
+            p = to_float(r.get("Performance"))
+            if p is not None:
+                yes.append((str_or_empty(r.get("Token")).upper(), p))
+    yes.sort(key=lambda x: x[1], reverse=True)
+    return yes[:n]
 
 def run_telegram_summary():
-    sh = _gspread()
-    stats = _get_all_records(sh.worksheet("Rotation_Stats"))
+    stats = get_records_cached("Rotation_Stats", ttl_s=300) or []
+    if not stats:
+        return
 
-    pending = sum(1 for r in stats if str(r.get("Status","")).upper() == "PENDING")
-    yes = sum(1 for r in stats if str(r.get("Decision","")).upper() == "YES")
-    no  = sum(1 for r in stats if str(r.get("Decision","")).upper() == "NO")
-    skip= sum(1 for r in stats if str(r.get("Decision","")).upper() == "SKIP")
+    top = _top_yes(stats, n=5)
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    msg = _fmt_summary(pending, yes, no, skip)
-    # once per UTC day; no spam on reboots
-    send_once_per_day("daily_summary", msg)
+    lines = [f"📣 *NovaTrade Summary* — {now}", ""]
+    if top:
+        lines.append("*Top YES by Performance*")
+        for t, p in top:
+            lines.append(f"• {t}: `{p:.2f}`")
+    else:
+        lines.append("_No YES positions with numeric performance yet._")
+
+    msg = "\n".join(lines[:MAX_LINES])
+    send_telegram_message_dedup(msg, key="tg_summary", ttl_min=DEDUP_TTL_MIN)
