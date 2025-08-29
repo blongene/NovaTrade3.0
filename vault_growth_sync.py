@@ -1,44 +1,34 @@
-# vault_growth_sync.py
-import os
-from utils import (
-    with_sheet_backoff,
-    get_ws,
-    get_records_cached,   # cache-first list[dict] by sheet name
-)
+# vault_growth_sync.py — NovaTrade 3.0 (Phase-1 Polish)
+# Read-only scan of Token_Vault; zero per-cell writes.
+
 from time import sleep
+from utils import (
+    get_ws,
+    get_records_cached,
+    with_sheet_backoff,
+)
 
 SHEET_VAULT = "Token_Vault"
 
 @with_sheet_backoff
-def _get_vault_rows():
-    # Single cached read (default gate + backoff happen inside)
-    return get_records_cached(SHEET_VAULT, ttl_s=300)  # 5-minute cache
-
 def run_vault_growth_sync():
-    print("📦 Syncing Vault ROI + Memory Stats...")
+    print("📦 Syncing Vault ROI + Memory Stats …")
     try:
-        # Touch the worksheet once so gspread auth happens (also gated/backed off)
-        _ = get_ws(SHEET_VAULT)
-
-        rows = _get_vault_rows() or []
+        rows = get_records_cached(SHEET_VAULT, ttl_s=300) or []
         if not rows:
-            print("ℹ️ No rows in Token_Vault; nothing to sync.")
+            print("ℹ️ Token_Vault empty; nothing to sync.")
             return
 
-        # NOTE: This lightweight version only verifies we can read without tripping
-        # quota on boot storms. If/when we want to compute & write per-row fields,
-        # we’ll add a single batch_update here. For now: read-only = zero write bursts.
+        # No writes yet — just confirming read access is stable.
         print(f"✅ Vault Growth sync complete. {len(rows)} row(s) scanned, 0 updated.")
 
     except Exception as e:
-        msg = str(e)
-        # Graceful degrade on quota/service bounces
-        if "429" in msg or "quota" in msg.lower():
-            print("⏳ Sheets 429 in vault_growth_sync; backing off softly and skipping this pass.")
-            # tiny jitter so concurrent threads desynchronize a bit
+        msg = str(e).lower()
+        if "429" in msg or "quota" in msg:
+            print("⏳ Sheets 429 in vault_growth_sync; backing off softly.")
             sleep(1.2)
             return
-        if "503" in msg or "unavailable" in msg.lower():
-            print("🌩️ Sheets 503 (service unavailable) in vault_growth_sync; skipping this pass.")
+        if "503" in msg or "unavailable" in msg:
+            print("🌩️ Sheets 503 in vault_growth_sync; skipping this pass.")
             return
         print(f"❌ vault_growth_sync error: {e}")
