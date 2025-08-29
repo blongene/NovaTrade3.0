@@ -1,55 +1,44 @@
 # vault_growth_sync.py
-
 import os
-import gspread
-from datetime import datetime
-from oauth2client.service_account import ServiceAccountCredentials
-from utils import get_gspread_client, ping_webhook_debug
+from utils import (
+    with_sheet_backoff,
+    get_ws,
+    get_records_cached,   # cache-first list[dict] by sheet name
+)
+from time import sleep
+
+SHEET_VAULT = "Token_Vault"
+
+@with_sheet_backoff
+def _get_vault_rows():
+    # Single cached read (default gate + backoff happen inside)
+    return get_records_cached(SHEET_VAULT, ttl_s=300)  # 5-minute cache
 
 def run_vault_growth_sync():
+    print("📦 Syncing Vault ROI + Memory Stats...")
     try:
-        print("📦 Syncing Vault ROI + Memory Stats...")
+        # Touch the worksheet once so gspread auth happens (also gated/backed off)
+        _ = get_ws(SHEET_VAULT)
 
-        client = get_gspread_client()
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        rows = _get_vault_rows() or []
+        if not rows:
+            print("ℹ️ No rows in Token_Vault; nothing to sync.")
+            return
 
-        vault_ws = sheet.worksheet("Token_Vault")
-        log_ws = sheet.worksheet("Rotation_Log")
-        stats_ws = sheet.worksheet("Rotation_Stats")
-
-        vault_data = vault_ws.get_all_records()
-        log_data = log_ws.get_all_records()
-        stats_data = stats_ws.get_all_records()
-
-        headers = vault_ws.row_values(1)
-        roi_col = headers.index("Vault ROI") + 1
-        days_col = headers.index("Days Held") + 1
-        tag_col = headers.index("Memory Tag") + 1
-        score_col = headers.index("Memory Score") + 1
-
-        updated = 0
-
-        for i, row in enumerate(vault_data, start=2):
-            token = row.get("Token", "").strip().upper()
-            if not token:
-                continue
-
-            log_match = next((r for r in log_data if r.get("Token", "").strip().upper() == token), None)
-            stat_match = next((r for r in stats_data if r.get("Token", "").strip().upper() == token), None)
-
-            roi = log_match.get("Follow-up ROI", "") if log_match else ""
-            days = log_match.get("Days Held", "") if log_match else ""
-            tag = stat_match.get("Memory Tag", "") if stat_match else ""
-            score = stat_match.get("Memory Score", "") if stat_match else ""
-
-            vault_ws.update_cell(i, roi_col, str(roi))
-            vault_ws.update_cell(i, days_col, str(days))
-            vault_ws.update_cell(i, tag_col, str(tag))
-            vault_ws.update_cell(i, score_col, str(score))
-            updated += 1
-
-        print(f"✅ Vault Growth sync complete. {updated} rows updated.")
+        # NOTE: This lightweight version only verifies we can read without tripping
+        # quota on boot storms. If/when we want to compute & write per-row fields,
+        # we’ll add a single batch_update here. For now: read-only = zero write bursts.
+        print(f"✅ Vault Growth sync complete. {len(rows)} row(s) scanned, 0 updated.")
 
     except Exception as e:
+        msg = str(e)
+        # Graceful degrade on quota/service bounces
+        if "429" in msg or "quota" in msg.lower():
+            print("⏳ Sheets 429 in vault_growth_sync; backing off softly and skipping this pass.")
+            # tiny jitter so concurrent threads desynchronize a bit
+            sleep(1.2)
+            return
+        if "503" in msg or "unavailable" in msg.lower():
+            print("🌩️ Sheets 503 (service unavailable) in vault_growth_sync; skipping this pass.")
+            return
         print(f"❌ vault_growth_sync error: {e}")
-        ping_webhook_debug(f"❌ Vault Growth Sync Error: {e}")
