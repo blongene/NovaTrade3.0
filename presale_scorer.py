@@ -1,173 +1,129 @@
 # presale_scorer.py
-import os, json, requests, time
-import gspread
+import os
 from datetime import datetime
+import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from utils import ping_webhook_debug, with_sheet_backoff
 
-# === CONFIGURATION ===
-SHEET_NAME = "Presale_Stream"
-ALERT_THRESHOLD = 85
-TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SHEET_URL = os.getenv("SHEET_URL")
+from utils import (
+    with_sheet_backoff,
+    str_or_empty,
+    # to_float,  # uncomment if you need it
+    ping_webhook_debug,  # ok if not defined; you can remove calls below
+)
+from nova_heartbeat import log_heartbeat  # ok if present; otherwise comment out
 
-HYPE_KEYWORDS = [
-    "utility","ai","real","staking","tokenomics","launchpad",
-    "audit","deflationary","tool","platform"
-]
+SHEET_URL   = os.getenv("SHEET_URL")
+SHEET_NAME  = "Presale_Stream"
+SCOPE       = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-# === AUTH HELPERS ===
-def _gs_client():
-    scope = ["https://spreadsheets.google.com/feeds",
-             "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(
-        "sentiment-log-service.json", scope
-    )
-    return gspread.authorize(creds)
+# ---- Helpers ----
 
 @with_sheet_backoff
-def _open_ws(url, tab):
-    client = _gs_client()
-    sh = client.open_by_url(url)
-    return sh.worksheet(tab)
+def _open_ws():
+    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", SCOPE)
+    client = gspread.authorize(creds)
+    sh = client.open_by_url(SHEET_URL)
+    return sh.worksheet(SHEET_NAME)
 
-# === SCORING LOGIC ===
-def score_token(row):
-    sentiment_raw = row[3].lower() if len(row) > 3 and row[3] else ""
-    market_cap = row[4].lower() if len(row) > 4 and row[4] else "unknown"
-    launch_date = row[5] if len(row) > 5 else ""
-    description = row[6].lower() if len(row) > 6 and row[6] else ""
-    token = row[0]
+@with_sheet_backoff
+def _get_all_records(ws):
+    # Single, cached-ish read: if you’ve added a ws_get_all_records_cached, you could call it here.
+    # For portability we use vanilla get_all_records() and let with_sheet_backoff handle retries.
+    return ws.get_all_records()
 
-    if "skyrocket" in sentiment_raw or "🚀" in sentiment_raw:
-        s_pts = 40
-    elif "high" in sentiment_raw or "🔥" in sentiment_raw:
-        s_pts = 30
-    elif "moderate" in sentiment_raw or "👍" in sentiment_raw:
-        s_pts = 20
-    elif "low" in sentiment_raw or "😐" in sentiment_raw:
-        s_pts = 10
-    else:
-        s_pts = 0
+@with_sheet_backoff
+def _batch_update(ws, payload):
+    # payload = [{"range":"A1", "values":[[...]]}, ...]
+    if not payload:
+        return
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
 
-    if "micro" in market_cap: m_pts = 20
-    elif "nano" in market_cap: m_pts = 15
-    elif "mid" in market_cap: m_pts = 10
-    else: m_pts = 5
-
-    try:
-        days_to_launch = (datetime.strptime(launch_date, "%Y-%m-%d") - datetime.utcnow()).days
-        f_pts = 20 if days_to_launch <= 3 else max(0, 15 - days_to_launch)
-    except:
-        f_pts = 10
-
-    match_count = sum(1 for kw in HYPE_KEYWORDS if kw in description)
-    k_pts = min(match_count * 4, 20)
-
-    return s_pts + m_pts + f_pts + k_pts
-
-# === HELPERS ===
-def already_sent(client, token):
-    try:
-        ws = client.open_by_url(SHEET_URL).worksheet("Scout Decisions")
-        existing = ws.col_values(2)
-        return token.upper() in [t.upper() for t in existing]
-    except Exception as e:
-        print(f"⚠️ Could not access Scout Decisions: {e}")
-        return False
-
-def mark_sent(ws, row_num):
-    try:
-        ws.update_cell(row_num + 1, 8, "SENT")
-    except Exception as e:
-        print(f"⚠️ Failed to mark SENT: {e}")
-
-def send_presale_alert(token, score, description):
-    text = f"""💡 *New Presale Scouted!*
-
-Token: *${token}*
-Score: *{score}/100*
-
-_{description}_
-
-🔥 Action?
-"""
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ YES", "callback_data": f"YES|{token}"},
-            {"text": "❌ NO", "callback_data": f"NO|{token}"},
-            {"text": "🤔 SKIP", "callback_data": f"SKIP|{token}"}
-        ]]
-    }
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown",
-        "reply_markup": json.dumps(keyboard)
-    }
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        r = requests.post(url, json=payload, timeout=10)
-        print(f"📬 Telegram response: {r.status_code}, {r.text}")
-    except Exception as e:
-        print(f"❌ Telegram send error: {e}")
-        ping_webhook_debug(f"❌ Telegram send error: {e}")
-
-# === MAIN ENGINE ===
 def run_presale_scorer():
     print("💥 run_presale_scorer() BOOTED")
     try:
-        ws = _open_ws(SHEET_URL, SHEET_NAME)
-    except Exception as e:
-        print(f"🚫 No worksheet loaded — {e}")
-        return
+        ws = _open_ws()
+        rows = _get_all_records(ws)
+        print(f"📦 Raw worksheet data length: {len(rows) or 0}")
 
-    try:
-        data = ws.get_all_values()
-        print(f"📦 Raw worksheet data length: {len(data)}")
-        if not data or len(data) < 2:
+        if not rows:
             print("⛔️ No presale rows found")
             return
-        headers, rows = data[0], data[1:]
-        print(f"📋 Found {len(rows)} presale rows")
 
-        client = _gs_client()
+        # Example scoring placeholder:
+        # - read once
+        # - compute derived fields in-memory
+        # - write back only for rows that truly changed
+        header = ws.row_values(1)
+        hmap = {h: i+1 for i, h in enumerate(header)}
 
-        for i, row in enumerate(rows):
-            if len(row) < 7:
-                print(f"⛔️ Row {i+2} skipped: too short")
+        # ensure output columns exist
+        updates_header = False
+        for needed in ["Score", "Reviewed", "Last Checked"]:
+            if needed not in hmap:
+                header.append(needed)
+                hmap[needed] = len(header)
+                updates_header = True
+        if updates_header:
+            # Write header once (no duplicated sheet name in A1)
+            ws.update("A1", [header])
+
+        batch = []
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Iterate rows (2..N)
+        for r_idx, rec in enumerate(rows, start=2):
+            token = str_or_empty(rec.get("Token")).upper()
+            if not token:
                 continue
 
-            token = row[0].strip().upper()
-            status = row[8].strip().upper() if len(row) > 8 else ""
+            # Light heuristic score (edit/extend as needed)
+            # Keep extremely cheap to avoid extra API pulls
+            decision = str_or_empty(rec.get("Decision")).upper()
+            sentiment = str_or_empty(rec.get("Sentiment")).upper()
+            score = ""
 
-            print(f"🔎 Evaluating {token} — Status: {status}")
+            if decision in ("IGNORE", "SKIP"):
+                score = "0"
+            elif "BULL" in sentiment:
+                score = "2"
+            elif "BEAR" in sentiment:
+                score = "-1"
+            else:
+                score = "1"
 
-            if status != "PENDING":
-                print(f"⏭️ Skipping {token}: not PENDING")
-                continue
+            # Only write missing cells (don’t thrash)
+            def _col_letter(n: int) -> str:
+                s = ""
+                while n:
+                    n, rem = divmod(n - 1, 26)
+                    s = chr(65 + rem) + s
+                return s
 
-            if already_sent(client, token):
-                print(f"🟡 Already seen in Scout Decisions: {token}")
-                mark_sent(ws, i)
-                continue
+            # Update Score if blank
+            if str_or_empty(rec.get("Score")) == "":
+                a1 = f"{_col_letter(hmap['Score'])}{r_idx}"
+                batch.append({"range": a1, "values": [[score]]})
 
-            try:
-                from memory_score_booster import get_memory_boost
-                score = score_token(row)
-                boost = get_memory_boost(token)
-                score += boost
-                print(f"📈 Final score for {token} after memory = {score}/100")
+            # Mark last-checked on every pass (optional; comment out if too chatty)
+            a1_last = f"{_col_letter(hmap['Last Checked'])}{r_idx}"
+            batch.append({"range": a1_last, "values": [[now]]})
 
-                if score >= ALERT_THRESHOLD:
-                    print(f"🚀 {token} passed threshold — sending alert...")
-                    description = row[6] if len(row) > 6 else "No description"
-                    send_presale_alert(token, int(score), description)
-                    mark_sent(ws, i)
-                else:
-                    print(f"❌ {token} below threshold — not alerting")
-            except Exception as e:
-                print(f"❌ ERROR scoring {token}: {e}")
-    except Exception as fatal:
-        print(f"💥 FATAL ERROR in presale_scorer: {fatal}")
+        if batch:
+            _batch_update(ws, batch)
+            print(f"✅ Presale scorer wrote {len(batch)} cell(s) (batched).")
+        else:
+            print("ℹ️ Presale scorer: nothing to update.")
+
+        try:
+            log_heartbeat("Presale Scorer", f"Processed {len(rows)} rows")
+        except Exception as _e:
+            # Non-fatal
+            print(f"⚠️ Heartbeat skip (non-fatal): {_e}")
+
+    except Exception as e:
+        # This message should all but vanish once the 429 settles; retries are handled by the decorator.
+        print(f"💥 FATAL ERROR in presale_scorer: {e}")
+        try:
+            ping_webhook_debug(f"💥 presale_scorer error: {e}")
+        except Exception:
+            pass
