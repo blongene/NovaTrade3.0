@@ -66,13 +66,31 @@ def with_sheet_backoff(fn):
                 return fn(*a, **k)
             except Exception as e:
                 msg = str(e).lower()
-                retryable = ("429" in msg or "quota" in msg or "rate limit" in msg
-                             or "internal error" in msg or "temporarily" in msg)
+                retryable = (
+                    "429" in msg or
+                    "quota" in msg or
+                    "rate limit" in msg or
+                    "internal error" in msg or
+                    "temporarily" in msg or
+                    "unavailable" in msg
+                )
                 if i == max_tries - 1 or not retryable:
                     raise
+                # record the quota hit
+                from utils import _bump_429, get_429_metrics
+                try:
+                    _bump_429()
+                    metrics = get_429_metrics()
+                    if metrics["count"] >= int(os.getenv("SHEETS_429_STORM_THRESHOLD", "4")):
+                        # extra dampening in storm minutes
+                        extra = float(os.getenv("SHEETS_429_STORM_SLEEP", "3.0"))
+                        time.sleep(extra)
+                except Exception:
+                    pass
                 sleep_s = base * (2 ** i) + random.uniform(0, 0.4)
                 print(f"⏳ Sheets backoff {sleep_s:.2f}s in {fn.__name__}: {e}")
                 time.sleep(sleep_s)
+                continue
     return _inner
 
 def throttle_retry(max_retries=3, delay=2, jitter=1):
@@ -91,6 +109,29 @@ def throttle_retry(max_retries=3, delay=2, jitter=1):
                         raise
         return wrapper
     return decorator
+
+# ===== 429 metrics (rolling per-minute counter) =====
+_429_count_min = 0
+_429_min_bucket = int(time.time() // 60)
+
+def _bump_429():
+    global _429_count_min, _429_min_bucket
+    now_bucket = int(time.time() // 60)
+    if now_bucket != _429_min_bucket:
+        _429_min_bucket = now_bucket
+        _429_count_min = 0
+    _429_count_min += 1
+
+def get_429_metrics():
+    # returns current minute bucket and count
+    return {"minute": _429_min_bucket, "count": _429_count_min}
+
+# ===== Cold-boot suppression (for redeploy storms) =====
+_BOOT_TS = time.time()
+_BOOT_SUPPRESS_SEC = int(os.getenv("BOOT_SUPPRESS_SEC", "90"))  # default: first 90s are “quiet”
+
+def is_cold_boot():
+    return (time.time() - _BOOT_TS) < _BOOT_SUPPRESS_SEC
 
 # =============================================================================
 # GSpread Auth + Cached open_by_url
