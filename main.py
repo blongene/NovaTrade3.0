@@ -193,7 +193,7 @@ if __name__ == "__main__":
     # ===== Schedules (kept; added gentle offsets where it matters) =====
     schedule.every(60).minutes.do(run_rotation_log_updater)
     schedule.every(60).minutes.do(run_rebalance_scanner)
-    schedule.every(60).minutes.do(run_rotation_memory)
+    schedule.every(60).minutes.at(":33").do(run_rotation_memory)
     schedule.every(6).hours.do(run_sentiment_radar)
     schedule.every(3).hours.do(run_memory_rebuy_scan)
     schedule.every(3).hours.do(run_sentiment_summary)
