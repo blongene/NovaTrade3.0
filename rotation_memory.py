@@ -63,7 +63,7 @@ def run_rotation_memory():
         cur = str_or_empty(r.get("Memory Tag"))
         if tag != cur:
             writes.append({
-                "range": f"{TAB}!{_col_letter(mem_col)}{i}",
+                "range": f"{_col_letter(mem_col)}{i}",
                 "values": [[tag]],
             })
 
