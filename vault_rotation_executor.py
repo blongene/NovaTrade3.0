@@ -1,68 +1,78 @@
 # vault_rotation_executor.py
-
 import os
-import gspread
 from datetime import datetime
+import gspread
+from gspread.exceptions import APIError
 from oauth2client.service_account import ServiceAccountCredentials
-from utils import send_telegram_message, ping_webhook_debug
+
+from utils import with_sheet_backoff, str_or_empty, safe_float
+
+SHEET_URL = os.getenv("SHEET_URL")
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+
+@with_sheet_backoff
+def _open_sheet():
+    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", SCOPE)
+    client = gspread.authorize(creds)
+    return client.open_by_url(SHEET_URL)
+
+@with_sheet_backoff
+def _get_ws(title: str):
+    sh = _open_sheet()
+    return sh.worksheet(title)
 
 def run_vault_rotation_executor():
-    print("🚀 Running Vault Rotation Executor...")
-
+    print("▶️ Vault rotation executor …")
     try:
-        # Auth
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+        # Only read what we need once (typical: read Token_Vault decisions)
+        vault_ws = _get_ws("Token_Vault")
+        log_ws   = _get_ws("Vault_Rotation_Log") if "Vault_Rotation_Log" in [w.title for w in _open_sheet().worksheets()] else None
 
-        vault_ws = sheet.worksheet("Token_Vault")
-        log_ws = sheet.worksheet("Rotation_Log")
+        rows = vault_ws.get_all_records()
+        # Find candidates: Decision == "ROTATE" and not yet logged today
+        today = datetime.utcnow().date().isoformat()
+        already = set()
+        if log_ws:
+            log_vals = log_ws.get_all_values()
+            if log_vals:
+                for r in log_vals[1:]:
+                    # Expect cols: Date | Token | Action ...
+                    if r and len(r) >= 2 and r[0].startswith(today):
+                        already.add(str_or_empty(r[1]).strip().upper())
 
-        vault_data = vault_ws.get_all_records()
-        log_data = log_ws.get_all_records()
-        log_tokens = {row.get("Token", "").strip().upper() for row in log_data}
-
-        headers = vault_ws.row_values(1)
-        decision_col = headers.index("Decision") + 1
-        last_reviewed_col = headers.index("Last Reviewed") + 1
-
-        now = datetime.utcnow()
-        new_rotations = 0
-
-        for i, row in enumerate(vault_data, start=2):
-            token = row.get("Token", "").strip().upper()
-            decision = row.get("Decision", "").strip().upper()
-
-            if decision != "READY TO ROTATE":
+        to_log = []
+        for r in rows:
+            t = str_or_empty(r.get("Token")).strip().upper()
+            decision = str_or_empty(r.get("Decision")).strip().upper()
+            if not t or decision != "ROTATE":
                 continue
-            if not token or token in log_tokens:
+            if t in already:
                 continue
+            to_log.append(t)
 
-            score = row.get("Score", "")
-            sentiment = row.get("Sentiment", "")
-            market_cap = row.get("Market Cap", "")
-            roi = row.get("Vault ROI", "")
-            source = row.get("Source", "Vault")
-            memory_tag = row.get("Memory Tag", "")
-            now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        if not to_log:
+            print("✅ Vault rotation execution complete. 0 token(s) logged.")
+            return
 
-            log_ws.append_row([
-                now_str, token, "From Vault", score, sentiment, market_cap, "", "0", "0", "N/A"
-            ])
-            vault_ws.update_cell(i, decision_col, "ROTATED")
-            vault_ws.update_cell(i, last_reviewed_col, now.isoformat())
+        # Batch append minimal rows
+        if not log_ws:
+            # create on the fly if missing
+            sh = _open_sheet()
+            log_ws = sh.add_worksheet(title="Vault_Rotation_Log", rows=1000, cols=6)
+            log_ws.update("A1", [["Date", "Token", "Action", "Notes"]])
 
-            send_telegram_message(
-                f"📤 ${token} has been rotated out of the vault and logged to Rotation_Log.\n"
-                f"ROI: {roi} | Memory: {memory_tag}"
-            )
+        append_rows = [[f"{today}T00:00:00Z", t, "ROTATED", "Auto-exec"] for t in to_log]
+        # Use update with dynamic range
+        start_row = len(log_ws.get_all_values()) + 1
+        end_row = start_row + len(append_rows) - 1
+        log_ws.update(f"A{start_row}:D{end_row}", append_rows, value_input_option="USER_ENTERED")
 
-            print(f"✅ {token} rotated and logged.")
-            new_rotations += 1
+        print(f"✅ Vault rotation execution complete. {len(append_rows)} token(s) logged.")
 
-        print(f"✅ Vault rotation execution complete. {new_rotations} token(s) logged.")
-
+    except APIError as e:
+        if "429" in str(e):
+            print("❌ Error in vault_rotation_executor: APIError 429 (quota) — skipping this cycle.")
+            return
+        raise
     except Exception as e:
         print(f"❌ Error in vault_rotation_executor: {e}")
-        ping_webhook_debug(f"❌ vault_rotation_executor error: {e}")
