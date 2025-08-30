@@ -1,76 +1,139 @@
+# rotation_feedback_engine.py — NT3.0 Phase-1 Polish
+# Reads Rotation_Log once, computes which rows need re-vote prompts,
+# sends de-duped Telegram prompts, optionally stamps a single "Prompted At" column.
+# All writes batched; boot quiet-window aware.
+
 import os
-import requests
-from datetime import datetime
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime, timedelta
+from utils import (
+    get_ws, get_records_cached, ws_batch_update,
+    str_or_empty, send_telegram_prompt, tg_should_send, tg_mark_sent,
+    with_sheet_backoff, is_cold_boot,
+)
 
-PROMPT_MEMORY = {}
+TAB = "Rotation_Log"
+PROMPT_COL_NAME = os.getenv("ROT_FEEDBACK_PROMPT_COL", "Prompted At")
+TTL_READ_S      = int(os.getenv("ROT_FEEDBACK_TTL_READ_SEC", "300"))
+DEDUP_TTL_MIN   = int(os.getenv("ROT_FEEDBACK_DEDUP_MIN", "240"))
+MAX_PROMPTS     = int(os.getenv("ROT_FEEDBACK_MAX_PROMPTS", "8"))
+MIN_DAYS_HELD   = float(os.getenv("ROT_FEEDBACK_MIN_DAYS", "2"))     # only prompt after N days held
+RECHECK_NEG_ROI = float(os.getenv("ROT_FEEDBACK_NEG_ROI", "-10"))    # prompt if Follow-up ROI <= this
 
+def _col_letter(n: int) -> str:
+    s = ""; 
+    while n: n, r = divmod(n-1, 26); s = chr(65+r)+s
+    return s
+
+@with_sheet_backoff
 def run_rotation_feedback_engine():
-    try:
-        # Authenticate
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+    if is_cold_boot():
+        print("⏸ rotation_feedback_engine skipped (cold boot quiet window).")
+        return
 
-        stats_ws = sheet.worksheet("Rotation_Stats")
-        review_ws = sheet.worksheet("ROI_Review_Log")
+    print("▶ Rotation feedback engine …")
 
-        stats_rows = stats_ws.get_all_records()
-        review_rows = review_ws.get_all_records()
+    rows = get_records_cached(TAB, ttl_s=TTL_READ_S) or []
+    if not rows:
+        print("ℹ️ Rotation_Log empty; skipping.")
+        return
 
-        for i, row in enumerate(stats_rows, start=2):
-            token = str(row.get("Token", "")).strip()
-            decision = str(row.get("Decision", "")).strip().upper()
-            roi = str(row.get("Follow-up ROI", "")).strip()
+    ws = get_ws(TAB)
+    header = ws.row_values(1)
 
-            try:
-                days_held = int(row.get("Days Held", 0))
-            except ValueError:
-                continue
+    # required/optional columns
+    def _ix(name):  return header.index(name)+1 if name in header else None
+    c_token     = _ix("Token")
+    c_init_roi  = _ix("Initial ROI")
+    c_fup_roi   = _ix("Follow-up ROI")
+    c_decision  = _ix("Decision")
+    c_days      = _ix("Days Held")
+    c_status    = _ix("Status")
+    c_userresp  = _ix("User Response")
+    c_confirm   = _ix("Confirmed")
+    c_prompted  = _ix(PROMPT_COL_NAME)
 
-            if decision != "YES" or days_held not in [7, 14, 30]:
-                continue
+    if not c_token:
+        print("⚠️ Missing 'Token' column in Rotation_Log.")
+        return
 
-            memory_key = f"{token}_review_{days_held}"
-            if PROMPT_MEMORY.get(memory_key):
-                continue
+    writes = []
+    add_header = False
+    if not c_prompted:
+        c_prompted = len(header) + 1
+        add_header = True
+        writes.append({"range": f"{_col_letter(c_prompted)}1", "values": [[PROMPT_COL_NAME]]})
 
-            # Check if already answered in ROI_Review_Log
-            already_answered = any(
-                r["Token"].strip().upper() == token.upper()
-                and int(r.get("Days Held", 0)) == days_held
-                and r.get("Would You Say YES Again?", "").strip() != ""
-                for r in review_rows
-            )
-            if already_answered:
-                continue
+    # build revote candidates
+    candidates = []
+    for r in rows:
+        token = str_or_empty(r.get("Token")).upper()
+        if not token:
+            continue
+        decision = str_or_empty(r.get("Decision")).upper()
+        if decision != "YES":
+            continue
 
-            # 🔁 Prompt user via Telegram
-            message = f"📊 *Feedback Request: {token}*\n– Days Held: {days_held}d\n– ROI: {roi}\n\nWould you vote YES again?"
-            keyboard = {
-                "inline_keyboard": [[
-                    {"text": "✅ YES Again", "callback_data": f"REYES|{token}|{days_held}"},
-                    {"text": "❌ NO", "callback_data": f"RENO|{token}|{days_held}"}
-                ]]
-            }
+        days = float(str(r.get("Days Held") or "0").replace(",","") or 0)
+        if days < MIN_DAYS_HELD:
+            continue
 
-            resp = requests.post(
-                f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}/sendMessage",
-                json={
-                    "chat_id": os.getenv("CHAT_ID"),
-                    "text": message,
-                    "parse_mode": "Markdown",
-                    "reply_markup": keyboard
-                }
-            )
+        follow = r.get("Follow-up ROI")
+        try:
+            f_roi = float(str(follow).replace("%","").replace(",","")) if follow not in (None, "") else None
+        except Exception:
+            f_roi = None
 
-            if resp.ok:
-                PROMPT_MEMORY[memory_key] = True
-                print(f"📬 Feedback ping sent for {token} @ {days_held}d")
-            else:
-                print(f"⚠️ Telegram ping failed for {token}: {resp.status_code} - {resp.text}")
+        userresp = str_or_empty(r.get("User Response")).upper()
+        confirmed = str_or_empty(r.get("Confirmed")).upper()
 
-    except Exception as e:
-        print(f"❌ rotation_feedback_engine error: {e}")
+        # if already has a user response/confirmed, skip
+        if userresp in {"YES","NO"} or confirmed in {"YES","NO"}:
+            continue
+
+        # prompt if ROI is sufficiently negative or stale
+        should_prompt = (f_roi is not None and f_roi <= RECHECK_NEG_ROI) or (f_roi is None and days >= (MIN_DAYS_HELD+1))
+        if should_prompt:
+            candidates.append((token, f_roi, days))
+
+    # send prompts (de-duped), then stamp Prompted At for those rows
+    # build a token → row index map
+    token_to_idx = {}
+    for idx, r in enumerate(rows, start=2):
+        t = str_or_empty(r.get("Token")).upper()
+        if t and t not in token_to_idx:
+            token_to_idx[t] = idx
+
+    sent = 0
+    for token, f_roi, days in sorted(candidates, key=lambda x: (x[1] if x[1] is not None else 1e9)):
+        if sent >= MAX_PROMPTS:
+            break
+        key = f"rot_feedback:{token}"
+        if not tg_should_send(f"ROTFEED|{token}", key=key, ttl_min=DEDUP_TTL_MIN):
+            continue
+
+        roi_str = "unknown" if f_roi is None else f"{f_roi:.2f}%"
+        msg = (f"*Re-Vote Needed*\n\n"
+               f"*{token}*\n"
+               f"• Days held: `{days:.1f}`\n"
+               f"• Follow-up ROI: `{roi_str}`\n\n"
+               "Rotate out or keep holding?")
+        send_telegram_prompt(
+            token_or_title=token,
+            message=msg,
+            buttons=[["YES","NO"],["HOLD"]],
+            prefix="RE-VOTE",
+            dedupe_key=key,
+            ttl_min=DEDUP_TTL_MIN,
+        )
+        tg_mark_sent(f"ROTFEED|{token}", key=key)
+        sent += 1
+
+        idx = token_to_idx.get(token)
+        if idx:
+            writes.append({"range": f"{_col_letter(c_prompted)}{idx}",
+                           "values": [[datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")]]})
+
+    if writes:
+        ws_batch_update(ws, writes)
+
+    print(f"✅ rotation_feedback_engine: {sent} prompt(s) sent.")
