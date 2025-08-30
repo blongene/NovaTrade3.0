@@ -1,33 +1,23 @@
-# unlock_horizon_alerts.py
+# unlock_horizon_alerts.py — NT3.0 Phase-1 Polish
+# Alert for tokens that unlock within N days and are not claimed yet.
+# - Single cached read from Claim_Tracker
+# - De-duped Telegram alerts (per token)
+# - Optional single batch write to "Alerted At"
+
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 
 from utils import (
+    get_ws, get_records_cached, ws_batch_update,
+    str_or_empty, send_telegram_prompt, tg_should_send, tg_mark_sent,
     with_sheet_backoff,
-    get_ws,
-    get_records_cached,
-    ws_batch_update,
-    send_telegram_message_dedup,
-    ping_webhook_debug,
-    safe_float,
 )
 
-SHEET_CLAIMS = "Claim_Tracker"
-ENV_COOLDOWN_MIN = int(os.getenv("UNLOCK_HORIZON_COOLDOWN_MIN", "30"))
-_ENV_LAST_RUN_FILE = "/tmp/nt_unlock_horizon.last"
+TAB = "Claim_Tracker"
 
-def _recently_ran() -> bool:
-    try:
-        ts = float(open(_ENV_LAST_RUN_FILE, "r").read().strip())
-        return (datetime.utcnow() - datetime.utcfromtimestamp(ts)) < timedelta(minutes=ENV_COOLDOWN_MIN)
-    except Exception:
-        return False
-
-def _mark_ran():
-    try:
-        open(_ENV_LAST_RUN_FILE, "w").write(str(datetime.utcnow().timestamp()))
-    except Exception:
-        pass
+WINDOW_DAYS   = int(os.getenv("UNLOCK_ALERT_WINDOW_DAYS", "7"))
+MAX_PROMPTS   = int(os.getenv("UNLOCK_ALERT_MAX", "6"))
+DEDUP_TTL_MIN = int(os.getenv("UNLOCK_ALERT_TTL_MIN", "240"))  # 4h quiet window
 
 def _col_letter(n: int) -> str:
     s = ""
@@ -36,102 +26,157 @@ def _col_letter(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
+def _parse_ymd(s: str):
+    s = str_or_empty(s)
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    return None
+
+def _boolish(v) -> bool:
+    s = str_or_empty(v).lower()
+    return s in {"true", "yes", "y", "1", "claimed", "✅", "done"}
+
 @with_sheet_backoff
 def run_unlock_horizon_alerts():
     print("🔔 Running Unlock Horizon Alerts...")
 
-    # simple guard so redeploy storms don’t refire immediately
-    if _recently_ran():
-        print("⏳ Unlock Horizon: cooldown active; skipping.")
+    rows = get_records_cached(TAB, ttl_s=300) or []
+    if not rows:
+        print("ℹ️ Claim_Tracker empty; skipping.")
         return
 
-    try:
-        # 1) bulk read once, using cache to keep reads low
-        ws = get_ws(SHEET_CLAIMS)
-        rows = get_records_cached(SHEET_CLAIMS, ttl_s=120)  # one cached read
+    # Fuzzy headers
+    # (Adjust/add synonyms if your sheet differs)
+    H_TOKEN     = ("Token", "Asset", "Coin")
+    H_UNLOCK    = ("Unlock Date", "Unlock_Date", "Unlock At", "Unlock")
+    H_CLAIMED   = ("Claimed?", "Claimed")
+    H_STATUS    = ("Status",)
+    H_ALERTED   = ("Alerted At", "Unlock Alerted At")
 
-        if not rows:
-            print("ℹ️ No rows in Claim_Tracker.")
-            _mark_ran()
-            return
+    # build name->present map from first row
+    # (we use dict access later via r.get(name))
+    def pick_name(sample_row: dict, candidates: tuple[str, ...]) -> str | None:
+        for name in candidates:
+            if name in sample_row:
+                return name
+        return None
 
-        # map headers → column index (1-based)
-        headers = ws.row_values(1)
-        hidx = {h: i+1 for i, h in enumerate(headers)}
+    # Choose header names off the first row’s keys
+    keys = rows[0].keys() if rows else []
+    sample = {k: None for k in keys}
 
-        # ensure we have the columns we’ll read/write
-        need = ["Token", "Unlock Date", "Days Since Unlock", "Status", "Last Alerted"]
-        missing = [c for c in need if c not in hidx]
-        if missing:
-            print(f"ℹ️ Claim Tracker missing columns: {', '.join(missing)}; skipping.")
-            _mark_ran()
-            return
+    name_token   = pick_name(sample, H_TOKEN)
+    name_unlock  = pick_name(sample, H_UNLOCK)
+    name_claimed = pick_name(sample, H_CLAIMED)
+    name_status  = pick_name(sample, H_STATUS)
+    name_alerted = pick_name(sample, H_ALERTED)  # may be None
 
-        now = datetime.utcnow()
-        updates = []
-        alerts = []
+    if not name_token or not name_unlock:
+        print("⚠️ Missing required columns (Token/Unlock Date).")
+        return
 
-        for i, rec in enumerate(rows, start=2):  # start at row 2
-            token = (rec.get("Token") or "").strip().upper()
-            if not token:
-                continue
+    today = date.today()
+    horizon_end = today + timedelta(days=WINDOW_DAYS)
 
-            unlock_raw = (rec.get("Unlock Date") or "").strip()
-            status = (rec.get("Status") or "").strip().upper()
-            last_alerted = (rec.get("Last Alerted") or "").strip()
+    candidates = []
+    for r in rows:
+        token   = str_or_empty(r.get(name_token)).upper()
+        if not token:
+            continue
+        unlock  = _parse_ymd(r.get(name_unlock))
+        claimed = _boolish(r.get(name_claimed)) if name_claimed else False
+        status  = str_or_empty(r.get(name_status))
 
-            # skip if already resolved/claimed
-            if status in {"RESOLVED", "CLAIMED", "ARCHIVED"}:
-                continue
+        if claimed:
+            continue
+        if not unlock:
+            continue
+        if unlock < today:  # already unlocked → other flows handle
+            continue
+        if unlock > horizon_end:
+            continue
 
-            # parse unlock date (expect ISO-ish)
-            try:
-                if not unlock_raw:
-                    continue
-                # be tolerant of 'YYYY-MM-DD' or ISO with time
-                dt = datetime.fromisoformat(unlock_raw.replace("Z", "+00:00")).replace(tzinfo=None)
-            except Exception:
-                # not a valid date; skip quietly
-                continue
+        # only alert if sheet isn't already telling us it's claimed/resolved
+        candidates.append({
+            "token": token,
+            "unlock": unlock,
+            "row": r,  # keep whole row for future fields if needed
+        })
 
-            days_since = (now - dt).days
-            # write Days Since Unlock
-            a1_days = f"{_col_letter(hidx['Days Since Unlock'])}{i}"
-            updates.append({"range": a1_days, "values": [[str(days_since)]]})
+    if not candidates:
+        print("✅ No unlocks within window.")
+        return
 
-            # alert once per day max
-            should_alert = False
-            if days_since >= 0:
-                if not last_alerted:
-                    should_alert = True
-                else:
-                    try:
-                        la = datetime.fromisoformat(last_alerted.replace("Z", "+00:00")).replace(tzinfo=None)
-                        should_alert = (now.date() > la.date())
-                    except Exception:
-                        should_alert = True
+    # Prepare a single ws + header row for optional writeback
+    ws = get_ws(TAB)
+    header = ws.row_values(1)
+    if name_alerted and name_alerted in header:
+        alerted_col = header.index(name_alerted) + 1
+        add_header = False
+    else:
+        # if column missing, we’ll add it once (to the right)
+        alerted_col = len(header) + 1
+        add_header = True
+        name_alerted = name_alerted or "Alerted At"
 
-            if should_alert:
-                alerts.append(f"• {token} unlocked {days_since}d ago (on {dt.date()})")
-                a1_last = f"{_col_letter(hidx['Last Alerted'])}{i}"
-                updates.append({"range": a1_last, "values": [[now.isoformat(timespec='seconds')]]})
+    # Send alerts (de-duped), capped
+    candidates.sort(key=lambda c: c["unlock"])  # soonest first
+    sent = 0
+    writes = []
+    if add_header:
+        writes.append({"range": f"{_col_letter(alerted_col)}1", "values": [[name_alerted]]})
 
-        # 2) batch write once
-        if updates:
-            ws_batch_update(ws, updates)
-            print(f"✅ Unlock horizon check complete. {len(updates)} cells updated, {len(alerts)} alert(s) prepared.")
-        else:
-            print("✅ Unlock horizon check complete. 0 rows updated, 0 alerts sent.")
+    # Build a quick row index map: token -> row index (2-based)
+    # Using cached records, we can reconstruct position reliably
+    token_to_ridx = {}
+    for idx, r in enumerate(rows, start=2):
+        t = str_or_empty(r.get(name_token)).upper()
+        if t and t not in token_to_ridx:
+            token_to_ridx[t] = idx
 
-        # 3) single de-duped Telegram summary (optional)
-        if alerts:
-            body = "🔔 <b>Unlock Horizon</b>\n" + "\n".join(alerts)
-            send_telegram_message_dedup(body, key="unlock_horizon_daily", ttl_min=60)
+    for c in candidates:
+        if sent >= MAX_PROMPTS:
+            break
+        token  = c["token"]
+        unlock = c["unlock"]
 
-        _mark_ran()
+        key = f"unlock_alert:{token}"
+        if not tg_should_send(f"UNLOCK|{token}", key=key, ttl_min=DEDUP_TTL_MIN):
+            continue
 
-    except Exception as e:
-        # soft-fail & set cooldown so we don’t thrash
-        print(f"❌ Error in run_unlock_horizon_alerts: {e}")
-        ping_webhook_debug(f"❌ Unlock Horizon error: {e}")
-        _mark_ran()
+        msg = (
+            f"*Upcoming Unlock Window*\n\n"
+            f"*{token}*\n"
+            f"• Unlock date: `{unlock.isoformat()}`\n"
+            f"• Window: next {WINDOW_DAYS} day(s)\n\n"
+            f"Tap *YES* to mark as handled/snooze after you’ve scheduled the claim."
+        )
+        # Use inline YES/NO for consistency with other flows
+        send_telegram_prompt(
+            token_or_title=token,
+            message=msg,
+            buttons=["YES", "NO"],
+            prefix="UNLOCK",
+            dedupe_key=key,
+            ttl_min=DEDUP_TTL_MIN,
+        )
+        tg_mark_sent(f"UNLOCK|{token}", key=key)
+        sent += 1
+
+        # Optional writeback: Alerted At timestamp
+        ridx = token_to_ridx.get(token)
+        if ridx:
+            writes.append({
+                "range": f"{_col_letter(alerted_col)}{ridx}",
+                "values": [[datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")]],
+            })
+
+    if writes:
+        ws_batch_update(ws, writes)
+
+    print(f"✅ Unlock horizon alerts: {sent} prompt(s) sent.")
