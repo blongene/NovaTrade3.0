@@ -1,45 +1,65 @@
-# memory_score_sync.py
+# memory_score_sync.py — NT3.0 Phase-1 Polish (batch write)
+from utils import (
+    get_ws, get_records_cached, ws_batch_update,
+    str_or_empty, with_sheet_backoff
+)
 
-import os
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+TAB = "Rotation_Stats"
+COL_TOTAL = "Total Memory Score"
 
+def _col_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+@with_sheet_backoff
 def run_memory_score_sync():
     print("🧠 Calculating Total Memory Score...")
+    rows = get_records_cached(TAB, ttl_s=300) or []
+    if not rows:
+        print("ℹ️ Rotation_Stats empty; skipping.")
+        return
 
-    try:
-        # Google Sheets auth
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+    ws = get_ws(TAB)
+    header = ws.row_values(1)
 
-        stats_ws = sheet.worksheet("Rotation_Stats")
-        rows = stats_ws.get_all_records()
-        headers = stats_ws.row_values(1)
+    # Required/optional columns
+    ms_col = header.index("Memory Score") + 1 if "Memory Score" in header else None
+    rw_col = header.index("Rebuy Weight") + 1 if "Rebuy Weight" in header else None
+    vm_col = header.index("Memory Vault Score") + 1 if "Memory Vault Score" in header else None
 
-        memory_col = headers.index("Memory Score") + 1
-        rebuy_weight_col = headers.index("Rebuy Weight") + 1
-        vault_score_col = headers.index("Memory Vault Score") + 1 if "Memory Vault Score" in headers else None
-        total_col = headers.index("Total Memory Score") + 1 if "Total Memory Score" in headers else len(headers) + 1
+    if COL_TOTAL in header:
+        tot_col = header.index(COL_TOTAL) + 1
+        add_header = False
+    else:
+        tot_col = len(header) + 1
+        add_header = True
 
-        if "Total Memory Score" not in headers:
-            stats_ws.update_cell(1, total_col, "Total Memory Score")
+    def _to_float(s, default=0.0):
+        try:
+            return float(str(s).strip())
+        except Exception:
+            return default
 
-        for i, row in enumerate(rows, start=2):
-            try:
-                m_score = float(row.get("Memory Score", 0))
-                r_weight = float(row.get("Rebuy Weight", 0))
-                v_score = float(row.get("Memory Vault Score", 0)) if vault_score_col else 0
+    writes = []
+    if add_header:
+        writes.append({"range": f"{_col_letter(tot_col)}1", "values": [[COL_TOTAL]]})
 
-                total = round(m_score + r_weight + v_score, 2)
-                stats_ws.update_cell(i, total_col, total)
-                print(f"✅ {row.get('Token', '')} → Total Score = {total}")
+    for i, r in enumerate(rows, start=2):
+        m = _to_float(r.get("Memory Score")) if ms_col else 0.0
+        w = _to_float(r.get("Rebuy Weight")) if rw_col else 0.0
+        v = _to_float(r.get("Memory Vault Score")) if vm_col else 0.0
+        total = round(m + w + v, 2)
 
-            except Exception as e:
-                print(f"⚠️ Row {i} skipped: {e}")
+        cur = str_or_empty(r.get(COL_TOTAL))
+        new = f"{total:.2f}"
+        if new != cur:
+            writes.append({"range": f"{_col_letter(tot_col)}{i}", "values": [[new]]})
 
-        print("✅ Total Memory Score sync complete.")
-
-    except Exception as e:
-        print(f"❌ Error in run_memory_score_sync: {e}")
+    if writes:
+        ws_batch_update(ws, writes)
+        print(f"✅ Total Memory Score sync complete. {len(writes)} cell(s) updated.")
+    else:
+        print("✅ Total Memory Score sync complete. 0 changes.")
