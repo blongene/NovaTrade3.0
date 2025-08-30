@@ -4,6 +4,9 @@ import requests
 from flask import Flask, request
 from utils import send_telegram_message_dedup
 
+from api_commands import bp as cmdapi_bp
+telegram_app.register_blueprint(cmdapi_bp)
+
 app = Flask(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
