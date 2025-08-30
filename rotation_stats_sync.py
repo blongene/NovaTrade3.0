@@ -1,123 +1,153 @@
-# rotation_stats_sync.py
+# rotation_stats_sync.py — NT3.0 Phase-1 Polish (cache-first + single batch)
+# Mirrors ROI/decision fields from Rotation_Log → Rotation_Stats without hammering Sheets.
 
-import re
+import os
+from datetime import datetime
 from utils import (
-    get_ws,
-    safe_get_all_records,
-    ws_batch_update,
-    with_sheet_backoff,
-    safe_float,        # parses "12.3%" -> 12.3, "" -> 0.0
+    get_ws, get_records_cached, ws_batch_update,
+    str_or_empty, to_float, with_sheet_backoff
 )
 
-STATS_SHEET = "Rotation_Stats"
-LOG_SHEET = "Rotation_Log"
+SRC_TAB = "Rotation_Log"
+DST_TAB = "Rotation_Stats"
 
-def _col_letter(idx_1b: int) -> str:
-    n = idx_1b
-    out = ""
+# Tunables
+TTL_READ_S      = int(os.getenv("ROTSTATS_TTL_READ_SEC", "300"))   # cache reads 5m
+MAX_UPDATES     = int(os.getenv("ROTSTATS_MAX_UPDATES", "400"))    # cap per run
+CREATE_MISSING  = os.getenv("ROTSTATS_CREATE_MISSING", "true").lower() == "true"
+
+NEEDED_HEADERS = ["Token","Initial ROI","Follow-up ROI","Decision","Days Held","Status","Memory Tag","Performance"]
+
+def _col_letter(n: int) -> str:
+    s = ""
     while n:
-        n, r = divmod(n - 1, 26)
-        out = chr(65 + r) + out
-    return out
+        n, r = divmod(n-1, 26)
+        s = chr(65+r)+s
+    return s
 
-def _is_number_str(s: str) -> bool:
-    return bool(re.match(r"^-?\d+(\.\d+)?$", (s or "").strip()))
+def _normalize_roi(v):
+    x = to_float(v, default=None)
+    return None if x is None else round(x, 4)
 
 @with_sheet_backoff
 def run_rotation_stats_sync():
     print("📊 Syncing Rotation_Stats...")
-    try:
-        stats_ws = get_ws(STATS_SHEET)
-        log_ws = get_ws(LOG_SHEET)
 
-        # Read all once (cached + rate-limited)
-        stats_rows = safe_get_all_records(stats_ws, ttl_s=180)  # list[dict]
-        log_rows = safe_get_all_records(log_ws, ttl_s=180)      # list[dict]
-        headers = stats_ws.row_values(1) or []
-        hidx = {h: i + 1 for i, h in enumerate(headers)}  # 1-based indices
+    src_rows = get_records_cached(SRC_TAB, ttl_s=TTL_READ_S) or []
+    if not src_rows:
+        print("ℹ️ Rotation_Log empty; skipping.")
+        return
 
-        # Ensure required headers exist
-        changed_header = False
-        if "Memory Tag" not in hidx:
-            headers.append("Memory Tag")
-            hidx["Memory Tag"] = len(headers)
+    # Build SRC map by token
+    src_map = {}
+    for r in src_rows:
+        t = str_or_empty(r.get("Token")).upper()
+        if not t:
+            continue
+        src_map[t] = {
+            "Initial ROI": _normalize_roi(r.get("Initial ROI")),
+            "Follow-up ROI": _normalize_roi(r.get("Follow-up ROI")),
+            "Decision": str_or_empty(r.get("Decision")).upper(),
+            "Days Held": to_float(r.get("Days Held"), 0) or 0,
+            "Status": str_or_empty(r.get("Status")),
+            # Optional fields present in SRC that we mirror if you track them there:
+            "Memory Tag": str_or_empty(r.get("Memory Tag")),
+            "Performance": _normalize_roi(r.get("Performance")),
+        }
+
+    # Open DST once, ensure headers, build column index
+    ws = get_ws(DST_TAB)
+    header = ws.row_values(1) or []
+    writes = []
+
+    # Ensure headers exist (append any missing at the end)
+    col_index = {h: i+1 for i, h in enumerate(header)}
+    changed_header = False
+    for h in NEEDED_HEADERS:
+        if h not in col_index:
+            header.append(h)
+            col_index[h] = len(header)
             changed_header = True
-        if "Performance" not in hidx:
-            headers.append("Performance")
-            hidx["Performance"] = len(headers)
-            changed_header = True
+    if changed_header:
+        writes.append({"range": f"A1:{_col_letter(len(header))}1", "values": [header]})
 
-        if changed_header:
-            # single atomic header write
-            stats_ws.update("A1", [headers])
+    # Read current DST body cheaply via cached records
+    dst_rows = get_records_cached(DST_TAB, ttl_s=TTL_READ_S) or []
 
-        memory_col = hidx["Memory Tag"]
-        perf_col = hidx["Performance"]
+    # Map existing rows by Token for update; track which tokens are missing
+    dst_token_to_rowidx = {}  # 2-based row index
+    for i, r in enumerate(dst_rows, start=2):
+        t = str_or_empty(r.get("Token")).upper()
+        if t and t not in dst_token_to_rowidx:
+            dst_token_to_rowidx[t] = i
 
-        # Build a quick lookup for Rotation_Log by token
-        def _tok(s): return (s or "").strip().upper()
-        log_by_token = {}
-        for r in log_rows:
-            t = _tok(r.get("Token"))
-            if t:
-                log_by_token[t] = r
-
-        updates = []  # for ws_batch_update
-        for i, row in enumerate(stats_rows, start=2):  # data starts at row 2
-            token = _tok(row.get("Token"))
-            if not token:
+    # Assemble updates for existing rows
+    updates = 0
+    for token, src in src_map.items():
+        row_idx = dst_token_to_rowidx.get(token)
+        if not row_idx:
+            continue
+        row_writes = []
+        for key in NEEDED_HEADERS:
+            if key == "Token":
                 continue
-
-            # --- ROI source preference: Rotation_Log -> fallback own column
-            roi_src = "Rotation_Log"
-            roi_val = ""
-            log_match = log_by_token.get(token)
-            if log_match:
-                roi_val = str(log_match.get("Follow-up ROI", "")).replace("%", "").strip()
-            if not _is_number_str(roi_val):
-                roi_val = str(row.get("Follow-up ROI", "")).replace("%", "").strip()
-                roi_src = "Rotation_Stats"
-
-            if not _is_number_str(roi_val):
-                # nothing to do for this token
+            col = col_index.get(key)
+            if not col:
                 continue
+            val = src.get(key)
+            # write normalized strings; keep blank if None
+            if isinstance(val, float):
+                val = f"{val}"
+            row_writes.append((col, val if val is not None else ""))
 
-            roi = float(roi_val)
+        if row_writes:
+            # Coalesce adjacent columns into minimal ranges
+            row_writes.sort(key=lambda x: x[0])
+            # pack into contiguous A1 ranges
+            start = end = None
+            block = []
+            for col, val in row_writes:
+                if start is None:
+                    start = end = col
+                    block = [val]
+                elif col == end + 1:
+                    end = col
+                    block.append(val)
+                else:
+                    writes.append({"range": f"{_col_letter(start)}{row_idx}:{_col_letter(end)}{row_idx}",
+                                   "values": [block]})
+                    start = end = col
+                    block = [val]
+            if block:
+                writes.append({"range": f"{_col_letter(start)}{row_idx}:{_col_letter(end)}{row_idx}",
+                               "values": [block]})
+            updates += 1
+            if updates >= MAX_UPDATES:
+                break
 
-            # --- Memory Tag classification
-            if roi >= 200:
-                tag = "🟢 Big Win"
-            elif 25 <= roi < 200:
-                tag = "✅ Small Win"
-            elif -24 <= roi <= 24:
-                tag = "⚪ Break-Even"
-            elif -70 <= roi < -25:
-                tag = "🔻 Loss"
-            elif roi <= -71:
-                tag = "🔴 Big Loss"
-            else:
-                tag = ""
+    # Optionally append new rows for tokens not present in DST
+    if CREATE_MISSING:
+        new_rows = []
+        for token, src in src_map.items():
+            if token in dst_token_to_rowidx:
+                continue
+            row = [""] * len(header)
+            row[col_index["Token"]-1] = token
+            for key in NEEDED_HEADERS:
+                if key == "Token":
+                    continue
+                if key in col_index:
+                    j = col_index[key]-1
+                    v = src.get(key)
+                    row[j] = f"{v}" if isinstance(v, float) else (v or "")
+            new_rows.append(row)
+            if len(new_rows) >= MAX_UPDATES:
+                break
+        if new_rows:
+            writes.append({"range": f"A{len(dst_rows)+2}", "values": new_rows})
 
-            # --- Tag write
-            a1_tag = f"{_col_letter(memory_col)}{i}"
-            updates.append({"range": a1_tag, "values": [[tag]]})
-            print(f"🧠 {token} tagged as {tag} (ROI={roi} from {roi_src})")
-
-            # --- Performance = followup / initial (if initial present)
-            initial_roi_str = str(row.get("Initial ROI", "")).replace("%", "").strip()
-            if _is_number_str(initial_roi_str):
-                initial = float(initial_roi_str)
-                if initial != 0:
-                    perf = round(roi / initial, 2)
-                    a1_perf = f"{_col_letter(perf_col)}{i}"   # no sheet name here
-                    updates.append({"range": a1_perf, "values": [[perf]]})
-                    print(f"📈 {token} performance = {perf}")
-
-        if updates:
-            ws_batch_update(stats_ws, updates)
-            print(f"✅ Rotation_Stats sync complete: {len(updates)} cell(s) updated (batched).")
-        else:
-            print("ℹ️ Rotation_Stats: nothing to update.")
-
-    except Exception as e:
-        print(f"❌ Error in run_rotation_stats_sync: {e}")
+    if writes:
+        ws_batch_update(ws, writes)
+        print(f"✅ Rotation_Stats synced. Rows touched: {updates}, new rows: {len(writes[-1]['values']) if writes and 'values' in writes[-1] and isinstance(writes[-1]['values'], list) else 0}.")
+    else:
+        print("✅ Rotation_Stats already up to date.")
