@@ -1,34 +1,32 @@
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import os
-from utils import send_telegram_message_dedup, with_sheet_backoff, get_ws, str_or_empty
+# nova_trigger_watcher.py — cache-first + zero chatter
+import os, time, random
+from utils import get_values_cached, with_sheet_backoff, str_or_empty
 
-send_telegram_message_dedup("🧠 Sync Required\nNew decisions are pending rotation. Please review the planner tab.",
-                            key="sync_required", ttl_min=30)
+TAB = os.getenv("NOVA_TRIGGER_TAB", "NovaTrigger")   # simple 2-cell sheet
+TTL = int(os.getenv("NOVA_TRIGGER_TTL_SEC", "120"))  # cache 2m
+JIT_MIN = float(os.getenv("NOVA_TRIGGER_JITTER_MIN_S", "0.3"))
+JIT_MAX = float(os.getenv("NOVA_TRIGGER_JITTER_MAX_S", "1.2"))
+
+@with_sheet_backoff
 def check_nova_trigger():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
+    print("▶ Nova trigger check …")
+    time.sleep(random.uniform(JIT_MIN, JIT_MAX))  # de-sync from neighbors
 
-    sheet = client.open_by_url(os.getenv("SHEET_URL"))
-    trigger_ws = sheet.worksheet("NovaTrigger")
-    raw = trigger_ws.acell("A1").value.strip().upper()
+    # Values-only, single read (then TTL-cached by utils)
+    vals = get_values_cached(TAB, ttl_s=TTL) or []
+    if not vals:
+        print(f"ℹ️ {TAB} empty; no trigger.")
+        return False, ""
 
-    if not raw or raw == "READY":
-        return
+    # Minimal schema:
+    # A1 = "Enabled" / "On" / "1" to fire
+    # B1 = optional message
+    flag = str_or_empty(vals[0][0] if vals[0] else "").strip().lower()
+    msg  = str_or_empty(vals[0][1] if len(vals[0]) > 1 else "")
 
-    alert_map = {
-        "SOS": "🚨 *NovaTrade SOS*\nThis is a test alert to confirm outbound messaging is working.",
-        "FYI ONLY": "📘 *NovaTrade FYI*\nNon-urgent update: system status or data refreshed.",
-        "SYNC NEEDED": "🧩 *NovaTrade Sync Needed*\nPlease review the latest responses or re-run the sync loop.",
-        "NOVA UPDATE": "🧠 *NovaTrade Intelligence*\nA logic update or system improvement has been deployed.",
-    }
-
-    msg = alert_map.get(raw)
-    if msg:
-        send_telegram_message_dedup(msg, key="nova_trigger_watch", ttl_min=10)
-        print(f"✅ NovaTrigger sent: {raw}")
-    else:
-        print(f"⚠️ Unknown NovaTrigger value: {raw}")
-
-    trigger_ws.update_acell("A1", "READY")
+    is_on = flag in {"1","on","true","enabled","yes","y"}
+    if is_on:
+        print("✅ NovaTrigger ON")
+        return True, msg
+    print("✅ NovaTrigger OFF")
+    return False, ""
