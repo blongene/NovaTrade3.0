@@ -1,44 +1,72 @@
-# === memory_weight_sync.py (patched to ensure write to Rotation_Memory) ===
-from datetime import datetime
-import re
-import statistics
-import os
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+# memory_weight_sync.py — NT3.0 Phase-1 Polish (batch write)
+from utils import (
+    get_ws, get_records_cached, ws_batch_update,
+    str_or_empty, with_sheet_backoff
+)
 
+SRC_TAB = "Rotation_Memory"     # where Wins/Losses live
+DST_TAB = "Rotation_Stats"      # where Memory Weight column lives
+DST_COL = "Memory Weight"
 
+def _col_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+@with_sheet_backoff
 def run_memory_weight_sync():
     print("🔁 Syncing Memory Weights...")
-    try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
+    mem_rows  = get_records_cached(SRC_TAB, ttl_s=300) or []
+    stats_rows = get_records_cached(DST_TAB, ttl_s=300) or []
+    if not mem_rows or not stats_rows:
+        print("ℹ️ Missing source or destination rows; skipping.")
+        return
 
-        memory_ws = sheet.worksheet("Rotation_Memory")
-        headers = memory_ws.row_values(1)
-        data = memory_ws.get_all_records()
+    # Map token → weight
+    def _to_int(x, default=0):
+        try:
+            return int(float(str(x).strip()))
+        except Exception:
+            return default
 
-        weight_col = headers.index("Memory Weight") + 1 if "Memory Weight" in headers else len(headers) + 1
-        if "Memory Weight" not in headers:
-            memory_ws.update_cell(1, weight_col, "Memory Weight")
+    weights = {}
+    for r in mem_rows:
+        t = str_or_empty(r.get("Token")).upper()
+        if not t:
+            continue
+        wins   = _to_int(r.get("Wins"))
+        losses = _to_int(r.get("Losses"))
+        total  = wins + losses
+        weight = round(wins / total, 2) if total > 0 else ""
+        weights[t] = weight
 
-        for i, row in enumerate(data, start=2):
-            try:
-                wins = int(float(row.get("Wins", 0)))
-            except:
-                wins = 0
-            try:
-                losses = int(float(row.get("Losses", 0)))
-            except:
-                losses = 0
+    ws = get_ws(DST_TAB)
+    header = ws.row_values(1)
 
-            total = wins + losses
-            weight = round(wins / total, 2) if total > 0 else ""
-            memory_ws.update_cell(i, weight_col, weight)
-            print(f"🧠 {str(row.get('Token', '')).strip()} → Memory Weight = {weight}")
+    if DST_COL in header:
+        col_ix = header.index(DST_COL) + 1
+        add_header = False
+    else:
+        col_ix = len(header) + 1
+        add_header = True
 
-        print("✅ Memory Weight sync complete.")
+    writes = []
+    if add_header:
+        writes.append({"range": f"{_col_letter(col_ix)}1", "values": [[DST_COL]]})
 
-    except Exception as e:
-        print(f"❌ Error in run_memory_weight_sync: {e}")
+    for i, r in enumerate(stats_rows, start=2):
+        t = str_or_empty(r.get("Token")).upper()
+        if not t:
+            continue
+        new = weights.get(t, "")
+        cur = str_or_empty(r.get(DST_COL))
+        if new != cur:
+            writes.append({"range": f"{_col_letter(col_ix)}{i}", "values": [[new]]})
+
+    if writes:
+        ws_batch_update(ws, writes)
+        print(f"✅ Memory Weight sync complete. {len(writes)} cell(s) updated.")
+    else:
+        print("✅ Memory Weight sync complete. 0 changes.")
