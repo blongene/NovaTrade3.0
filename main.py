@@ -12,6 +12,7 @@ from utils import (
     send_boot_notice_once, send_system_online_once, send_telegram_message_dedup,
     get_ws, get_records_cached, get_values_cached,
 )
+import gspread_guard
 
 # ===== Utility helpers =====
 def jitter(min_s=0.2, max_s=0.7):
