@@ -56,26 +56,28 @@ def safe_float(value, default=0.0):
 # =============================================================================
 
 def with_sheet_backoff(fn):
-    """Retry wrapper for Google Sheets 429/quota/5xx errors (exponential + jitter)."""
+    """
+    Retry wrapper for Google Sheets 429/quota/5xx errors (exponential + jitter).
+    Backoff is configurable via env:
+      SHEETS_BACKOFF_BASE (seconds, default 1.0)
+      SHEETS_BACKOFF_MAX_TRIES (default 8)
+    So worst-case retry can stretch out to ~2 minutes.
+    """
     @wraps(fn)
     def _inner(*a, **k):
-        max_tries = 6
-        base = 0.35  # starting backoff in seconds
+        max_tries = int(os.getenv("SHEETS_BACKOFF_MAX_TRIES", "8"))
+        base = float(os.getenv("SHEETS_BACKOFF_BASE", "1.0"))
         for i in range(max_tries):
             try:
                 return fn(*a, **k)
             except Exception as e:
                 msg = str(e).lower()
-                retryable = (
-                    "429" in msg
-                    or "quota" in msg
-                    or "rate limit" in msg
-                    or "internal error" in msg
-                    or "temporarily" in msg
-                )
+                retryable = any(x in msg for x in (
+                    "429", "quota", "rate limit", "internal error", "temporarily"
+                ))
                 if i == max_tries - 1 or not retryable:
                     raise
-                sleep_s = base * (2 ** i) + random.uniform(0, 0.4)
+                sleep_s = base * (2 ** i) + random.uniform(0, 0.5)
                 print(f"⏳ Sheets backoff {sleep_s:.2f}s in {fn.__name__}: {e}")
                 time.sleep(sleep_s)
     return _inner
