@@ -1,128 +1,134 @@
-# roi_feedback_sync.py
-import os
-from datetime import datetime
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from utils import with_sheet_backoff, get_gspread_client, send_telegram_message, ping_webhook_debug
+# roi_feedback_sync.py — NT3.0 Render Phase-1 diet
+# Syncs ROI_Review_Log decisions into Rotation_Stats with 1 cached read + 1 batch write.
 
-SHEET_URL = os.getenv("SHEET_URL")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+import os, time, random
+from utils import (
+    get_values_cached, get_ws, ws_batch_update, with_sheet_backoff, str_or_empty
+)
 
-def _open_sheet():
-    client = get_gspread_client()
-    return client.open_by_url(SHEET_URL)
+LOG_TAB   = os.getenv("ROI_LOG_TAB", "ROI_Review_Log")
+STATS_TAB = os.getenv("ROT_STATS_TAB", "Rotation_Stats")
+
+TTL_LOG_S    = int(os.getenv("ROI_SYNC_TTL_LOG_SEC", "300"))   # cache 5m
+TTL_STATS_S  = int(os.getenv("ROI_SYNC_TTL_STATS_SEC", "300")) # cache 5m
+MAX_WRITES   = int(os.getenv("ROI_SYNC_MAX_WRITES", "400"))
+JIT_MIN_S    = float(os.getenv("ROI_SYNC_JITTER_MIN_S", "0.4"))
+JIT_MAX_S    = float(os.getenv("ROI_SYNC_JITTER_MAX_S", "1.4"))
+
+YES_SET = {"YES","Y","TRUE","ON","REBUY","ROTATE","VAULT"}
+NO_SET  = {"NO","N","FALSE","OFF","HOLD","SKIP"}
+
+def _col_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n-1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def _find_col(header, *names):
+    for name in names:
+        if name in header:
+            return header.index(name)
+    return None
 
 @with_sheet_backoff
-def _get_all(ws):
-    return ws.get_all_values()
-
-@with_sheet_backoff
-def _append(ws, row):
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-@with_sheet_backoff
-def _update_cell(ws, r, c, v):
-    ws.update_cell(r, c, v)
-
-def _header_index_map(headers):
-    return {h.strip(): i for i, h in enumerate(headers)}
-
-def _normalize(s):
-    return (s or "").strip().upper()
-
-def _safe_float(x, default=None):
-    try:
-        return float(str(x).replace("%", "").strip())
-    except Exception:
-        return default
-
 def run_roi_feedback_sync():
-    """
-    Syncs 'Would you vote YES again?' feedback from ROI_Review_Log into Rotation_Stats.
-    - Writes 'Last Feedback' (YES/NO/SKIP)
-    - Writes 'Last Feedback At' (UTC)
-    - Optionally updates 'Performance Note' column if present
-    Skips rows without valid token or feedback. Backoff protects against 429s.
-    """
-    try:
-        print("🔄 Syncing ROI feedback from ROI_Review_Log → Rotation_Stats ...")
-        sh = _open_sheet()
+    print("📅 Syncing ROI feedback responses…")
+    time.sleep(random.uniform(JIT_MIN_S, JIT_MAX_S))  # de-sync from neighbors
 
-        log_ws = sh.worksheet("ROI_Review_Log")
-        stats_ws = sh.worksheet("Rotation_Stats")
+    # ---------- Read ROI_Review_Log (values-only, cached) ----------
+    log_vals = get_values_cached(LOG_TAB, ttl_s=TTL_LOG_S) or []
+    if not log_vals or not log_vals[0]:
+        print(f"ℹ️ {LOG_TAB} empty; nothing to sync.")
+        return
 
-        log_vals = _get_all(log_ws)
-        stats_vals = _get_all(stats_ws)
+    log_header = log_vals[0]
+    tcol = _find_col(log_header, "Token")
+    dcol = _find_col(log_header, "Decision", "Response")
+    if tcol is None or dcol is None:
+        miss = []
+        if tcol is None: miss.append("Token")
+        if dcol is None: miss.append("Decision/Response")
+        print(f"⚠️ {LOG_TAB} missing columns: {', '.join(miss)}; skipping.")
+        return
 
-        if not log_vals or not stats_vals:
-            print("⚠️ Missing sheet values; aborting feedback sync.")
-            return
+    # Build latest decision per token (last write wins)
+    decisions = {}
+    for row in log_vals[1:]:
+        token = str_or_empty(row[tcol] if tcol < len(row) else "").upper()
+        if not token:
+            continue
+        dec = str_or_empty(row[dcol] if dcol < len(row) else "").upper()
+        if dec:
+            decisions[token] = dec
 
-        log_headers = log_vals[0]
-        stats_headers = stats_vals[0]
-        log_idx = _header_index_map(log_headers)
-        stats_idx = _header_index_map(stats_headers)
+    if not decisions:
+        print("ℹ️ No decisions found in ROI_Review_Log; skipping.")
+        return
 
-        # Required columns
-        t_col = log_idx.get("Token", 1)
-        d_col = log_idx.get("Decision", 2)
+    # ---------- Read Rotation_Stats (values-only, cached) ----------
+    stats_vals = get_values_cached(STATS_TAB, ttl_s=TTL_STATS_S) or []
+    if not stats_vals or not stats_vals[0]:
+        print(f"ℹ️ {STATS_TAB} empty; skipping.")
+        return
 
-        # Stats columns (create if missing)
-        if "Last Feedback" not in stats_idx:
-            stats_headers.append("Last Feedback")
-            stats_idx["Last Feedback"] = len(stats_headers) - 1
-        if "Last Feedback At" not in stats_idx:
-            stats_headers.append("Last Feedback At")
-            stats_idx["Last Feedback At"] = len(stats_headers) - 1
-        if stats_headers != stats_vals[0]:
-            # write updated header row
-            _update_cell(stats_ws, 1, 1, stats_headers[0])  # touch to ensure worksheet is “dirty”
-            stats_ws.update("A1", [stats_headers])
+    stats_header = stats_vals[0]
+    s_tok = _find_col(stats_header, "Token")
+    s_usr = _find_col(stats_header, "User Response", "Response")
+    s_conf = _find_col(stats_header, "Confirmed")
+    if s_tok is None or s_usr is None or s_conf is None:
+        miss = []
+        if s_tok is None: miss.append("Token")
+        if s_usr is None: miss.append("User Response/Response")
+        if s_conf is None: miss.append("Confirmed")
+        print(f"⚠️ {STATS_TAB} missing columns: {', '.join(miss)}; skipping.")
+        return
 
-        # Build a token → row mapping for Rotation_Stats for fast lookup
-        token_col = stats_idx.get("Token")
-        if token_col is None:
-            print("⛔️ Rotation_Stats requires a 'Token' column. Aborting.")
-            return
+    # ---------- Compute writes ----------
+    writes = []
+    touched = 0
 
-        stats_map = {}  # TOKEN -> (row_num, row_list)
-        for r_i, row in enumerate(stats_vals[1:], start=2):
-            tok = _normalize(row[token_col]) if token_col < len(row) else ""
-            if tok:
-                stats_map[tok] = (r_i, row)
+    for r_idx, row in enumerate(stats_vals[1:], start=2):
+        token = str_or_empty(row[s_tok] if s_tok < len(row) else "").upper()
+        if not token:
+            continue
+        new_dec = decisions.get(token)
+        if not new_dec:
+            continue
 
-        updates = 0
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        cur_resp = str_or_empty(row[s_usr] if s_usr < len(row) else "").upper()
+        cur_conf = str_or_empty(row[s_conf] if s_conf < len(row) else "").upper()
 
-        for log_row in log_vals[1:]:
-            token = _normalize(log_row[t_col] if t_col < len(log_row) else "")
-            decision = _normalize(log_row[d_col] if d_col < len(log_row) else "")
-            if not token or decision not in {"YES", "NO", "SKIP"}:
-                continue
+        # Normalize YES/NO-ish
+        if new_dec in YES_SET:
+            target_resp = "YES"
+            target_conf = "YES"
+        elif new_dec in NO_SET:
+            target_resp = "NO"
+            target_conf = "" if cur_conf == "" else ""   # keep unconfirmed on NO
+        else:
+            # freeform text → set response, leave Confirmed alone
+            target_resp = new_dec
+            target_conf = cur_conf
 
-            if token not in stats_map:
-                # Not all tokens must be in Rotation_Stats—skip silently
-                continue
+        # Only write if changes needed
+        row_writes = []
+        if target_resp != cur_resp:
+            row_writes.append({"range": f"{_col_letter(s_usr+1)}{r_idx}", "values": [[target_resp]]})
+        if target_conf != cur_conf:
+            row_writes.append({"range": f"{_col_letter(s_conf+1)}{r_idx}", "values": [[target_conf]]})
 
-            # Prepare row to update
-            row_num, current = stats_map[token]
-            # Ensure row length >= required columns
-            need_len = max(stats_idx["Last Feedback"], stats_idx["Last Feedback At"]) + 1
-            if len(current) < need_len:
-                current += [""] * (need_len - len(current))
+        if row_writes:
+            writes.extend(row_writes)
+            touched += 1
+            if touched >= MAX_WRITES:
+                break
 
-            last_fb_val = current[stats_idx["Last Feedback"]]
-            last_at_val = current[stats_idx["Last Feedback At"]]
+    if not writes:
+        print("✅ ROI feedback sync: no changes needed.")
+        return
 
-            # Update if different (idempotent)
-            if (last_fb_val or "").strip().upper() != decision or not last_at_val:
-                _update_cell(stats_ws, row_num, stats_idx["Last Feedback"] + 1, decision)
-                _update_cell(stats_ws, row_num, stats_idx["Last Feedback At"] + 1, now)
-                updates += 1
-
-        print(f"✅ ROI Feedback sync complete. {updates} row(s) updated.")
-        if updates and TELEGRAM_CHAT_ID:
-            send_telegram_message(f"🧠 ROI feedback sync complete • {updates} stats row(s) updated.")
-    except Exception as e:
-        print(f"❌ roi_feedback_sync error: {e}")
-        ping_webhook_debug(f"roi_feedback_sync error: {e}")
+    # ---------- One batched write ----------
+    ws = get_ws(STATS_TAB)  # open only if we actually write
+    ws_batch_update(ws, writes)
+    print(f"✅ ROI feedback sync: updated {touched} row(s).")
