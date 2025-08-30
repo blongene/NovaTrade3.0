@@ -8,8 +8,9 @@ bp = Blueprint("cmdapi", __name__)
 SECRET = os.getenv("OUTBOX_SECRET", "")
 AGENTS = set((os.getenv("AGENT_ID") or "orion-local").split(","))  # allow list
 
-@bp.before_app_first_request
-def _init():
+# ✅ Works on all Flask versions: runs once when blueprint is registered
+@bp.record_once
+def _on_register(setup_state):
     init()
 
 def _auth_or_403():
