@@ -1,44 +1,94 @@
-# vault_memory_evaluator.py
 
-import os
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from utils import safe_float
+# vault_memory_evaluator.py — Phase-1 Polish
+# Produces a lean staging table: Vault_Memory_Eval(Token, Score, Tag, Notes)
 
-def evaluate_vault_memory(_unused=None):
+from utils import (
+    get_ws, get_values_cached, get_records_cached, ws_batch_update,
+    str_or_empty, to_float, with_sheet_backoff
+)
+
+EVAL_TAB = "Vault_Memory_Eval"
+SRC_TAB  = "Token_Vault"
+
+def _col_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+@with_sheet_backoff
+def evaluate_vault_memory():
     print("🧠 Evaluating Vault Memory Scores...")
+    rows = get_records_cached(SRC_TAB, ttl_s=300) or []
+    if not rows:
+        print("ℹ️ Token_Vault empty; nothing to score.")
+        _ensure_eval_header()
+        return
 
+    # Build output rows: Token, Score, Tag, Notes (robust to missing columns)
+    out = []
+    for r in rows:
+        token = str_or_empty(r.get("Token")).upper()
+        if not token:
+            continue
+        tag   = str_or_empty(r.get("Vault Tag"))
+        roi   = to_float(r.get("ROI"))      # optional
+        days  = to_float(r.get("Days Locked"))  # optional
+
+        score = 0.0
+        # simple, safe signals (tweak later without quota harm)
+        if roi is not None:
+            score += min(max(roi, -100.0), 300.0) * 0.10
+        if days is not None:
+            score += min(max(days, 0.0), 365.0) * 0.02
+        if tag:
+            score += 1.0  # tiny bias for tagged items
+
+        notes = []
+        if roi is not None:  notes.append(f"roi={roi:.2f}")
+        if days is not None: notes.append(f"days={int(days)}")
+        if tag:              notes.append(f"tag={tag}")
+        out.append([token, f"{score:.2f}", tag, ", ".join(notes)])
+
+    # Create/ensure header, then write entire table in a single batch
+    ws = get_ws(EVAL_TAB) if _sheet_exists(EVAL_TAB) else _create_eval_tab()
+    header = get_values_cached(EVAL_TAB, ttl_s=120)
+    needs_header = not header or not header[0] or header[0][0] != "Token"
+
+    writes = []
+    if needs_header:
+        writes.append({"range": "A1:D1", "values": [["Token", "Score", "Tag", "Notes"]]})
+
+    # clear previous body (A2:D) by overwriting with new body only (no explicit clear to avoid extra write)
+    if out:
+        writes.append({"range": "A2", "values": out})
+    else:
+        # if no rows, keep header only; nothing else to do
+        pass
+
+    if writes:
+        ws_batch_update(ws, writes)
+    print(f"✅ Vault memory evaluator: {len(out)} token(s) scored.")
+
+def _sheet_exists(title: str) -> bool:
     try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
-        stats_ws = sheet.worksheet("Rotation_Stats")
+        get_ws(title)
+        return True
+    except Exception:
+        return False
 
-        headers = stats_ws.row_values(1)
-        data = stats_ws.get_all_records()
+def _create_eval_tab():
+    # create once with header
+    ws = get_ws(SRC_TAB).spreadsheet.add_worksheet(title=EVAL_TAB, rows=2000, cols=8)
+    ws.batch_update([{"range": "A1:D1", "values": [["Token", "Score", "Tag", "Notes"]]}], value_input_option="RAW")
+    return get_ws(EVAL_TAB)
 
-        # Ensure the column exists
-        vault_score_col = headers.index("Memory Vault Score") + 1 if "Memory Vault Score" in headers else len(headers) + 1
-        if "Memory Vault Score" not in headers:
-            stats_ws.update_cell(1, vault_score_col, "Memory Vault Score")
-
-        for i, row in enumerate(data, start=2):
-            token = str(row.get("Token", "")).strip().upper()
-            vault_tag = str(row.get("Vault Tag", "")).strip()
-            if vault_tag != "✅ Vaulted":
-                stats_ws.update_cell(i, vault_score_col, "")
-                continue
-
-            mem_score = safe_float(row.get("Memory Score", 0))
-            rebuy_roi = safe_float(row.get("Avg Rebuy ROI", 0))
-            rebuy_count = safe_float(row.get("Rebuy Count", 0))
-
-            score = round(mem_score + (rebuy_roi / 50.0) + (rebuy_count * 0.2), 2)
-            stats_ws.update_cell(i, vault_score_col, score)
-            print(f"✅ {token} → Memory Vault Score = {score}")
-
-        print("✅ Vault Memory Evaluation complete.")
-
-    except Exception as e:
-        print(f"❌ Error in run_vault_memory_evaluator: {e}")
+def _ensure_eval_header():
+    try:
+        ws = get_ws(EVAL_TAB) if _sheet_exists(EVAL_TAB) else _create_eval_tab()
+        vals = get_values_cached(EVAL_TAB, ttl_s=60)
+        if not vals or not vals[0] or vals[0][0] != "Token":
+            ws_batch_update(ws, [{"range": "A1:D1", "values": [["Token", "Score", "Tag", "Notes"]]}])
+    except Exception:
+        pass
