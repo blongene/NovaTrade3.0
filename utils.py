@@ -51,6 +51,34 @@ def safe_float(value, default=0.0):
     except (ValueError, TypeError, AttributeError):
         return default
 
+def _strip_sheet_prefix(a1: str) -> str:
+    if not isinstance(a1, str):
+        return a1
+    # If the range already contains '!', drop the sheet prefix for Worksheet.batch_update
+    # e.g., "'Rotation_Log'!M2" -> "M2", "Rotation_Log!C5:D9" -> "C5:D9"
+    parts = a1.split("!", 1)
+    return parts[-1] if len(parts) == 2 else a1
+
+@with_sheets_gate
+@with_sheet_backoff
+def ws_batch_update(ws, updates):
+    """
+    updates = [ {"range": "A2", "values": [[...]]}, {"range": "C5:D5", "values": [[...]]}, ... ]
+    Accepts ranges with or without sheet prefix and normalizes them for Worksheet.batch_update.
+    """
+    if not updates:
+        return None
+    _sheet_write_gate()
+    sanitized = []
+    for u in updates:
+        if not u: 
+            continue
+        rng = u.get("range")
+        if rng:
+            u = {**u, "range": _strip_sheet_prefix(rng)}
+        sanitized.append(u)
+    return ws.batch_update(sanitized, value_input_option="USER_ENTERED")
+
 # =============================================================================
 # Backoff / Retry Utilities
 # =============================================================================
