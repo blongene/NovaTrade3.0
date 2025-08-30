@@ -5,7 +5,10 @@ from flask import Flask, request
 from utils import send_telegram_message_dedup
 
 from api_commands import bp as cmdapi_bp
+from outbox_db import init as outbox_init
+
 telegram_app.register_blueprint(cmdapi_bp)
+outbox_init()  # safe to call twice; DDL is idempotent
 
 app = Flask(__name__)
 
