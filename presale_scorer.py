@@ -1,129 +1,157 @@
-# presale_scorer.py
+# presale_scorer.py — NT3.0 Phase-1 Polish
+# Cache-first presale scan with batched write & de-duped Telegram prompts.
+
 import os
 from datetime import datetime
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-
 from utils import (
-    with_sheet_backoff,
-    str_or_empty,
-    # to_float,  # uncomment if you need it
-    ping_webhook_debug,  # ok if not defined; you can remove calls below
+    get_ws, get_records_cached, ws_batch_update,
+    str_or_empty, to_float, send_telegram_prompt, tg_should_send, tg_mark_sent,
+    with_sheet_backoff, is_cold_boot
 )
-from nova_heartbeat import log_heartbeat  # ok if present; otherwise comment out
 
-SHEET_URL   = os.getenv("SHEET_URL")
-SHEET_NAME  = "Presale_Stream"
-SCOPE       = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+TAB = "Presale_Stream"
 
-# ---- Helpers ----
+MAX_PROMPTS   = int(os.getenv("PRESALE_PROMPT_MAX", "5"))
+TTL_MIN       = int(os.getenv("PRESALE_PROMPT_TTL_MIN", "180"))  # 3h quiet window
+TTL_READ_S    = int(os.getenv("PRESALE_TTL_READ_SEC", "300"))    # cache sheet reads 5m
+SCORE_MIN     = float(os.getenv("PRESALE_MIN_SCORE", "2.0"))     # threshold to ping
+
+def _col_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def _score(row: dict) -> float:
+    """Conservative, robust scoring; safe if some fields are missing."""
+    # Common columns (use what exists, coerce safely)
+    hype     = to_float(row.get("Mentions"), 0)            # social mentions / radar
+    tg       = to_float(row.get("TG Followers"), 0)        # telegram
+    ct       = to_float(row.get("CT Followers"), 0)        # twitter/x
+    kols     = to_float(row.get("KOLs"), 0)                # influencers
+    liq      = to_float(row.get("Liquidity"), 0)           # planned/initial
+    fdv      = to_float(row.get("FDV"), 0)                 # fully diluted val
+    audits   = str_or_empty(row.get("Audit")).lower()      # text: certik/xyz/none
+    chain    = str_or_empty(row.get("Chain")).lower()
+
+    s = 0.0
+    s += min(hype, 5000) * 0.0004
+    s += min(tg,   50000) * 0.00002
+    s += min(ct,   100000) * 0.00001
+    s += min(kols,   200) * 0.01
+    s += min(liq,  200000) * 0.000005
+    # penalize very high FDV (worse entry risk)
+    if fdv and fdv > 0:
+        s -= min(fdv / 1_000_000, 30) * 0.03
+    # audit bonus
+    if "certik" in audits or "solid" in audits or "hacken" in audits:
+        s += 0.5
+    # chain nuance (cheap L2s slightly preferred)
+    if "base" in chain or "bsc" in chain or "arb" in chain:
+        s += 0.2
+    return round(s, 2)
+
+def _pick_header(header: list[str], *candidates):
+    for c in candidates:
+        if c in header:
+            return c
+    return None
 
 @with_sheet_backoff
-def _open_ws():
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", SCOPE)
-    client = gspread.authorize(creds)
-    sh = client.open_by_url(SHEET_URL)
-    return sh.worksheet(SHEET_NAME)
-
-@with_sheet_backoff
-def _get_all_records(ws):
-    # Single, cached-ish read: if you’ve added a ws_get_all_records_cached, you could call it here.
-    # For portability we use vanilla get_all_records() and let with_sheet_backoff handle retries.
-    return ws.get_all_records()
-
-@with_sheet_backoff
-def _batch_update(ws, payload):
-    # payload = [{"range":"A1", "values":[[...]]}, ...]
-    if not payload:
-        return
-    ws.batch_update(payload, value_input_option="USER_ENTERED")
-
 def run_presale_scorer():
-    print("💥 run_presale_scorer() BOOTED")
-    try:
-        ws = _open_ws()
-        rows = _get_all_records(ws)
-        print(f"📦 Raw worksheet data length: {len(rows) or 0}")
+    if is_cold_boot():
+        # avoid redeploy storms hammering the sheet at boot
+        print("⏸ presale_scorer skipped (cold boot quiet window).")
+        return
 
-        if not rows:
-            print("⛔️ No presale rows found")
-            return
+    print("🎯 Presale scorer …")
+    rows = get_records_cached(TAB, ttl_s=TTL_READ_S) or []
+    if not rows:
+        print("ℹ️ Presale_Stream empty; skipping.")
+        return
 
-        # Example scoring placeholder:
-        # - read once
-        # - compute derived fields in-memory
-        # - write back only for rows that truly changed
-        header = ws.row_values(1)
-        hmap = {h: i+1 for i, h in enumerate(header)}
+    # We’ll optionally write a single timestamp column once per alerted row
+    ws = get_ws(TAB)
+    header = ws.row_values(1)
 
-        # ensure output columns exist
-        updates_header = False
-        for needed in ["Score", "Reviewed", "Last Checked"]:
-            if needed not in hmap:
-                header.append(needed)
-                hmap[needed] = len(header)
-                updates_header = True
-        if updates_header:
-            # Write header once (no duplicated sheet name in A1)
-            ws.update("A1", [header])
+    h_token   = _pick_header(header, "Token", "Asset", "Project", "Ticker")
+    h_alerted = _pick_header(header, "Scored At", "Alerted At", "Presale Alerted At")
+    if not h_token:
+        print("⚠️ Missing 'Token/Asset/Project/Ticker' header.")
+        return
 
-        batch = []
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    # map display row index (2-based) for writeback
+    token_to_ridx = {}
+    for idx, r in enumerate(rows, start=2):
+        t = str_or_empty(r.get(h_token)).upper()
+        if t and t not in token_to_ridx:
+            token_to_ridx[t] = idx
 
-        # Iterate rows (2..N)
-        for r_idx, rec in enumerate(rows, start=2):
-            token = str_or_empty(rec.get("Token")).upper()
-            if not token:
-                continue
+    # ensure header for writeback
+    writes = []
+    if not h_alerted:
+        h_alerted = "Scored At"
+        col_ix = len(header) + 1
+        writes.append({"range": f"{_col_letter(col_ix)}1", "values": [[h_alerted]]})
+    else:
+        col_ix = header.index(h_alerted) + 1
 
-            # Light heuristic score (edit/extend as needed)
-            # Keep extremely cheap to avoid extra API pulls
-            decision = str_or_empty(rec.get("Decision")).upper()
-            sentiment = str_or_empty(rec.get("Sentiment")).upper()
-            score = ""
+    # score & select
+    candidates = []
+    for r in rows:
+        token = str_or_empty(r.get(h_token)).upper()
+        if not token:
+            continue
+        s = _score(r)
+        if s >= SCORE_MIN:
+            candidates.append((token, s, r))
 
-            if decision in ("IGNORE", "SKIP"):
-                score = "0"
-            elif "BULL" in sentiment:
-                score = "2"
-            elif "BEAR" in sentiment:
-                score = "-1"
-            else:
-                score = "1"
+    # sort by score desc; cap prompts
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    sent = 0
+    for token, s, r in candidates:
+        if sent >= MAX_PROMPTS:
+            break
+        key = f"presale:{token}"
+        if not tg_should_send(f"PRESALE|{token}", key=key, ttl_min=TTL_MIN):
+            continue
 
-            # Only write missing cells (don’t thrash)
-            def _col_letter(n: int) -> str:
-                s = ""
-                while n:
-                    n, rem = divmod(n - 1, 26)
-                    s = chr(65 + rem) + s
-                return s
+        liq  = str_or_empty(r.get("Liquidity"))
+        fdv  = str_or_empty(r.get("FDV"))
+        when = str_or_empty(r.get("TGE") or r.get("Launch Date") or r.get("Date"))
 
-            # Update Score if blank
-            if str_or_empty(rec.get("Score")) == "":
-                a1 = f"{_col_letter(hmap['Score'])}{r_idx}"
-                batch.append({"range": a1, "values": [[score]]})
+        lines = [
+            f"*Presale Candidate*  — score `{s:.2f}`",
+            f"*{token}*",
+        ]
+        if when: lines.append(f"• TGE/Launch: `{when}`")
+        if liq:  lines.append(f"• Liquidity: `{liq}`")
+        if fdv:  lines.append(f"• FDV: `{fdv}`")
+        lines.append("")
+        lines.append("Track this presale?")
+        msg = "\n".join(lines)
 
-            # Mark last-checked on every pass (optional; comment out if too chatty)
-            a1_last = f"{_col_letter(hmap['Last Checked'])}{r_idx}"
-            batch.append({"range": a1_last, "values": [[now]]})
+        send_telegram_prompt(
+            token_or_title=token,
+            message=msg,
+            buttons=["YES", "NO"],
+            prefix="PRESALE",
+            dedupe_key=key,
+            ttl_min=TTL_MIN,
+        )
+        tg_mark_sent(f"PRESALE|{token}", key=key)
+        sent += 1
 
-        if batch:
-            _batch_update(ws, batch)
-            print(f"✅ Presale scorer wrote {len(batch)} cell(s) (batched).")
-        else:
-            print("ℹ️ Presale scorer: nothing to update.")
+        # optional single writeback: timestamp when we alerted/scored
+        ridx = token_to_ridx.get(token)
+        if ridx:
+            writes.append({
+                "range": f"{_col_letter(col_ix)}{ridx}",
+                "values": [[datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")]],
+            })
 
-        try:
-            log_heartbeat("Presale Scorer", f"Processed {len(rows)} rows")
-        except Exception as _e:
-            # Non-fatal
-            print(f"⚠️ Heartbeat skip (non-fatal): {_e}")
+    if writes:
+        ws_batch_update(ws, writes)
 
-    except Exception as e:
-        # This message should all but vanish once the 429 settles; retries are handled by the decorator.
-        print(f"💥 FATAL ERROR in presale_scorer: {e}")
-        try:
-            ping_webhook_debug(f"💥 presale_scorer error: {e}")
-        except Exception:
-            pass
+    print(f"✅ presale_scorer: {sent} prompt(s) sent.")
