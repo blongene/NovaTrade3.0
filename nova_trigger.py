@@ -1,32 +1,13 @@
-
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-import os
+# nova_trigger.py — Telegram-only notifier (no Sheets I/O)
+import os, time, random
 from utils import send_telegram_message_dedup
 
-def trigger_nova_ping(message_type="SOS"):
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
+JIT_MIN = float(os.getenv("NOVA_PING_JITTER_MIN_S", "0.2"))
+JIT_MAX = float(os.getenv("NOVA_PING_JITTER_MAX_S", "0.8"))
 
-    sheet_url = os.getenv("SHEET_URL")
-    if not sheet_url:
-        print("❌ SHEET_URL not found in environment variables.")
-        return
-
-    sheet = client.open_by_url(sheet_url)
-    try:
-        nova_ws = sheet.worksheet("NovaTrigger")
-    except:
-        print("❌ NovaTrigger sheet not found.")
-        return
-
-    valid_values = ["SOS", "FYI ONLY", "SYNC NEEDED", "NOVA UPDATE", "PRESALE ALERT", "ROTATION COMPLETE"]
-    if message_type not in valid_values:
-        print(f"⚠️ Invalid message_type: {message_type}")
-        return
-
-    nova_ws.update("A1", [[message_type]])
-    print(f"✅ NovaTrigger set to '{message_type}' at {datetime.utcnow()}")
-
+def trigger_nova_ping(title: str = "NOVA UPDATE", body: str = ""):
+    print("▶ Nova ping …")
+    time.sleep(random.uniform(JIT_MIN, JIT_MAX))
+    # One call to Telegram with global de-dup (15–20m by env TG_DEDUP_TTL_MIN)
+    msg = f"🔔 *{title}*\n{body}".strip()
+    send_telegram_message_dedup(msg, key="nova_ping")
