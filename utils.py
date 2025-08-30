@@ -59,8 +59,6 @@ def _strip_sheet_prefix(a1: str) -> str:
     parts = a1.split("!", 1)
     return parts[-1] if len(parts) == 2 else a1
 
-@with_sheets_gate
-@with_sheet_backoff
 def ws_batch_update(ws, updates):
     """
     updates = [ {"range": "A2", "values": [[...]]}, {"range": "C5:D5", "values": [[...]]}, ... ]
