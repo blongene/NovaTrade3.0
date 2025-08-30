@@ -1,57 +1,73 @@
-# vault_memory_importer.py
-from typing import List, Dict
-from utils import get_ws, get_records_cached, with_sheet_backoff
+# vault_memory_importer.py — Phase-1 Polish
+# Syncs Vault_Memory_Eval scores → Rotation_Stats.Vault Memory (single batch write)
 
-def _col_letter(c: int) -> str:
+from utils import (
+    get_ws, get_records_cached, ws_batch_update,
+    str_or_empty, to_float, with_sheet_backoff
+)
+
+EVAL_TAB   = "Vault_Memory_Eval"
+TARGET_TAB = "Rotation_Stats"
+TARGET_COL_NAME = "Vault Memory"
+
+def _col_letter(n: int) -> str:
     s = ""
-    while c:
-        c, r = divmod(c - 1, 26)
+    while n:
+        n, r = divmod(n - 1, 26)
         s = chr(65 + r) + s
     return s
 
 @with_sheet_backoff
 def run_vault_memory_importer():
-    """
-    Import per-token memory vault scores (computed elsewhere) into Rotation_Stats!<Memory Vault Score>.
-    Expects evaluate_vault_memory() to yield a dict like {"MIND": 1.0, "ABC": 0.6, ...}.
-    """
-    # Late import to avoid circulars
-    from vault_memory_evaluator import evaluate_vault_memory
+    print("📥 Vault memory importer …")
 
-    try:
-        result = evaluate_vault_memory()
-        if not isinstance(result, dict) or not result:
-            print("ℹ️ Vault memory importer: no evaluator data; skipping.")
-            return
+    eval_rows   = get_records_cached(EVAL_TAB, ttl_s=300) or []
+    target_rows = get_records_cached(TARGET_TAB, ttl_s=300) or []
 
-        stats_ws = get_ws("Rotation_Stats")
-        stats_rows: List[Dict[str, str]] = get_records_cached("Rotation_Stats", ttl_s=120)
-        if stats_rows is None:
-            stats_rows = []
+    if not eval_rows:
+        print("ℹ️ Vault memory importer: no evaluator data; skipping.")
+        return
+    if not target_rows:
+        print("ℹ️ Rotation_Stats is empty; skipping.")
+        return
 
-        # header (single call)
-        headers = stats_ws.row_values(1) or []
-        try:
-            col_idx = [h.strip().lower() for h in headers].index("memory vault score") + 1
-        except ValueError:
-            print("⚠️ 'Memory Vault Score' column not found in Rotation_Stats; skipping.")
-            return
+    # Build token -> score map (string score ok, we store as-is)
+    scores = {}
+    for r in eval_rows:
+        token = str_or_empty(r.get("Token")).upper()
+        if not token:
+            continue
+        s = str_or_empty(r.get("Score"))
+        if s:
+            scores[token] = s
 
-        # Build batch updates, only for rows we have a score for
-        batch_body = []
-        for i, row in enumerate(stats_rows, start=2):
-            token = (row.get("Token") or "").strip().upper()
-            if not token:
-                continue
-            score = result.get(token)
-            if score is None:
-                continue
-            batch_body.append({"range": f"{_col_letter(col_idx)}{i}", "values": [[score]]})
+    ws = get_ws(TARGET_TAB)
+    header = ws.row_values(1)
 
-        if batch_body:
-            stats_ws.batch_update(batch_body, value_input_option="USER_ENTERED")
-            print(f"✅ Vault Memory imported for {len(batch_body)} row(s).")
-        else:
-            print("ℹ️ Vault memory importer: nothing to update.")
-    except Exception as e:
-        print(f"❌ Error in run_vault_memory_importer: {e}")
+    # Ensure column
+    if TARGET_COL_NAME in header:
+        col_ix = header.index(TARGET_COL_NAME) + 1
+        header_write = False
+    else:
+        col_ix = len(header) + 1
+        header_write = True
+
+    writes = []
+    if header_write:
+        writes.append({"range": f"{_col_letter(col_ix)}1", "values": [[TARGET_COL_NAME]]})
+
+    # Stage cell updates
+    for i, r in enumerate(target_rows, start=2):
+        token = str_or_empty(r.get("Token")).upper()
+        if not token:
+            continue
+        new_val = scores.get(token, "")
+        cur_val = str_or_empty(r.get(TARGET_COL_NAME))
+        if new_val and new_val != cur_val:
+            writes.append({"range": f"{_col_letter(col_ix)}{i}", "values": [[new_val]]})
+
+    if writes:
+        ws_batch_update(ws, writes)
+        print(f"✅ Vault memory importer: {len(writes)} cell(s) updated.")
+    else:
+        print("✅ Vault memory importer: 0 changes.")
