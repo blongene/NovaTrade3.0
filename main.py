@@ -172,8 +172,10 @@ if __name__ == "__main__":
     print("📰 Sentiment Radar (boot pass)…")
     jitter(); safe_call("Sentiment radar", run_sentiment_radar, sleep_after=1)
 
-    jitter(); safe_call("Nova trigger check", check_nova_trigger, sleep_after=1)
-    jitter(); safe_call("Nova ping", trigger_nova_ping, "NOVA UPDATE", sleep_after=1)
+    jitter(); 
+    on, note = check_nova_trigger()
+    if on:
+        trigger_nova_ping("NOVA UPDATE", note or "Signal is ON.")   
 
     # 🔕 CLAIM LOGIC: delay and schedule (no boot storm)
     def _late_claims():
