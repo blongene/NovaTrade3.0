@@ -1,9 +1,4 @@
 # rotation_memory_scoring.py — NT3.0 Phase-1 Polish
-# - Cache-first read from Rotation_Stats (via utils)
-# - Computes Memory Score using the same rules you had
-# - Ensures "Memory Score" column exists
-# - Single ws_batch_update(...) write (no per-cell updates)
-
 from utils import (
     get_ws, get_records_cached, ws_batch_update,
     str_or_empty, with_sheet_backoff
@@ -22,7 +17,6 @@ def _col_letter(n: int) -> str:
 @with_sheet_backoff
 def run_memory_scoring():
     print("🧠 Calculating weighted Memory Scores...")
-
     rows = get_records_cached(TAB, ttl_s=300) or []
     if not rows:
         print("ℹ️ Rotation_Stats empty; skipping.")
@@ -31,7 +25,6 @@ def run_memory_scoring():
     ws = get_ws(TAB)
     header = ws.row_values(1)
 
-    # Ensure Memory Score column exists
     if COL_NAME in header:
         score_col = header.index(COL_NAME) + 1
         add_header = False
@@ -39,7 +32,6 @@ def run_memory_scoring():
         score_col = len(header) + 1
         add_header = True
 
-    # Optional columns
     tag_present  = "Memory Tag" in header
     vote_present = "Re-Vote" in header
 
@@ -51,33 +43,23 @@ def run_memory_scoring():
         tag  = str_or_empty(r.get("Memory Tag") if tag_present else "")
         vote = str_or_empty(r.get("Re-Vote") if vote_present else "").upper()
 
-        # --- scoring rules (kept exactly as in your original) ---
         score = 0
-        if "Big Win" in tag:
-            score += 3
-        elif "Small Win" in tag:
-            score += 2
-        elif "Break-Even" in tag:
-            score += 1
-        elif "Loss" in tag:
-            score -= 1
-        elif "Big Loss" in tag:
-            score -= 2
+        if "Big Win" in tag:       score += 3
+        elif "Small Win" in tag:   score += 2
+        elif "Break-Even" in tag:  score += 1
+        elif "Loss" in tag:        score -= 1
+        elif "Big Loss" in tag:    score -= 2
 
-        if vote == "YES":
-            score += 1
-        elif vote == "NO":
-            score -= 2
-        # --------------------------------------------------------
+        if vote == "YES": score += 1
+        elif vote == "NO": score -= 2
 
-        # Only write if it actually changes (prevents churn)
-        current = str_or_empty(r.get(COL_NAME))
-        new_str = str(score)
-        if new_str != current:
-            writes.append({"range": f"{_col_letter(score_col)}{i}", "values": [[new_str]]})
+        cur = str_or_empty(r.get(COL_NAME))
+        new = str(score)
+        if new != cur:
+            writes.append({"range": f"{_col_letter(score_col)}{i}", "values": [[new]]})
 
     if writes:
-        ws_batch_update(ws, writes)  # single round-trip
+        ws_batch_update(ws, writes)
         print(f"✅ Memory Scoring complete. {len(writes)} cell(s) updated.")
     else:
         print("✅ Memory Scoring complete. 0 changes.")
