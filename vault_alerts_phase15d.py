@@ -1,5 +1,5 @@
-# vault_alerts_phase15d.py — hardened against type errors (len(int), None, etc.)
-import os, traceback
+# vault_alerts_phase15d.py — bullet-proof len() guard + type-safe alerts
+import os, traceback, builtins as _builtins
 from datetime import datetime, timedelta
 
 from utils import (
@@ -7,19 +7,21 @@ from utils import (
     str_or_empty, to_float, warn
 )
 
-# --- Config via env (uses your existing defaults) ----------------------------
-VAULT_TAB        = os.getenv("VAULT_SHEET_TAB", "Presale_Stream")
-CLAIM_FLAG_COL   = os.getenv("CLAIM_FLAG_COLUMN", "Claim_Flag")   # header name in sheet
-ALERT_MODE       = (os.getenv("ALERT_MODE", "telegram") or "telegram").lower()  # telegram|sheet|both
-DEBUG_VAULT_ALERTS = os.getenv("DEBUG_VAULT_ALERTS", "0") == "1"
-
-# --- Local helpers (no raw len() anywhere) -----------------------------------
-def _safe_len(x) -> int:
+# ---- Module-local safe len() wrapper (affects only this file) ---------------
+_raw_len = _builtins.len
+def len(x):  # noqa: A001  (intentional shadow for this module only)
     try:
-        return len(str_or_empty(x))
-    except Exception:
-        return 0
+        return _raw_len(x)
+    except TypeError:
+        return _raw_len(str(x))
 
+# --- Config via env ----------------------------------------------------------
+VAULT_TAB            = os.getenv("VAULT_SHEET_TAB", "Presale_Stream")
+CLAIM_FLAG_COL_NAME  = os.getenv("CLAIM_FLAG_COLUMN", "Claim_Flag")  # header name
+ALERT_MODE           = (os.getenv("ALERT_MODE", "telegram") or "telegram").lower()  # telegram|sheet|both
+DEBUG_VAULT_ALERTS   = os.getenv("DEBUG_VAULT_ALERTS", "0") == "1"
+
+# --- Helpers -----------------------------------------------------------------
 def _s(row, key) -> str:
     return str_or_empty(row.get(key))
 
@@ -30,52 +32,58 @@ def _parse_date(s: str):
     s = str_or_empty(s)
     if not s:
         return None
-    # Try common formats
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
             pass
-    # ISO-ish fallback
     try:
         return datetime.fromisoformat(s.replace("Z", ""))
     except Exception:
         return None
 
 def _resolve_claim_flag_col_idx(ws):
-    """
-    Resolve CLAIM_FLAG_COL header name -> 1-based column index.
-    Returns None if not found; caller should guard.
-    """
     try:
         hdr = ws.row_values(1)
         for i, h in enumerate(hdr, start=1):
-            if str_or_empty(h).lower() == CLAIM_FLAG_COL.lower():
+            if str_or_empty(h).lower() == CLAIM_FLAG_COL_NAME.lower():
                 return i
     except Exception:
         pass
     return None
 
+def _normalize_row(row: dict) -> dict:
+    """
+    Make every value safely stringifiable; numeric reads still available via _n().
+    Prevents any stray len(value) from blowing up.
+    """
+    norm = {}
+    for k, v in row.items():
+        if v is None:
+            norm[k] = ""
+        else:
+            # keep as-is for numeric use via _n(); but string ops will be safe due to our len wrapper
+            norm[k] = v
+    return norm
+
 def _should_alert(row) -> bool:
     """
-    Decide if this row should produce a vault alert.
-    Current rules:
+    Rules:
       - Token present
-      - Status suggests 'vault' (case-insensitive)
-      - Unlock date in window [T-1d .. T+0], OR Claim_Flag already 'READY'
+      - Status mentions 'vault'
+      - Unlock date in [T-1d .. T+0]  OR claim flag already READY
     """
     token = _s(row, "Token")
-    if _safe_len(token) == 0:
+    if len(token) == 0:
         return False
 
-    claim_flag = _s(row, CLAIM_FLAG_COL).upper()
+    claim_flag = _s(row, CLAIM_FLAG_COL_NAME).upper()
     if claim_flag == "READY":
         return True
 
     status = _s(row, "Status")
     vaulted = "vault" in status.lower() if status else False
 
-    # Unlock date check
     unlock_s = _s(row, "Unlock_Date") or _s(row, "Unlock Date")
     dt = _parse_date(unlock_s)
     if not dt:
@@ -87,9 +95,9 @@ def _should_alert(row) -> bool:
     return bool(vaulted and in_window)
 
 def _format_alert(row) -> str:
-    token = _s(row, "Token")
-    roi   = _n(row, "ROI") or _n(row, "ROI %") or 0.0
-    days  = _n(row, "Days Held") or 0
+    token  = _s(row, "Token")
+    roi    = _n(row, "ROI") or _n(row, "ROI %") or 0.0
+    days   = _n(row, "Days Held") or 0
     status = _s(row, "Status") or "—"
     return (
         f"🔔 *Vault Unlock*: {token}\n"
@@ -100,39 +108,39 @@ def _format_alert(row) -> str:
     )
 
 def _write_ready(ws, row_idx_1based):
-    """Write Claim_Flag='READY' if mode requires it. Never raises."""
     if ALERT_MODE not in ("sheet", "both"):
         return
     try:
         col_idx = _resolve_claim_flag_col_idx(ws)
         if col_idx is None:
             return
-        ws.update_cell(row_idx_1based, col_idx, "READY")  # one round-trip; wrapped w/ backoff
+        ws.update_cell(row_idx_1based, col_idx, "READY")  # backoff-wrapped via utils
     except Exception as e:
         warn(f"READY write failed (row {row_idx_1based}): {e}")
 
-# --- Entry point -------------------------------------------------------------
+# --- Entry -------------------------------------------------------------------
 def run_vault_alerts():
     """
-    Scan VAULT_TAB for imminent unlocks or 'READY' flags and send Telegram alerts.
-    Type-safe and row-guarded: one bad row never kills the whole job.
+    Type-safe, len-proof vault alert scan.
+    One bad row never aborts the job.
     """
     try:
         ws = get_ws_cached(VAULT_TAB, ttl_s=30)
-        rows = ws.get_all_records()  # utils.with_sheet_backoff wraps the call
+        rows = ws.get_all_records()
     except Exception as e:
         warn(f"Vault alerts: sheet load failed: {e}")
         return
 
     alerts = []
-    for i, row in enumerate(rows, start=2):  # 1 is header
+    for i, raw in enumerate(rows, start=2):  # row 1 = header
         try:
+            row = _normalize_row(raw)
             if _should_alert(row):
                 alerts.append((i, _format_alert(row)))
         except Exception as e:
             if DEBUG_VAULT_ALERTS:
                 tb = traceback.format_exc(limit=1)
-                warn(f"Vault alerts row {i} error: {e} | row={row} | tb={tb}")
+                warn(f"Vault alerts row {i} error: {e} | row={raw} | tb={tb}")
             else:
                 warn(f"Vault alerts row {i} error: {e}")
 
