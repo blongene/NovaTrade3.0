@@ -1,6 +1,7 @@
 # utils.py — NT3.0 Phase-1 Polish (quota-proof + quiet + cached values + legacy shims)
 import os, time, json, threading, functools, hashlib, hmac
 from datetime import datetime, timezone, timedelta
+from contextlib import contextmanager
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -61,6 +62,41 @@ def set_sheets_budget(reads_per_min=None, writes_per_min=None):
     if writes_per_min:
         _write_bucket = TokenBucket(writes_per_min, writes_per_min / 60.0)
 
+# ========= Sheets gate (legacy compat: decorator + context manager) =========
+def _take_tokens(bucket, tokens: int):
+    tokens = max(1, int(tokens))
+    for _ in range(tokens):
+        _wait_for(bucket)
+
+def with_sheets_gate(mode: str = "read", tokens: int = 1):
+    """
+    Decorator form: pre-consume read/write tokens before running the func.
+    """
+    mode_l = (mode or "read").lower()
+    bucket = _read_bucket if mode_l == "read" else _write_bucket
+    def _decorator(fn):
+        @functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
+            _take_tokens(bucket, tokens)
+            return fn(*args, **kwargs)
+        return _wrapper
+    return _decorator
+
+@contextmanager
+def sheets_gate(mode: str = "read", tokens: int = 1):
+    """
+    Context-manager form:
+        with sheets_gate("write", tokens=3):
+            ...
+    """
+    mode_l = (mode or "read").lower()
+    bucket = _read_bucket if mode_l == "read" else _write_bucket
+    _take_tokens(bucket, tokens)
+    try:
+        yield
+    finally:
+        pass
+
 # ========= Telegram (de-duped) =========
 _dedup_cache = {}
 _dedup_lock = threading.Lock()
@@ -88,12 +124,6 @@ def send_telegram_message_dedup(message: str, key: str, ttl_min: int = TG_DEDUP_
 
 # ========= Telegram prompt (inline keyboard) — legacy compat =========
 def _build_inline_keyboard(buttons):
-    """
-    buttons can be:
-      - list of strings: ["YES", "NO"]  -> callback_data same as label
-      - list of (label, callback_or_url) tuples
-      - list of lists for multi-row keyboards
-    """
     def to_btn(b):
         if isinstance(b, (list, tuple)) and len(b) >= 2:
             label, val = b[0], b[1]
@@ -102,7 +132,6 @@ def _build_inline_keyboard(buttons):
         if isinstance(val, str) and val.lower().startswith(("http://", "https://", "tg://")):
             return {"text": str(label), "url": val}
         return {"text": str(label), "callback_data": str(val)}
-
     if not isinstance(buttons, list):
         buttons = [buttons]
     rows = []
@@ -114,7 +143,6 @@ def _build_inline_keyboard(buttons):
     return {"inline_keyboard": rows}
 
 def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_TTL_MIN):
-    # allow 2-arg legacy form: (text, key)
     if isinstance(buttons, str) and key is None:
         key = buttons
         buttons = None
@@ -168,11 +196,9 @@ def send_telegram_message_if_new(message: str, key: str = None, ttl_min: int = T
     if tg_should_send(message, key=key, ttl_min=ttl_min, consume=True):
         _tg_send_raw(message)
 
-# Optional alias some modules used historically
 def send_telegram_inline(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_TTL_MIN):
     return send_telegram_prompt(text, buttons=buttons, key=key, ttl_min=ttl_min)
 
-# Backwards-compat alias used by some modules
 def send_telegram_message(message: str, key: str = "default"):
     send_telegram_message_dedup(message, key, ttl_min=TG_DEDUP_TTL_MIN)
 
@@ -203,10 +229,6 @@ _gs_lock = threading.Lock()
 _gs_client = None
 
 def _load_service_account():
-    """
-    Loads Google creds from either a JSON file path (SVC_JSON) or the default
-    'sentiment-log-service.json' in cwd. Also supports SVC_JSON containing raw JSON.
-    """
     svc = os.getenv("SVC_JSON") or "sentiment-log-service.json"
     if os.path.isfile(svc):
         return ServiceAccountCredentials.from_json_keyfile_name(svc, _SCOPE)
@@ -285,6 +307,10 @@ def get_ws_cached(name: str, ttl_s: int = 120):
 def _ws_get_all_records(ws):
     return ws.get_all_records()
 
+@with_sheet_backoff
+def _ws_get_all_values(ws):
+    return ws.get_all_values()
+
 def get_all_records_cached(name: str, ttl_s: int = 120):
     key = f"rows::{name}"
     with _cache_lock:
@@ -300,7 +326,6 @@ def get_all_records_cached(name: str, ttl_s: int = 120):
         _cached_rows[key] = (time.time()+ttl_s, rows)
     return rows
 
-# Backwards-compat alias some modules expect
 def get_records_cached(sheet_name: str, ttl_s: int = 120):
     return get_all_records_cached(sheet_name, ttl_s)
 
@@ -309,8 +334,13 @@ def get_records_cached(sheet_name: str, ttl_s: int = 120):
 def _ws_get(ws, range_a1: str):
     return ws.get(range_a1)
 
-def get_values_cached(sheet_name: str, range_a1: str, ttl_s: int = 60):
-    key = f"vals::{sheet_name}::{range_a1}"
+def get_values_cached(sheet_name: str, range_a1: str | None = None, ttl_s: int = 60):
+    """
+    Returns a 2D list.
+      - If range_a1 is provided: uses ws.get(range_a1)
+      - If None: uses ws.get_all_values()
+    """
+    key = f"vals::{sheet_name}::{range_a1 or '__ALL__'}"
     with _cache_lock:
         item = _values_cache.get(key)
         if item:
@@ -318,8 +348,9 @@ def get_values_cached(sheet_name: str, range_a1: str, ttl_s: int = 60):
             if time.time() < exp:
                 return vals
             _values_cache.pop(key, None)
+
     ws = get_ws_cached(sheet_name, ttl_s=ttl_s)
-    vals = _ws_get(ws, range_a1)
+    vals = _ws_get(ws, range_a1) if range_a1 else _ws_get_all_values(ws)
     with _cache_lock:
         _values_cache[key] = (time.time() + ttl_s, vals)
     return vals
@@ -343,9 +374,16 @@ def ws_batch_update(ws, writes):
 def ws_append_row(ws, values):
     ws.append_row(values, value_input_option="RAW")
 
+# sanitize A1 ranges to avoid duplicate sheet-name bugs before updating
+def sanitize_range(a1: str) -> str:
+    if "!" not in a1: return a1
+    tab, rng = a1.split("!", 1)
+    tab = tab.split("!")[-1]
+    return f"{tab}!{rng}"
+
 @with_sheet_backoff
 def ws_update(ws, range_a1, values):
-    ws.update(range_a1, values)
+    ws.update(sanitize_range(range_a1), values)
 
 # ========= A1 helpers / parsing =========
 def str_or_empty(v):
@@ -359,12 +397,15 @@ def to_float(v):
     except Exception:
         return None
 
+# ========= Safe length helper =========
+def safe_len(x) -> int:
+    try:
+        return len(x)
+    except TypeError:
+        return len(str(x))
+
 # ========= Legacy-safe parsing helpers (compat) =========
 def safe_float(v, default=None):
-    """
-    Accepts numbers/strings like '12.3', '12%', '1,234', '-', 'N/A'.
-    Returns float or `default` when not parseable.
-    """
     s = str_or_empty(v).strip()
     if s == "" or s in {"-", "—", "N/A", "n/a", "NA", "na", "None", "null"}:
         return default
@@ -394,12 +435,6 @@ def cell_address(col_idx, row_idx):
         n, rem = divmod(n - 1, 26)
         letters = chr(65 + rem) + letters
     return f"{letters}{row_idx}"
-
-def sanitize_range(a1: str) -> str:
-    if "!" not in a1: return a1
-    tab, rng = a1.split("!", 1)
-    tab = tab.split("!")[-1]
-    return f"{tab}!{rng}"
 
 # ========= Legacy compat shims =========
 def ping_webhook_debug(message: str):
