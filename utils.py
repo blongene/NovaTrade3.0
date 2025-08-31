@@ -160,6 +160,50 @@ def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_T
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         warn(f"Telegram prompt send failed: {e}")
+        
+# ========= Telegram de-dupe helpers (legacy compat) =========
+import hashlib as _hashlib
+
+def _tg_key_from_message(msg: str) -> str:
+    # Stable short hash key from message text (legacy behavior)
+    h = _hashlib.sha1(str(msg).encode()).hexdigest()[:12]
+    return f"tg:{h}"
+
+def tg_should_send(key_or_message: str, key: str = None, ttl_min: int = TG_DEDUP_TTL_MIN, consume: bool = True) -> bool:
+    """
+    Legacy-friendly guard to decide if we should send a Telegram message.
+    - If only 'key_or_message' is provided, we'll hash the message text for a stable dedupe key.
+    - If 'key' is provided, we use it directly.
+    - If 'consume' is True, we also mark it as sent now; set consume=False if caller will mark later.
+
+    Returns: True if we should send, else False.
+    """
+    k = key or _tg_key_from_message(key_or_message)
+    now = time.time()
+    with _dedup_lock:
+        last = _dedup_cache.get(k, 0)
+        if now - last < ttl_min * 60:
+            return False
+        if consume:
+            _dedup_cache[k] = now
+    return True
+
+def tg_mark_sent(key_or_message: str, key: str = None):
+    """
+    Mark a dedupe key as sent without checking TTL (legacy helper).
+    Useful if caller used tg_should_send(..., consume=False) and sends separately.
+    """
+    k = key or _tg_key_from_message(key_or_message)
+    with _dedup_lock:
+        _dedup_cache[k] = time.time()
+
+def send_telegram_message_if_new(message: str, key: str = None, ttl_min: int = TG_DEDUP_TTL_MIN):
+    """
+    Convenience: only send if not sent within ttl.
+    Equivalent to: if tg_should_send(message, key): _tg_send_raw(message)
+    """
+    if tg_should_send(message, key=key, ttl_min=ttl_min, consume=True):
+        _tg_send_raw(message)
 
 # Optional alias some modules used historically
 def send_telegram_inline(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_TTL_MIN):
