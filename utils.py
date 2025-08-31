@@ -86,6 +86,85 @@ def send_telegram_message_dedup(message: str, key: str, ttl_min: int = TG_DEDUP_
         _dedup_cache[key] = now
     _tg_send_raw(message)
 
+# ========= Telegram prompt (inline keyboard) — legacy compat =========
+def _build_inline_keyboard(buttons):
+    """
+    buttons can be:
+      - list of strings: ["YES", "NO"]  -> callback_data same as label
+      - list of (label, callback_or_url) tuples
+      - list of lists for multi-row keyboards
+    """
+    def to_btn(b):
+        if isinstance(b, (list, tuple)) and len(b) >= 2:
+            label, val = b[0], b[1]
+        else:
+            label, val = str(b), str(b)
+
+        # URL buttons if looks like a link, else callback_data
+        if isinstance(val, str) and val.lower().startswith(("http://", "https://", "tg://")):
+            return {"text": str(label), "url": val}
+        return {"text": str(label), "callback_data": str(val)}
+
+    # normalize to rows
+    if not isinstance(buttons, list):
+        buttons = [buttons]
+    rows = []
+    for row in buttons:
+        if isinstance(row, list) and row and isinstance(row[0], (list, tuple, str)):
+            # already a row list -> map each item
+            rows.append([to_btn(x) for x in row])
+        else:
+            # single row
+            rows.append([to_btn(row)])  # row is a single button
+    return {"inline_keyboard": rows}
+
+def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_TTL_MIN):
+    """
+    Legacy-friendly inline prompt.
+    Common historical call forms we support:
+      send_telegram_prompt("Approve trade?")                      # default YES/NO
+      send_telegram_prompt("Approve?", ["YES","NO"])              # two buttons
+      send_telegram_prompt("Choose", [("Open Sheet", SHEET_URL)]) # URL button
+      send_telegram_prompt("Approve?", key="approve_trade_XYZ")   # de-duped
+      send_telegram_prompt("Approve?", "approve_trade_XYZ")       # 2nd arg as key (compat)
+    """
+    # allow 2-arg legacy form: (text, key)
+    if isinstance(buttons, str) and key is None:
+        key = buttons
+        buttons = None
+
+    # dedupe if key provided
+    if key:
+        now = time.time()
+        with _dedup_lock:
+            last = _dedup_cache.get(key, 0)
+            if now - last < ttl_min * 60:
+                return
+            _dedup_cache[key] = now
+
+    if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        warn("Telegram disabled; cannot send prompt.")
+        return
+
+    if not buttons:
+        buttons = ["YES", "NO"]
+
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": _build_inline_keyboard(buttons),
+        }
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        warn(f"Telegram prompt send failed: {e}")
+
+# Optional alias some modules used historically
+def send_telegram_inline(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_TTL_MIN):
+    return send_telegram_prompt(text, buttons=buttons, key=key, ttl_min=ttl_min)
+
 # Backwards-compat alias used by some modules
 def send_telegram_message(message: str, key: str = "default"):
     send_telegram_message_dedup(message, key, ttl_min=TG_DEDUP_TTL_MIN)
