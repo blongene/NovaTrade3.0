@@ -223,6 +223,21 @@ def send_boot_notice_once(message="🟢 NovaTrade system booted and live.", cool
 def send_system_online_once():
     send_once_per_day("system_online", "✅ NovaTrade online — all modules healthy.")
 
+# ========= Cold boot detection (legacy compat) =========
+# Returns True only for an initial window after process start (or if forced by env).
+_BOOT_STARTED_AT = time.time()
+COLD_BOOT_WINDOW_SEC = int(float(os.getenv("COLD_BOOT_WINDOW_MIN", "5")) * 60)  # default 5 minutes
+
+def is_cold_boot() -> bool:
+    if os.getenv("FORCE_COLD_BOOT", "0") == "1":
+        return True
+    return (time.time() - _BOOT_STARTED_AT) <= COLD_BOOT_WINDOW_SEC
+
+def mark_warm_boot():
+    """Optional helper some modules used: immediately end the cold-boot window."""
+    global _BOOT_STARTED_AT
+    _BOOT_STARTED_AT = 0
+
 # ========= Service / Sheets helpers =========
 _SCOPE = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
 _gs_lock = threading.Lock()
