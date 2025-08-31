@@ -1,5 +1,8 @@
 # main.py — NovaTrade 3.0 (Phase-1 Polish)
 # Boot is serialized + gentle; all Sheets IO goes through utils.
+from logging_setup import init_logging
+log = init_logging()
+log.info("📡 Orion Cloud Boot Sequence Initiated")
 
 import os, time, threading, schedule, random, hashlib, json
 from flask import Flask
