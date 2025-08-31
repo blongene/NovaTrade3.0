@@ -67,3 +67,12 @@ telegram_app.register_blueprint(cmdapi_bp)
 # (Optional) If you want belt-and-suspenders DB init, uncomment:
 from outbox_db import init as outbox_init
 outbox_init()  # DDL is idempotent
+
+# in telegram_webhook.py (or a tiny health module)
+@telegram_app.get("/healthz")
+def healthz():
+    return {"ok": True}, 200
+
+# Also ensure:
+telegram_app.config["PROPAGATE_EXCEPTIONS"] = False
+
