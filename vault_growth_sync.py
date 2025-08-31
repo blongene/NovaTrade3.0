@@ -18,10 +18,7 @@ def run_vault_growth_sync():
         if not rows:
             print("ℹ️ Token_Vault empty; nothing to sync.")
             return
-
-        # No writes yet — just confirming read access is stable.
         print(f"✅ Vault Growth sync complete. {len(rows)} row(s) scanned, 0 updated.")
-
     except Exception as e:
         msg = str(e).lower()
         if "429" in msg or "quota" in msg:
