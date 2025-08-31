@@ -1,7 +1,6 @@
-# utils.py — NT3.0 Phase-1 Polish (quota-proof + quiet)
+# utils.py — NT3.0 Phase-1 Polish (quota-proof + quiet + legacy shims)
 import os, time, json, threading, functools, hashlib, hmac
-from datetime import datetime
-from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -36,7 +35,6 @@ class TokenBucket:
         self.tokens = capacity
         self.last = time.monotonic()
         self.lock = threading.Lock()
-
     def take(self, n=1):
         with self.lock:
             now = time.monotonic()
@@ -87,32 +85,6 @@ def send_telegram_message_dedup(message: str, key: str, ttl_min: int = TG_DEDUP_
             return
         _dedup_cache[key] = now
     _tg_send_raw(message)
-    
-# --- Legacy compat shims (to satisfy older modules) --------------------------
-def ping_webhook_debug(message: str):
-    """
-    Legacy helper used by nova_watchdog and a few older modules.
-    Writes to Webhook_Debug!A1 (best-effort) and sends a de-duped Telegram debug ping.
-    Safe no-op if Sheet or Telegram isn’t configured.
-    """
-    # Telegram debug ping (de-duped)
-    try:
-        send_telegram_message_dedup(f"🛠️ Debug: {message}", key="webhook_debug")
-    except Exception:
-        pass
-
-    # Sheet debug cell (best-effort)
-    try:
-        ws = get_ws_cached("Webhook_Debug", ttl_s=30)
-        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        ws.update("A1", f"{ts}Z — {message}", _sheet_op="update")
-    except Exception:
-        # Silently ignore if the tab is missing or quota/backoff is in play
-        pass
-
-# Optional alias if any code references ping_webhook()
-def ping_webhook(message: str):
-    ping_webhook_debug(message)
 
 # Backwards-compat alias used by some modules
 def send_telegram_message(message: str, key: str = "default"):
@@ -238,7 +210,7 @@ def get_all_records_cached(name: str, ttl_s: int = 120):
 def get_records_cached(sheet_name: str, ttl_s: int = 120):
     return get_all_records_cached(sheet_name, ttl_s)
 
-# ========= Batch writes (single round-trip) =========
+# ========= Batch/Append/Update writes (single round-trips) =========
 @with_sheet_backoff
 def ws_batch_update(ws, writes):
     """
@@ -250,6 +222,13 @@ def ws_batch_update(ws, writes):
 @with_sheet_backoff
 def ws_append_row(ws, values):
     ws.append_row(values, value_input_option="RAW")
+
+@with_sheet_backoff
+def ws_update(ws, range_a1, values):
+    """
+    Safe wrapper for ws.update. 'values' can be a scalar or 2D list.
+    """
+    ws.update(range_a1, values)
 
 # ========= A1 helpers / parsing =========
 def str_or_empty(v):
@@ -278,6 +257,96 @@ def sanitize_range(a1: str) -> str:
     tab, rng = a1.split("!", 1)
     tab = tab.split("!")[-1]
     return f"{tab}!{rng}"
+
+# ========= Legacy compat shims =========
+def ping_webhook_debug(message: str):
+    """
+    Legacy helper used by nova_watchdog and a few older modules.
+    Writes to Webhook_Debug!A1 (best-effort) and sends a de-duped Telegram debug ping.
+    Safe no-op if Sheet or Telegram isn’t configured.
+    """
+    # Telegram debug ping (de-duped)
+    try:
+        send_telegram_message_dedup(f"🛠️ Debug: {message}", key="webhook_debug")
+    except Exception:
+        pass
+    # Sheet debug cell (best-effort)
+    try:
+        ws = get_ws_cached("Webhook_Debug", ttl_s=30)
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        ws_update(ws, "A1", f"{ts}Z — {message}")
+    except Exception:
+        # Silently ignore if the tab is missing or quota/backoff is in play
+        pass
+
+def ping_webhook(message: str):
+    """Optional alias some callers use."""
+    ping_webhook_debug(message)
+
+# --- detect_stalled_tokens (used by nova_watchdog) --------------------------
+WATCHDOG_TAB = os.getenv("WATCHDOG_TAB", "Rotation_Log")
+WATCHDOG_TOKEN_COL = os.getenv("WATCHDOG_TOKEN_COL", "Token")
+WATCHDOG_TIME_HEADERS = [h.strip() for h in os.getenv(
+    "WATCHDOG_TIME_HEADERS",
+    "Last Updated,Updated At,Timestamp,Last_Alerted,Last Alerted,Last Seen"
+).split(",")]
+STALLED_THRESHOLD_HOURS = float(os.getenv("WATCHDOG_STALLED_THRESHOLD_HOURS", "12"))
+
+def _parse_dt(val):
+    s = str_or_empty(val)
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def detect_stalled_tokens(
+    tab: str = WATCHDOG_TAB,
+    token_col: str = WATCHDOG_TOKEN_COL,
+    time_headers: list[str] = WATCHDOG_TIME_HEADERS,
+    threshold_hours: float = STALLED_THRESHOLD_HOURS,
+):
+    """
+    Returns a list of dicts for rows whose latest timestamp-like column is older than threshold.
+    Safe no-op on missing tabs/headers; never raises.
+    """
+    stalled = []
+    try:
+        ws = get_ws_cached(tab, ttl_s=60)
+        rows = ws.get_all_records()  # wrapped by backoff via decorator on _ws_get_all_records in cached callsites
+        now = datetime.now(timezone.utc)
+        for idx, row in enumerate(rows, start=2):  # header is row 1
+            token = str_or_empty(row.get(token_col))
+            if not token:
+                continue
+            seen_dt = None
+            last_col = None
+            for h in time_headers:
+                dt = _parse_dt(row.get(h))
+                if dt:
+                    seen_dt, last_col = dt, h
+                    break
+            if not seen_dt:
+                continue
+            age_h = (now - seen_dt).total_seconds() / 3600.0
+            if age_h >= threshold_hours:
+                stalled.append({
+                    "row": idx,
+                    "token": token,
+                    "age_hours": round(age_h, 2),
+                    "last_seen_col": last_col,
+                    "last_seen": seen_dt.isoformat().replace("+00:00", "Z"),
+                })
+    except Exception as e:
+        warn(f"detect_stalled_tokens: fallback no-op due to {e}")
+        return []
+    return stalled
 
 # ========= HMAC helpers (Phase-2 ready) =========
 def hmac_hex(secret: str, payload: dict) -> str:
