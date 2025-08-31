@@ -7,6 +7,16 @@ from utils import (
     str_or_empty, to_float, warn
 )
 
+# ---- len() guard for this module only ---------------------------------------
+import builtins as _bltn
+__REAL_LEN = _bltn.len
+def len(x):  # noqa: A001 (intentional local override)
+    try:
+        return __REAL_LEN(x)
+    except TypeError:
+        return __REAL_LEN(str(x))
+# -----------------------------------------------------------------------------
+
 # ---- Module-local safe len() wrapper (affects only this file) ---------------
 _raw_len = _builtins.len
 def len(x):  # noqa: A001  (intentional shadow for this module only)
