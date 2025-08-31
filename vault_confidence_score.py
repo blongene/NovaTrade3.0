@@ -1,26 +1,18 @@
-# vault_confidence_score.py
-
-import gspread
+# vault_confidence_score.py — use utils wrappers, keep same scoring policy
 import os
-from oauth2client.service_account import ServiceAccountCredentials
-from utils import safe_float
+from utils import get_all_records_cached, safe_float, str_or_empty
 
-def calculate_confidence(token):
+def calculate_confidence(token: str) -> int:
     try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-        client = gspread.authorize(creds)
+        rows = get_all_records_cached("Rotation_Stats", ttl_s=300) or []
+        t_upper = str(token).strip().upper()
 
-        sheet = client.open_by_url(os.getenv("SHEET_URL"))
-        stats_ws = sheet.worksheet("Rotation_Stats")
-        records = stats_ws.get_all_records()
-
-        for row in records:
-            row_token = str(row.get("Token", "")).strip().upper()
-            if row_token != token.upper():
+        for row in rows:
+            row_token = str_or_empty(row.get("Token")).upper()
+            if row_token != t_upper:
                 continue
 
-            score = safe_float(row.get("Memory Vault Score", 0))
+            score = safe_float(row.get("Memory Vault Score"), default=0) or 0
             # Map score to confidence %
             if score >= 5:
                 return 90
@@ -31,7 +23,7 @@ def calculate_confidence(token):
             else:
                 return 20
 
-        return 0  # fallback if token not found
+        return 0  # not found
 
     except Exception as e:
         print(f"❌ Confidence Score error for {token}: {e}")
