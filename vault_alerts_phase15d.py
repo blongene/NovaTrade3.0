@@ -1,12 +1,3 @@
-# vault_alerts_phase15d.py — bullet-proof len() guard + type-safe alerts
-import os, traceback, builtins as _builtins
-from datetime import datetime, timedelta
-
-from utils import (
-    get_ws_cached, send_telegram_message_dedup,
-    str_or_empty, to_float, warn
-)
-
 # ---- len() guard for this module only ---------------------------------------
 import builtins as _bltn
 __REAL_LEN = _bltn.len
@@ -17,13 +8,14 @@ def len(x):  # noqa: A001 (intentional local override)
         return __REAL_LEN(str(x))
 # -----------------------------------------------------------------------------
 
-# ---- Module-local safe len() wrapper (affects only this file) ---------------
-_raw_len = _builtins.len
-def len(x):  # noqa: A001  (intentional shadow for this module only)
-    try:
-        return _raw_len(x)
-    except TypeError:
-        return _raw_len(str(x))
+# vault_alerts_phase15d.py — hardened + len-proof
+import os, traceback
+from datetime import datetime, timedelta
+
+from utils import (
+    get_ws_cached, send_telegram_message_dedup,
+    str_or_empty, to_float, warn
+)
 
 # --- Config via env ----------------------------------------------------------
 VAULT_TAB            = os.getenv("VAULT_SHEET_TAB", "Presale_Stream")
@@ -61,20 +53,6 @@ def _resolve_claim_flag_col_idx(ws):
     except Exception:
         pass
     return None
-
-def _normalize_row(row: dict) -> dict:
-    """
-    Make every value safely stringifiable; numeric reads still available via _n().
-    Prevents any stray len(value) from blowing up.
-    """
-    norm = {}
-    for k, v in row.items():
-        if v is None:
-            norm[k] = ""
-        else:
-            # keep as-is for numeric use via _n(); but string ops will be safe due to our len wrapper
-            norm[k] = v
-    return norm
 
 def _should_alert(row) -> bool:
     """
@@ -136,21 +114,20 @@ def run_vault_alerts():
     """
     try:
         ws = get_ws_cached(VAULT_TAB, ttl_s=30)
-        rows = ws.get_all_records()
+        rows = ws.get_all_records()  # utils wraps with backoff/budget
     except Exception as e:
         warn(f"Vault alerts: sheet load failed: {e}")
         return
 
     alerts = []
-    for i, raw in enumerate(rows, start=2):  # row 1 = header
+    for i, row in enumerate(rows, start=2):  # row 1 = header
         try:
-            row = _normalize_row(raw)
             if _should_alert(row):
                 alerts.append((i, _format_alert(row)))
         except Exception as e:
             if DEBUG_VAULT_ALERTS:
                 tb = traceback.format_exc(limit=1)
-                warn(f"Vault alerts row {i} error: {e} | row={raw} | tb={tb}")
+                warn(f"Vault alerts row {i} error: {e} | row={row} | tb={tb}")
             else:
                 warn(f"Vault alerts row {i} error: {e}")
 
