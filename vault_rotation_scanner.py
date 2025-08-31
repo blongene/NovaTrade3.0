@@ -1,10 +1,10 @@
-# vault_rotation_scanner.py — NT3.0 Render Phase-1 polish
+# vault_rotation_scanner.py — NT3.0 Render Phase-1 polish (fixed float + reads)
 # Scans vault positions once (cached) and marks rotation candidates with one batch write.
 
 import os, time, random
 from utils import (
     get_values_cached, get_ws, ws_batch_update, with_sheet_backoff,
-    str_or_empty, to_float
+    str_or_empty, safe_float
 )
 
 SRC_TAB       = os.getenv("VAULT_SRC_TAB", "Vaults")            # same as tracker by default
@@ -38,6 +38,7 @@ def run_vault_rotation_scanner():
     print("🔁 Scanning Vault for Rotation Candidates…")
     time.sleep(random.uniform(JIT_MIN_S, JIT_MAX_S))
 
+    # Full-sheet read (cached). With updated utils, range_a1 can be omitted.
     vals = get_values_cached(SRC_TAB, ttl_s=TTL_READ_S) or []
     if not vals:
         print(f"ℹ️ {SRC_TAB} empty; skipping.")
@@ -80,7 +81,7 @@ def run_vault_rotation_scanner():
         token = str_or_empty(row[tok_i] if tok_i < len(row) else "").upper()
         if not token:
             continue
-        roi = to_float(row[roi_i] if roi_i < len(row) else "", default=None)
+        roi = safe_float(row[roi_i] if roi_i < len(row) else "", default=None)
         status = str_or_empty(row[status_i] if (status_i is not None and status_i < len(row)) else "").upper()
 
         # Skip blocked statuses
@@ -101,7 +102,6 @@ def run_vault_rotation_scanner():
             writes.append({"range": f"{_col_letter(last_i+1)}{r_idx}", "values": [[now]]})
             touched += 1
         elif not candidate and already:
-            # clear candidate flag if it recovered
             writes.append({"range": f"{_col_letter(cand_i+1)}{r_idx}", "values": [[""]]})
             writes.append({"range": f"{_col_letter(reason_i+1)}{r_idx}", "values": [[""]]})
             writes.append({"range": f"{_col_letter(last_i+1)}{r_idx}", "values": [[now]]})
