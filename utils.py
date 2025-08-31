@@ -62,35 +62,41 @@ def set_sheets_budget(reads_per_min=None, writes_per_min=None):
     if writes_per_min:
         _write_bucket = TokenBucket(writes_per_min, writes_per_min / 60.0)
 
-# ========= Sheets gate (legacy compat: decorator + context manager) =========
+# ========= Sheets gate (decorator + context manager; supports bare & param) =========
 def _take_tokens(bucket, tokens: int):
     tokens = max(1, int(tokens))
     for _ in range(tokens):
         _wait_for(bucket)
 
-def with_sheets_gate(mode: str = "read", tokens: int = 1):
+def with_sheets_gate(_fn=None, *, mode: str = "read", tokens: int = 1):
     """
-    Decorator form: pre-consume read/write tokens before running the func.
+    Usage:
+      @with_sheets_gate
+      def f(): ...
+
+      @with_sheets_gate(mode="write", tokens=2)
+      def g(): ...
     """
-    mode_l = (mode or "read").lower()
-    bucket = _read_bucket if mode_l == "read" else _write_bucket
-    def _decorator(fn):
-        @functools.wraps(fn)
-        def _wrapper(*args, **kwargs):
-            _take_tokens(bucket, tokens)
-            return fn(*args, **kwargs)
-        return _wrapper
-    return _decorator
+    def _make_decorator(_mode: str = "read", _tokens: int = 1):
+        bucket = _read_bucket if (_mode or "read").lower() == "read" else _write_bucket
+        def _decorator(fn):
+            @functools.wraps(fn)
+            def _wrapper(*args, **kwargs):
+                _take_tokens(bucket, _tokens)
+                return fn(*args, **kwargs)
+            return _wrapper
+        return _decorator
+
+    # Bare form: @with_sheets_gate
+    if callable(_fn) and mode == "read" and tokens == 1:
+        return _make_decorator()(_fn)
+
+    # Parametrized form
+    return _make_decorator(mode, tokens)
 
 @contextmanager
 def sheets_gate(mode: str = "read", tokens: int = 1):
-    """
-    Context-manager form:
-        with sheets_gate("write", tokens=3):
-            ...
-    """
-    mode_l = (mode or "read").lower()
-    bucket = _read_bucket if mode_l == "read" else _write_bucket
+    bucket = _read_bucket if (mode or "read").lower() == "read" else _write_bucket
     _take_tokens(bucket, tokens)
     try:
         yield
@@ -124,6 +130,12 @@ def send_telegram_message_dedup(message: str, key: str, ttl_min: int = TG_DEDUP_
 
 # ========= Telegram prompt (inline keyboard) — legacy compat =========
 def _build_inline_keyboard(buttons):
+    """
+    buttons can be:
+      - list of strings: ["YES", "NO"]
+      - list of (label, callback_or_url) tuples
+      - list of lists for multi-row keyboards
+    """
     def to_btn(b):
         if isinstance(b, (list, tuple)) and len(b) >= 2:
             label, val = b[0], b[1]
@@ -132,6 +144,7 @@ def _build_inline_keyboard(buttons):
         if isinstance(val, str) and val.lower().startswith(("http://", "https://", "tg://")):
             return {"text": str(label), "url": val}
         return {"text": str(label), "callback_data": str(val)}
+
     if not isinstance(buttons, list):
         buttons = [buttons]
     rows = []
@@ -143,6 +156,7 @@ def _build_inline_keyboard(buttons):
     return {"inline_keyboard": rows}
 
 def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_TTL_MIN):
+    # allow 2-arg legacy form: (text, key)
     if isinstance(buttons, str) and key is None:
         key = buttons
         buttons = None
@@ -229,6 +243,10 @@ _gs_lock = threading.Lock()
 _gs_client = None
 
 def _load_service_account():
+    """
+    Loads Google creds from either a JSON file path (SVC_JSON) or the default
+    'sentiment-log-service.json' in cwd. Also supports SVC_JSON containing raw JSON.
+    """
     svc = os.getenv("SVC_JSON") or "sentiment-log-service.json"
     if os.path.isfile(svc):
         return ServiceAccountCredentials.from_json_keyfile_name(svc, _SCOPE)
@@ -257,6 +275,7 @@ def with_sheet_backoff(fn):
         while True:
             try:
                 op = k.pop("_sheet_op", None) or fn.__name__
+                # choose budget bucket by operation name
                 if "update" in op or "batch" in op or "append" in op:
                     _wait_for(_write_bucket)
                 else:
@@ -271,6 +290,7 @@ def with_sheet_backoff(fn):
                     continue
                 raise
             except Exception as e:
+                # retry on obvious transients
                 if any(x in str(e).lower() for x in ["timed out", "connection reset", "temporarily", "unavailable"]):
                     warn(f"Transient error ({fn.__name__}): {e}; retrying…")
                     time.sleep(delay)
@@ -326,6 +346,7 @@ def get_all_records_cached(name: str, ttl_s: int = 120):
         _cached_rows[key] = (time.time()+ttl_s, rows)
     return rows
 
+# Backwards-compat alias some modules expect
 def get_records_cached(sheet_name: str, ttl_s: int = 120):
     return get_all_records_cached(sheet_name, ttl_s)
 
@@ -389,13 +410,14 @@ def ws_update(ws, range_a1, values):
 def str_or_empty(v):
     return str(v).strip() if v is not None else ""
 
-def to_float(v):
+def to_float(v, default=None):
     s = str_or_empty(v).replace("%", "").replace(",", "")
-    if s == "": return None
+    if s == "":
+        return default
     try:
         return float(s)
     except Exception:
-        return None
+        return default
 
 # ========= Safe length helper =========
 def safe_len(x) -> int:
