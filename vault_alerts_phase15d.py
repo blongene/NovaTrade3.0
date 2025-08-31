@@ -102,19 +102,15 @@ def _write_ready(ws, row_idx_1based):
         col_idx = _resolve_claim_flag_col_idx(ws)
         if col_idx is None:
             return
-        ws.update_cell(row_idx_1based, col_idx, "READY")  # backoff-wrapped via utils
+        ws.update_cell(row_idx_1based, col_idx, "READY")  # backoff-wrapped via utils decorators on Worksheet methods
     except Exception as e:
         warn(f"READY write failed (row {row_idx_1based}): {e}")
 
-# --- Entry -------------------------------------------------------------------
 def run_vault_alerts():
-    """
-    Type-safe, len-proof vault alert scan.
-    One bad row never aborts the job.
-    """
+    """Type-safe, len-proof vault alert scan. One bad row never aborts the job."""
     try:
         ws = get_ws_cached(VAULT_TAB, ttl_s=30)
-        rows = ws.get_all_records()  # utils wraps with backoff/budget
+        rows = ws.get_all_records()  # utils caches & backoff in fetch helpers
     except Exception as e:
         warn(f"Vault alerts: sheet load failed: {e}")
         return
