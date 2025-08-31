@@ -87,6 +87,32 @@ def send_telegram_message_dedup(message: str, key: str, ttl_min: int = TG_DEDUP_
             return
         _dedup_cache[key] = now
     _tg_send_raw(message)
+    
+# --- Legacy compat shims (to satisfy older modules) --------------------------
+def ping_webhook_debug(message: str):
+    """
+    Legacy helper used by nova_watchdog and a few older modules.
+    Writes to Webhook_Debug!A1 (best-effort) and sends a de-duped Telegram debug ping.
+    Safe no-op if Sheet or Telegram isn’t configured.
+    """
+    # Telegram debug ping (de-duped)
+    try:
+        send_telegram_message_dedup(f"🛠️ Debug: {message}", key="webhook_debug")
+    except Exception:
+        pass
+
+    # Sheet debug cell (best-effort)
+    try:
+        ws = get_ws_cached("Webhook_Debug", ttl_s=30)
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        ws.update("A1", f"{ts}Z — {message}", _sheet_op="update")
+    except Exception:
+        # Silently ignore if the tab is missing or quota/backoff is in play
+        pass
+
+# Optional alias if any code references ping_webhook()
+def ping_webhook(message: str):
+    ping_webhook_debug(message)
 
 # Backwards-compat alias used by some modules
 def send_telegram_message(message: str, key: str = "default"):
