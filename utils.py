@@ -99,41 +99,25 @@ def _build_inline_keyboard(buttons):
             label, val = b[0], b[1]
         else:
             label, val = str(b), str(b)
-
-        # URL buttons if looks like a link, else callback_data
         if isinstance(val, str) and val.lower().startswith(("http://", "https://", "tg://")):
             return {"text": str(label), "url": val}
         return {"text": str(label), "callback_data": str(val)}
 
-    # normalize to rows
     if not isinstance(buttons, list):
         buttons = [buttons]
     rows = []
     for row in buttons:
         if isinstance(row, list) and row and isinstance(row[0], (list, tuple, str)):
-            # already a row list -> map each item
             rows.append([to_btn(x) for x in row])
         else:
-            # single row
-            rows.append([to_btn(row)])  # row is a single button
+            rows.append([to_btn(row)])
     return {"inline_keyboard": rows}
 
 def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_TTL_MIN):
-    """
-    Legacy-friendly inline prompt.
-    Common historical call forms we support:
-      send_telegram_prompt("Approve trade?")                      # default YES/NO
-      send_telegram_prompt("Approve?", ["YES","NO"])              # two buttons
-      send_telegram_prompt("Choose", [("Open Sheet", SHEET_URL)]) # URL button
-      send_telegram_prompt("Approve?", key="approve_trade_XYZ")   # de-duped
-      send_telegram_prompt("Approve?", "approve_trade_XYZ")       # 2nd arg as key (compat)
-    """
     # allow 2-arg legacy form: (text, key)
     if isinstance(buttons, str) and key is None:
         key = buttons
         buttons = None
-
-    # dedupe if key provided
     if key:
         now = time.time()
         with _dedup_lock:
@@ -141,14 +125,11 @@ def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_T
             if now - last < ttl_min * 60:
                 return
             _dedup_cache[key] = now
-
     if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
         warn("Telegram disabled; cannot send prompt.")
         return
-
     if not buttons:
         buttons = ["YES", "NO"]
-
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         payload = {
@@ -160,24 +141,14 @@ def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_T
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         warn(f"Telegram prompt send failed: {e}")
-        
+
 # ========= Telegram de-dupe helpers (legacy compat) =========
 import hashlib as _hashlib
-
 def _tg_key_from_message(msg: str) -> str:
-    # Stable short hash key from message text (legacy behavior)
     h = _hashlib.sha1(str(msg).encode()).hexdigest()[:12]
     return f"tg:{h}"
 
 def tg_should_send(key_or_message: str, key: str = None, ttl_min: int = TG_DEDUP_TTL_MIN, consume: bool = True) -> bool:
-    """
-    Legacy-friendly guard to decide if we should send a Telegram message.
-    - If only 'key_or_message' is provided, we'll hash the message text for a stable dedupe key.
-    - If 'key' is provided, we use it directly.
-    - If 'consume' is True, we also mark it as sent now; set consume=False if caller will mark later.
-
-    Returns: True if we should send, else False.
-    """
     k = key or _tg_key_from_message(key_or_message)
     now = time.time()
     with _dedup_lock:
@@ -189,19 +160,11 @@ def tg_should_send(key_or_message: str, key: str = None, ttl_min: int = TG_DEDUP
     return True
 
 def tg_mark_sent(key_or_message: str, key: str = None):
-    """
-    Mark a dedupe key as sent without checking TTL (legacy helper).
-    Useful if caller used tg_should_send(..., consume=False) and sends separately.
-    """
     k = key or _tg_key_from_message(key_or_message)
     with _dedup_lock:
         _dedup_cache[k] = time.time()
 
 def send_telegram_message_if_new(message: str, key: str = None, ttl_min: int = TG_DEDUP_TTL_MIN):
-    """
-    Convenience: only send if not sent within ttl.
-    Equivalent to: if tg_should_send(message, key): _tg_send_raw(message)
-    """
     if tg_should_send(message, key=key, ttl_min=ttl_min, consume=True):
         _tg_send_raw(message)
 
@@ -224,17 +187,13 @@ def send_system_online_once():
     send_once_per_day("system_online", "✅ NovaTrade online — all modules healthy.")
 
 # ========= Cold boot detection (legacy compat) =========
-# Returns True only for an initial window after process start (or if forced by env).
 _BOOT_STARTED_AT = time.time()
 COLD_BOOT_WINDOW_SEC = int(float(os.getenv("COLD_BOOT_WINDOW_MIN", "5")) * 60)  # default 5 minutes
-
 def is_cold_boot() -> bool:
     if os.getenv("FORCE_COLD_BOOT", "0") == "1":
         return True
     return (time.time() - _BOOT_STARTED_AT) <= COLD_BOOT_WINDOW_SEC
-
 def mark_warm_boot():
-    """Optional helper some modules used: immediately end the cold-boot window."""
     global _BOOT_STARTED_AT
     _BOOT_STARTED_AT = 0
 
@@ -251,12 +210,10 @@ def _load_service_account():
     svc = os.getenv("SVC_JSON") or "sentiment-log-service.json"
     if os.path.isfile(svc):
         return ServiceAccountCredentials.from_json_keyfile_name(svc, _SCOPE)
-    # try raw json in env
     try:
         data = json.loads(svc)
         return ServiceAccountCredentials.from_json_keyfile_dict(data, _SCOPE)
     except Exception:
-        # fallback to default file
         return ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", _SCOPE)
 
 def get_gspread_client():
@@ -278,7 +235,6 @@ def with_sheet_backoff(fn):
         while True:
             try:
                 op = k.pop("_sheet_op", None) or fn.__name__
-                # choose bucket
                 if "update" in op or "batch" in op or "append" in op:
                     _wait_for(_write_bucket)
                 else:
@@ -293,7 +249,6 @@ def with_sheet_backoff(fn):
                     continue
                 raise
             except Exception as e:
-                # retry on obvious transient issues
                 if any(x in str(e).lower() for x in ["timed out", "connection reset", "temporarily", "unavailable"]):
                     warn(f"Transient error ({fn.__name__}): {e}; retrying…")
                     time.sleep(delay)
@@ -352,14 +307,9 @@ def get_records_cached(sheet_name: str, ttl_s: int = 120):
 # ========= Cached range reads (values) =========
 @with_sheet_backoff
 def _ws_get(ws, range_a1: str):
-    # raw values (2D list) from a range; honors sheet budgets/backoff
     return ws.get(range_a1)
 
 def get_values_cached(sheet_name: str, range_a1: str, ttl_s: int = 60):
-    """
-    Return a 2D list (like gspread.get) for the given A1 range, cached for ttl_s.
-    Example: vals = get_values_cached("Rotation_Stats", "A1:C100")
-    """
     key = f"vals::{sheet_name}::{range_a1}"
     with _cache_lock:
         item = _values_cache.get(key)
@@ -368,7 +318,6 @@ def get_values_cached(sheet_name: str, range_a1: str, ttl_s: int = 60):
             if time.time() < exp:
                 return vals
             _values_cache.pop(key, None)
-
     ws = get_ws_cached(sheet_name, ttl_s=ttl_s)
     vals = _ws_get(ws, range_a1)
     with _cache_lock:
@@ -376,10 +325,6 @@ def get_values_cached(sheet_name: str, range_a1: str, ttl_s: int = 60):
     return vals
 
 def get_value_cached(sheet_name: str, cell_a1: str, ttl_s: int = 60):
-    """
-    Convenience for single-cell reads. Returns a scalar ('' if empty).
-    Example: v = get_value_cached("NovaHeartbeat", "A2")
-    """
     data = get_values_cached(sheet_name, cell_a1, ttl_s=ttl_s)
     if not data:
         return ""
@@ -391,9 +336,6 @@ def get_value_cached(sheet_name: str, cell_a1: str, ttl_s: int = 60):
 # ========= Batch/Append/Update writes (single round-trips) =========
 @with_sheet_backoff
 def ws_batch_update(ws, writes):
-    """
-    writes: list of {"range": "Tab!A1", "values": [[...]]}
-    """
     if not writes: return
     ws.batch_update(writes, value_input_option="RAW")
 
@@ -403,9 +345,6 @@ def ws_append_row(ws, values):
 
 @with_sheet_backoff
 def ws_update(ws, range_a1, values):
-    """
-    Safe wrapper for ws.update. 'values' can be a scalar or 2D list.
-    """
     ws.update(range_a1, values)
 
 # ========= A1 helpers / parsing =========
@@ -420,8 +359,35 @@ def to_float(v):
     except Exception:
         return None
 
+# ========= Legacy-safe parsing helpers (compat) =========
+def safe_float(v, default=None):
+    """
+    Accepts numbers/strings like '12.3', '12%', '1,234', '-', 'N/A'.
+    Returns float or `default` when not parseable.
+    """
+    s = str_or_empty(v).strip()
+    if s == "" or s in {"-", "—", "N/A", "n/a", "NA", "na", "None", "null"}:
+        return default
+    s = s.replace("%", "").replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return default
+
+def safe_int(v, default=None):
+    f = safe_float(v, default=None)
+    if f is None:
+        return default
+    try:
+        return int(float(f))
+    except Exception:
+        return default
+
+def safe_str(v, default=""):
+    s = str_or_empty(v)
+    return s if s != "" else default
+
 def cell_address(col_idx, row_idx):
-    """1-based col,row → A1 address"""
     n = col_idx
     letters = ""
     while n:
@@ -430,7 +396,6 @@ def cell_address(col_idx, row_idx):
     return f"{letters}{row_idx}"
 
 def sanitize_range(a1: str) -> str:
-    """Defensive: strip duplicate sheet names like 'Tab!Tab!A1'"""
     if "!" not in a1: return a1
     tab, rng = a1.split("!", 1)
     tab = tab.split("!")[-1]
@@ -438,27 +403,18 @@ def sanitize_range(a1: str) -> str:
 
 # ========= Legacy compat shims =========
 def ping_webhook_debug(message: str):
-    """
-    Legacy helper used by nova_watchdog and a few older modules.
-    Writes to Webhook_Debug!A1 (best-effort) and sends a de-duped Telegram debug ping.
-    Safe no-op if Sheet or Telegram isn’t configured.
-    """
-    # Telegram debug ping (de-duped)
     try:
         send_telegram_message_dedup(f"🛠️ Debug: {message}", key="webhook_debug")
     except Exception:
         pass
-    # Sheet debug cell (best-effort)
     try:
         ws = get_ws_cached("Webhook_Debug", ttl_s=30)
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         ws_update(ws, "A1", f"{ts}Z — {message}")
     except Exception:
-        # Silently ignore if the tab is missing or quota/backoff is in play
         pass
 
 def ping_webhook(message: str):
-    """Optional alias some callers use."""
     ping_webhook_debug(message)
 
 # --- detect_stalled_tokens (used by nova_watchdog) --------------------------
@@ -490,16 +446,12 @@ def detect_stalled_tokens(
     time_headers: list[str] = WATCHDOG_TIME_HEADERS,
     threshold_hours: float = STALLED_THRESHOLD_HOURS,
 ):
-    """
-    Returns a list of dicts for rows whose latest timestamp-like column is older than threshold.
-    Safe no-op on missing tabs/headers; never raises.
-    """
     stalled = []
     try:
         ws = get_ws_cached(tab, ttl_s=60)
-        rows = ws.get_all_records()  # wrapped by backoff at callsite
+        rows = ws.get_all_records()
         now = datetime.now(timezone.utc)
-        for idx, row in enumerate(rows, start=2):  # header is row 1
+        for idx, row in enumerate(rows, start=2):
             token = str_or_empty(row.get(token_col))
             if not token:
                 continue
