@@ -2,6 +2,8 @@
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import logging
+log = logging.getLogger("nova.vault_alerts")
 
 from utils import with_sheet_backoff, send_telegram_message_dedup
 
@@ -121,7 +123,13 @@ def run_vault_alerts():
                 # Never fail the run on Telegram hiccups
                 print(f"⚠️ Telegram send skipped for {token}: {te}")
 
-        print(f"✅ Vault alert check complete. {alerts_sent} Telegram(s) sent.")
+        sent = len(alerts_sent)  # or whatever your counter is
+        if sent > 0:
+            log.info("✅ Vault alert check complete. %d Telegram(s) sent.", sent)
+        else:
+            # keep no-op noise out of “info” if you prefer:
+            log.debug("Vault alert check complete. No alerts to send.")
+        return True
 
     except Exception as e:
         # Keep this quiet & resilient; the decorator already retries reads.
