@@ -1,4 +1,4 @@
-# utils.py — NT3.0 Phase-1 Polish (quota-proof + quiet + legacy shims)
+# utils.py — NT3.0 Phase-1 Polish (quota-proof + quiet + cached values + legacy shims)
 import os, time, json, threading, functools, hashlib, hmac
 from datetime import datetime, timezone, timedelta
 
@@ -54,7 +54,7 @@ def _wait_for(bucket):
         time.sleep(0.2)
 
 def set_sheets_budget(reads_per_min=None, writes_per_min=None):
-    """Optional live tuning."""
+    """Optional live tuning at runtime."""
     global _read_bucket, _write_bucket
     if reads_per_min:
         _read_bucket  = TokenBucket(reads_per_min,  reads_per_min  / 60.0)
@@ -167,6 +167,7 @@ def with_sheet_backoff(fn):
 # ========= Cached reads (TTL) =========
 _cached_ws = {}
 _cached_rows = {}
+_values_cache = {}
 _cache_lock = threading.Lock()
 
 @with_sheet_backoff
@@ -209,6 +210,45 @@ def get_all_records_cached(name: str, ttl_s: int = 120):
 # Backwards-compat alias some modules expect
 def get_records_cached(sheet_name: str, ttl_s: int = 120):
     return get_all_records_cached(sheet_name, ttl_s)
+
+# ========= Cached range reads (values) =========
+@with_sheet_backoff
+def _ws_get(ws, range_a1: str):
+    # raw values (2D list) from a range; honors sheet budgets/backoff
+    return ws.get(range_a1)
+
+def get_values_cached(sheet_name: str, range_a1: str, ttl_s: int = 60):
+    """
+    Return a 2D list (like gspread.get) for the given A1 range, cached for ttl_s.
+    Example: vals = get_values_cached("Rotation_Stats", "A1:C100")
+    """
+    key = f"vals::{sheet_name}::{range_a1}"
+    with _cache_lock:
+        item = _values_cache.get(key)
+        if item:
+            exp, vals = item
+            if time.time() < exp:
+                return vals
+            _values_cache.pop(key, None)
+
+    ws = get_ws_cached(sheet_name, ttl_s=ttl_s)
+    vals = _ws_get(ws, range_a1)
+    with _cache_lock:
+        _values_cache[key] = (time.time() + ttl_s, vals)
+    return vals
+
+def get_value_cached(sheet_name: str, cell_a1: str, ttl_s: int = 60):
+    """
+    Convenience for single-cell reads. Returns a scalar ('' if empty).
+    Example: v = get_value_cached("NovaHeartbeat", "A2")
+    """
+    data = get_values_cached(sheet_name, cell_a1, ttl_s=ttl_s)
+    if not data:
+        return ""
+    row = data[0] if isinstance(data, list) else data
+    if isinstance(row, list) and row:
+        return row[0]
+    return row or ""
 
 # ========= Batch/Append/Update writes (single round-trips) =========
 @with_sheet_backoff
@@ -319,7 +359,7 @@ def detect_stalled_tokens(
     stalled = []
     try:
         ws = get_ws_cached(tab, ttl_s=60)
-        rows = ws.get_all_records()  # wrapped by backoff via decorator on _ws_get_all_records in cached callsites
+        rows = ws.get_all_records()  # wrapped by backoff at callsite
         now = datetime.now(timezone.utc)
         for idx, row in enumerate(rows, start=2):  # header is row 1
             token = str_or_empty(row.get(token_col))
