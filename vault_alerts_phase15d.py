@@ -1,20 +1,11 @@
-# ---- len() guard for this module only ---------------------------------------
-import builtins as _bltn
-__REAL_LEN = _bltn.len
-def len(x):  # noqa: A001 (intentional local override)
-    try:
-        return __REAL_LEN(x)
-    except TypeError:
-        return __REAL_LEN(str(x))
-# -----------------------------------------------------------------------------
+# vault_alerts_phase15d.py — hardened + len-proof + complete summary path
 
-# vault_alerts_phase15d.py — hardened + len-proof
 import os, traceback
 from datetime import datetime, timedelta
 
 from utils import (
     get_ws_cached, send_telegram_message_dedup,
-    str_or_empty, to_float, warn
+    str_or_empty, to_float, warn, safe_len
 )
 
 # --- Config via env ----------------------------------------------------------
@@ -28,7 +19,7 @@ def _s(row, key) -> str:
     return str_or_empty(row.get(key))
 
 def _n(row, key):
-    return to_float(row.get(key))
+    return to_float(row.get(key), default=None)
 
 def _parse_date(s: str):
     s = str_or_empty(s)
@@ -62,7 +53,7 @@ def _should_alert(row) -> bool:
       - Unlock date in [T-1d .. T+0]  OR claim flag already READY
     """
     token = _s(row, "Token")
-    if len(token) == 0:
+    if safe_len(token) == 0:
         return False
 
     claim_flag = _s(row, CLAIM_FLAG_COL_NAME).upper()
@@ -89,8 +80,8 @@ def _format_alert(row) -> str:
     status = _s(row, "Status") or "—"
     return (
         f"🔔 *Vault Unlock*: {token}\n"
-        f"• ROI: {roi:.2f}%\n"
-        f"• Days held: {int(days)}\n"
+        f"• ROI: {float(roi):.2f}%\n"
+        f"• Days held: {int(float(days)) if days is not None else 0}\n"
         f"• Status: {status}\n"
         f"• Action: Claim & restake? (or rotate)"
     )
@@ -102,15 +93,19 @@ def _write_ready(ws, row_idx_1based):
         col_idx = _resolve_claim_flag_col_idx(ws)
         if col_idx is None:
             return
-        ws.update_cell(row_idx_1based, col_idx, "READY")  # backoff-wrapped via utils decorators on Worksheet methods
+        ws.update_cell(row_idx_1based, col_idx, "READY")  # backoff-wrapped via utils
     except Exception as e:
         warn(f"READY write failed (row {row_idx_1based}): {e}")
 
+# --- Entry -------------------------------------------------------------------
 def run_vault_alerts():
-    """Type-safe, len-proof vault alert scan. One bad row never aborts the job."""
+    """
+    Type-safe, len-proof vault alert scan.
+    One bad row never aborts the job.
+    """
     try:
         ws = get_ws_cached(VAULT_TAB, ttl_s=30)
-        rows = ws.get_all_records()  # utils caches & backoff in fetch helpers
+        rows = ws.get_all_records()  # utils wraps with backoff/budget in calling context
     except Exception as e:
         warn(f"Vault alerts: sheet load failed: {e}")
         return
@@ -135,7 +130,8 @@ def run_vault_alerts():
                 warn(f"Telegram send failed for row {row_idx}: {e}")
         _write_ready(ws, row_idx)
 
+    # Summary (always deduped)
     if alerts:
         send_telegram_message_dedup(f"✅ Vault alerts sent: {len(alerts)}", key="vault_alerts_summary")
     else:
-        send_telegram_message_dedup("ℹ️ No vault alerts today.", key="vault_alerts_none")
+        send_telegram_message_dedup("ℹ️ No vault unlock alerts this pass.", key="vault_alerts_summary_empty")
