@@ -1,6 +1,20 @@
-# utils.py — NT3.0 Phase-1 Polish (quota-proof + quiet + cached values + legacy shims)
+# utils.py — NovaTrade 3.0 (quota-proof, quiet logging, cached reads, legacy shims)
+# - Global token buckets for Sheets
+# - Exponential backoff/jitter for quota & transient errors
+# - Cached worksheet/records/values with TTL
+# - Telegram messaging + inline prompt + dedupe helpers
+# - Cold-boot detection
+# - Decorators: with_sheet_backoff, with_sheets_gate (also usable bare: @with_sheets_gate)
+# - Context manager: sheets_gate(...), for manual gating
+# - Safe parsers: safe_float/int/str, to_float(default=...), safe_len
+# - Legacy aliases kept for older modules:
+#       get_records_cached, safe_get_all_records,
+#       send_telegram_message, send_telegram_inline, send_telegram_message_if_new,
+#       send_telegram_prompt, tg_should_send, is_cold_boot,
+#       ping_webhook_debug, ping_webhook
+
 import os, time, json, threading, functools, hashlib, hmac
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from contextlib import contextmanager
 
 import gspread
@@ -31,12 +45,13 @@ def error(msg): print(f"[{_ts()}] ERROR {msg}")
 # ========= Token Bucket (global budgets) =========
 class TokenBucket:
     def __init__(self, capacity, refill_per_sec):
-        self.capacity = capacity
-        self.refill_per_sec = refill_per_sec
-        self.tokens = capacity
+        self.capacity = max(1, int(capacity))
+        self.refill_per_sec = float(refill_per_sec)
+        self.tokens = float(capacity)
         self.last = time.monotonic()
         self.lock = threading.Lock()
     def take(self, n=1):
+        n = max(1, int(n))
         with self.lock:
             now = time.monotonic()
             elapsed = now - self.last
@@ -58,45 +73,40 @@ def set_sheets_budget(reads_per_min=None, writes_per_min=None):
     """Optional live tuning at runtime."""
     global _read_bucket, _write_bucket
     if reads_per_min:
+        reads_per_min = int(reads_per_min)
         _read_bucket  = TokenBucket(reads_per_min,  reads_per_min  / 60.0)
     if writes_per_min:
+        writes_per_min = int(writes_per_min)
         _write_bucket = TokenBucket(writes_per_min, writes_per_min / 60.0)
 
-# ========= Sheets gate (decorator + context manager; supports bare & param) =========
-def _take_tokens(bucket, tokens: int):
-    tokens = max(1, int(tokens))
+# ========= Sheets gate (decorator + context manager) =========
+def _take_tokens(bucket, tokens):
+    tokens = max(1, int(tokens or 1))
     for _ in range(tokens):
         _wait_for(bucket)
 
-def with_sheets_gate(_fn=None, *, mode: str = "read", tokens: int = 1):
+def with_sheets_gate(_fn=None, *, mode="read", tokens=1):
     """
-    Usage:
+    Decorator that pre-consumes read/write tokens before running the function.
+    Supports both usages:
       @with_sheets_gate
-      def f(): ...
-
-      @with_sheets_gate(mode="write", tokens=2)
-      def g(): ...
+      @with_sheets_gate(mode="write", tokens=3)
     """
-    def _make_decorator(_mode: str = "read", _tokens: int = 1):
-        bucket = _read_bucket if (_mode or "read").lower() == "read" else _write_bucket
-        def _decorator(fn):
-            @functools.wraps(fn)
-            def _wrapper(*args, **kwargs):
-                _take_tokens(bucket, _tokens)
-                return fn(*args, **kwargs)
-            return _wrapper
-        return _decorator
-
-    # Bare form: @with_sheets_gate
-    if callable(_fn) and mode == "read" and tokens == 1:
-        return _make_decorator()(_fn)
-
-    # Parametrized form
-    return _make_decorator(mode, tokens)
+    def _decorator(fn):
+        @functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
+            bucket = _read_bucket if str(mode).lower() == "read" else _write_bucket
+            _take_tokens(bucket, tokens)
+            return fn(*args, **kwargs)
+        return _wrapper
+    if callable(_fn):  # bare decorator form
+        return _decorator(_fn)
+    return _decorator
 
 @contextmanager
-def sheets_gate(mode: str = "read", tokens: int = 1):
-    bucket = _read_bucket if (mode or "read").lower() == "read" else _write_bucket
+def sheets_gate(mode="read", tokens=1):
+    """Context-manager form for manual gating."""
+    bucket = _read_bucket if str(mode).lower() == "read" else _write_bucket
     _take_tokens(bucket, tokens)
     try:
         yield
@@ -128,13 +138,13 @@ def send_telegram_message_dedup(message: str, key: str, ttl_min: int = TG_DEDUP_
         _dedup_cache[key] = now
     _tg_send_raw(message)
 
-# ========= Telegram prompt (inline keyboard) — legacy compat =========
+# ========= Telegram prompt (inline keyboard) =========
 def _build_inline_keyboard(buttons):
     """
     buttons can be:
-      - list of strings: ["YES", "NO"]
-      - list of (label, callback_or_url) tuples
-      - list of lists for multi-row keyboards
+      - ["YES","NO"]
+      - [("Open Sheet", "https://..."), ("Approve", "APPROVE_X")]
+      - [[("Row1-Btn1","A")],[("Row2-Btn1","B"),("Row2-Btn2","C")]]
     """
     def to_btn(b):
         if isinstance(b, (list, tuple)) and len(b) >= 2:
@@ -144,7 +154,6 @@ def _build_inline_keyboard(buttons):
         if isinstance(val, str) and val.lower().startswith(("http://", "https://", "tg://")):
             return {"text": str(label), "url": val}
         return {"text": str(label), "callback_data": str(val)}
-
     if not isinstance(buttons, list):
         buttons = [buttons]
     rows = []
@@ -156,7 +165,7 @@ def _build_inline_keyboard(buttons):
     return {"inline_keyboard": rows}
 
 def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_TTL_MIN):
-    # allow 2-arg legacy form: (text, key)
+    # allow legacy (text, key) form
     if isinstance(buttons, str) and key is None:
         key = buttons
         buttons = None
@@ -184,11 +193,10 @@ def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_T
     except Exception as e:
         warn(f"Telegram prompt send failed: {e}")
 
-# ========= Telegram de-dupe helpers (legacy compat) =========
+# ========= Telegram dedupe helpers / aliases =========
 import hashlib as _hashlib
 def _tg_key_from_message(msg: str) -> str:
-    h = _hashlib.sha1(str(msg).encode()).hexdigest()[:12]
-    return f"tg:{h}"
+    return f"tg:{_hashlib.sha1(str(msg).encode()).hexdigest()[:12]}"
 
 def tg_should_send(key_or_message: str, key: str = None, ttl_min: int = TG_DEDUP_TTL_MIN, consume: bool = True) -> bool:
     k = key or _tg_key_from_message(key_or_message)
@@ -210,6 +218,7 @@ def send_telegram_message_if_new(message: str, key: str = None, ttl_min: int = T
     if tg_should_send(message, key=key, ttl_min=ttl_min, consume=True):
         _tg_send_raw(message)
 
+# Historical aliases
 def send_telegram_inline(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_TTL_MIN):
     return send_telegram_prompt(text, buttons=buttons, key=key, ttl_min=ttl_min)
 
@@ -226,13 +235,15 @@ def send_boot_notice_once(message="🟢 NovaTrade system booted and live.", cool
 def send_system_online_once():
     send_once_per_day("system_online", "✅ NovaTrade online — all modules healthy.")
 
-# ========= Cold boot detection (legacy compat) =========
+# ========= Cold boot detection =========
 _BOOT_STARTED_AT = time.time()
-COLD_BOOT_WINDOW_SEC = int(float(os.getenv("COLD_BOOT_WINDOW_MIN", "5")) * 60)  # default 5 minutes
+COLD_BOOT_WINDOW_SEC = int(float(os.getenv("COLD_BOOT_WINDOW_MIN", "5")) * 60)  # default 5 min
+
 def is_cold_boot() -> bool:
     if os.getenv("FORCE_COLD_BOOT", "0") == "1":
         return True
     return (time.time() - _BOOT_STARTED_AT) <= COLD_BOOT_WINDOW_SEC
+
 def mark_warm_boot():
     global _BOOT_STARTED_AT
     _BOOT_STARTED_AT = 0
@@ -244,8 +255,8 @@ _gs_client = None
 
 def _load_service_account():
     """
-    Loads Google creds from either a JSON file path (SVC_JSON) or the default
-    'sentiment-log-service.json' in cwd. Also supports SVC_JSON containing raw JSON.
+    Load Google creds from either a JSON file path (SVC_JSON) or the default
+    'sentiment-log-service.json'. Also supports SVC_JSON containing raw JSON.
     """
     svc = os.getenv("SVC_JSON") or "sentiment-log-service.json"
     if os.path.isfile(svc):
@@ -275,6 +286,7 @@ def with_sheet_backoff(fn):
         while True:
             try:
                 op = k.pop("_sheet_op", None) or fn.__name__
+                # choose bucket
                 if "update" in op or "batch" in op or "append" in op:
                     _wait_for(_write_bucket)
                 else:
@@ -289,6 +301,7 @@ def with_sheet_backoff(fn):
                     continue
                 raise
             except Exception as e:
+                # retry on obvious transient issues
                 if any(x in str(e).lower() for x in ["timed out", "connection reset", "temporarily", "unavailable"]):
                     warn(f"Transient error ({fn.__name__}): {e}; retrying…")
                     time.sleep(delay)
@@ -304,10 +317,10 @@ _values_cache = {}
 _cache_lock = threading.Lock()
 
 @with_sheet_backoff
-def get_ws(name: str):
+def get_ws(name):
     return get_sheet().worksheet(name)
 
-def get_ws_cached(name: str, ttl_s: int = 120):
+def get_ws_cached(name, ttl_s=120):
     key = f"ws::{name}"
     with _cache_lock:
         item = _cached_ws.get(key)
@@ -329,7 +342,7 @@ def _ws_get_all_records(ws):
 def _ws_get_all_values(ws):
     return ws.get_all_values()
 
-def get_all_records_cached(name: str, ttl_s: int = 120):
+def get_all_records_cached(name, ttl_s=120):
     key = f"rows::{name}"
     with _cache_lock:
         item = _cached_rows.get(key)
@@ -344,16 +357,16 @@ def get_all_records_cached(name: str, ttl_s: int = 120):
         _cached_rows[key] = (time.time()+ttl_s, rows)
     return rows
 
-# Backwards-compat alias some modules expect
-def get_records_cached(sheet_name: str, ttl_s: int = 120):
+# Legacy alias
+def get_records_cached(sheet_name, ttl_s=120):
     return get_all_records_cached(sheet_name, ttl_s)
 
 # ========= Cached range reads (values) =========
 @with_sheet_backoff
-def _ws_get(ws, range_a1: str):
+def _ws_get(ws, range_a1):
     return ws.get(range_a1)
 
-def get_values_cached(sheet_name: str, range_a1=None, ttl_s: int = 60):
+def get_values_cached(sheet_name, range_a1=None, ttl_s=60):
     """
     Returns a 2D list.
       - If range_a1 is provided: uses ws.get(range_a1)
@@ -374,7 +387,7 @@ def get_values_cached(sheet_name: str, range_a1=None, ttl_s: int = 60):
         _values_cache[key] = (time.time() + ttl_s, vals)
     return vals
 
-def get_value_cached(sheet_name: str, cell_a1: str, ttl_s: int = 60):
+def get_value_cached(sheet_name, cell_a1, ttl_s=60):
     data = get_values_cached(sheet_name, cell_a1, ttl_s=ttl_s)
     if not data:
         return ""
@@ -383,7 +396,16 @@ def get_value_cached(sheet_name: str, cell_a1: str, ttl_s: int = 60):
         return row[0]
     return row or ""
 
-# ========= Batch/Append/Update writes (single round-trips) =========
+# Often expected by older modules
+def safe_get_all_records(sheet_name, ttl_s=120):
+    """Legacy helper: cached get_all_records with soft failure to []"""
+    try:
+        return get_all_records_cached(sheet_name, ttl_s=ttl_s) or []
+    except Exception as e:
+        warn(f"safe_get_all_records({sheet_name}) failed: {e}")
+        return []
+
+# ========= Batch/Append/Update writes =========
 @with_sheet_backoff
 def ws_batch_update(ws, writes):
     if not writes: return
@@ -409,28 +431,11 @@ def str_or_empty(v):
     return str(v).strip() if v is not None else ""
 
 def to_float(v, default=None):
-    s = str_or_empty(v).replace("%", "").replace(",", "")
-    if s == "":
-        return default
-    try:
-        return float(s)
-    except Exception:
-        return default
-
-# ========= Safe length helper (defensive) =========
-def safe_len(x) -> int:
-    try:
-        return len(x)
-    except TypeError:
-        return len(str(x))
-
-# ========= Legacy-safe parsing helpers (compat) =========
-def safe_float(v, default=None):
     """
-    Accepts numbers/strings like '12.3', '12%', '1,234', '-', 'N/A'.
+    Parse floats safely: accepts '12.3', '12%', '1,234', '-', 'N/A'.
     Returns float or `default` when not parseable.
     """
-    s = str_or_empty(v).strip()
+    s = str_or_empty(v)
     if s == "" or s in {"-", "—", "N/A", "n/a", "NA", "na", "None", "null"}:
         return default
     s = s.replace("%", "").replace(",", "")
@@ -439,8 +444,11 @@ def safe_float(v, default=None):
     except Exception:
         return default
 
+def safe_float(v, default=None):
+    return to_float(v, default=default)
+
 def safe_int(v, default=None):
-    f = safe_float(v, default=None)
+    f = to_float(v, default=None)
     if f is None:
         return default
     try:
@@ -452,7 +460,14 @@ def safe_str(v, default=""):
     s = str_or_empty(v)
     return s if s != "" else default
 
+def safe_len(x) -> int:
+    try:
+        return len(x)
+    except TypeError:
+        return len(str(x))
+
 def cell_address(col_idx, row_idx):
+    """1-based col,row → A1 address"""
     n = col_idx
     letters = ""
     while n:
@@ -462,6 +477,7 @@ def cell_address(col_idx, row_idx):
 
 # ========= Legacy compat shims =========
 def ping_webhook_debug(message: str):
+    """Best-effort Telegram + Webhook_Debug!A1 write; silent on failure."""
     try:
         send_telegram_message_dedup(f"🛠️ Debug: {message}", key="webhook_debug")
     except Exception:
@@ -500,17 +516,21 @@ def _parse_dt(val):
         return None
 
 def detect_stalled_tokens(
-    tab: str = WATCHDOG_TAB,
-    token_col: str = WATCHDOG_TOKEN_COL,
-    time_headers: list[str] = WATCHDOG_TIME_HEADERS,
-    threshold_hours: float = STALLED_THRESHOLD_HOURS,
+    tab=WATCHDOG_TAB,
+    token_col=WATCHDOG_TOKEN_COL,
+    time_headers=WATCHDOG_TIME_HEADERS,
+    threshold_hours=STALLED_THRESHOLD_HOURS,
 ):
+    """
+    Returns a list of dicts for rows whose latest timestamp-like column
+    is older than threshold. Safe no-op on missing tabs/headers; never raises.
+    """
     stalled = []
     try:
         ws = get_ws_cached(tab, ttl_s=60)
         rows = ws.get_all_records()
         now = datetime.now(timezone.utc)
-        for idx, row in enumerate(rows, start=2):
+        for idx, row in enumerate(rows, start=2):  # header is row 1
             token = str_or_empty(row.get(token_col))
             if not token:
                 continue
@@ -524,7 +544,7 @@ def detect_stalled_tokens(
             if not seen_dt:
                 continue
             age_h = (now - seen_dt).total_seconds() / 3600.0
-            if age_h >= threshold_hours:
+            if age_h >= float(threshold_hours):
                 stalled.append({
                     "row": idx,
                     "token": token,
@@ -537,7 +557,7 @@ def detect_stalled_tokens(
         return []
     return stalled
 
-# ========= HMAC helpers (Phase-2 ready) =========
+# ========= HMAC helpers =========
 def hmac_hex(secret: str, payload: dict) -> str:
     key = secret.encode()
     msg = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
