@@ -1,64 +1,53 @@
-# top_token_summary.py — quota-safe + utils-only
-import time
+# top_token_summary.py — NT3.0 quota-safe + compat
 from utils import (
-    info, warn,
-    get_values_cached, ws_update, get_ws_cached,
-    safe_len, str_or_empty, to_float, with_sheets_gate
+    get_values_cached,          # cached get_all_values() or ranged reads
+    send_telegram_message_if_new,
+    str_or_empty, to_float, info, warn,
 )
 
-TAB_STATS   = "Rotation_Stats"
-TAB_SUMMARY = "Top_Token_Summary"
-TTL_S       = 300  # cache for reads
-
-@with_sheets_gate("read", tokens=2)
-def _read_stats():
-    vals = get_values_cached(TAB_STATS, ttl_s=TTL_S) or []
-    if not vals: return [], {}
-    header = vals[0]; rows = vals[1:]
-    h = {h:i for i,h in enumerate(header)}
-    return rows, h
-
-def _col(h, name): return h.get(name)
+SRC_TAB = "Rotation_Stats"
+TTL_S   = 180  # cache to avoid 429s
 
 def run_top_token_summary():
     info("▶ Top token summary")
-    try:
-        rows, h = _read_stats()
-        if not rows:
-            warn("Top summary: Rotation_Stats empty; skipping.")
-            return
+    vals = get_values_cached(SRC_TAB, ttl_s=TTL_S) or []
+    if not vals:
+        warn(f"{SRC_TAB} empty; skipping.")
+        return
 
-        need = ["Token", "Follow-up ROI", "Memory Vault Score"]
-        missing = [c for c in need if c not in h]
-        if missing:
-            warn(f"Top summary: missing headers: {', '.join(missing)}; skipping.")
-            return
+    header = vals[0]
+    rows   = vals[1:]
 
-        i_tok = _col(h, "Token")
-        i_roi = _col(h, "Follow-up ROI") if "Follow-up ROI" in h else _col(h, "Follow-up ROI (%)")
-        i_mem = _col(h, "Memory Vault Score")
+    def hidx(name, default=None):
+        try:
+            return header.index(name)
+        except ValueError:
+            return default
 
-        scored = []
-        for r in rows:
-            t = str_or_empty(r[i_tok] if i_tok is not None and i_tok < safe_len(r) else "").upper()
-            if not t: continue
-            roi = to_float(r[i_roi] if i_roi is not None and i_roi < safe_len(r) else "", default=0.0) or 0.0
-            mem = to_float(r[i_mem] if i_mem is not None and i_mem < safe_len(r) else "", default=0.0) or 0.0
-            scored.append((t, roi, mem))
+    tok_i = hidx("Token")
+    roi_i = hidx("Follow-up ROI") if hidx("Follow-up ROI") is not None else hidx("Follow-up ROI (%)")
 
-        # rank by memory then ROI
-        scored.sort(key=lambda x: (-x[2], -x[1]))
-        top = scored[:10]
+    if tok_i is None or roi_i is None:
+        warn(f"{SRC_TAB} missing columns: Token and/or Follow-up ROI; skipping.")
+        return
 
-        # Ensure summary sheet exists and write simple list to A1:C
-        ws = get_ws_cached(TAB_SUMMARY, ttl_s=60)
-        out = [["Token","ROI %","Memory Score"]] + [[t, f"{roi:.2f}", f"{mem:.2f}"] for t,roi,mem in top]
-        ws_update(ws, "A1", out)
-        info("✅ Top token summary updated.")
-    except Exception as e:
-        msg = str(e).lower()
-        if "429" in msg or "quota" in msg:
-            warn("Top token summary: 429; will retry on next schedule.")
-            time.sleep(1.0)
-            return
-        warn(f"Top token summary error: {e}")
+    leaders = []
+    for r in rows:
+        t = str_or_empty(r[tok_i] if tok_i < len(r) else "").upper()
+        if not t:
+            continue
+        roi = to_float(r[roi_i] if roi_i < len(r) else "", default=None)
+        if roi is None:
+            continue
+        leaders.append((t, roi))
+
+    leaders.sort(key=lambda x: x[1], reverse=True)
+    top = leaders[:5]
+
+    if not top:
+        warn("No tokens with ROI to summarize.")
+        return
+
+    msg = "📈 *Top Follow-up ROI*\n" + "\n".join([f"• {t}: {roi:.2f}%" for t, roi in top])
+    # de-duped by message text hash
+    send_telegram_message_if_new(msg)
