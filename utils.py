@@ -275,7 +275,6 @@ def with_sheet_backoff(fn):
         while True:
             try:
                 op = k.pop("_sheet_op", None) or fn.__name__
-                # choose budget bucket by operation name
                 if "update" in op or "batch" in op or "append" in op:
                     _wait_for(_write_bucket)
                 else:
@@ -290,7 +289,6 @@ def with_sheet_backoff(fn):
                     continue
                 raise
             except Exception as e:
-                # retry on obvious transients
                 if any(x in str(e).lower() for x in ["timed out", "connection reset", "temporarily", "unavailable"]):
                     warn(f"Transient error ({fn.__name__}): {e}; retrying…")
                     time.sleep(delay)
@@ -355,7 +353,7 @@ def get_records_cached(sheet_name: str, ttl_s: int = 120):
 def _ws_get(ws, range_a1: str):
     return ws.get(range_a1)
 
-def get_values_cached(sheet_name: str, range_a1: str | None = None, ttl_s: int = 60):
+def get_values_cached(sheet_name: str, range_a1=None, ttl_s: int = 60):
     """
     Returns a 2D list.
       - If range_a1 is provided: uses ws.get(range_a1)
@@ -395,8 +393,8 @@ def ws_batch_update(ws, writes):
 def ws_append_row(ws, values):
     ws.append_row(values, value_input_option="RAW")
 
-# sanitize A1 ranges to avoid duplicate sheet-name bugs before updating
 def sanitize_range(a1: str) -> str:
+    """Defensive: strip duplicate sheet names like 'Tab!Tab!A1'"""
     if "!" not in a1: return a1
     tab, rng = a1.split("!", 1)
     tab = tab.split("!")[-1]
@@ -419,7 +417,7 @@ def to_float(v, default=None):
     except Exception:
         return default
 
-# ========= Safe length helper =========
+# ========= Safe length helper (defensive) =========
 def safe_len(x) -> int:
     try:
         return len(x)
@@ -428,6 +426,10 @@ def safe_len(x) -> int:
 
 # ========= Legacy-safe parsing helpers (compat) =========
 def safe_float(v, default=None):
+    """
+    Accepts numbers/strings like '12.3', '12%', '1,234', '-', 'N/A'.
+    Returns float or `default` when not parseable.
+    """
     s = str_or_empty(v).strip()
     if s == "" or s in {"-", "—", "N/A", "n/a", "NA", "na", "None", "null"}:
         return default
