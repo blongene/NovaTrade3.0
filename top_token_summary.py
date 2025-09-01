@@ -1,102 +1,64 @@
-# top_token_summary.py
-import re
-from datetime import datetime
+# top_token_summary.py — quota-safe + utils-only
+import time
 from utils import (
-    get_ws,
-    safe_get_all_records,
-    ws_batch_update,
-    with_sheet_backoff,
+    info, warn,
+    get_values_cached, ws_update, get_ws_cached,
+    safe_len, str_or_empty, to_float, with_sheets_gate
 )
 
-def _to_float(s):
-    try:
-        return float(str(s).replace("%", "").strip())
-    except Exception:
-        return None
+TAB_STATS   = "Rotation_Stats"
+TAB_SUMMARY = "Top_Token_Summary"
+TTL_S       = 300  # cache for reads
 
-@with_sheet_backoff
+@with_sheets_gate("read", tokens=2)
+def _read_stats():
+    vals = get_values_cached(TAB_STATS, ttl_s=TTL_S) or []
+    if not vals: return [], {}
+    header = vals[0]; rows = vals[1:]
+    h = {h:i for i,h in enumerate(header)}
+    return rows, h
+
+def _col(h, name): return h.get(name)
+
 def run_top_token_summary():
-    print("📈 Running Top Token ROI Summary...")
-
-    stats_ws = get_ws("Rotation_Stats")
-
-    # one cached read pass
-    stats_rows = safe_get_all_records(stats_ws, ttl_s=180)
-    if not stats_rows:
-        print("ℹ️ Rotation_Stats empty; nothing to summarize.")
-        return
-
-    # Ensure headers and find columns (robust to missing)
-    headers = stats_ws.row_values(1)
-    if not headers:
-        print("ℹ️ Rotation_Stats has no header.")
-        return
-
-    # Find (or add) columns for: Milestone/Last Alerted if you use it
+    info("▶ Top token summary")
     try:
-        token_col_idx = headers.index("Token") + 1
-    except ValueError:
-        print("ℹ️ No 'Token' column in Rotation_Stats; skipping.")
-        return
+        rows, h = _read_stats()
+        if not rows:
+            warn("Top summary: Rotation_Stats empty; skipping.")
+            return
 
-    if "Follow-up ROI" in headers:
-        followup_col_idx = headers.index("Follow-up ROI") + 1
-    elif "ROI %" in headers:
-        followup_col_idx = headers.index("ROI %") + 1
-    elif "ROI" in headers:
-        followup_col_idx = headers.index("ROI") + 1
-    else:
-        print("ℹ️ No 'Follow-up ROI'/'ROI %'/'ROI' in Rotation_Stats; skipping.")
-        return
+        need = ["Token", "Follow-up ROI", "Memory Vault Score"]
+        missing = [c for c in need if c not in h]
+        if missing:
+            warn(f"Top summary: missing headers: {', '.join(missing)}; skipping.")
+            return
 
-    # Choose top winners by Follow-up ROI (numeric)
-    enriched = []
-    for i, rec in enumerate(stats_rows, start=2):  # data rows start at 2
-        token = (rec.get("Token") or "").strip().upper()
-        if not token:
-            continue
-        roi_raw = rec.get("Follow-up ROI") or rec.get("ROI %") or rec.get("ROI")
-        roi = _to_float(roi_raw)
-        if roi is None:
-            continue
-        enriched.append((i, token, roi))
+        i_tok = _col(h, "Token")
+        i_roi = _col(h, "Follow-up ROI") if "Follow-up ROI" in h else _col(h, "Follow-up ROI (%)")
+        i_mem = _col(h, "Memory Vault Score")
 
-    if not enriched:
-        print("ℹ️ No numeric ROI in Rotation_Stats; nothing to alert.")
-        return
+        scored = []
+        for r in rows:
+            t = str_or_empty(r[i_tok] if i_tok is not None and i_tok < safe_len(r) else "").upper()
+            if not t: continue
+            roi = to_float(r[i_roi] if i_roi is not None and i_roi < safe_len(r) else "", default=0.0) or 0.0
+            mem = to_float(r[i_mem] if i_mem is not None and i_mem < safe_len(r) else "", default=0.0) or 0.0
+            scored.append((t, roi, mem))
 
-    # simple example: pick top 3 > some threshold (e.g., >100%)
-    winners = sorted(enriched, key=lambda x: x[2], reverse=True)[:3]
+        # rank by memory then ROI
+        scored.sort(key=lambda x: (-x[2], -x[1]))
+        top = scored[:10]
 
-    # If you need to write a 'Milestone' column, batch once:
-    # Ensure the column exists
-    if "Last Alerted" in headers:
-        last_alert_col_idx = headers.index("Last Alerted") + 1
-    else:
-        headers.append("Last Alerted")
-        # Write header + no row shift
-        ws_batch_update(stats_ws, [{"range": "A1", "values": [headers]}])
-        last_alert_col_idx = len(headers)
-
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    updates = []
-    alerts_sent = 0
-
-    for row_idx, token, roi in winners:
-        # Example policy: only alert when ROI >= 200
-        if roi >= 200:
-            a1 = f"{_col_letter(last_alert_col_idx)}{row_idx}"
-            updates.append({"range": f"Rotation_Stats!{a1}", "values": [[f"{roi:.2f}% at {now}"]]})
-            alerts_sent += 1
-
-    if updates:
-        ws_batch_update(stats_ws, updates)
-
-    print(f"✅ Top Token Summary complete. {alerts_sent} alert(s) sent.")
-
-def _col_letter(n):
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
+        # Ensure summary sheet exists and write simple list to A1:C
+        ws = get_ws_cached(TAB_SUMMARY, ttl_s=60)
+        out = [["Token","ROI %","Memory Score"]] + [[t, f"{roi:.2f}", f"{mem:.2f}"] for t,roi,mem in top]
+        ws_update(ws, "A1", out)
+        info("✅ Top token summary updated.")
+    except Exception as e:
+        msg = str(e).lower()
+        if "429" in msg or "quota" in msg:
+            warn("Top token summary: 429; will retry on next schedule.")
+            time.sleep(1.0)
+            return
+        warn(f"Top token summary error: {e}")
