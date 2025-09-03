@@ -4,6 +4,8 @@ from flask import Blueprint, request, jsonify
 from outbox_db import init, pull, ack
 from hmac_auth import verify
 
+OUTBOX_SECRET = os.getenv("OUTBOX_SECRET", "")
+
 bp = Blueprint("cmdapi", __name__)
 SECRET = os.getenv("OUTBOX_SECRET", "")
 AGENTS = set((os.getenv("AGENT_ID") or "orion-local").split(","))  # allow list
@@ -18,13 +20,17 @@ def _auth_or_403():
     ts  = request.headers.get("X-Timestamp", "")
     sig = request.headers.get("X-Signature", "")
     body = request.get_data() or b""
-    if not (sig and ts and verify(SECRET, body, ts, sig, ttl_s=300)):
+    if not (sig and ts and verify(OUTBOX_SECRET, body, ts, sig, ttl_s=300)):
         return jsonify({"error": "unauthorized"}), 401
 
 
 @bp.route("/api/commands/pull", methods=["POST"])
 def api_pull():
-    ok, res = _auth_or_403()
+    ts  = request.headers.get("X-Timestamp", "")
+    sig = request.headers.get("X-Signature", "")
+    body = request.get_data() or b""
+    if not verify(OUTBOX_SECRET, body, ts, sig, ttl_s=300):
+        return jsonify({"error": "unauthorized"}), 401
     if not ok:
         msg, code = res
         return jsonify({"error": msg}), code
@@ -39,6 +45,11 @@ def api_pull():
 
 @bp.route("/api/commands/ack", methods=["POST"])
 def api_ack():
+    ts  = request.headers.get("X-Timestamp", "")
+    sig = request.headers.get("X-Signature", "")
+    body = request.get_data() or b""
+    if not verify(OUTBOX_SECRET, body, ts, sig, ttl_s=300):
+        return jsonify({"error": "unauthorized"}), 401
     ok, res = _auth_or_403()
     if not ok:
         msg, code = res
