@@ -452,6 +452,15 @@ def ensure_sheet_headers(tab: str, required_headers: list[str]) -> list[str]:
         return []
 
 # ========= Legacy compat shims =========
+# --- Compat shims expected by gspread_guard / legacy modules ------------------
+def ws_get_all_records_cached(name: str, ttl_s: int = 120):
+    # old name → new implementation
+    return get_all_records_cached(name, ttl_s)
+
+def ws_get_values_cached(name: str, ttl_s: int = 60):
+    # old name → new implementation (ALL values)
+    return get_values_cached(name, range_a1=None, ttl_s=ttl_s)
+
 def ping_webhook_debug(message: str):
     try:
         send_telegram_message_dedup(f"🛠️ Debug: {message}", key="webhook_debug")
@@ -460,7 +469,8 @@ def ping_webhook_debug(message: str):
     try:
         ws = get_ws_cached("Webhook_Debug", ttl_s=30)
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        ws_update(ws, "A1", f"{ts}Z — {message}")
+        # gspread update expects a 2D list
+        ws_update(ws, "A1", [[f"{ts}Z — {message}"]])
     except Exception:
         pass
 
