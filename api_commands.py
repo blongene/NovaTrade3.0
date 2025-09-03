@@ -15,14 +15,12 @@ def _on_register(setup_state):
 
 def _auth_or_403():
     agent = request.headers.get("X-Agent-ID", "")
-    ts    = request.headers.get("X-Timestamp", "")
-    sig   = request.headers.get("X-Signature", "")
-    if not agent or agent not in AGENTS:
-        return False, ("forbidden", 403)
+    ts  = request.headers.get("X-Timestamp", "")
+    sig = request.headers.get("X-Signature", "")
     body = request.get_data() or b""
-    if not (sig and ts and verify(SECRET, body, ts, ttl_s=300)):
-        return False, ("unauthorized", 401)
-    return True, agent
+    if not (sig and ts and verify(SECRET, body, ts, sig, ttl_s=300)):
+        return jsonify({"error": "unauthorized"}), 401
+
 
 @bp.route("/api/commands/pull", methods=["POST"])
 def api_pull():
