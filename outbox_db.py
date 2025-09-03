@@ -1,11 +1,12 @@
 # outbox_db.py — tiny SQLite outbox for commands + receipts (cloud)
 # in outbox_db.py before sqlite connect
 import os
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
 import sqlite3, json, time
 from contextlib import contextmanager
-DB_PATH = os.getenv("OUTBOX_DB_PATH", "/tmp/outbox.db")
+DB_PATH = os.getenv("OUTBOX_DB_PATH", "./data/outbox.db")
+
+_dir = os.path.dirname(os.path.abspath(DB_PATH)) or "."
+os.makedirs(_dir, exist_ok=True)
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -31,7 +32,9 @@ CREATE TABLE IF NOT EXISTS receipts (
   FOREIGN KEY(cmd_id) REFERENCES commands(id)
 );
 """
-
+def _get_conn():
+    return sqlite3.connect(DB_PATH, isolation_level=None, check_same_thread=False)
+  
 @contextmanager
 def _conn():
     con = sqlite3.connect(DB_PATH)
