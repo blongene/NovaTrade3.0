@@ -9,7 +9,7 @@ try:
         info, warn, error,
         send_boot_notice_once, send_system_online_once, send_telegram_message_dedup,
         is_cold_boot,
-        # optional: using token buckets indirectly through your utils wrappers
+        # token buckets & caches live inside utils wrappers
     )
 except Exception as e:
     # If utils can't import, nothing else matters. Fail loud.
@@ -20,6 +20,7 @@ except Exception as e:
 # The webhook module may be missing in some deployments; keep soft.
 _telegram_app = None
 def _try_start_flask():
+    """DEV ONLY: start a local Flask server; production uses gunicorn via wsgi.py."""
     global _telegram_app
     try:
         from flask import Flask
@@ -27,7 +28,7 @@ def _try_start_flask():
             from telegram_webhook import telegram_app, set_telegram_webhook
         except Exception as e:
             warn(f"telegram_webhook not available or failed to import: {e}")
-            # Provide a tiny fallback Flask app so Render health checks pass
+            # Provide a tiny fallback Flask app so Render health checks pass in dev
             telegram_app = Flask(__name__)
             def set_telegram_webhook():
                 info("Skipping Telegram webhook (module missing).")
@@ -38,11 +39,23 @@ def _try_start_flask():
             info("✅ Telegram webhook configured.")
         except Exception as e:
             warn(f"Webhook setup skipped: {e}")
-        info("Starting Flask app on port 10000…")
-        telegram_app.run(host="0.0.0.0", port=10000)
+        port = int(os.getenv("PORT", "10000"))
+        info(f"Starting Flask app on port {port}…")
+        telegram_app.run(host="0.0.0.0", port=port)
     except Exception as e:
         warn(f"Flask/telegram app not started: {e}")
 
+def _configure_webhook_only():
+    """Production path: configure webhook without starting a dev server."""
+    try:
+        from telegram_webhook import set_telegram_webhook
+        info("Setting Telegram webhook…")
+        set_telegram_webhook()
+        info("✅ Telegram webhook configured.")
+    except Exception as e:
+        warn(f"Webhook setup skipped: {e}")
+
+# --- Thread helper & jitter --------------------------------------------------
 def _thread(fn: Callable, *a, **k):
     t = threading.Thread(target=fn, args=a, kwargs=k, daemon=True)
     t.start()
@@ -53,9 +66,7 @@ def _sleep_jitter(min_s=0.35, max_s=1.10):
 
 # --- Safe import + call helpers ----------------------------------------------
 def _safe_import(module_path: str):
-    """
-    Import a module by string. Returns module or None.
-    """
+    """Import a module by string. Returns module or None."""
     try:
         __import__(module_path)
         return globals()[module_path] if module_path in globals() else __import__(module_path)
@@ -64,10 +75,7 @@ def _safe_import(module_path: str):
         return None
 
 def _safe_call(label: str, module_path: str, func_name: str, *args, **kwargs):
-    """
-    Import module lazily and call func if present.
-    Errors are caught and logged; never raises.
-    """
+    """Import module lazily and call func if present. Never raises."""
     try:
         mod = _safe_import(module_path)
         if not mod:
@@ -81,13 +89,10 @@ def _safe_call(label: str, module_path: str, func_name: str, *args, **kwargs):
     except Exception as e:
         error(f"{label} failed: {e}")
 
-def _schedule(label: str, module_path: str, func_name: str, when: Optional[str]=None, every: Optional[int]=None, unit: str="minutes"):
-    """
-    Add a scheduled job that safely imports & runs target each time.
-    Supports either specific time 'HH:MM' (daily) or every N units.
-    """
+def _schedule(label: str, module_path: str, func_name: str,
+              when: Optional[str]=None, every: Optional[int]=None, unit: str="minutes"):
+    """Add a scheduled job that safely imports & runs target each time."""
     def job():
-        # small jitter per run to reduce synchronized bursts
         _sleep_jitter(0.2, 0.6)
         _safe_call(label, module_path, func_name)
 
@@ -99,7 +104,6 @@ def _schedule(label: str, module_path: str, func_name: str, when: Optional[str]=
         ev.do(job)
         info(f"⏰ Scheduled {label} every {every} {unit}")
     else:
-        # immediate fire-and-forget in a thread
         _thread(job)
 
 # --- Optional background loop: staking yield (soft) --------------------------
@@ -124,13 +128,11 @@ def _staking_yield_loop():
 def _boot_serialize_first_minute():
     """
     Run the heaviest read/write jobs in a serialized, jittered order to
-    minimize Sheets 429 bursts during cold boot.
-    Each call is 'best effort' and cannot crash the boot.
+    minimize Sheets 429 bursts during cold boot. Best-effort; never raises.
     """
-    # Light ping
     _safe_call("Watchdog",                    "nova_watchdog",              "run_watchdog");                 _sleep_jitter()
 
-    # If your presale stream existence is used as a proxy for sheet health, load once (soft).
+    # Soft sheet health probe (optional)
     try:
         from utils import get_gspread_client
         SHEET_URL = os.getenv("SHEET_URL", "")
@@ -143,7 +145,6 @@ def _boot_serialize_first_minute():
         warn(f"Presale_Stream load skipped: {e}")
     _sleep_jitter()
 
-    # Boot passes (heavy reads spaced)
     _safe_call("ROI tracker (boot)",          "roi_tracker",                "scan_roi_tracking");            _sleep_jitter()
     _safe_call("Milestone alerts (boot)",     "milestone_alerts",           "run_milestone_alerts");         _sleep_jitter()
     _safe_call("Vault sync",                   "token_vault_sync",           "sync_token_vault");             _sleep_jitter()
@@ -153,10 +154,7 @@ def _boot_serialize_first_minute():
     _safe_call("Scout→Planner sync",           "scout_to_planner_sync",      "sync_rotation_planner");        _sleep_jitter()
     _safe_call("ROI feedback sync",            "roi_feedback_sync",          "run_roi_feedback_sync");        _sleep_jitter()
 
-    # One-shot radar (soft)
     _safe_call("Sentiment Radar (boot)",       "sentiment_radar",            "run_sentiment_radar");          _sleep_jitter()
-
-    # Nova trigger (soft)
     _safe_call("Nova trigger watcher",         "nova_trigger_watcher",       "check_nova_trigger");           _sleep_jitter()
     _safe_call("Nova ping",                    "nova_trigger",               "trigger_nova_ping", "NOVA UPDATE"); _sleep_jitter()
 
@@ -187,7 +185,6 @@ def _kick_once_and_threads():
         while True:
             schedule.run_pending()
             time.sleep(1)
-
     _thread(_scheduler_loop)
 
     # Stalled asset & claims (boot pass)
@@ -270,35 +267,30 @@ def _kick_once_and_threads():
     info("Unlock horizon alerts…")
     _safe_call("Unlock horizon alerts", "unlock_horizon_alerts", "run_unlock_horizon_alerts"); _sleep_jitter()
 
-# --- Main --------------------------------------------------------------------
-if __name__ == "__main__":
-    # Boot notices (de-duped in utils)
+# --- Production-safe boot (no dev server) ------------------------------------
+def boot():
+    """Start all jobs/threads; expose Flask via wsgi.py/gunicorn (no app.run here)."""
     send_boot_notice_once("🟢 NovaTrade system booted and live.")
-
-    # Start Flask + webhook (soft)
-    _thread(_try_start_flask)
-    time.sleep(0.8)
-
-    # Voice loop (optional)
-    _thread(_safe_call, "Orion Voice Loop", "orion_voice_loop", "run_orion_voice_loop")
+    _configure_webhook_only()
     time.sleep(0.4)
 
-    # Serialize the first minute to avoid Sheets 429 storms
+    _thread(_safe_call, "Orion Voice Loop", "orion_voice_loop", "run_orion_voice_loop")
+    time.sleep(0.2)
+
     _boot_serialize_first_minute()
-
-    # Daily online ping
     send_system_online_once()
-
-    # Set schedules
     _set_schedules()
-
-    # Kick once / background threads
     _kick_once_and_threads()
 
-    # Final boot ping (de-duped)
     send_telegram_message_dedup("✅ NovaTrade boot sequence complete.", key="boot_done")
-
-    # Keep main thread alive
     info("NovaTrade main loop running.")
+    return True
+
+# --- Dev entrypoint -----------------------------------------------------------
+if __name__ == "__main__":
+    # Do the same boot…
+    boot()
+    # …and start the dev Flask server in a thread for local testing.
+    _thread(_try_start_flask)
     while True:
         time.sleep(5)
