@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS receipts (
   UNIQUE(cmd_id, agent_id),
   FOREIGN KEY(cmd_id) REFERENCES commands(id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS ux_receipts_cmd_agent ON receipts(cmd_id, agent_id);
 """
 
 def _connect():
@@ -167,9 +168,8 @@ def ack(agent_id: str, receipts: list[dict]):
             # Upsert receipt (idempotent on UNIQUE(cmd_id, agent_id))
             try:
                 con.execute(
-                    "INSERT INTO receipts(cmd_id,agent_id,ok,status,received_at,txid,fills,message,result) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
-                    (cmd_id, agent_id, ok, status, ts, txid, fills, message, result)
+                  "INSERT OR IGNORE INTO receipts(cmd_id,agent_id,ok,received_at,result) VALUES(?,?,?,?,?)",
+                  (cmd_id, agent_id, ok, now, result)
                 )
             except sqlite3.IntegrityError:
                 # update existing receipt
