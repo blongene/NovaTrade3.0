@@ -1,6 +1,7 @@
 # main.py — NovaTrade 3.0 (bullet-proof boot, lazy imports, quota-safe)
 import os, time, random, threading, schedule
 from typing import Optional, Callable
+import gspread_guard  # patches Worksheet methods (cache+gates+backoff)
 
 # --- Utils (required) --------------------------------------------------------
 try:
