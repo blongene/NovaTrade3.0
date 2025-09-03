@@ -23,6 +23,11 @@ BACKOFF_BASE_S = float(os.getenv("SHEETS_BACKOFF_BASE_S", "1.75"))
 BACKOFF_MAX_S  = float(os.getenv("SHEETS_BACKOFF_MAX_S",  "24"))
 BACKOFF_JIT_S  = float(os.getenv("SHEETS_BACKOFF_JIT_S",  "0.35"))  # small jitter to desync callers
 
+# Cache TTL defaults (tunable via env)
+DEFAULT_ROWS_TTL_S   = int(os.getenv("ROWS_TTL_S",   "240"))  # was 120
+DEFAULT_VALUES_TTL_S = int(os.getenv("VALUES_TTL_S", "120"))  # was 60
+DEFAULT_WS_TTL_S     = int(os.getenv("WS_TTL_S",     "180"))  # worksheet handle
+
 # ========= Logging (quiet, single-line) =========
 def _ts(): return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 def info(msg):  print(f"[{_ts()}] INFO  {msg}")
@@ -285,7 +290,8 @@ _cache_lock = threading.Lock()
 def get_ws(name: str):
     return get_sheet().worksheet(name)
 
-def get_ws_cached(name: str, ttl_s: int = 120):
+def get_ws_cached(name: str, ttl_s: int | None = None):
+    ttl_s = DEFAULT_WS_TTL_S if ttl_s is None else ttl_s
     key = f"ws::{name}"
     with _cache_lock:
         item = _cached_ws.get(key)
@@ -307,7 +313,8 @@ def _ws_get_all_records(ws):
 def _ws_get_all_values(ws):
     return ws.get_all_values()
 
-def get_all_records_cached(name: str, ttl_s: int = 120):
+def get_all_records_cached(name: str, ttl_s: int | None = None):
+    ttl_s = DEFAULT_ROWS_TTL_S if ttl_s is None else ttl_s
     key = f"rows::{name}"
     with _cache_lock:
         item = _cached_rows.get(key)
@@ -331,7 +338,8 @@ def get_records_cached(sheet_name: str, ttl_s: int = 120):
 def _ws_get(ws, range_a1: str):
     return ws.get(range_a1)
 
-def get_values_cached(sheet_name: str, range_a1: str | None = None, ttl_s: int = 60):
+def get_values_cached(sheet_name: str, range_a1: str | None = None, ttl_s: int | None = None):
+    ttl_s = DEFAULT_VALUES_TTL_S if ttl_s is None else ttl_s
     """
     Returns a 2D list.
       - If range_a1 is provided: uses ws.get(range_a1)
