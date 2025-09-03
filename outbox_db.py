@@ -1,5 +1,9 @@
 # outbox_db.py — tiny SQLite outbox for commands + receipts (cloud)
-import os, sqlite3, json, time
+# in outbox_db.py before sqlite connect
+import os
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+import sqlite3, json, time
 from contextlib import contextmanager
 DB_PATH = os.getenv("OUTBOX_DB_PATH", "/tmp/outbox.db")
 
