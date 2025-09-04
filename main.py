@@ -18,7 +18,9 @@ except Exception as e:
 
 # --- Telegram webhook / Flask (optional) -------------------------------------
 # The webhook module may be missing in some deployments; keep soft.
+RUN_WEBHOOK_IN_MAIN = (os.getenv("RUN_WEBHOOK_IN_MAIN", "0").strip() in {"1", "true", "yes"})
 _telegram_app = None
+
 def _try_start_flask():
     """DEV ONLY: start a local Flask server; production uses gunicorn via wsgi.py."""
     global _telegram_app
@@ -28,7 +30,7 @@ def _try_start_flask():
             from telegram_webhook import telegram_app, set_telegram_webhook
         except Exception as e:
             warn(f"telegram_webhook not available or failed to import: {e}")
-            # Provide a tiny fallback Flask app so Render health checks pass in dev
+            # Provide a tiny fallback Flask app so local dev health checks pass
             telegram_app = Flask(__name__)
             def set_telegram_webhook():
                 info("Skipping Telegram webhook (module missing).")
@@ -44,6 +46,11 @@ def _try_start_flask():
         telegram_app.run(host="0.0.0.0", port=port)
     except Exception as e:
         warn(f"Flask/telegram app not started: {e}")
+
+# Start Flask + webhook (soft) — now gated, defaults OFF
+if RUN_WEBHOOK_IN_MAIN:
+    _thread(_try_start_flask)
+
 
 def _configure_webhook_only():
     """Production path: configure webhook without starting a dev server."""
