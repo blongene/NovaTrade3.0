@@ -49,10 +49,6 @@ def _try_start_flask():
     except Exception as e:
         warn(f"Flask/telegram app not started: {e}")
 
-# Start Flask + webhook (soft) — now gated, defaults OFF (Render uses gunicorn wsgi:app)
-if RUN_WEBHOOK_IN_MAIN:
-    _thread(_try_start_flask)
-
 def _configure_webhook_only():
     """Production path: configure webhook without starting a dev server."""
     try:
@@ -72,6 +68,10 @@ def _thread(fn: Callable, *a, **k):
 def _sleep_jitter(min_s=0.35, max_s=1.10):
     time.sleep(random.uniform(min_s, max_s))
 
+# Start Flask + webhook (soft) — now gated, defaults OFF (Render uses gunicorn wsgi:app)
+if RUN_WEBHOOK_IN_MAIN:
+    _thread(_try_start_flask)
+    
 # --- Safe import + call helpers ----------------------------------------------
 def _safe_import(module_path: str):
     """Import a module by string. Returns module or None."""
@@ -341,8 +341,14 @@ def _kick_once_and_threads():
 def boot():
     """Start all jobs/threads; expose Flask via wsgi.py/gunicorn (no app.run here)."""
     send_boot_notice_once("🟢 NovaTrade system booted and live.")
-    _configure_webhook_only()
+
+    # ⬇⬇⬇ Only set the Telegram webhook if this process is designated to do so
+    if os.getenv("SET_WEBHOOK_IN_THIS_PROCESS", "1").strip().lower() in {"1","true","yes"}:
+        _configure_webhook_only()
+    # ⬆⬆⬆
+
     time.sleep(0.4)
+    _thread(_safe_call, "Orion Voice Loop", "orion_voice_loop", "run_orion_voice_loop")
 
     _thread(_safe_call, "Orion Voice Loop", "orion_voice_loop", "run_orion_voice_loop")
     time.sleep(0.2)
@@ -373,5 +379,17 @@ except Exception:
     from flask import Flask
     _flask_app = Flask(__name__)
 
-_flask_app.register_blueprint(_receipts_bp)
+# Optionally also register your Command Bus if you have it, but guard by name.
+try:
+    from command_bus_api import cmdapi_bp  # Blueprint('cmdapi', __name__, ...)
+    if 'cmdapi' not in _flask_app.blueprints:
+        _flask_app.register_blueprint(cmdapi_bp)
+except Exception as e:
+    warn(f"Command Bus API not available: {e}")
+
+# Receipts API — register once
+if 'receipts' not in _flask_app.blueprints:
+    _flask_app.register_blueprint(_receipts_bp)
+
 app = _flask_app  # gunicorn loads this
+
