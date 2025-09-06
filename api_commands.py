@@ -3,8 +3,9 @@ import os, json, time
 from flask import Blueprint, request, jsonify
 from outbox_db import init, pull, ack
 from hmac_auth import verify  # verify(secret, body_bytes, timestamp, signature, ttl_s=...)
+from hmac_auth import require_hmac
 
-bp = Blueprint("cmdapi", __name__)
+bp = Blueprint("cmdapi", __name__, url_prefix="/api/commands")
 
 OUTBOX_SECRET = os.getenv("OUTBOX_SECRET", "")
 # Comma-separated allow-list of agents; defaults to single agent 'orion-local'
@@ -31,6 +32,30 @@ def _require_auth():
     if not (sig and ts and verify(OUTBOX_SECRET, body, ts, sig, ttl_s=300)):
         return None, (jsonify({"error": "unauthorized"}), 401)
     return agent, None
+
+@bp.post("/pull")
+def pull():
+    ok, err = require_hmac(request)
+    if not ok:
+        return jsonify(error=err), 401
+    data = request.get_json(silent=True) or {}
+    agent_id = request.headers.get("X-Agent-Id") or data.get("agent_id") or ""
+    if not agent_id:
+        return jsonify(error="missing agent id"), 400
+    # ... your existing DB lease/select logic ...
+    # return jsonify(commands)
+
+@bp.post("/ack")
+def ack():
+    ok, err = require_hmac(request)
+    if not ok:
+        return jsonify(error=err), 401
+    data = request.get_json(silent=True) or {}
+    agent_id = request.headers.get("X-Agent-Id") or data.get("agent_id") or ""
+    if not agent_id:
+        return jsonify(error="missing agent id"), 400
+    # ... your existing ack/update logic ...
+    # return jsonify(ok=True)
 
 @bp.route("/api/commands/pull", methods=["POST"])
 def api_pull():
