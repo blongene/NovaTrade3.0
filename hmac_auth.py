@@ -1,25 +1,36 @@
-# hmac_auth.py — HMAC signing & verification (shared with edge)
-import hmac, hashlib, time
+cat > hmac_auth.py <<'PY'
+import os, hmac, hashlib
+from flask import request
 
-def sign(secret: str, body: bytes, ts: str) -> str:
-    """
-    Canonical signature: HMAC-SHA256(secret, "<unix_ts>.<raw_body>")
-    - secret: shared key (OUTBOX_SECRET / EDGE_SECRET)
-    - body: raw request/response bytes (exactly as sent)
-    - ts: unix timestamp string (e.g., "1693612345")
-    """
-    msg = ts.encode() + b"." + body
-    return hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+OUTBOX_SECRET = os.environ.get("OUTBOX_SECRET", "")
 
-def verify(secret: str, body: bytes, ts: str, sig: str, ttl_s: int = 180) -> bool:
+def _hex_hmac(body: bytes) -> str:
+    return hmac.new(OUTBOX_SECRET.encode(), body, hashlib.sha256).hexdigest()
+
+def require_hmac(req=None):
     """
-    Validates signature and freshness (± ttl_s).
+    Verify HMAC against the *raw* body bytes exactly as received.
+    Accept header names:
+      - X-Signature (hex digest)
+      - X-Hub-Signature-256: 'sha256=<hexdigest>' (GitHub style)
+    Also allow an emergency bypass via OUTBOX_ALLOW_UNAUTH=1 (for debugging only).
     """
-    try:
-        ts_i = int(ts)
-    except Exception:
-        return False
-    if not secret or abs(time.time() - ts_i) > ttl_s:
-        return False
-    expected = sign(secret, body, ts)
-    return hmac.compare_digest(expected, sig or "")
+    if os.environ.get("OUTBOX_ALLOW_UNAUTH", "0").lower() in {"1","true","yes"}:
+        return True, "bypass"
+
+    if not OUTBOX_SECRET:
+        return False, "server missing OUTBOX_SECRET"
+
+    req = req or request
+    body = req.get_data(cache=False) or b""
+    hdr  = (req.headers.get("X-Signature") or
+            req.headers.get("X-Signature-Hex") or
+            req.headers.get("X-Hub-Signature-256") or "")
+
+    if hdr.startswith("sha256="):
+        hdr = hdr.split("=",1)[1]
+
+    expected = _hex_hmac(body)
+    ok = hmac.compare_digest(hdr, expected)
+    return ok, ("ok" if ok else "unauthorized")
+PY
