@@ -1,0 +1,20 @@
+NovaTrade 3.0 — Phase-2 Prep (Oct 3, 2025)
+- Registered Command Bus blueprint (api_commands.bp) onto the Flask app in main.py.
+- This exposes /api/commands endpoints using the existing outbox_db + hmac_auth modules.
+- Configure env:
+    OUTBOX_DB_PATH=/data/outbox.db
+    OUTBOX_LEASE_S=120
+    OUTBOX_SECRET=<strong_shared_secret>
+    AGENT_ID=edge-nl-1   # or list: 'edge-nl-1,edge-nl-2'
+- Edge agents must sign requests per hmac_auth.py (X-Timestamp/X-Signature headers).
+
+
+Ops helper: POST /ops/enqueue (HMAC required)
+Headers:
+  X-Timestamp, X-Signature (see hmac_auth.py)
+Body example:
+{
+  "agent_id": "edge-nl-1",
+  "type": "order.place",
+  "payload": {"venue":"MEXC","symbol":"BTC/USDT","side":"BUY","amount":"25","time_in_force":"IOC"}
+}

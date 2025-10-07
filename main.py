@@ -20,6 +20,58 @@ except Exception as e:
     raise
 
 # --- Telegram webhook / Flask (optional) -------------------------------------
+RUN_WEBHOOK_IN_MAIN = (os.getenv("RUN_WEBHOOK_IN_MAIN", "0").strip().lower() in {"1","true","yes"})
+_telegram_app = None
+
+def _try_start_flask():
+    """DEV ONLY: start a local Flask server; production uses gunicorn via wsgi.py."""
+    global _telegram_app
+    try:
+        from flask import Flask
+        try:
+            from telegram_webhook import telegram_app, set_telegram_webhook
+        except Exception as e:
+            warn(f"telegram_webhook not available or failed to import: {e}")
+            # Tiny fallback so local dev has a health endpoint
+            telegram_app = Flask(__name__)
+            def set_telegram_webhook():
+                info("Skipping Telegram webhook (module missing).")
+        _telegram_app = telegram_app
+        # --- Register Command Bus API (Blueprint) ---
+        try:
+            from api_commands import bp as _cmd_bp
+            _telegram_app.register_blueprint(_cmd_bp)
+            info("✅ Command Bus API registered at /api/commands")
+        # --- Register Ops helper (enqueue) ---
+        try:
+            from ops_enqueue import bp as _ops_bp
+            _telegram_app.register_blueprint(_ops_bp)
+            info("✅ Ops helper registered at /ops/enqueue")
+        # --- Register Ops venue checker ---
+        try:
+            from ops_venue import bp as _ops_venue_bp
+            _telegram_app.register_blueprint(_ops_venue_bp)
+            info("✅ Ops venue checker at /ops/venue_check")
+        except Exception as e:
+            warn(f"Ops venue checker not registered: {e}")
+
+        except Exception as e:
+            warn(f"Ops helper not registered: {e}")
+
+        except Exception as e:
+            warn(f"Command Bus API not registered: {e}")
+
+        info("Setting Telegram webhook…")
+        try:
+            set_telegram_webhook()
+            info("✅ Telegram webhook configured.")
+        except Exception as e:
+            warn(f"Webhook setup skipped: {e}")
+        port = int(os.getenv("PORT", "10000"))
+        info(f"Starting Flask app on port {port}…")
+        telegram_app.run(host="0.0.0.0", port=port)
+    except Exception as e:
+        warn(f"Flask/telegram app not started: {e}")
 
 def _configure_webhook_only():
     """Production path: configure webhook without starting a dev server."""
@@ -40,6 +92,9 @@ def _thread(fn: Callable, *a, **k):
 def _sleep_jitter(min_s=0.35, max_s=1.10):
     time.sleep(random.uniform(min_s, max_s))
 
+# Start Flask + webhook (soft) — now gated, defaults OFF (Render uses gunicorn wsgi:app)
+if RUN_WEBHOOK_IN_MAIN:
+    _thread(_try_start_flask)
     
 # --- Safe import + call helpers ----------------------------------------------
 def _safe_import(module_path: str):
@@ -331,4 +386,34 @@ def boot():
     info("NovaTrade main loop running.")
     return True
 
+# --- Dev entrypoint -----------------------------------------------------------
+if __name__ == "__main__":
+    # Do the same boot…
+    boot()
+    # …and start the dev Flask server in a thread for local testing.
+    _thread(_try_start_flask)
+    while True:
+        time.sleep(5)
+
+# --- WSGI app for Render (gunicorn points at main:app) -----------------------
+try:
+    # Try to reuse telegram app if available so both share one server
+    from telegram_webhook import telegram_app as _flask_app
+except Exception:
+    from flask import Flask
+    _flask_app = Flask(__name__)
+
+# Optionally also register your Command Bus if you have it, but guard by name.
+try:
+    from command_bus_api import cmdapi_bp  # Blueprint('cmdapi', __name__, ...)
+    if 'cmdapi' not in _flask_app.blueprints:
+        _flask_app.register_blueprint(cmdapi_bp)
+except Exception as e:
+    warn(f"Command Bus API not available: {e}")
+
+# Receipts API — register once
+if 'receipts' not in _flask_app.blueprints:
+    _flask_app.register_blueprint(_receipts_bp)
+
+app = _flask_app  # gunicorn loads this
 

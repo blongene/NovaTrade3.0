@@ -1,10 +1,8 @@
 # wsgi.py — web entrypoint (binds immediately, starts Nova boot once)
 
 import os, threading, time
-from flask import Flask, jsonify
 
 # --- Base app (telegram_webhook if present; else fallback) -------------------
-_TELEGRAM_APP_ERROR = None
 try:
     from telegram_webhook import telegram_app as app, set_telegram_webhook
     try:
@@ -13,17 +11,20 @@ try:
     except Exception as e:
         print(f"[WEB] webhook setup skipped: {e}")
 except Exception as e:
-    _TELEGRAM_APP_ERROR = e
+    from flask import Flask, jsonify
     app = Flask(__name__)
-    print(f"[WEB] Fallback Flask app created: {_TELEGRAM_APP_ERROR}")
+    @app.get("/health")
+    def _health_fallback():
+        return jsonify(ok=True, fallback=True, reason=str(e)), 200
 
-
-# --- Health endpoint ---------------------------------------------------------
-@app.get("/health")
-def health_check():
-    if _TELEGRAM_APP_ERROR:
-        return jsonify(ok=True, fallback=True, reason=str(_TELEGRAM_APP_ERROR)), 200
-    return jsonify(ok=True), 200
+# Always provide a lightweight health endpoint
+try:
+    from flask import jsonify
+    @app.get("/health")
+    def _health_ok():
+        return jsonify(ok=True), 200
+except Exception:
+    pass
 
 # --- Register Command Bus API (pull/ack) ------------------------------------
 try:

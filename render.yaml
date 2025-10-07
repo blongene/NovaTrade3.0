@@ -3,4 +3,4 @@ services:
     name: NovaTrade3.0
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn wsgi:app
+    startCommand: python main.py
