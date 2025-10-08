@@ -90,14 +90,6 @@ def set_telegram_webhook():
         print(f"[TG] setWebhook failed: {err}")
         return False
 
-# ---------- Command Bus blueprint (best-effort) ----------
-try:
-    from api_commands import bp as cmdapi_bp  # exposes /api/commands/*
-    telegram_app.register_blueprint(cmdapi_bp)
-    print("[WEB] Command Bus API registered on telegram_app.")
-except Exception as err:
-    print(f"[WEB] Command Bus API not available: {err}")
-
 # ---------- Optional: initialize Outbox DB (idempotent) ----------
 try:
     from outbox_db import init as outbox_init
