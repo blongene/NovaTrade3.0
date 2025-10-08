@@ -28,14 +28,16 @@ from outbox_db import init, enqueue
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--agent", default=None, help="Agent ID to target (default: env AGENT_ID or 'orion-local')")
+    p.add_argument("--agent", default=None, help="Agent ID to target (or set AGENT_ID)")
     p.add_argument("--kind", required=True, help="Command kind, e.g. 'order.place'")
     p.add_argument("--payload", required=True, help="JSON payload string for the command")
     p.add_argument("--dedupe", default=None, help="Optional dedupe_key to suppress duplicate pending/in_flight")
     p.add_argument("--delay", type=int, default=0, help="Seconds from now before command becomes pullable (not_before)")
     args = p.parse_args()
 
-    agent = args.agent or (os.getenv("AGENT_ID", "").split(",")[0] or "orion-local")
+    agent = args.agent or (os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID"))
+    if not agent:
+        raise SystemExit("agent_id required (use --agent or set AGENT_ID)")
 
     try:
         payload = json.loads(args.payload)
