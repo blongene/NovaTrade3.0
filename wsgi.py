@@ -51,18 +51,6 @@ def health():
         # Never 500 on health
         return jsonify(ok=True, fallback=True, reason=str(err)), 200
 
-# --- TEMP DEBUG ROUTE --------------------------------------------------------
-try:
-    @app.get("/ops/debug/pending")
-    def _debug_pending():
-        import outbox_db as db
-        agent = (request.args.get("agent") or "").strip()
-        db.init()
-        items = db.pull(agent_id=agent or "edge-cb-1", limit=100, lease_s=999999)
-        return jsonify(items), 200
-except Exception as err:
-    print(f"[WEB] debug pending skipped: {err}")
-
 # -----------------------------
 # Blueprints: Command Bus + Ops (best-effort)
 # -----------------------------
@@ -85,6 +73,40 @@ for mod_name, attr_name, what in [
         print(f"[WEB] {what} registered.")
     except Exception as err:
         print(f"[WEB] {what} not available: {err}")
+
+# --- TEMP: safe debug routes (remove after testing) --------------------------
+from flask import request, jsonify
+
+@app.get("/ops/debug/pending")
+def _debug_pending():
+    import sqlite3, os
+    from outbox_db import DB_PATH
+    agent = (request.args.get("agent") or "").strip()
+
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+
+    # Show newest 50 with optional agent filter; do NOT update status.
+    sql = "SELECT id, agent_id, kind, status, not_before, lease_expires_at, payload FROM commands"
+    args = []
+    if agent:
+        sql += " WHERE agent_id=?"
+        args.append(agent)
+    sql += " ORDER BY id DESC LIMIT 50"
+
+    rows = con.execute(sql, args).fetchall()
+    con.close()
+    return jsonify([dict(r) for r in rows]), 200
+
+@app.get("/ops/debug/receipts")
+def _debug_receipts():
+    import sqlite3
+    from outbox_db import DB_PATH
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = con.execute("SELECT id, cmd_id, agent_id, ok, status, txid, message, received_at FROM receipts ORDER BY id DESC LIMIT 50").fetchall()
+    con.close()
+    return jsonify([dict(r) for r in rows]), 200
 
 # -----------------------------
 # Start NovaTrade boot sequence once (scheduler, loops, etc.)
