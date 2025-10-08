@@ -51,6 +51,18 @@ def health():
         # Never 500 on health
         return jsonify(ok=True, fallback=True, reason=str(err)), 200
 
+# --- TEMP DEBUG ROUTE --------------------------------------------------------
+try:
+    @app.get("/ops/debug/pending")
+    def _debug_pending():
+        import outbox_db as db
+        agent = (request.args.get("agent") or "").strip()
+        db.init()
+        items = db.pull(agent_id=agent or "edge-cb-1", limit=100, lease_s=999999)
+        return jsonify(items), 200
+except Exception as err:
+    print(f"[WEB] debug pending skipped: {err}")
+
 # -----------------------------
 # Blueprints: Command Bus + Ops (best-effort)
 # -----------------------------
