@@ -10,7 +10,7 @@ Usage examples:
   python admin_peek.py --list --status pending --limit 20
 
   # List in-flight (leased) commands for a specific agent
-  python admin_peek.py --list --status in_flight --agent orion-local
+  python admin_peek.py --list --status in_flight
 
   # Show a single command (with payload + latest receipt)
   python admin_peek.py --show 42
