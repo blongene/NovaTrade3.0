@@ -37,7 +37,10 @@ def _try_start_flask():
             def set_telegram_webhook():
                 info("Skipping Telegram webhook (module missing).")
         _telegram_app = telegram_app
-    
+    except Exception as e:
+        warn(f"Flask/telegram init failed: {e}")
+        return  # bail out cleanly; don't continue if Flask isn't ready
+
     # --- Register Ops helper (enqueue) ---
     try:
         from ops_enqueue import bp as _ops_bp
@@ -66,7 +69,7 @@ def _try_start_flask():
     if os.getenv("RUN_FLASK_DEV", "0").strip().lower() in {"1", "true", "yes"}:
         port = int(os.getenv("PORT", "10000"))
         info(f"Starting Flask app on port {port}…")
-        telegram_app.run(host="0.0.0.0", port=port)
+        _telegram_app.run(host="0.0.0.0", port=port)
 
 # --- Thread helper & jitter --------------------------------------------------
 def _thread(fn: Callable, *a, **k):
