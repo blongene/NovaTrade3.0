@@ -1,86 +1,74 @@
-# api_commands.py — Command Bus API (cloud)
-import os, json, time
+# api_commands.py — Command Bus blueprint: /api/commands/pull, /ack
+import os, json
 from flask import Blueprint, request, jsonify
-from outbox_db import init, pull, ack
-from hmac_auth import verify  # verify(secret, body_bytes, timestamp, signature, ttl_s=...)
+
+# Storage & HMAC
+from outbox_db import init as db_init, pull_pending_for_agent, set_inflight_lease, ack_receipt, enqueue  # adjust if your functions differ
 from hmac_auth import require_hmac
 
-bp = Blueprint("cmdapi", __name__, url_prefix="/api/commands")
+bp = Blueprint("api_commands", __name__, url_prefix="/api/commands")
 
-OUTBOX_SECRET = os.getenv("OUTBOX_SECRET", "")
-# Comma-separated allow-list of agents; defaults to single agent 'orion-local'
-AGENTS = {a.strip() for a in (os.getenv("AGENT_ID") or "orion-local").split(",") if a.strip()}
+# Config: require HMAC on pull? (ACK always requires HMAC)
+REQUIRE_HMAC_PULL = os.getenv("REQUIRE_HMAC_PULL", "0").strip().lower() in {"1","true","yes"}
 
-@bp.record_once
-def _on_register(_):
-    init()
-
-def _require_auth():
-    """
-    Returns (agent, None) on success, or (None, (json_response, http_code)) on failure.
-    Auth = HMAC of raw body + timestamp header + allowed agent id.
-    """
-    agent = request.headers.get("X-Agent-ID", "").strip()
-    ts    = request.headers.get("X-Timestamp", "").strip()
-    sig   = request.headers.get("X-Signature", "").strip()
-    body  = request.get_data() or b""
-
-    if not agent:
-        return None, (jsonify({"error": "missing agent id"}), 400)
-    if agent not in AGENTS:
-        return None, (jsonify({"error": "forbidden agent"}), 403)
-    if not (sig and ts and verify(OUTBOX_SECRET, body, ts, sig, ttl_s=300)):
-        return None, (jsonify({"error": "unauthorized"}), 401)
-    return agent, None
+# Ensure DB tables exist (idempotent)
+try:
+    db_init()
+except Exception as err:
+    print(f"[API] outbox db init skipped: {err}")
 
 @bp.post("/pull")
 def pull():
-    ok, err = require_hmac(request)
-    if not ok:
-        return jsonify(error=err), 401
-    data = request.get_json(silent=True) or {}
-    agent_id = request.headers.get("X-Agent-Id") or data.get("agent_id") or ""
-    if not agent_id:
-        return jsonify(error="missing agent id"), 400
-    # ... your existing DB lease/select logic ...
-    # return jsonify(commands)
+    # Optional HMAC
+    if REQUIRE_HMAC_PULL:
+        ok, err = require_hmac(request)
+        if not ok:
+            return jsonify(error=err), 401
+
+    body = request.get_json(silent=True) or {}
+    agent = (body.get("agent_id") or "").strip() or "edge-unknown"
+    max_n = int(body.get("max") or 5)
+
+    try:
+        # Expire leases inside your DB layer (if supported) or here; keeping it simple:
+        cmds = pull_pending_for_agent(agent_id=agent, limit=max_n)
+        # Set leases (lease TTL from env or a default)
+        ttl_s = int(os.getenv("OUTBOX_LEASE_S", "120"))
+        items = []
+        for c in cmds:
+            # Expect row dict like: {"id":..., "type":..., "payload":..., "hmac":...}
+            cid = c["id"]
+            set_inflight_lease(cid, ttl_s)
+            items.append({
+                "id": cid,
+                "type": c.get("type") or "order.place",
+                "payload": json.loads(c.get("payload") or "{}"),
+                "hmac": c.get("hmac"),
+                "ttl_s": ttl_s
+            })
+        return jsonify(items), 200
+    except Exception as err:
+        return jsonify(error=str(err)), 500
 
 @bp.post("/ack")
 def ack():
+    # HMAC required
     ok, err = require_hmac(request)
     if not ok:
         return jsonify(error=err), 401
-    data = request.get_json(silent=True) or {}
-    agent_id = request.headers.get("X-Agent-Id") or data.get("agent_id") or ""
-    if not agent_id:
-        return jsonify(error="missing agent id"), 400
-    # ... your existing ack/update logic ...
-    # return jsonify(ok=True)
 
-@bp.route("/api/commands/pull", methods=["POST"])
-def api_pull():
-    agent, err = _require_auth()
-    if err: return err
-
+    body = request.get_json(force=True)
     try:
-        data  = request.get_json(force=True) or {}
-        limit = int(data.get("limit", 10))
-        cmds  = pull(agent, limit=limit)
-        return jsonify({"ok": True, "agent": agent, "commands": cmds})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@bp.route("/api/commands/ack", methods=["POST"])
-def api_ack():
-    agent, err = _require_auth()
-    if err: return err
-
-    try:
-        data = request.get_json(force=True) or {}
-        receipts = data.get("receipts", [])
-        if not isinstance(receipts, list):
-            return jsonify({"ok": False, "error": "receipts must be a list"}), 400
-        ack(agent, receipts)
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        rid = ack_receipt(
+            cmd_id=body.get("id"),
+            agent_id=body.get("agent_id"),
+            status=body.get("status"),
+            txid=body.get("txid"),
+            fills=body.get("fills") or [],
+            message=body.get("message"),
+            ts=body.get("ts"),
+            hmac=body.get("hmac")
+        )
+        return jsonify(ok=True, receipt_id=rid), 200
+    except Exception as err:
+        return jsonify(ok=False, error=str(err)), 500
