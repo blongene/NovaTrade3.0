@@ -3,7 +3,9 @@ import os, time, hashlib
 from utils import info
 from outbox_db import enqueue
 
-AGENT_ID = os.getenv("AGENT_ID", "orion-local")
+AGENT_ID = os.getenv("AGENT_ID") or os.getenv("EDGE_AGENT_ID")
+if not AGENT_ID:
+    raise RuntimeError("AGENT_ID required")
 EMIT_ENABLED = os.getenv("EMIT_ENABLED", "0").lower() in {"1","true","yes"}
 
 def _dedupe(s: str) -> str:
