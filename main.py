@@ -355,8 +355,8 @@ def boot():
     send_boot_notice_once("🟢 NovaTrade system booted and live.")
 
     # ⬇⬇⬇ Only set the Telegram webhook if this process is designated to do so
-    if os.getenv("SET_WEBHOOK_IN_THIS_PROCESS", "1").strip().lower() in {"1","true","yes"}:
-        _configure_webhook_only()
+    #if os.getenv("SET_WEBHOOK_IN_THIS_PROCESS", "1").strip().lower() in {"1","true","yes"}:
+     #   _configure_webhook_only()
     # ⬆⬆⬆
 
     time.sleep(0.4)
