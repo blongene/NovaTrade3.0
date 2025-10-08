@@ -107,6 +107,57 @@ def _debug_receipts():
     rows = con.execute("SELECT id, cmd_id, agent_id, ok, status, txid, message, received_at FROM receipts ORDER BY id DESC LIMIT 50").fetchall()
     con.close()
     return jsonify([dict(r) for r in rows]), 200
+# --- TEMP DEBUG (safe read-only) --------------------------------------------
+from flask import request, jsonify
+import os, sqlite3
+from outbox_db import DB_PATH
+
+@app.get("/ops/debug/dbinfo")
+def _debug_dbinfo():
+    p = DB_PATH
+    exists = os.path.exists(p)
+    size = os.path.getsize(p) if exists else 0
+    info = {"DB_PATH": p, "exists": exists, "size": size}
+    if exists:
+        con = sqlite3.connect(p)
+        con.row_factory = sqlite3.Row
+        info["tables"] = [r["name"] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")]
+        # counts by status
+        counts = {}
+        for s in ("pending","in_flight","done","error"):
+            cur = con.execute("SELECT COUNT(*) AS n FROM commands WHERE status=?", (s,))
+            counts[s] = cur.fetchone()["n"]
+        info["counts"] = counts
+        con.close()
+    return jsonify(info), 200
+
+@app.get("/ops/debug/cmds")
+def _debug_cmds():
+    """List the 50 most recent commands (no state change)."""
+    agent = (request.args.get("agent") or "").strip()
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    sql = ("SELECT id, created_at, agent_id, kind, status, not_before, "
+           "lease_expires_at, payload FROM commands ")
+    args = []
+    if agent:
+        sql += "WHERE agent_id=? "
+        args.append(agent)
+    sql += "ORDER BY id DESC LIMIT 50"
+    rows = [dict(r) for r in con.execute(sql, args).fetchall()]
+    con.close()
+    return jsonify(rows), 200
+
+@app.get("/ops/debug/receipts")
+def _debug_receipts():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = [dict(r) for r in con.execute(
+        "SELECT id, cmd_id, agent_id, ok, status, txid, message, received_at "
+        "FROM receipts ORDER BY id DESC LIMIT 50").fetchall()]
+    con.close()
+    return jsonify(rows), 200
 
 # -----------------------------
 # Start NovaTrade boot sequence once (scheduler, loops, etc.)
