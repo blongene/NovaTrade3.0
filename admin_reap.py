@@ -7,13 +7,13 @@ Examples:
   python admin_reap.py --expired
 
   # Same, but only for a specific agent
-  python admin_reap.py --expired --agent orion-local
+  python admin_reap.py --expired
 
   # Force a command back to pending by id (even if lease not expired)
   python admin_reap.py --force 42
 
   # See what's currently leased
-  python admin_reap.py --list --agent orion-local
+  python admin_reap.py --list
 """
 
 import os, sqlite3, time, argparse
