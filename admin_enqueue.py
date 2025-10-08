@@ -4,7 +4,7 @@ admin_enqueue.py — seed commands into the Outbox (cloud)
 
 Usage examples:
 
-1) Minimal dry-run test (default agent from AGENT_ID or 'orion-local'):
+1) Minimal dry-run test (default agent from AGENT_ID):
    python admin_enqueue.py --kind order.place --payload '{"venue":"MEXC","symbol":"BTC/USDT","side":"BUY","quote_amount":5,"mode":"market"}'
 
 2) Specify agent and dedupe key (prevents duplicate pending/in_flight):
