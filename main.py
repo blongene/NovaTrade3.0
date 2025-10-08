@@ -37,51 +37,43 @@ def _try_start_flask():
             def set_telegram_webhook():
                 info("Skipping Telegram webhook (module missing).")
         _telegram_app = telegram_app
-        # --- Register Command Bus API (Blueprint) ---
-        try:
-            from api_commands import bp as _cmd_bp
-            _telegram_app.register_blueprint(_cmd_bp)
-            info("✅ Command Bus API registered at /api/commands")
-        # --- Register Ops helper (enqueue) ---
-        try:
-            from ops_enqueue import bp as _ops_bp
-            _telegram_app.register_blueprint(_ops_bp)
-            info("✅ Ops helper registered at /ops/enqueue")
-        # --- Register Ops venue checker ---
-        try:
-            from ops_venue import bp as _ops_venue_bp
-            _telegram_app.register_blueprint(_ops_venue_bp)
-            info("✅ Ops venue checker at /ops/venue_check")
-        except Exception as e:
-            warn(f"Ops venue checker not registered: {e}")
-
-        except Exception as e:
-            warn(f"Ops helper not registered: {e}")
-
-        except Exception as e:
-            warn(f"Command Bus API not registered: {e}")
-
-        info("Setting Telegram webhook…")
-        try:
-            set_telegram_webhook()
-            info("✅ Telegram webhook configured.")
-        except Exception as e:
-            warn(f"Webhook setup skipped: {e}")
-        port = int(os.getenv("PORT", "10000"))
-        info(f"Starting Flask app on port {port}…")
-        telegram_app.run(host="0.0.0.0", port=port)
-    except Exception as e:
-        warn(f"Flask/telegram app not started: {e}")
-
-def _configure_webhook_only():
-    """Production path: configure webhook without starting a dev server."""
+      # --- Register Command Bus API (Blueprint) ---
     try:
-        from telegram_webhook import set_telegram_webhook
-        info("Setting Telegram webhook…")
+        from api_commands import bp as _cmd_bp
+        _telegram_app.register_blueprint(_cmd_bp)
+        info("✅ Command Bus API registered at /api/commands")
+    except Exception as e:
+        warn(f"Command Bus API not registered: {e}")
+
+    # --- Register Ops helper (enqueue) ---
+    try:
+        from ops_enqueue import bp as _ops_bp
+        _telegram_app.register_blueprint(_ops_bp)
+        info("✅ Ops helper registered at /ops/enqueue")
+    except Exception as e:
+        warn(f"Ops helper not registered: {e}")
+
+    # --- Register Ops venue checker ---
+    try:
+        from ops_venue import bp as _ops_venue_bp
+        _telegram_app.register_blueprint(_ops_venue_bp)
+        info("✅ Ops venue checker at /ops/venue_check")
+    except Exception as e:
+        warn(f"Ops venue checker not registered: {e}")
+
+    # --- Telegram webhook (best-effort, never fatal) ---
+    info("Setting Telegram webhook…")
+    try:
         set_telegram_webhook()
         info("✅ Telegram webhook configured.")
     except Exception as e:
         warn(f"Webhook setup skipped: {e}")
+
+    # --- Only run the dev server when explicitly requested ---
+    if os.getenv("RUN_FLASK_DEV", "0").strip().lower() in {"1", "true", "yes"}:
+        port = int(os.getenv("PORT", "10000"))
+        info(f"Starting Flask app on port {port}…")
+        telegram_app.run(host="0.0.0.0", port=port)
 
 # --- Thread helper & jitter --------------------------------------------------
 def _thread(fn: Callable, *a, **k):
