@@ -388,17 +388,8 @@ except Exception:
     from flask import Flask
     _flask_app = Flask(__name__)
 
-# Optionally also register your Command Bus if you have it, but guard by name.
-try:
-    from command_bus_api import cmdapi_bp  # Blueprint('cmdapi', __name__, ...)
-    if 'cmdapi' not in _flask_app.blueprints:
-        _flask_app.register_blueprint(cmdapi_bp)
-except Exception as e:
-    warn(f"Command Bus API not available: {e}")
-
 # Receipts API — register once
 if 'receipts' not in _flask_app.blueprints:
     _flask_app.register_blueprint(_receipts_bp)
 
 app = _flask_app  # gunicorn loads this
-
