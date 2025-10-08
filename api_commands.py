@@ -1,19 +1,17 @@
-# api_commands.py — Command Bus blueprint: /api/commands/pull, /ack
-import os, json
+# api_commands.py — Command Bus for NovaTrade (compatible with your outbox_db)
+import os, json, time
 from flask import Blueprint, request, jsonify
-
-# Storage & HMAC
-from outbox_db import init as db_init, pull_pending_for_agent, set_inflight_lease, ack_receipt, enqueue  # adjust if your functions differ
 from hmac_auth import require_hmac
+import outbox_db as db
 
 bp = Blueprint("api_commands", __name__, url_prefix="/api/commands")
 
 # Config: require HMAC on pull? (ACK always requires HMAC)
 REQUIRE_HMAC_PULL = os.getenv("REQUIRE_HMAC_PULL", "0").strip().lower() in {"1","true","yes"}
 
-# Ensure DB tables exist (idempotent)
+# Ensure schema exists (idempotent)
 try:
-    db_init()
+    db.init()
 except Exception as err:
     print(f"[API] outbox db init skipped: {err}")
 
@@ -26,25 +24,26 @@ def pull():
             return jsonify(error=err), 401
 
     body = request.get_json(silent=True) or {}
-    agent = (body.get("agent_id") or "").strip() or "edge-unknown"
-    max_n = int(body.get("max") or 5)
+    agent_id = (body.get("agent_id") or "").strip() or "edge-unknown"
+    limit    = int(body.get("max") or 5)
+    lease_s  = int(os.getenv("OUTBOX_LEASE_S", "45"))
 
     try:
-        # Expire leases inside your DB layer (if supported) or here; keeping it simple:
-        cmds = pull_pending_for_agent(agent_id=agent, limit=max_n)
-        # Set leases (lease TTL from env or a default)
-        ttl_s = int(os.getenv("OUTBOX_LEASE_S", "120"))
+        # Return expired leases to pending (optional hygiene)
+        try:
+            db.reap_expired()
+        except Exception as e:
+            print(f"[API] reap_expired skipped: {e}")
+
+        rows = db.pull(agent_id=agent_id, limit=limit, lease_s=lease_s) or []
+        # Normalize for Edge Agent: id, type, payload, ttl
         items = []
-        for c in cmds:
-            # Expect row dict like: {"id":..., "type":..., "payload":..., "hmac":...}
-            cid = c["id"]
-            set_inflight_lease(cid, ttl_s)
+        for r in rows:
             items.append({
-                "id": cid,
-                "type": c.get("type") or "order.place",
-                "payload": json.loads(c.get("payload") or "{}"),
-                "hmac": c.get("hmac"),
-                "ttl_s": ttl_s
+                "id": r["id"],
+                "type": r.get("kind") or "order.place",
+                "payload": r.get("payload") or {},   # outbox_db already dict-ified
+                "ttl_s": lease_s
             })
         return jsonify(items), 200
     except Exception as err:
@@ -58,17 +57,23 @@ def ack():
         return jsonify(error=err), 401
 
     body = request.get_json(force=True)
+    agent_id = (body.get("agent_id") or "").strip() or "edge-unknown"
+
+    # Edge sends a single result; outbox_db.ack expects a list
+    receipt = {
+        "id": int(body.get("id")),
+        "ok": (body.get("status") == "ok"),
+        "status": body.get("status"),
+        "txid": body.get("txid"),
+        "message": body.get("message"),
+        "result": {
+            "fills": body.get("fills") or [],
+            "ts": body.get("ts"),
+            "hmac": body.get("hmac")
+        }
+    }
     try:
-        rid = ack_receipt(
-            cmd_id=body.get("id"),
-            agent_id=body.get("agent_id"),
-            status=body.get("status"),
-            txid=body.get("txid"),
-            fills=body.get("fills") or [],
-            message=body.get("message"),
-            ts=body.get("ts"),
-            hmac=body.get("hmac")
-        )
-        return jsonify(ok=True, receipt_id=rid), 200
+        db.ack(agent_id=agent_id, receipts=[receipt])
+        return jsonify(ok=True), 200
     except Exception as err:
         return jsonify(ok=False, error=str(err)), 500
