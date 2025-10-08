@@ -37,14 +37,7 @@ def _try_start_flask():
             def set_telegram_webhook():
                 info("Skipping Telegram webhook (module missing).")
         _telegram_app = telegram_app
-      # --- Register Command Bus API (Blueprint) ---
-    try:
-        from api_commands import bp as _cmd_bp
-        _telegram_app.register_blueprint(_cmd_bp)
-        info("✅ Command Bus API registered at /api/commands")
-    except Exception as e:
-        warn(f"Command Bus API not registered: {e}")
-
+    
     # --- Register Ops helper (enqueue) ---
     try:
         from ops_enqueue import bp as _ops_bp
