@@ -362,9 +362,6 @@ def boot():
     time.sleep(0.4)
     _thread(_safe_call, "Orion Voice Loop", "orion_voice_loop", "run_orion_voice_loop")
 
-    _thread(_safe_call, "Orion Voice Loop", "orion_voice_loop", "run_orion_voice_loop")
-    time.sleep(0.2)
-
     _boot_serialize_first_minute()
     send_system_online_once()
     _set_schedules()
