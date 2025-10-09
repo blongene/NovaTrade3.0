@@ -50,6 +50,18 @@ def health():
     except Exception as err:
         # Never 500 on health
         return jsonify(ok=True, fallback=True, reason=str(err)), 200
+        
+@app.post("/ops/admin/clear_bad_pending")
+def _clear_bad_pending():
+    import sqlite3
+    from outbox_db import DB_PATH
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute(
+        "DELETE FROM commands WHERE status='pending' AND instr(agent_id, ',')>0"
+    )
+    n = cur.rowcount or 0
+    con.commit(); con.close()
+    return jsonify(deleted=n), 200
 
 # -----------------------------
 # Blueprints: Command Bus + Ops (best-effort)
