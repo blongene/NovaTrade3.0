@@ -35,7 +35,9 @@ def pull():
             return jsonify(error=err), 401
 
     body = request.get_json(silent=True) or {}
-    agent_id = (body.get("agent_id") or "").strip() or "edge-unknown"
+    agent = (body.get("agent_id") or "").strip() or "edge-unknown"
+    if not _agent_ok(agent):
+        return jsonify(error=f"agent '{agent}' not allowed"), 403
     limit    = int(body.get("max") or 5)
     lease_s  = int(os.getenv("OUTBOX_LEASE_S", "45"))
 
@@ -68,7 +70,10 @@ def ack():
         return jsonify(error=err), 401
 
     body = request.get_json(force=True)
-    agent_id = (body.get("agent_id") or "").strip() or "edge-unknown"
+    agent = (body.get("agent_id") or "").strip() or "edge-unknown"
+    if not _agent_ok(agent):
+        return jsonify(error=f"agent '{agent}' not allowed"), 403
+
 
     # Edge sends a single result; outbox_db.ack expects a list
     receipt = {
