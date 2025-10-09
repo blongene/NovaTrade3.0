@@ -1,62 +1,54 @@
-# api_commands.py — Command Bus for NovaTrade (compatible with your outbox_db)
-import os, json, time
+# api_commands.py — Command Bus: /api/commands/pull, /ack  (aligned to outbox_db.py)
+import os, time
 from flask import Blueprint, request, jsonify
+from outbox_db import init as db_init, pull as db_pull, ack as db_ack, enqueue as db_enqueue, reap_expired
 from hmac_auth import require_hmac
-import outbox_db as db
 
 bp = Blueprint("api_commands", __name__, url_prefix="/api/commands")
 
-# Config: require HMAC on pull? (ACK always requires HMAC)
 REQUIRE_HMAC_PULL = os.getenv("REQUIRE_HMAC_PULL", "0").strip().lower() in {"1","true","yes"}
-# Allow list for pull/ack. Prefer OUTBOX_AGENT_ALLOW; else AGENT_ID list; else allow-all (setup)
-_allow_env = (os.getenv("OUTBOX_AGENT_ALLOW") or os.getenv("AGENT_ID") or "").strip()
-if _allow_env:
-    AGENTS = {a.strip() for a in _allow_env.split(",") if a.strip()}
-    ALLOW_ALL = False
-else:
-    AGENTS = set()
-    ALLOW_ALL = True
+# ACK always uses HMAC via require_hmac below
 
-def _agent_ok(agent_id: str) -> bool:
-    return ALLOW_ALL or agent_id in AGENTS
+ALLOW = {a.strip() for a in (os.getenv("OUTBOX_AGENT_ALLOW") or os.getenv("AGENT_ID") or "").split(",") if a.strip()}
 
-# Ensure schema exists (idempotent)
 try:
-    db.init()
+    db_init()
 except Exception as err:
     print(f"[API] outbox db init skipped: {err}")
 
+def _agent_allowed(aid: str) -> bool:
+    return True if not ALLOW else (aid in ALLOW)
+
 @bp.post("/pull")
 def pull():
-    # Optional HMAC
     if REQUIRE_HMAC_PULL:
         ok, err = require_hmac(request)
         if not ok:
             return jsonify(error=err), 401
 
     body = request.get_json(silent=True) or {}
-    agent = (body.get("agent_id") or "").strip() or "edge-unknown"
-    if not _agent_ok(agent):
-        return jsonify(error=f"agent '{agent}' not allowed"), 403
-    limit    = int(body.get("max") or 5)
-    lease_s  = int(os.getenv("OUTBOX_LEASE_S", "45"))
+    agent_id = (body.get("agent_id") or "").strip()
+    if not agent_id:
+        return jsonify(error="missing agent_id"), 400
+    if not _agent_allowed(agent_id):
+        return jsonify(error="agent not allowed"), 403
+
+    limit = int(body.get("max") or 5)
+    lease_s = int(os.getenv("OUTBOX_LEASE_S", "120"))
 
     try:
-        # Return expired leases to pending (optional hygiene)
         try:
-            db.reap_expired()
-        except Exception as e:
-            print(f"[API] reap_expired skipped: {e}")
+            reap_expired(int(time.time()))
+        except Exception:
+            pass
 
-        rows = db.pull(agent_id=agent, limit=limit, lease_s=lease_s) or []
-        # Normalize for Edge Agent: id, type, payload, ttl
+        rows = db_pull(agent_id=agent_id, limit=limit, lease_s=lease_s)
         items = []
         for r in rows:
             items.append({
                 "id": r["id"],
                 "type": r.get("kind") or "order.place",
-                "payload": r.get("payload") or {},   # outbox_db already dict-ified
-                "ttl_s": lease_s
+                "payload": r.get("payload") or {},
             })
         return jsonify(items), 200
     except Exception as err:
@@ -64,32 +56,31 @@ def pull():
 
 @bp.post("/ack")
 def ack():
-    # HMAC required
     ok, err = require_hmac(request)
     if not ok:
-        return jsonify(error=err), 401
+        return jsonify(ok=False, error=err), 401
 
     body = request.get_json(force=True)
-    agent = (body.get("agent_id") or "").strip() or "edge-unknown"
-    if not _agent_ok(agent):
-        return jsonify(error=f"agent '{agent}' not allowed"), 403
+    agent_id = (body.get("agent_id") or "").strip()
+    if not agent_id:
+        return jsonify(ok=False, error="missing agent_id"), 400
+    if not _agent_allowed(agent_id):
+        return jsonify(ok=False, error="agent not allowed"), 403
 
+    cmd_id = body.get("id")
+    if not cmd_id:
+        return jsonify(ok=False, error="missing id"), 400
 
-    # Edge sends a single result; outbox_db.ack expects a list
-    receipt = {
-        "id": int(body.get("id")),
-        "ok": (body.get("status") == "ok"),
-        "status": body.get("status"),
-        "txid": body.get("txid"),
-        "message": body.get("message"),
-        "result": {
-            "fills": body.get("fills") or [],
-            "ts": body.get("ts"),
-            "hmac": body.get("hmac")
-        }
-    }
     try:
-        db.ack(agent_id=agent_id, receipts=[receipt])
+        receipt = {
+            "id": int(cmd_id),
+            "ok": bool(body.get("ok")),
+            "status": body.get("status"),
+            "txid": body.get("txid"),
+            "message": body.get("message"),
+            "result": body.get("result") or {},
+        }
+        db_ack(agent_id=agent_id, receipts=[receipt])
         return jsonify(ok=True), 200
-    except Exception as err:
-        return jsonify(ok=False, error=str(err)), 500
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
