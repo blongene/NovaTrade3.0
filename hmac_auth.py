@@ -76,3 +76,14 @@ def check_hmac(request):
 def require_hmac(request):
     ok, err = check_hmac(request)
     return ok, err
+# Accept both header names
+def _get_headers(req):
+    ts = req.headers.get("X-Timestamp", "")
+    sig = req.headers.get("X-Signature") or req.headers.get("X-Nova-Signature") or ""
+    return (ts, sig)
+
+# Allow EDGE_SECRET as a fallback (optional)
+EDGE_SECRET = os.getenv("EDGE_SECRET") or ""
+if not OUTBOX_SECRET and EDGE_SECRET:
+    OUTBOX_SECRET = EDGE_SECRET
+SECRET_BYTES = OUTBOX_SECRET.encode()
