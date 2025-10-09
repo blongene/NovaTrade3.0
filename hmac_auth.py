@@ -54,7 +54,7 @@ def check_hmac(request):
 
     ts, sig = _get_headers(request)
     try:
-        raw = request.get_data(cache=False)  # bytes
+        raw = request.get_data()  # <- keep default cache=True so the view can get_json() later
     except Exception:
         raw = b""
 
