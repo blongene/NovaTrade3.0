@@ -48,7 +48,7 @@ def pull():
         except Exception as e:
             print(f"[API] reap_expired skipped: {e}")
 
-        rows = db.pull(agent_id=agent_id, limit=limit, lease_s=lease_s) or []
+        rows = db.pull(agent_id=agent, limit=limit, lease_s=lease_s) or []
         # Normalize for Edge Agent: id, type, payload, ttl
         items = []
         for r in rows:
