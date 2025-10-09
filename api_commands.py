@@ -8,6 +8,17 @@ bp = Blueprint("api_commands", __name__, url_prefix="/api/commands")
 
 # Config: require HMAC on pull? (ACK always requires HMAC)
 REQUIRE_HMAC_PULL = os.getenv("REQUIRE_HMAC_PULL", "0").strip().lower() in {"1","true","yes"}
+# Allow list for pull/ack. Prefer OUTBOX_AGENT_ALLOW; else AGENT_ID list; else allow-all (setup)
+_allow_env = (os.getenv("OUTBOX_AGENT_ALLOW") or os.getenv("AGENT_ID") or "").strip()
+if _allow_env:
+    AGENTS = {a.strip() for a in _allow_env.split(",") if a.strip()}
+    ALLOW_ALL = False
+else:
+    AGENTS = set()
+    ALLOW_ALL = True
+
+def _agent_ok(agent_id: str) -> bool:
+    return ALLOW_ALL or agent_id in AGENTS
 
 # Ensure schema exists (idempotent)
 try:
