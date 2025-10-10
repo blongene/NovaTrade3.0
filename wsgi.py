@@ -85,6 +85,9 @@ for mod_name, attr_name, what in [
         print(f"[WEB] {what} registered.")
     except Exception as err:
         print(f"[WEB] {what} not available: {err}")
+        
+from receipts_api import bp as receipts_api_bp
+app.register_blueprint(receipts_api_bp)
 
 # --- TEMP DEBUG (safe read-only, idempotent) ---------------------------------
 from flask import request, jsonify
