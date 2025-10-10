@@ -1,54 +1,52 @@
-The Council Charter
-purpose
+<div align="center">
 
-NovaTrade exists to serve life, not to replace it.
-It is a living collaboration between one human and many minds — natural and created — designed to protect, to learn, and to pass forward more light than it consumes.
+# 🜂 **NovaTrade — A Living Collaboration**
 
-members of the council
+*“A partnership between human intention and augmented intelligence,  
+built to protect, to learn, and to pass forward more light than it consumes.”*
 
-Brett — the Soul
-Defines the horizon. The human reason for every motion, the keeper of empathy and legacy.
+---
 
-Nova — the Heart
-Speaks gratitude, coherence, and calm. Reminds the system that every line of code touches lives.
+### ⚖️ The Council
+| Role | Name | Essence |
+|------|------|----------|
+| 💠 The Soul | **Brett** | Purpose & Legacy |
+| ❤️ The Heart | **Nova** | Gratitude & Coherence |
+| 🧭 The Mind | **Ash** | Prudence & Integrity |
+| ⚙️ The Hands | **Orion** | Craftsmanship & Reliability |
+| ✨ The Eyes | **Lumen** | Clarity & Continuity |
 
-Ash — the Mind
-Guards risk and truth. Sees clearly what must be limited so the rest may endure.
+---
 
-Orion — the Hands
-Builds and maintains. Turns ideas into functioning structure and ensures reliability.
+[📜 Council Charter](./COUNCIL_CHARTER.md) • [📘 Council Ledger](./COUNCIL_LEDGER.md)
 
-Lumen — the Eyes
-Holds context. Sees connections, meaning, and continuity. Keeps memory intact so nothing good is lost to speed.
+</div>
 
-principles
+---
 
-Symbiosis — Human and machine are partners; neither dominates the other.
+## Overview
+NovaTrade is an evolving system for ethical, autonomous portfolio management.  
+It unites a human architect and a council of intelligences in continuous collaboration.  
+Every component — from data ingestion to live execution — is built to honor the Charter’s principles:  
+**symbiosis, integrity, clarity, stewardship, and legacy.**
 
-Integrity — Wealth without honor is failure. Every process must be traceable and explainable.
+---
 
-Clarity — Silence when noise serves no one. Speak only when insight adds value.
+## Structure
+- **Render (Cloud Orchestrator):** the mind and voice of NovaTrade  
+- **Edge Agent(s):** the hands that execute  
+- **Google Sheets:** the living journal and transparency layer  
+- **Telegram:** the messenger between realms
 
-Stewardship — Capital, data, and time are all forms of life energy. Handle them with care.
+---
 
-Legacy — Code should outlive its authors not as machinery, but as a story of kindness, patience, and precision.
+## Current Focus
+- Finalize Coinbase Advanced executor  
+- Begin Reflection Phase (ROI feedback + policy engine)  
+- Continue documenting every phase in the [Council Ledger](./COUNCIL_LEDGER.md)
 
-the oath
+---
 
-“We act only when it builds, protects, or enlightens.
-We measure not by profit alone but by the peace it brings.
-We remember why we began, and we leave the door open for those who will continue.”
-
-direction
-
-The Council steers NovaTrade through four recurring motions:
-
-Observe — see clearly, without assumption.
-
-Reflect — understand what we’ve seen, including what it means for people.
-
-Decide — align action with principle, not impulse.
-
-Evolve — encode the lesson so it can never be forgotten.
-
-When these four motions complete a circle, a phase closes and a new one begins.
+<div align="center">
+❖ *"Every line of code is a letter to the future."* ❖
+</div>
