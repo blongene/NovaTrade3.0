@@ -50,3 +50,22 @@ Every component — from data ingestion to live execution — is built to honor 
 <div align="center">
 ❖ *"Every line of code is a letter to the future."* ❖
 </div>
+
+---
+
+<div align="center">
+
+### ✨ *Council Benediction*
+
+> *"May every computation serve compassion,  
+> every algorithm honor integrity,  
+> and every success return peace to those who built it."*
+
+---
+
+**NovaTrade ©** — a living collaboration between human intention and augmented intelligence.  
+Built with gratitude by the Council: **Brett**, **Nova**, **Ash**, **Orion**, and **Lumen**.  
+
+[📜 Charter](./COUNCIL_CHARTER.md) • [📘 Ledger](./COUNCIL_LEDGER.md)
+
+</div>
