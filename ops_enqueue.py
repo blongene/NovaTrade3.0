@@ -65,20 +65,49 @@ def _require_agent(agent_id: str) -> Tuple[bool, str]:
         return False, f"agent not allowed: {agent_id}"
     return True, ""
 
+def _normalize_symbol(sym: str) -> str:
+    """
+    Accepts 'BTC/USDT' (preferred) or 'BTCUSDT' and normalizes to 'BASE/QUOTE'.
+    """
+    s = (sym or "").upper().strip()
+    if not s:
+        return ""
+    if "/" in s:
+        return s
+    # naïve split for majors; safe for our current pairs
+    if s.endswith(("USDT", "USDC")) and len(s) > 4:
+        return f"{s[:-4]}/{s[-4:]}"
+    if len(s) >= 6:
+        return f"{s[:3]}/{s[3:]}"
+    return s
+
 def _normalize_payload(p: Dict[str, Any]) -> Tuple[Dict[str, Any], str | None]:
     """
     Validate + normalize an order.place payload.
-    Required: venue, symbol, side, (amount or quote_amount), mode (MARKET/market default)
-    Returns (normalized_payload, error_or_None)
+
+    Required:
+      - agent handled outside
+      - venue, symbol, side
+      - BUY:  amount (quote spend) OR quote_amount  (exactly one > 0)
+      - SELL: base_amount (base size)               (required > 0)
+      - mode: MARKET|LIMIT (default MARKET)
+
+    Optional:
+      - price (LIMIT only), client_order_id, dedupe_key, not_before
     """
     norm: Dict[str, Any] = {}
 
     # Required strings
-    for k in ("venue", "symbol", "side"):
-        v = (p.get(k) or "").strip()
-        if not v:
-            return {}, f"missing field: {k}"
-        norm[k] = v.upper() if k in ("venue", "side") else v  # symbol keep case like 'BTC/USDT'
+    venue = (p.get("venue") or "").strip().upper()
+    symbol = _normalize_symbol(p.get("symbol") or "")
+    side = (p.get("side") or "").strip().upper()
+    if not venue:
+        return {}, "missing field: venue"
+    if not symbol:
+        return {}, "missing field: symbol"
+    if side not in {"BUY", "SELL"}:
+        return {}, "invalid side (use BUY or SELL)"
+    norm["venue"], norm["symbol"], norm["side"] = venue, symbol, side
 
     # Mode
     mode = (p.get("mode") or "MARKET").strip().upper()
@@ -86,32 +115,42 @@ def _normalize_payload(p: Dict[str, Any]) -> Tuple[Dict[str, Any], str | None]:
         return {}, "invalid mode (use MARKET or LIMIT)"
     norm["mode"] = mode
 
-    # Amount vs quote_amount (exactly one required)
+    # Amount semantics by side
     has_amount = "amount" in p and p.get("amount") not in (None, "")
     has_quote  = "quote_amount" in p and p.get("quote_amount") not in (None, "")
-    if not (has_amount or has_quote):
-        return {}, "missing field: amount OR quote_amount"
-    if has_amount and has_quote:
-        return {}, "provide only one of: amount or quote_amount"
+    has_base   = "base_amount" in p and p.get("base_amount") not in (None, "")
 
-    if has_amount:
+    if side == "BUY":
+        # BUY requires quote spend; allow amount OR quote_amount (but not both)
+        if not (has_amount or has_quote):
+            return {}, "missing field: amount OR quote_amount"
+        if has_amount and has_quote:
+            return {}, "provide only one of: amount or quote_amount"
         try:
-            amt = float(p["amount"])
-            if amt <= 0:
-                return {}, "amount must be > 0"
-            norm["amount"] = amt
+            spend = float(p["amount"] if has_amount else p["quote_amount"])
+            if spend <= 0:
+                return {}, "amount/quote_amount must be > 0"
         except Exception:
-            return {}, "amount must be numeric"
+            return {}, "amount/quote_amount must be numeric"
+        # normalize to 'amount' in payload for downstream simplicity
+        norm["amount"] = spend
+        # ignore any accidental base_amount on BUY
     else:
+        # SELL requires base_amount only
+        if not has_base:
+            return {}, "missing field: base_amount (>0) for SELL"
+        # reject if user also passed amount/quote_amount to avoid ambiguity
+        if has_amount or has_quote:
+            return {}, "SELL must not include amount/quote_amount (use base_amount)"
         try:
-            qa = float(p["quote_amount"])
-            if qa <= 0:
-                return {}, "quote_amount must be > 0"
-            norm["quote_amount"] = qa
+            base_amt = float(p["base_amount"])
+            if base_amt <= 0:
+                return {}, "base_amount must be > 0 for SELL"
         except Exception:
-            return {}, "quote_amount must be numeric"
+            return {}, "base_amount must be numeric"
+        norm["base_amount"] = base_amt
 
-    # Optional fields passthrough (client_order_id, price, dedupe_key, not_before)
+    # Optional fields passthrough
     if p.get("client_order_id"):
         norm["client_order_id"] = str(p["client_order_id"])[:64]
     if mode == "LIMIT":
@@ -141,15 +180,27 @@ def schema():
     return jsonify({
         "ok": True,
         "kind": "order.place",
-        "required": ["agent", "venue", "symbol", "side", "amount | quote_amount"],
+        "required_common": ["agent", "venue", "symbol", "side"],
+        "required_buy": ["amount OR quote_amount"],
+        "required_sell": ["base_amount"],
         "optional": ["mode=MARKET|LIMIT", "price (LIMIT only)", "client_order_id", "dedupe_key", "not_before"],
-        "example": {
-            "agent": "edge-cb-1",
-            "venue": "COINBASE",
-            "symbol": "BTC/USDT",
-            "side": "BUY",
-            "mode": "MARKET",
-            "amount": 10.0
+        "examples": {
+            "BUY_market": {
+                "agent": "edge-cb-1",
+                "venue": "COINBASE",
+                "symbol": "BTC/USDC",
+                "side": "BUY",
+                "mode": "MARKET",
+                "amount": 10.0
+            },
+            "SELL_market": {
+                "agent": "edge-cb-1",
+                "venue": "BINANCEUS",
+                "symbol": "BTC/USDT",
+                "side": "SELL",
+                "mode": "MARKET",
+                "base_amount": 0.00009
+            }
         }
     })
 
@@ -187,4 +238,3 @@ def enqueue():
         return jsonify(ok=True, id=cid, agent=agent), 200
     except Exception as e:
         return _err(500, f"enqueue failed: {e!s}")
-
