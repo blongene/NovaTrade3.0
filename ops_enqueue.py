@@ -1,240 +1,169 @@
 # ops_enqueue.py — strict enqueue endpoint for NovaTrade 3.0
-# Routes:
-#   POST /ops/enqueue        -> enqueue a validated command (HMAC required if enabled)
-#   GET  /ops/enqueue/schema -> quick schema help (no auth)
-#
-# Env:
-#   OUTBOX_AGENT_ALLOW   comma list of allowed agent IDs (optional)
-#   REQUIRE_HMAC_OPS     1/true to require HMAC for /ops/*
-#   OUTBOX_LEASE_S       default lease seconds (not used here; DB controls)
-#
-# Depends:
-#   outbox_db.enqueue(agent_id, kind, payload, not_before=0, dedupe_key=None) -> int
-#   hmac_auth.require_hmac(request) -> (ok: bool, err: str)
-
 from __future__ import annotations
 import os, json
 from typing import Any, Dict, Tuple
 from flask import Blueprint, request, jsonify
-
-# DB + HMAC helpers (already in your repo)
 from outbox_db import enqueue as db_enqueue
 from hmac_auth import require_hmac
 
 bp = Blueprint("ops", __name__, url_prefix="/ops")
 
-# ---------- Config ----------
-REQUIRE_HMAC = os.getenv("REQUIRE_HMAC_OPS", "1").strip().lower() in {"1", "true", "yes"}
+REQUIRE_HMAC = os.getenv("REQUIRE_HMAC_OPS", "1").strip().lower() in {"1","true","yes"}
 ALLOW = {a.strip() for a in (os.getenv("OUTBOX_AGENT_ALLOW") or "").split(",") if a.strip()}
+PAIR_GUARD_MODE = (os.getenv("PAIR_GUARD_MODE") or "rewrite").strip().lower()  # rewrite|warn|off
 
-# ---------- Utilities ----------
 def _err(status: int, msg: str, extra: Dict[str, Any] | None = None):
     body = {"ok": False, "error": msg}
-    if extra:
-        body.update(extra)
+    if extra: body.update(extra)
     return jsonify(body), status
 
 def _as_json() -> Tuple[Dict[str, Any], bool]:
-    """
-    Load JSON body safely from application/json or form-encoded 'json'/'payload'.
-    Returns (dict, ok).
-    """
     ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
     if ctype == "application/json":
-        try:
-            return request.get_json(force=True) or {}, True
-        except Exception:
-            return {}, False
-    # allow simple form submits for quick tests
-    if ctype in {"application/x-www-form-urlencoded", "multipart/form-data"}:
+        try: return request.get_json(force=True) or {}, True
+        except Exception: return {}, False
+    if ctype in {"application/x-www-form-urlencoded","multipart/form-data"}:
         raw = request.form.get("json") or request.form.get("payload") or ""
-        try:
-            return (json.loads(raw) if raw else {}), True
-        except Exception:
-            return {}, False
-    # last-ditch: body as json
-    try:
-        return json.loads((request.get_data() or b"{}").decode("utf-8") or "{}"), True
-    except Exception:
-        return {}, False
+        try: return (json.loads(raw) if raw else {}), True
+        except Exception: return {}, False
+    try: return json.loads((request.get_data() or b"{}").decode("utf-8") or "{}"), True
+    except Exception: return {}, False
 
 def _require_agent(agent_id: str) -> Tuple[bool, str]:
-    if not agent_id:
-        return False, "missing field: agent"
-    if ALLOW and agent_id not in ALLOW:
-        return False, f"agent not allowed: {agent_id}"
+    if not agent_id: return False, "missing field: agent"
+    if ALLOW and agent_id not in ALLOW: return False, f"agent not allowed: {agent_id}"
     return True, ""
 
 def _normalize_symbol(sym: str) -> str:
-    """
-    Accepts 'BTC/USDT' (preferred) or 'BTCUSDT' and normalizes to 'BASE/QUOTE'.
-    """
-    s = (sym or "").upper().strip()
-    if not s:
-        return ""
-    if "/" in s:
-        return s
-    # naïve split for majors; safe for our current pairs
-    if s.endswith(("USDT", "USDC")) and len(s) > 4:
-        return f"{s[:-4]}/{s[-4:]}"
+    s = (sym or "").upper().replace(" ", "")
+    if not s: return ""
+    if "/" in s: base, quote = s.split("/", 1); return f"{base}/{quote}"
+    if "-" in s: base, quote = s.split("-", 1); return f"{base}/{quote}"
+    # naive fallback: BTCUSDT -> BTC/USDT
     if len(s) >= 6:
-        return f"{s[:3]}/{s[3:]}"
+        return f"{s[:-4]}/{s[-4:]}"
     return s
 
+def _pair_guard(venue: str, requested_symbol: str) -> Tuple[str, Dict[str, Any]]:
+    """Potentially rewrite BINANCEUS …/USDC -> …/USDT (policy), return (resolved, extras)."""
+    extras: Dict[str, Any] = {"requested_symbol": requested_symbol}
+    resolved = requested_symbol
+    if venue == "BINANCEUS":
+        if requested_symbol.endswith("/USDC"):
+            if PAIR_GUARD_MODE == "rewrite":
+                resolved = requested_symbol[:-4] + "USDT"
+                extras["pair_guard"] = "rewritten_USDC_to_USDT"
+            elif PAIR_GUARD_MODE == "warn":
+                extras["pair_guard"] = "warn_USDC_on_BINANCEUS"
+            else:
+                extras["pair_guard"] = "off"
+    extras["resolved_symbol"] = resolved
+    return resolved, extras
+
 def _normalize_payload(p: Dict[str, Any]) -> Tuple[Dict[str, Any], str | None]:
-    """
-    Validate + normalize an order.place payload.
-
-    Required:
-      - agent handled outside
-      - venue, symbol, side
-      - BUY:  amount (quote spend) OR quote_amount  (exactly one > 0)
-      - SELL: base_amount (base size)               (required > 0)
-      - mode: MARKET|LIMIT (default MARKET)
-
-    Optional:
-      - price (LIMIT only), client_order_id, dedupe_key, not_before
-    """
     norm: Dict[str, Any] = {}
 
-    # Required strings
     venue = (p.get("venue") or "").strip().upper()
-    symbol = _normalize_symbol(p.get("symbol") or "")
+    if not venue: return {}, "missing field: venue"
+    requested_symbol = _normalize_symbol(p.get("symbol") or "")
+    if not requested_symbol: return {}, "missing field: symbol"
     side = (p.get("side") or "").strip().upper()
-    if not venue:
-        return {}, "missing field: venue"
-    if not symbol:
-        return {}, "missing field: symbol"
-    if side not in {"BUY", "SELL"}:
-        return {}, "invalid side (use BUY or SELL)"
-    norm["venue"], norm["symbol"], norm["side"] = venue, symbol, side
+    if side not in {"BUY","SELL"}: return {}, "invalid side (use BUY or SELL)"
 
-    # Mode
+    resolved_symbol, extras = _pair_guard(venue, requested_symbol)
+
     mode = (p.get("mode") or "MARKET").strip().upper()
-    if mode not in {"MARKET", "LIMIT"}:
-        return {}, "invalid mode (use MARKET or LIMIT)"
-    norm["mode"] = mode
+    if mode not in {"MARKET","LIMIT"}: return {}, "invalid mode (use MARKET or LIMIT)"
 
-    # Amount semantics by side
+    # BUY vs SELL semantics
     has_amount = "amount" in p and p.get("amount") not in (None, "")
     has_quote  = "quote_amount" in p and p.get("quote_amount") not in (None, "")
     has_base   = "base_amount" in p and p.get("base_amount") not in (None, "")
 
     if side == "BUY":
-        # BUY requires quote spend; allow amount OR quote_amount (but not both)
         if not (has_amount or has_quote):
             return {}, "missing field: amount OR quote_amount"
         if has_amount and has_quote:
             return {}, "provide only one of: amount or quote_amount"
         try:
             spend = float(p["amount"] if has_amount else p["quote_amount"])
-            if spend <= 0:
-                return {}, "amount/quote_amount must be > 0"
+            if spend <= 0: return {}, "amount/quote_amount must be > 0"
         except Exception:
             return {}, "amount/quote_amount must be numeric"
-        # normalize to 'amount' in payload for downstream simplicity
         norm["amount"] = spend
-        # ignore any accidental base_amount on BUY
     else:
-        # SELL requires base_amount only
-        if not has_base:
-            return {}, "missing field: base_amount (>0) for SELL"
-        # reject if user also passed amount/quote_amount to avoid ambiguity
+        if not has_base: return {}, "missing field: base_amount (>0) for SELL"
         if has_amount or has_quote:
             return {}, "SELL must not include amount/quote_amount (use base_amount)"
         try:
             base_amt = float(p["base_amount"])
-            if base_amt <= 0:
-                return {}, "base_amount must be > 0 for SELL"
+            if base_amt <= 0: return {}, "base_amount must be > 0 for SELL"
         except Exception:
             return {}, "base_amount must be numeric"
         norm["base_amount"] = base_amt
 
-    # Optional fields passthrough
-    if p.get("client_order_id"):
-        norm["client_order_id"] = str(p["client_order_id"])[:64]
+    # passthroughs
+    if p.get("client_order_id"): norm["client_order_id"] = str(p["client_order_id"])[:64]
     if mode == "LIMIT":
         try:
-            price = float(p.get("price"))
-            if price <= 0:
-                return {}, "price must be > 0 for LIMIT orders"
+            price = float(p.get("price")); 
+            if price <= 0: return {}, "price must be > 0 for LIMIT orders"
             norm["price"] = price
-        except Exception:
-            return {}, "invalid price for LIMIT order"
-    if p.get("dedupe_key"):
-        norm["dedupe_key"] = str(p["dedupe_key"])[:100]
+        except Exception: return {}, "invalid price for LIMIT order"
+    if p.get("dedupe_key"): norm["dedupe_key"] = str(p["dedupe_key"])[:100]
     if p.get("not_before"):
         try:
-            nb = int(p["not_before"])
-            if nb < 0:
-                return {}, "not_before must be epoch seconds"
+            nb = int(p["not_before"]); 
+            if nb < 0: return {}, "not_before must be epoch seconds"
             norm["not_before"] = nb
-        except Exception:
-            return {}, "invalid not_before (epoch seconds)"
+        except Exception: return {}, "invalid not_before (epoch seconds)"
 
+    # finalize
+    norm.update({
+        "venue": venue,
+        "symbol": resolved_symbol,
+        "side": side,
+        "mode": mode,
+        "requested_symbol": extras["requested_symbol"],
+        "resolved_symbol":  extras["resolved_symbol"],
+    })
+    if "pair_guard" in extras: norm["pair_guard"] = extras["pair_guard"]
     return norm, None
 
-# ---------- Routes ----------
 @bp.get("/enqueue/schema")
 def schema():
     return jsonify({
         "ok": True,
         "kind": "order.place",
-        "required_common": ["agent", "venue", "symbol", "side"],
+        "pair_guard_mode": PAIR_GUARD_MODE,
+        "required_common": ["agent","venue","symbol","side"],
         "required_buy": ["amount OR quote_amount"],
         "required_sell": ["base_amount"],
-        "optional": ["mode=MARKET|LIMIT", "price (LIMIT only)", "client_order_id", "dedupe_key", "not_before"],
-        "examples": {
-            "BUY_market": {
-                "agent": "edge-cb-1",
-                "venue": "COINBASE",
-                "symbol": "BTC/USDC",
-                "side": "BUY",
-                "mode": "MARKET",
-                "amount": 10.0
-            },
-            "SELL_market": {
-                "agent": "edge-cb-1",
-                "venue": "BINANCEUS",
-                "symbol": "BTC/USDT",
-                "side": "SELL",
-                "mode": "MARKET",
-                "base_amount": 0.00009
-            }
-        }
+        "notes": ["BINANCEUS: USDT quote preferred; USDC auto-rewritten if PAIR_GUARD_MODE=rewrite"],
     })
 
 @bp.post("/enqueue")
 def enqueue():
-    # HMAC (optional but recommended)
     if REQUIRE_HMAC:
         ok, err = require_hmac(request)
-        if not ok:
-            return _err(401, err)
+        if not ok: return _err(401, err)
 
-    # Parse + validate
     body, ok = _as_json()
-    if not ok:
-        return _err(400, "malformed JSON body")
+    if not ok: return _err(400, "malformed JSON body")
 
     agent = (body.get("agent") or body.get("agent_id") or "").strip()
     ok, msg = _require_agent(agent)
-    if not ok:
-        return _err(403, msg)
+    if not ok: return _err(403, msg)
 
-    # normalize payload
     payload, perr = _normalize_payload(body)
-    if perr:
-        return _err(400, perr)
+    if perr: return _err(400, perr)
 
-    # enqueue
     kind = "order.place"
     dedupe_key = payload.pop("dedupe_key", None)
     not_before = int(payload.pop("not_before", 0) or 0)
     try:
         cid = db_enqueue(agent_id=agent, kind=kind, payload=payload, not_before=not_before, dedupe_key=dedupe_key)
-        if cid == -1:
-            return jsonify(ok=True, dedup=True), 200
-        return jsonify(ok=True, id=cid, agent=agent), 200
+        if cid == -1: return jsonify(ok=True, dedup=True), 200
+        return jsonify(ok=True, id=cid, agent=agent, pair_guard=payload.get("pair_guard")), 200
     except Exception as e:
         return _err(500, f"enqueue failed: {e!s}")
