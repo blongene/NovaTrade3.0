@@ -89,6 +89,9 @@ for mod_name, attr_name, what in [
 from receipts_api import bp as receipts_api_bp
 app.register_blueprint(receipts_api_bp)
 
+from telemetry_api import bp as telemetry_bp
+app.register_blueprint(telemetry_bp)
+
 # --- TEMP DEBUG (safe read-only, idempotent) ---------------------------------
 from flask import request, jsonify
 import os, sqlite3
