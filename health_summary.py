@@ -4,7 +4,7 @@ import os, sqlite3, json, time, math, urllib.parse, requests
 from datetime import datetime, timezone
 
 DB_PATH   = os.getenv("BUS_TELEMETRY_DB", "bus_telemetry.db")
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")         # e.g. "-1001234567890"
 TITLE     = os.getenv("HEALTH_TITLE", "☀️ NovaTrade Daily Report")
 STALE_MIN = int(os.getenv("HEARTBEAT_STALE_MIN", "60"))  # alert if last HB older than this
