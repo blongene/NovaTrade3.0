@@ -18,7 +18,7 @@ built to protect, to learn, and to pass forward more light than it consumes.”*
 
 ---
 
-[📜 Council Charter](./COUNCIL_CHARTER.md) • [📘 Council Ledger](./COUNCIL_LEDGER.md)
+[📜 Council Charter](./docs/charter/COUNCIL_CHARTER.md) • [📘 Council Ledger](./COUNCIL_LEDGER.md) • [📘 Phase 4 Completion Ledger](./docs/ledger/2025-10-16_Phase4_Completion_Ledger.md)
 
 </div>
 
