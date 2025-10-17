@@ -29,21 +29,23 @@ _ZAPPER_GQL_URL = "https://public.zapper.xyz/graphql"
 _GQL_WITH_CHAINS = """
 query TokenBalances($addresses: [Address!]!, $first: Int!, $after: String, $chainIds: [Int!]) {
   portfolioV2(addresses: $addresses, chainIds: $chainIds) {
-    tokenBalances(first: $first, after: $after) {
-      totalCount
-      edges {
-        node {
-          name
-          symbol
-          decimals
-          balanceRaw
-          balanceUSD
-          tokenAddress
-          chainId
+    tokenBalances {
+      byToken(first: $first, after: $after) {
+        totalCount
+        edges {
+          node {
+            name
+            symbol
+            decimals
+            balanceRaw
+            balanceUSD
+            tokenAddress
+            chainId
+          }
+          cursor
         }
-        cursor
+        pageInfo { hasNextPage endCursor }
       }
-      pageInfo { hasNextPage endCursor }
     }
   }
 }
@@ -52,31 +54,29 @@ query TokenBalances($addresses: [Address!]!, $first: Int!, $after: String, $chai
 _GQL_ALL_CHAINS = """
 query TokenBalances($addresses: [Address!]!, $first: Int!, $after: String) {
   portfolioV2(addresses: $addresses) {
-    tokenBalances(first: $first, after: $after) {
-      totalCount
-      edges {
-        node {
-          name
-          symbol
-          decimals
-          balanceRaw
-          balanceUSD
-          tokenAddress
-          chainId
+    tokenBalances {
+      byToken(first: $first, after: $after) {
+        totalCount
+        edges {
+          node {
+            name
+            symbol
+            decimals
+            balanceRaw
+            balanceUSD
+            tokenAddress
+            chainId
+          }
+          cursor
         }
-        cursor
+        pageInfo { hasNextPage endCursor }
       }
-      pageInfo { hasNextPage endCursor }
     }
   }
 }
 """
 
-def _zapper_graphql_fetch_symbols(address: str) -> Tuple[Set[str], Optional[str]]:
-    """
-    Query Zapper GraphQL for all token balances on one address.
-    Returns (symbols_set, error_or_None).
-    """
+def _zapper_graphql_fetch_symbols(address: str):
     if not ZAPPER_API_KEY:
         return set(), "zapper:no-key"
 
@@ -89,15 +89,13 @@ def _zapper_graphql_fetch_symbols(address: str) -> Tuple[Set[str], Optional[str]
     query = _GQL_WITH_CHAINS if ZAPPER_CHAIN_IDS else _GQL_ALL_CHAINS
     variables = {
         "addresses": [address],
-        "first": 250,     # pagination size
+        "first": 250,
         "after": None,
     }
     if ZAPPER_CHAIN_IDS:
         variables["chainIds"] = ZAPPER_CHAIN_IDS
 
-    out_syms: Set[str] = set()
-    seen_cursors = set()
-    loops = 0
+    out_syms, seen_cursors, loops = set(), set(), 0
 
     try:
         while True:
@@ -111,13 +109,14 @@ def _zapper_graphql_fetch_symbols(address: str) -> Tuple[Set[str], Optional[str]
             data = (j.get("data") or {})
             pf = data.get("portfolioV2") or {}
             tb = pf.get("tokenBalances") or {}
-            edges = tb.get("edges") or []
+            bt = tb.get("byToken") or {}
 
+            edges = bt.get("edges") or []
             for edge in edges:
                 node = edge.get("node") or {}
                 sym  = (node.get("symbol") or "").upper()
                 dec  = node.get("decimals") or 0
-                raw  = node.get("balanceRaw")  # string integer most likely
+                raw  = node.get("balanceRaw")
                 bal  = 0.0
                 try:
                     bal = float(raw) / (10 ** int(dec)) if raw is not None else 0.0
@@ -126,7 +125,7 @@ def _zapper_graphql_fetch_symbols(address: str) -> Tuple[Set[str], Optional[str]
                 if sym and bal > 0:
                     out_syms.add(sym)
 
-            page = tb.get("pageInfo") or {}
+            page = bt.get("pageInfo") or {}
             has_next = bool(page.get("hasNextPage"))
             end_cursor = page.get("endCursor")
             if not has_next or not end_cursor or end_cursor in seen_cursors:
@@ -140,7 +139,7 @@ def _zapper_graphql_fetch_symbols(address: str) -> Tuple[Set[str], Optional[str]
 
     except Exception as e:
         return out_syms, f"zapper:exc:{e}"
-
+      
 # ---------- Covalent/GoldRush Fallback ----------
 def _fetch_covalent_tokens(address: str, chains: List[str]) -> Tuple[Set[str], Optional[str]]:
     """
