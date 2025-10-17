@@ -49,36 +49,58 @@ def _fetch_zapper_tokens(address: str):
         return set(), f"zapper-exc:{e}"
 
 def _fetch_covalent_tokens(address: str, chains: list[str]):
-    """Return a set of token symbols using Covalent (balances_v2) across the given chains."""
-    if not COVALENT_API_KEY or not chains:
+    """Return a set of token symbols using Covalent/GoldRush balances_v2 across chains."""
+    key = os.getenv("COVALENT_API_KEY")
+    if not key or not chains:
         return set(), "no-fallback"
 
     out = set()
     err_agg = []
+
     for chain in chains:
+        ok = False
+
+        # 1) Try legacy Covalent style (?key=...)
         try:
-            # Example: https://api.covalenthq.com/v1/eth-mainnet/address/<addr>/balances_v2/?key=...
-            url = f"https://api.covalenthq.com/v1/{chain}/address/{address}/balances_v2/?key={COVALENT_API_KEY}"
-            r = requests.get(url, timeout=20)
-            if r.status_code != 200:
-                err_agg.append(f"{chain}:{r.status_code}")
-                continue
-            j = r.json() or {}
-            items = ((j.get("data") or {}).get("items") or [])
-            for it in items:
-                sym = (it.get("contract_ticker_symbol") or "").upper()
-                # Convert raw integer balance using decimals (if present)
-                raw = it.get("balance")
-                dec = it.get("contract_decimals") or 0
-                bal = 0.0
-                try:
-                    bal = float(raw) / (10 ** int(dec)) if raw is not None else 0.0
-                except Exception:
-                    pass
-                if sym and bal > 0:
-                    out.add(sym)
+            url_qs = f"https://api.covalenthq.com/v1/{chain}/address/{address}/balances_v2/?key={key}"
+            r = requests.get(url_qs, timeout=20)
+            if r.status_code == 200:
+                ok = True
+                j = r.json() or {}
+            else:
+                err_agg.append(f"{chain}:qs:{r.status_code}")
         except Exception as e:
-            err_agg.append(f"{chain}:exc:{e}")
+            err_agg.append(f"{chain}:qs_exc:{e}")
+
+        # 2) If not OK, try GoldRush style with Bearer header (same path)
+        if not ok:
+            try:
+                url_hdr = f"https://api.covalenthq.com/v1/{chain}/address/{address}/balances_v2/"
+                r = requests.get(url_hdr, timeout=20, headers={"Authorization": f"Bearer {key}"})
+                if r.status_code == 200:
+                    ok = True
+                    j = r.json() or {}
+                else:
+                    err_agg.append(f"{chain}:bearer:{r.status_code}")
+            except Exception as e:
+                err_agg.append(f"{chain}:bearer_exc:{e}")
+
+        if not ok:
+            continue
+
+        items = ((j.get("data") or {}).get("items") or [])
+        for it in items:
+            sym = (it.get("contract_ticker_symbol") or "").upper()
+            raw = it.get("balance")
+            dec = it.get("contract_decimals") or 0
+            bal = 0.0
+            try:
+                bal = float(raw) / (10 ** int(dec)) if raw is not None else 0.0
+            except Exception:
+                pass
+            if sym and bal > 0:
+                out.add(sym)
+
     return out, (";".join(err_agg) if err_agg else None)
 
 def fetch_wallet_tokens(address: str):
