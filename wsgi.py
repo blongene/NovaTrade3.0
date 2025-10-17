@@ -2,7 +2,6 @@
 import os, threading
 from flask import Flask, jsonify
 
-
 # -----------------------------
 # Base app: try Telegram app; else create a bare Flask app
 # -----------------------------
@@ -98,6 +97,19 @@ app.register_blueprint(telemetry_read_bp)
 
 from receipt_bus import bp as receipts_api
 app.register_blueprint(receipts_api)
+
+from daily_scheduler import run_daily
+
+def _send_daily_health():
+    # Import inside the function to avoid circular imports at startup
+    import health_summary
+    try:
+        health_summary.main()
+        print("[bus] daily health summary sent")
+    except Exception as e:
+        print("[bus] daily health summary error:", e)
+
+run_daily(_send_daily_health)
 
 # --- TEMP DEBUG (safe read-only, idempotent) ---------------------------------
 from flask import request, jsonify
