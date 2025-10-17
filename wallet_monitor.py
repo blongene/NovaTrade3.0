@@ -2,6 +2,7 @@
 import os
 import time
 import requests
+import re
 from datetime import datetime
 from typing import List, Optional, Tuple, Set
 from utils import send_telegram_message, get_gspread_client
@@ -23,6 +24,22 @@ ZAPPER_CHAIN_IDS  = [int(x.strip()) for x in (os.getenv("ZAPPER_CHAIN_IDS","").s
 # Covalent chains for fallback (Covalent expects slugs like 'eth-mainnet', 'base-mainnet')
 WALLET_CHAINS     = [c.strip() for c in (os.getenv("WALLET_CHAINS","eth-mainnet").split(",")) if c.strip()]
 
+# Filtering controls
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "0"))  # e.g., 5000000 for $5m floor
+REQUIRE_SYMBOL_CLEAN = (os.getenv("REQUIRE_SYMBOL_CLEAN", "1").lower() in {"1","true","yes"})
+
+# Allowed symbol pattern: letters/numbers/_-. up to 10 chars (adjust if needed)
+SYM_OK = re.compile(r"^[A-Z0-9._-]{2,10}$")
+
+def is_symbol_clean(sym: str) -> bool:
+    s = (sym or "").upper()
+    if not s: return False
+    if not SYM_OK.match(s): return False
+    # Reject obvious phishing markers
+    bad_fragments = ("HTTP", "HTTPS", "WWW.", "T.ME", "BIO.LINK", "T.LY", "WR.DO", "CLAIM", "VISIT")
+    if any(f in s for f in bad_fragments): return False
+    return True
+  
 # ---------- Zapper GraphQL Primary ----------
 _ZAPPER_GQL_URL = "https://public.zapper.xyz/graphql"
 
@@ -40,6 +57,7 @@ query TokenBalances($addresses: [Address!]!, $first: Int!, $after: String, $chai
             balanceRaw
             balanceUSD
             tokenAddress
+            onchainMarketData { marketCap }
           }
           cursor
         }
@@ -64,6 +82,7 @@ query TokenBalances($addresses: [Address!]!, $first: Int!, $after: String) {
             balanceRaw
             balanceUSD
             tokenAddress
+            onchainMarketData { marketCap }
           }
           cursor
         }
@@ -115,13 +134,22 @@ def _zapper_graphql_fetch_symbols(address: str):
                 sym  = (node.get("symbol") or "").upper()
                 dec  = node.get("decimals") or 0
                 raw  = node.get("balanceRaw")
-                bal  = 0.0
+                mcap = ((node.get("onchainMarketData") or {}).get("marketCap") or 0) or 0.0
+
+                # Apply symbol + market-cap filters
+                if REQUIRE_SYMBOL_CLEAN and not is_symbol_clean(sym):
+                    continue
+                if MIN_MARKET_CAP_USD > 0 and (not isinstance(mcap, (int, float)) or mcap < MIN_MARKET_CAP_USD):
+                    continue
+
+                bal = 0.0
                 try:
                     bal = float(raw) / (10 ** int(dec)) if raw is not None else 0.0
                 except Exception:
                     pass
                 if sym and bal > 0:
                     out_syms.add(sym)
+
 
             page = bt.get("pageInfo") or {}
             has_next = bool(page.get("hasNextPage"))
@@ -251,6 +279,18 @@ def run_wallet_monitor():
             for row in decision_data
             if (row.get("Decision") or "").strip().upper() == "YES"
         }
+
+        # Allowlist from Scout Decisions (Decision=YES)
+        allowlist = set(all_approved)
+        
+        # After gathering all_wallet_tokens, intersect with allowlist if you want only known tokens:
+        ONLY_ALLOWLIST = (os.getenv("WALLET_ALLOWLIST_ONLY", "0").lower() in {"1","true","yes"})
+        if ONLY_ALLOWLIST:
+            before = set(all_wallet_tokens)
+            all_wallet_tokens = all_wallet_tokens.intersection(allowlist)
+            dropped = before - all_wallet_tokens
+            if dropped:
+                print(f"ℹ️ Dropped {len(dropped)} non-allowlisted symbols.")
 
         all_wallet_tokens = set()
         for addr in (METAMASK_ADDRESS, BESTWALLET_ADDRESS):
