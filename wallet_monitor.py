@@ -1,89 +1,184 @@
-# wallet_monitor.py — Zapper (header auth) + Covalent fallback + Sheet alerts
+# wallet_monitor.py — Zapper GraphQL primary + Covalent/GoldRush fallback + Sheets/Telegram
 import os
 import time
 import requests
 from datetime import datetime
+from typing import List, Optional, Tuple, Set
 from utils import send_telegram_message, get_gspread_client
 
-# --- Env ---
-ZAPPER_API_KEY = os.getenv("ZAPPER_API_KEY")  # header: x-api-key
-COVALENT_API_KEY = os.getenv("COVALENT_API_KEY")  # optional fallback
+# ---------- Env ----------
+ZAPPER_API_KEY    = os.getenv("ZAPPER_API_KEY")  # header: x-zapper-api-key
+COVALENT_API_KEY  = os.getenv("COVALENT_API_KEY")  # optional fallback
 
-# Your wallet addresses
-METAMASK_ADDRESS = os.getenv("WALLET_METAMASK", "0x980032AAB743379a99C4Fd18A4538c8A5DCF47d6")
-BESTWALLET_ADDRESS = os.getenv("WALLET_BEST", "0x71197A977c905e54b159D8154a69c6948e3Fd880")
+METAMASK_ADDRESS  = os.getenv("WALLET_METAMASK", "0x980032AAB743379a99C4Fd18A4538c8A5DCF47d6")
+BESTWALLET_ADDRESS= os.getenv("WALLET_BEST", "0x71197A977c905e54b159D8154a69c6948e3Fd880")
 
-# Sheets
-SHEET_URL = os.getenv("SHEET_URL")
-CLAIM_TAB = os.getenv("CLAIM_TAB", "Claim_Tracker")
-SCOUT_TAB = os.getenv("SCOUT_TAB", "Scout Decisions")
+SHEET_URL         = os.getenv("SHEET_URL")
+CLAIM_TAB         = os.getenv("CLAIM_TAB", "Claim_Tracker")
+SCOUT_TAB         = os.getenv("SCOUT_TAB", "Scout Decisions")
 
-# Controls
-WALLET_MONITOR_ENABLED = (os.getenv("WALLET_MONITOR_ENABLED", "1").lower() in {"1", "true", "yes"})
-# Comma list of Covalent chains to check as fallback (lowest-cost single is 'eth-mainnet')
-WALLET_CHAINS = [c.strip() for c in (os.getenv("WALLET_CHAINS", "eth-mainnet").split(",")) if c.strip()]
+WALLET_MONITOR_ENABLED = (os.getenv("WALLET_MONITOR_ENABLED", "1").lower() in {"1","true","yes"})
+# Comma list of EVM chain IDs for Zapper GraphQL; if empty -> query all chains
+ZAPPER_CHAIN_IDS  = [int(x.strip()) for x in (os.getenv("ZAPPER_CHAIN_IDS","").split(",")) if x.strip().isdigit()]
+# Covalent chains for fallback (Covalent expects slugs like 'eth-mainnet', 'base-mainnet')
+WALLET_CHAINS     = [c.strip() for c in (os.getenv("WALLET_CHAINS","eth-mainnet").split(",")) if c.strip()]
 
-# ---------- Providers ----------
-def _fetch_zapper_tokens(address: str):
-    """Return a set of token symbols using Zapper (header-based API key)."""
+# ---------- Zapper GraphQL Primary ----------
+_ZAPPER_GQL_URL = "https://public.zapper.xyz/graphql"
+
+_GQL_WITH_CHAINS = """
+query TokenBalances($addresses: [Address!]!, $first: Int!, $after: String, $chainIds: [Int!]) {
+  portfolioV2(addresses: $addresses, chainIds: $chainIds) {
+    tokenBalances(first: $first, after: $after) {
+      totalCount
+      edges {
+        node {
+          name
+          symbol
+          decimals
+          balanceRaw
+          balanceUSD
+          tokenAddress
+          chainId
+        }
+        cursor
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+_GQL_ALL_CHAINS = """
+query TokenBalances($addresses: [Address!]!, $first: Int!, $after: String) {
+  portfolioV2(addresses: $addresses) {
+    tokenBalances(first: $first, after: $after) {
+      totalCount
+      edges {
+        node {
+          name
+          symbol
+          decimals
+          balanceRaw
+          balanceUSD
+          tokenAddress
+          chainId
+        }
+        cursor
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+def _zapper_graphql_fetch_symbols(address: str) -> Tuple[Set[str], Optional[str]]:
+    """
+    Query Zapper GraphQL for all token balances on one address.
+    Returns (symbols_set, error_or_None).
+    """
     if not ZAPPER_API_KEY:
-        return set(), "no-key"
+        return set(), "zapper:no-key"
 
-    url = f"https://api.zapper.xyz/v2/balances/tokens?addresses[]={address}"
-    headers = {"x-api-key": ZAPPER_API_KEY, "accept": "application/json"}
+    headers = {
+        "x-zapper-api-key": ZAPPER_API_KEY,
+        "content-type": "application/json",
+        "accept": "application/json",
+    }
+
+    query = _GQL_WITH_CHAINS if ZAPPER_CHAIN_IDS else _GQL_ALL_CHAINS
+    variables = {
+        "addresses": [address],
+        "first": 250,     # pagination size
+        "after": None,
+    }
+    if ZAPPER_CHAIN_IDS:
+        variables["chainIds"] = ZAPPER_CHAIN_IDS
+
+    out_syms: Set[str] = set()
+    seen_cursors = set()
+    loops = 0
+
     try:
-        r = requests.get(url, headers=headers, timeout=20)
-        if r.status_code != 200:
-            return set(), f"{r.status_code}:{r.text[:200]}"
-        data = r.json() or {}
-        acct = (data.get(address.lower()) or {})
-        syms = set()
-        for product in (acct.get("products") or []):
-            for asset in (product.get("assets") or []):
-                sym = (asset.get("symbol") or "").upper()
-                bal = float(asset.get("balance") or 0.0)
+        while True:
+            loops += 1
+            payload = {"query": query, "variables": variables}
+            r = requests.post(_ZAPPER_GQL_URL, headers=headers, json=payload, timeout=30)
+            if r.status_code != 200:
+                return out_syms, f"zapper:{r.status_code}:{r.text[:200]}"
+
+            j = r.json() or {}
+            data = (j.get("data") or {})
+            pf = data.get("portfolioV2") or {}
+            tb = pf.get("tokenBalances") or {}
+            edges = tb.get("edges") or []
+
+            for edge in edges:
+                node = edge.get("node") or {}
+                sym  = (node.get("symbol") or "").upper()
+                dec  = node.get("decimals") or 0
+                raw  = node.get("balanceRaw")  # string integer most likely
+                bal  = 0.0
+                try:
+                    bal = float(raw) / (10 ** int(dec)) if raw is not None else 0.0
+                except Exception:
+                    pass
                 if sym and bal > 0:
-                    syms.add(sym)
-        return syms, None
+                    out_syms.add(sym)
+
+            page = tb.get("pageInfo") or {}
+            has_next = bool(page.get("hasNextPage"))
+            end_cursor = page.get("endCursor")
+            if not has_next or not end_cursor or end_cursor in seen_cursors:
+                break
+            seen_cursors.add(end_cursor)
+            variables["after"] = end_cursor
+            if loops > 50:  # hard safety
+                break
+
+        return out_syms, None
+
     except Exception as e:
-        return set(), f"zapper-exc:{e}"
+        return out_syms, f"zapper:exc:{e}"
 
-def _fetch_covalent_tokens(address: str, chains: list[str]):
-    """Return a set of token symbols using Covalent/GoldRush balances_v2 across chains."""
-    key = os.getenv("COVALENT_API_KEY")
+# ---------- Covalent/GoldRush Fallback ----------
+def _fetch_covalent_tokens(address: str, chains: List[str]) -> Tuple[Set[str], Optional[str]]:
+    """
+    Try both Covalent legacy (?key=) and GoldRush Bearer header for balances_v2.
+    """
+    key = COVALENT_API_KEY
     if not key or not chains:
-        return set(), "no-fallback"
+        return set(), "covalent:no-key-or-chains"
 
-    out = set()
-    err_agg = []
+    syms: Set[str] = set()
+    errs = []
 
     for chain in chains:
         ok = False
+        j = None
 
-        # 1) Try legacy Covalent style (?key=...)
+        # 1) Legacy query-param style
         try:
             url_qs = f"https://api.covalenthq.com/v1/{chain}/address/{address}/balances_v2/?key={key}"
             r = requests.get(url_qs, timeout=20)
             if r.status_code == 200:
-                ok = True
-                j = r.json() or {}
+                ok, j = True, (r.json() or {})
             else:
-                err_agg.append(f"{chain}:qs:{r.status_code}")
+                errs.append(f"{chain}:qs:{r.status_code}")
         except Exception as e:
-            err_agg.append(f"{chain}:qs_exc:{e}")
+            errs.append(f"{chain}:qs_exc:{e}")
 
-        # 2) If not OK, try GoldRush style with Bearer header (same path)
+        # 2) Bearer header style
         if not ok:
             try:
                 url_hdr = f"https://api.covalenthq.com/v1/{chain}/address/{address}/balances_v2/"
                 r = requests.get(url_hdr, timeout=20, headers={"Authorization": f"Bearer {key}"})
                 if r.status_code == 200:
-                    ok = True
-                    j = r.json() or {}
+                    ok, j = True, (r.json() or {})
                 else:
-                    err_agg.append(f"{chain}:bearer:{r.status_code}")
+                    errs.append(f"{chain}:bearer:{r.status_code}")
             except Exception as e:
-                err_agg.append(f"{chain}:bearer_exc:{e}")
+                errs.append(f"{chain}:bearer_exc:{e}")
 
         if not ok:
             continue
@@ -99,28 +194,29 @@ def _fetch_covalent_tokens(address: str, chains: list[str]):
             except Exception:
                 pass
             if sym and bal > 0:
-                out.add(sym)
+                syms.add(sym)
 
-    return out, (";".join(err_agg) if err_agg else None)
+    return syms, (";".join(errs) if errs else None)
 
-def fetch_wallet_tokens(address: str):
+# ---------- Unified wallet fetch ----------
+def fetch_wallet_tokens(address: str) -> List[str]:
     """
-    Try Zapper first (header auth). If forbidden/empty, fall back to Covalent on configured chains.
-    Returns a deduped sorted list of symbols.
+    Primary: Zapper GraphQL (header auth).
+    Fallback: Covalent/GoldRush (if key present).
+    Returns a sorted, de-duplicated list of token symbols with non-zero balances.
     """
-    # 1) Zapper
-    z_syms, z_err = _fetch_zapper_tokens(address)
+    # 1) Zapper GQL
+    z_syms, z_err = _zapper_graphql_fetch_symbols(address)
     if z_syms:
         return sorted(z_syms)
 
-    # 2) Covalent fallback
+    # 2) Covalent fallback (optional)
     c_syms, c_err = _fetch_covalent_tokens(address, WALLET_CHAINS)
     if c_syms:
-        print(f"ℹ️ Zapper failed ({z_err}); used Covalent fallback for {address[:6]}…{address[-4:]}")
+        print(f"ℹ️ Zapper failed ({z_err}); used Covalent/GoldRush fallback for {address[:6]}…{address[-4:]}")
         return sorted(c_syms)
 
     # 3) Nothing worked
-    # Be explicit in logs one time
     print(f"⚠️ Wallet fetch 403/empty for {address[:6]}…{address[-4:]}. "
           f"Zapper={z_err} Covalent={c_err}. Check API keys / allow-list.")
     return []
@@ -185,11 +281,11 @@ def run_wallet_monitor():
             send_telegram_message(msg)
             print(f"🔔 Alert sent for token: {token}")
 
-            # Auto-mark 'Status' to Resolved if present
+            # Auto-mark 'Status' to Resolved if present (Status expected in column I)
             for i, row in enumerate(claim_data, start=2):  # row 2 = first data row
                 if (row.get('Token') or '').strip().upper() == token:
                     try:
-                        claim_ws.update_acell(f"I{i}", "Resolved")  # assumes Status col is I
+                        claim_ws.update_acell(f"I{i}", "Resolved")
                         print(f"✅ Status for {token} set to Resolved")
                     except Exception as e:
                         print(f"⚠️ Could not update sheet status for {token}: {e}")
