@@ -40,7 +40,6 @@ query TokenBalances($addresses: [Address!]!, $first: Int!, $after: String, $chai
             balanceRaw
             balanceUSD
             tokenAddress
-            chainId
           }
           cursor
         }
@@ -65,7 +64,6 @@ query TokenBalances($addresses: [Address!]!, $first: Int!, $after: String) {
             balanceRaw
             balanceUSD
             tokenAddress
-            chainId
           }
           cursor
         }
