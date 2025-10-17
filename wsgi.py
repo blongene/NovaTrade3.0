@@ -96,6 +96,9 @@ app.register_blueprint(telemetry_bp)
 from telemetry_read import bp as telemetry_read_bp
 app.register_blueprint(telemetry_read_bp)
 
+from receipt_bus import bp as receipts_api
+app.register_blueprint(receipts_api)
+
 # --- TEMP DEBUG (safe read-only, idempotent) ---------------------------------
 from flask import request, jsonify
 import os, sqlite3
