@@ -1,9 +1,10 @@
-# wsgi.py — web entrypoint (binds immediately, starts Nova boot once)
-import os, threading
-from flask import Flask, jsonify
+# wsgi.py — NovaTrade Bus web entrypoint (safe, idempotent blueprint registration)
+from __future__ import annotations
+import os, threading, sqlite3
+from flask import Flask, jsonify, request
 
 # -----------------------------
-# Base app: try Telegram app; else create a bare Flask app
+# Base app: try Telegram app; else bare Flask
 # -----------------------------
 telegram_init_err = None
 app = None
@@ -21,11 +22,11 @@ except Exception as err:
     app = Flask(__name__)
     print(f"[WEB] {telegram_init_err}; using bare Flask app")
 
-if app is None:  # absolute fallback safety
+if app is None:
     app = Flask(__name__)
 
 # -----------------------------
-# Health (ALWAYS 200; never depends on undefined names)
+# Health (ALWAYS 200)
 # -----------------------------
 def _read_version():
     for p in ("/data/VERSION", "./VERSION"):
@@ -45,15 +46,16 @@ def health():
             ok=True,
             version=_read_version(),
             db=os.environ.get("OUTBOX_DB_PATH"),
-            webhook=({"status": "ok"} if telegram_init_err is None else {"status": "degraded", "reason": telegram_init_err})
+            webhook=({"status": "ok"} if telegram_init_err is None
+                     else {"status": "degraded", "reason": telegram_init_err})
         ), 200
     except Exception as err:
         # Never 500 on health
         return jsonify(ok=True, fallback=True, reason=str(err)), 200
-        
+
+# Small admin helper to clear obviously bad pending rows
 @app.post("/ops/admin/clear_bad_pending")
 def _clear_bad_pending():
-    import sqlite3
     from outbox_db import DB_PATH
     con = sqlite3.connect(DB_PATH)
     cur = con.execute(
@@ -64,60 +66,82 @@ def _clear_bad_pending():
     return jsonify(deleted=n), 200
 
 # -----------------------------
-# Blueprints: Command Bus + Ops (best-effort)
+# Blueprint registration helpers (idempotent)
 # -----------------------------
-try:
-    from api_commands import bp as cmdapi_bp  # /api/commands/pull, /api/commands/ack
-    app.register_blueprint(cmdapi_bp)
-    print("[WEB] Command Bus API registered.")
-except Exception as err:
-    print(f"[WEB] Command Bus API not available: {err}")
+def _register_bp_once(bp, label: str = ""):
+    """
+    Register a Flask Blueprint only if its name is not already in app.blueprints.
+    """
+    try:
+        name = getattr(bp, "name", None) or ""
+        if name and name in app.blueprints:
+            print(f"[WEB] {label or name} already registered: skipped.")
+            return
+        app.register_blueprint(bp)
+        print(f"[WEB] {label or name} registered.")
+    except Exception as err:
+        print(f"[WEB] {label or 'blueprint'} not available: {err}")
 
-# Optional ops helpers if present
-for mod_name, attr_name, what in [
-    ("ops_enqueue", "bp", "Ops enqueue"),
-    ("ops_venue",   "bp", "Ops venue checker"),
-]:
+def _import_and_register(mod_name: str, attr_name: str = "bp", label: str = ""):
     try:
         mod = __import__(mod_name, fromlist=[attr_name])
         bp = getattr(mod, attr_name)
-        app.register_blueprint(bp)
-        print(f"[WEB] {what} registered.")
+        _register_bp_once(bp, label or mod_name)
     except Exception as err:
-        print(f"[WEB] {what} not available: {err}")
-        
-from receipts_api import bp as receipts_api_bp
-app.register_blueprint(receipts_api_bp)
+        print(f"[WEB] {label or mod_name} not available: {err}")
 
-from telemetry_api import bp as telemetry_bp
-app.register_blueprint(telemetry_bp)
+# -----------------------------
+# Command Bus + Ops + helpers
+# -----------------------------
+try:
+    from api_commands import bp as cmdapi_bp  # /api/commands/pull, /api/commands/ack
+    _register_bp_once(cmdapi_bp, "Command Bus API")
+except Exception as err:
+    print(f"[WEB] Command Bus API not available: {err}")
 
-from telemetry_read import bp as telemetry_read_bp
-app.register_blueprint(telemetry_read_bp)
+# Optional ops helpers (if present)
+for mod_name, label in [
+    ("ops_enqueue", "Ops enqueue"),
+    ("ops_venue",   "Ops venue checker"),
+]:
+    _import_and_register(mod_name, "bp", label)
 
-from receipt_bus import bp as receipts_api
-app.register_blueprint(receipts_api)
+# -----------------------------
+# Receipts / Telemetry endpoints
+# Prefer the NEW receipt_bus over legacy receipts_api if both exist.
+# -----------------------------
+# New Receipts API (with provenance → Sheets)
+try:
+    from receipt_bus import bp as receipt_bus_bp
+    _register_bp_once(receipt_bus_bp, "Receipts API (bus)")
+    RECEIPTS_REGISTERED = True
+except Exception as _e:
+    print(f"[WEB] Receipts API (bus) not available: {_e}")
+    RECEIPTS_REGISTERED = False
 
-from daily_scheduler import run_daily
+# Legacy receipts_api (only register if new one isn't present or uses a different name)
+try:
+    from receipts_api import bp as receipts_api_bp
+    # Register only if not already taken by the new one
+    if not RECEIPTS_REGISTERED or getattr(receipts_api_bp, "name", "") not in app.blueprints:
+        _register_bp_once(receipts_api_bp, "Receipts API (legacy)")
+    else:
+        print("[WEB] Receipts API (legacy) skipped: name already registered.")
+except Exception as _e:
+    print(f"[WEB] Receipts API (legacy) not available: {_e}")
 
-def _send_daily_health():
-    # Import inside the function to avoid circular imports at startup
-    import health_summary
-    try:
-        health_summary.main()
-        print("[bus] daily health summary sent")
-    except Exception as e:
-        print("[bus] daily health summary error:", e)
+# Telemetry write API (heartbeats/push from Edge)
+_import_and_register("telemetry_api", "bp", "Telemetry write API")
 
-run_daily(_send_daily_health)
+# Telemetry read-only view (browser quick check), optional
+_import_and_register("telemetry_read", "bp", "Telemetry read API")
 
-# --- TEMP DEBUG (safe read-only, idempotent) ---------------------------------
-from flask import request, jsonify
-import os, sqlite3
+# -----------------------------
+# Debug routes (safe, read-only)
+# -----------------------------
 from outbox_db import DB_PATH
 
 def _add_debug_route(rule, endpoint, view_func):
-    # only register if endpoint not present
     if endpoint not in app.view_functions:
         app.add_url_rule(rule, endpoint=endpoint, view_func=view_func, methods=["GET"])
 
@@ -165,12 +189,27 @@ _add_debug_route("/ops/debug/dbinfo",   "debug_dbinfo",   _dbg_dbinfo)
 _add_debug_route("/ops/debug/cmds",     "debug_cmds",     _dbg_cmds)
 _add_debug_route("/ops/debug/receipts", "debug_receipts", _dbg_receipts)
 
+# -----------------------------
+# Daily scheduler (no-cost, in-process)
+# -----------------------------
+try:
+    from daily_scheduler import run_daily
+    def _send_daily_health():
+        import health_summary
+        try:
+            health_summary.main()
+            print("[bus] daily health summary sent")
+        except Exception as e:
+            print("[bus] daily health summary error:", e)
+
+    run_daily(_send_daily_health)
+except Exception as err:
+    print(f"[WEB] daily scheduler not available: {err}")
 
 # -----------------------------
-# Start NovaTrade boot sequence once (scheduler, loops, etc.)
+# Boot sequence (background)
 # -----------------------------
 _BOOT_STARTED = False
-
 def _start_boot_once():
     global _BOOT_STARTED
     if _BOOT_STARTED:
