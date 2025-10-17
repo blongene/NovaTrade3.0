@@ -1,264 +1,182 @@
-# wallet_monitor.py  — resilient wallet watcher with Zapper + Covalent fallback
+# wallet_monitor.py — Zapper (header auth) + Covalent fallback + Sheet alerts
 import os
 import time
 import requests
 from datetime import datetime
-from typing import Dict, List, Set
-
 from utils import send_telegram_message, get_gspread_client
 
-# ========= ENV =========
-SHEET_URL         = os.getenv("SHEET_URL", "")
-METAMASK_ADDRESS  = os.getenv("WALLET_ADDR_METAMASK", "0x980032AAB743379a99C4Fd18A4538c8A5DCF47d6")
-BESTWALLET_ADDRESS= os.getenv("WALLET_ADDR_BEST",     "0x71197A977c905e54b159D8154a69c6948e3Fd880")
+# --- Env ---
+ZAPPER_API_KEY = os.getenv("ZAPPER_API_KEY")  # header: x-api-key
+COVALENT_API_KEY = os.getenv("COVALENT_API_KEY")  # optional fallback
 
-# Provider 1 (primary)
-ZAPPER_API_KEY    = os.getenv("ZAPPER_API_KEY", "").strip()
-ZAPPER_BASE       = os.getenv("ZAPPER_BASE_URL", "https://api.zapper.xyz").rstrip("/")
+# Your wallet addresses
+METAMASK_ADDRESS = os.getenv("WALLET_METAMASK", "0x980032AAB743379a99C4Fd18A4538c8A5DCF47d6")
+BESTWALLET_ADDRESS = os.getenv("WALLET_BEST", "0x71197A977c905e54b159D8154a69c6948e3Fd880")
 
-# Provider 2 (fallback)
-COVALENT_API_KEY  = os.getenv("COVALENT_API_KEY", "").strip()
-COVALENT_BASE     = os.getenv("COVALENT_BASE_URL", "https://api.covalenthq.com").rstrip("/")
-COVALENT_CHAIN_ID = int(os.getenv("COVALENT_CHAIN_ID", "1"))  # 1 = Ethereum mainnet
+# Sheets
+SHEET_URL = os.getenv("SHEET_URL")
+CLAIM_TAB = os.getenv("CLAIM_TAB", "Claim_Tracker")
+SCOUT_TAB = os.getenv("SCOUT_TAB", "Scout Decisions")
 
-HTTP_TIMEOUT_S    = float(os.getenv("WALLET_HTTP_TIMEOUT", "15"))
-HTTP_RETRIES      = int(os.getenv("WALLET_HTTP_RETRIES", "2"))
-BACKOFF_S         = float(os.getenv("WALLET_BACKOFF_S", "0.6"))
+# Controls
+WALLET_MONITOR_ENABLED = (os.getenv("WALLET_MONITOR_ENABLED", "1").lower() in {"1", "true", "yes"})
+# Comma list of Covalent chains to check as fallback (lowest-cost single is 'eth-mainnet')
+WALLET_CHAINS = [c.strip() for c in (os.getenv("WALLET_CHAINS", "eth-mainnet").split(",")) if c.strip()]
 
-ADDRESSES: List[str] = [METAMASK_ADDRESS, BESTWALLET_ADDRESS]
-
-# ========= HTTP helpers =========
-def _get(url: str, *, headers: Dict[str, str] | None = None, params: Dict | None = None):
-    last_exc = None
-    for i in range(HTTP_RETRIES + 1):
-        try:
-            r = requests.get(url, headers=headers or {}, params=params or {}, timeout=HTTP_TIMEOUT_S)
-            # Stop retrying on client errors except 429
-            if r.status_code in (401, 403, 400):
-                return r
-            if r.status_code == 429:
-                time.sleep(BACKOFF_S * (i + 1))
-                continue
-            if r.status_code >= 500:
-                time.sleep(BACKOFF_S * (i + 1))
-                last_exc = f"HTTP {r.status_code}"
-                continue
-            return r
-        except Exception as e:
-            last_exc = e
-            time.sleep(BACKOFF_S * (i + 1))
-    raise RuntimeError(f"wallet HTTP error: {last_exc}")
-
-# ========= Providers =========
-def fetch_wallet_tokens_zapper(address: str) -> Set[str]:
-    """
-    Uses Zapper v2 balances/tokens.
-    Auth: x-api-key header (preferred). Query param works for some plans but often 403s.
-    """
+# ---------- Providers ----------
+def _fetch_zapper_tokens(address: str):
+    """Return a set of token symbols using Zapper (header-based API key)."""
     if not ZAPPER_API_KEY:
-        return set()
-    url = f"{ZAPPER_BASE}/v2/balances/tokens"
-    headers = {"x-api-key": ZAPPER_API_KEY}
-    params = {"addresses[]": address}
-    try:
-        r = _get(url, headers=headers, params=params)
-        if r.status_code != 200:
-            print(f"⚠️ Zapper {address}: {r.status_code} - {r.text[:240]}")
-            return set()
-        j = r.json()
-        toks: Set[str] = set()
-        # Zapper returns keyed by lowercase address
-        acct = j.get(address.lower()) or {}
-        for product in acct.get("products", []):
-            for asset in product.get("assets", []):
-                sym = (asset.get("symbol") or "").upper().strip()
-                bal = float(asset.get("balance") or 0)
-                if sym and bal > 0:
-                    toks.add(sym)
-        return toks
-    except Exception as e:
-        print(f"❌ Zapper error for {address}: {e}")
-        return set()
+        return set(), "no-key"
 
-def fetch_wallet_tokens_covalent(address: str) -> Set[str]:
-    """
-    Covalent balances_v2 as a fallback.
-    """
-    if not COVALENT_API_KEY:
-        return set()
-    url = f"{COVALENT_BASE}/v1/{COVALENT_CHAIN_ID}/address/{address}/balances_v2/"
+    url = f"https://api.zapper.xyz/v2/balances/tokens?addresses[]={address}"
+    headers = {"x-api-key": ZAPPER_API_KEY, "accept": "application/json"}
     try:
-        r = _get(url, params={"key": COVALENT_API_KEY, "nft": False})
+        r = requests.get(url, headers=headers, timeout=20)
         if r.status_code != 200:
-            print(f"⚠️ Covalent {address}: {r.status_code} - {r.text[:240]}")
-            return set()
-        j = r.json()
-        items = (j.get("data") or {}).get("items") or []
-        toks: Set[str] = set()
-        for it in items:
-            if (it.get("type") or "").lower() != "cryptocurrency":
-                continue
-            sym = (it.get("contract_ticker_symbol") or "").upper().strip()
-            bal_raw = it.get("balance")
-            dec = int(it.get("contract_decimals") or 18)
-            try:
-                bal = float(bal_raw) / (10 ** dec)
-            except Exception:
-                bal = 0.0
-            if sym and bal > 0:
-                toks.add(sym)
-        return toks
+            return set(), f"{r.status_code}:{r.text[:200]}"
+        data = r.json() or {}
+        acct = (data.get(address.lower()) or {})
+        syms = set()
+        for product in (acct.get("products") or []):
+            for asset in (product.get("assets") or []):
+                sym = (asset.get("symbol") or "").upper()
+                bal = float(asset.get("balance") or 0.0)
+                if sym and bal > 0:
+                    syms.add(sym)
+        return syms, None
     except Exception as e:
-        print(f"❌ Covalent error for {address}: {e}")
-        return set()
+        return set(), f"zapper-exc:{e}"
+
+def _fetch_covalent_tokens(address: str, chains: list[str]):
+    """Return a set of token symbols using Covalent (balances_v2) across the given chains."""
+    if not COVALENT_API_KEY or not chains:
+        return set(), "no-fallback"
+
+    out = set()
+    err_agg = []
+    for chain in chains:
+        try:
+            # Example: https://api.covalenthq.com/v1/eth-mainnet/address/<addr>/balances_v2/?key=...
+            url = f"https://api.covalenthq.com/v1/{chain}/address/{address}/balances_v2/?key={COVALENT_API_KEY}"
+            r = requests.get(url, timeout=20)
+            if r.status_code != 200:
+                err_agg.append(f"{chain}:{r.status_code}")
+                continue
+            j = r.json() or {}
+            items = ((j.get("data") or {}).get("items") or [])
+            for it in items:
+                sym = (it.get("contract_ticker_symbol") or "").upper()
+                # Convert raw integer balance using decimals (if present)
+                raw = it.get("balance")
+                dec = it.get("contract_decimals") or 0
+                bal = 0.0
+                try:
+                    bal = float(raw) / (10 ** int(dec)) if raw is not None else 0.0
+                except Exception:
+                    pass
+                if sym and bal > 0:
+                    out.add(sym)
+        except Exception as e:
+            err_agg.append(f"{chain}:exc:{e}")
+    return out, (";".join(err_agg) if err_agg else None)
 
 def fetch_wallet_tokens(address: str):
-    tokens = []
+    """
+    Try Zapper first (header auth). If forbidden/empty, fall back to Covalent on configured chains.
+    Returns a deduped sorted list of symbols.
+    """
+    # 1) Zapper
+    z_syms, z_err = _fetch_zapper_tokens(address)
+    if z_syms:
+        return sorted(z_syms)
 
-    # 1) Try Zapper with header-based key
-    if ZAPPER_API_KEY:
-        try:
-            z_url = f"https://api.zapper.xyz/v2/balances/tokens?addresses[]={address}"
-            z_headers = {"x-api-key": ZAPPER_API_KEY, "accept": "application/json"}
-            r = requests.get(z_url, headers=z_headers, timeout=20)
-            if r.status_code == 200:
-                data = r.json() or {}
-                acct = data.get(address.lower(), {}) or {}
-                for product in acct.get("products", []) or []:
-                    for asset in product.get("assets", []) or []:
-                        sym = (asset.get("symbol") or "").upper()
-                        bal = float(asset.get("balance") or 0)
-                        if sym and bal > 0:
-                            tokens.append(sym)
-                # dedupe and return if we found anything
-                if tokens:
-                    return sorted(set(tokens))
-            else:
-                print(f"⚠️ Zapper fetch failed: {r.status_code} - {r.text[:200]}")
-        except Exception as e:
-            print(f"❌ Zapper error: {e}")
+    # 2) Covalent fallback
+    c_syms, c_err = _fetch_covalent_tokens(address, WALLET_CHAINS)
+    if c_syms:
+        print(f"ℹ️ Zapper failed ({z_err}); used Covalent fallback for {address[:6]}…{address[-4:]}")
+        return sorted(c_syms)
 
-    # 2) Fallback: Covalent (optional)
-    COV_KEY = os.getenv("COVALENT_API_KEY")
-    if COV_KEY:
-        try:
-            # eth-mainnet; adjust chain if you want multi-chain later
-            c_url = f"https://api.covalenthq.com/v1/eth-mainnet/address/{address}/balances_v2/?key={COV_KEY}"
-            r = requests.get(c_url, timeout=20)
-            if r.status_code == 200:
-                data = r.json() or {}
-                items = ((data.get("data") or {}).get("items") or [])
-                for it in items:
-                    sym = (it.get("contract_ticker_symbol") or "").upper()
-                    bal = float(it.get("balance") or 0)
-                    # Covalent returns raw integer balance; use formatted if provided
-                    display = it.get("pretty_quote") or it.get("quote")
-                    # be conservative: require non-zero balance
-                    if sym and (bal > 0):
-                        tokens.append(sym)
-                if tokens:
-                    return sorted(set(tokens))
-            else:
-                print(f"⚠️ Covalent fetch failed: {r.status_code} - {r.text[:200]}")
-        except Exception as e:
-            print(f"❌ Covalent error: {e}")
-
-    # Nothing worked
+    # 3) Nothing worked
+    # Be explicit in logs one time
+    print(f"⚠️ Wallet fetch 403/empty for {address[:6]}…{address[-4:]}. "
+          f"Zapper={z_err} Covalent={c_err}. Check API keys / allow-list.")
     return []
-# ========= Sheet logic =========
+
+# ---------- Monitor ----------
 def run_wallet_monitor():
+    if not WALLET_MONITOR_ENABLED:
+        print("🔕 Wallet Monitor disabled (WALLET_MONITOR_ENABLED=0).")
+        return
+
     print("🔍 Running Wallet Monitor...")
     try:
         client = get_gspread_client()
         sheet = client.open_by_url(SHEET_URL)
-        claim_ws = sheet.worksheet("Claim_Tracker")
-        decisions_ws = sheet.worksheet("Scout Decisions")
+        claim_ws = sheet.worksheet(CLAIM_TAB)
+        decisions_ws = sheet.worksheet(SCOUT_TAB)
 
-        claim_rows = claim_ws.get_all_records()
-        decision_rows = decisions_ws.get_all_records()
+        claim_data = claim_ws.get_all_records()
+        decision_data = decisions_ws.get_all_records()
 
         claimed_tokens = {
             (row.get("Token") or "").strip().upper()
-            for row in claim_rows
+            for row in claim_data
             if (row.get("Claimed?", "") or "").strip().lower() == "claimed"
         }
+
         pending_claims = {
             (row.get("Token") or "").strip().upper()
-            for row in claim_rows
+            for row in claim_data
             if (row.get("Claimed?", "") or "").strip().lower() != "claimed"
         }
-        approved_tokens = {
+
+        all_approved = {
             (row.get("Token") or "").strip().upper()
-            for row in decision_rows
+            for row in decision_data
             if (row.get("Decision") or "").strip().upper() == "YES"
         }
 
-        # Fetch wallet tokens across all configured addresses
-        wallet_tokens: Set[str] = set()
-        for addr in ADDRESSES:
-            if not addr:
-                continue
+        all_wallet_tokens = set()
+        for addr in (METAMASK_ADDRESS, BESTWALLET_ADDRESS):
             toks = fetch_wallet_tokens(addr)
-            if not toks and ZAPPER_API_KEY:
-                # If Zapper responded with 403, nudge in Telegram once
-                send_telegram_message(f"⚠️ Wallet fetch 403/empty for {addr[:6]}…{addr[-4:]}. "
-                                      "Check ZAPPER_API_KEY or provider allow-list. Falling back where possible.")
-            wallet_tokens |= toks
+            all_wallet_tokens.update(toks)
 
-        print(f"🧾 Wallet Tokens: {wallet_tokens}")
+        print(f"🧾 Wallet Tokens: {all_wallet_tokens}")
         print(f"📋 Pending Claim Tokens: {pending_claims}")
 
-        # Tokens that arrived and are approved but not marked claimed
-        unknown_arrivals = sorted([
-            t for t in wallet_tokens
-            if t in approved_tokens and t not in claimed_tokens
-        ])
+        if not all_wallet_tokens:
+            print("⚠️ Wallet providers returned no tokens; check ZAPPER_API_KEY and/or COVALENT_API_KEY (or allow-list).")
 
-        if not unknown_arrivals:
-            print("✅ Wallet monitor complete (no new arrivals).")
-            return
+        # Alert for arrivals: approved & not yet marked as claimed
+        unknown_arrivals = [
+            t for t in all_wallet_tokens
+            if t in all_approved and t not in claimed_tokens
+        ]
 
-        # Notify + mark “Resolved” in Status (column I) for rows we alert on
-        send_telegram_message(
-            "🪙 Detected new wallet tokens not marked as claimed:\n"
-            + "\n".join(f"• {t}" for t in unknown_arrivals)
-        )
+        for token in unknown_arrivals:
+            msg = (
+                f"⚠️ *{token}* has arrived in your wallet,\n"
+                f"but is *not marked as claimed* in the sheet.\n\n"
+                f"Would you like to mark it as claimed?"
+            )
+            send_telegram_message(msg)
+            print(f"🔔 Alert sent for token: {token}")
 
-        # Batch update to reduce quota: build cell updates for Status col (I)
-        # Find row indices once
-        token_to_rowidx: Dict[str, int] = {}
-        for i, row in enumerate(claim_rows, start=2):  # row 2 = first data row
-            tok = (row.get("Token") or "").strip().upper()
-            if tok and tok not in token_to_rowidx:
-                token_to_rowidx[tok] = i
-
-        updates = []
-        for tok in unknown_arrivals:
-            ri = token_to_rowidx.get(tok)
-            if ri:
-                updates.append((ri, "I"))  # Status column
-
-        if updates:
-            # gspread batch update A1 notation
-            body = {"valueInputOption": "USER_ENTERED", "data": [
-                {"range": f"I{ri}:I{ri}", "values": [["Resolved"]]} for (ri, _) in updates
-            ]}
-            # Raw HTTP via client (gspread batch_update)
-            sheet.batch_update(body)
-            for (ri, _) in updates:
-                print(f"✅ Status for row {ri} set to Resolved")
+            # Auto-mark 'Status' to Resolved if present
+            for i, row in enumerate(claim_data, start=2):  # row 2 = first data row
+                if (row.get('Token') or '').strip().upper() == token:
+                    try:
+                        claim_ws.update_acell(f"I{i}", "Resolved")  # assumes Status col is I
+                        print(f"✅ Status for {token} set to Resolved")
+                    except Exception as e:
+                        print(f"⚠️ Could not update sheet status for {token}: {e}")
 
         print("✅ Wallet monitor complete.")
 
-    if not all_wallet_tokens:
-        print("⚠️ Wallet providers returned no tokens; check API keys / allow-list.")
-    
     except Exception as e:
         print(f"❌ Error in run_wallet_monitor: {e}")
-        try:
-            send_telegram_message(f"❌ Wallet monitor error: {e}")
-        except Exception:
-            pass
 
+# For ad-hoc local test:
 if __name__ == "__main__":
     run_wallet_monitor()
