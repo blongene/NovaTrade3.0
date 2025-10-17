@@ -112,19 +112,59 @@ def fetch_wallet_tokens_covalent(address: str) -> Set[str]:
         print(f"❌ Covalent error for {address}: {e}")
         return set()
 
-def fetch_wallet_tokens(address: str) -> Set[str]:
-    """
-    Primary = Zapper (header auth). If that yields empty AND we have Covalent,
-    try Covalent as a fallback.
-    """
-    toks = fetch_wallet_tokens_zapper(address)
-    if not toks and COVALENT_API_KEY:
-        fb = fetch_wallet_tokens_covalent(address)
-        if fb:
-            print(f"ℹ️ Using Covalent fallback for {address} ({len(fb)} tokens).")
-        toks |= fb
-    return toks
+def fetch_wallet_tokens(address: str):
+    tokens = []
 
+    # 1) Try Zapper with header-based key
+    if ZAPPER_API_KEY:
+        try:
+            z_url = f"https://api.zapper.xyz/v2/balances/tokens?addresses[]={address}"
+            z_headers = {"x-api-key": ZAPPER_API_KEY, "accept": "application/json"}
+            r = requests.get(z_url, headers=z_headers, timeout=20)
+            if r.status_code == 200:
+                data = r.json() or {}
+                acct = data.get(address.lower(), {}) or {}
+                for product in acct.get("products", []) or []:
+                    for asset in product.get("assets", []) or []:
+                        sym = (asset.get("symbol") or "").upper()
+                        bal = float(asset.get("balance") or 0)
+                        if sym and bal > 0:
+                            tokens.append(sym)
+                # dedupe and return if we found anything
+                if tokens:
+                    return sorted(set(tokens))
+            else:
+                print(f"⚠️ Zapper fetch failed: {r.status_code} - {r.text[:200]}")
+        except Exception as e:
+            print(f"❌ Zapper error: {e}")
+
+    # 2) Fallback: Covalent (optional)
+    COV_KEY = os.getenv("COVALENT_API_KEY")
+    if COV_KEY:
+        try:
+            # eth-mainnet; adjust chain if you want multi-chain later
+            c_url = f"https://api.covalenthq.com/v1/eth-mainnet/address/{address}/balances_v2/?key={COV_KEY}"
+            r = requests.get(c_url, timeout=20)
+            if r.status_code == 200:
+                data = r.json() or {}
+                items = ((data.get("data") or {}).get("items") or [])
+                for it in items:
+                    sym = (it.get("contract_ticker_symbol") or "").upper()
+                    bal = float(it.get("balance") or 0)
+                    # Covalent returns raw integer balance; use formatted if provided
+                    display = it.get("pretty_quote") or it.get("quote")
+                    # be conservative: require non-zero balance
+                    if sym and (bal > 0):
+                        tokens.append(sym)
+                if tokens:
+                    return sorted(set(tokens))
+            else:
+                print(f"⚠️ Covalent fetch failed: {r.status_code} - {r.text[:200]}")
+        except Exception as e:
+            print(f"❌ Covalent error: {e}")
+
+    # Nothing worked
+    return []
 # ========= Sheet logic =========
 def run_wallet_monitor():
     print("🔍 Running Wallet Monitor...")
@@ -210,6 +250,9 @@ def run_wallet_monitor():
 
         print("✅ Wallet monitor complete.")
 
+    if not all_wallet_tokens:
+        print("⚠️ Wallet providers returned no tokens; check API keys / allow-list.")
+    
     except Exception as e:
         print(f"❌ Error in run_wallet_monitor: {e}")
         try:
