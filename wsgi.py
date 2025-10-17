@@ -2,6 +2,7 @@
 import os, threading
 from flask import Flask, jsonify
 
+
 # -----------------------------
 # Base app: try Telegram app; else create a bare Flask app
 # -----------------------------
@@ -91,6 +92,9 @@ app.register_blueprint(receipts_api_bp)
 
 from telemetry_api import bp as telemetry_bp
 app.register_blueprint(telemetry_bp)
+
+from telemetry_read import bp as telemetry_read_bp
+app.register_blueprint(telemetry_read_bp)
 
 # --- TEMP DEBUG (safe read-only, idempotent) ---------------------------------
 from flask import request, jsonify
