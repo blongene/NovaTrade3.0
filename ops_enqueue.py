@@ -11,6 +11,7 @@ bp = Blueprint("ops", __name__, url_prefix="/ops")
 REQUIRE_HMAC = os.getenv("REQUIRE_HMAC_OPS", "1").strip().lower() in {"1","true","yes"}
 ALLOW = {a.strip() for a in (os.getenv("OUTBOX_AGENT_ALLOW") or "").split(",") if a.strip()}
 PAIR_GUARD_MODE = (os.getenv("PAIR_GUARD_MODE") or "rewrite").strip().lower()  # rewrite|warn|off
+OUTBOX_SECRET_FILE=/etc/secrets/outbox_secret
 
 def _err(status: int, msg: str, extra: Dict[str, Any] | None = None):
     body = {"ok": False, "error": msg}
