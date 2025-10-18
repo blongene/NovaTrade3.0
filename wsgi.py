@@ -109,8 +109,6 @@ for mod_name, label in [
 from vault_intelligence import run_vault_intelligence
 from rebuy_driver import run_rebuy_driver
 from daily_summary import daily_phase5_summary
-from ops_api import OPS
-app.register_blueprint(OPS)
 
 import schedule, threading, time, os
 
