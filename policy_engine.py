@@ -167,3 +167,46 @@ class PolicyEngine:
 
         _append_policy_log(self.sh, [datetime.utcnow().isoformat(), token, action, patched.get("amount_usd", amt), "TRUE", "ok", json.dumps(patched), venue, patched.get("quote", quote), asset_state.get("liquidity_usd",""), self.cooldown_min])
         return True, "ok", patched
+
+# policy_utils.py (new) OR inside policy_engine.py
+import os, time
+from datetime import datetime
+from utils import get_ws_cached, with_sheet_backoff
+
+POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
+
+HEADERS = ["Timestamp","Token","Action","Amount_USD","OK","Reason","Patched","Venue","Quote","Liquidity","Cooldown_Min"]
+
+@with_sheet_backoff
+def _ensure_header(ws):
+    vals = ws.get_all_values()
+    if not vals or (vals and vals[0] != HEADERS):
+        ws.clear()
+        ws.append_row(HEADERS)
+
+def write_policy_log(decision: dict):
+    """
+    decision is expected to look like:
+      {
+        "ts": 1699999999, "token":"BTC", "action":"BUY", "amount_usd":5.0,
+        "ok": True, "reason":"", "patched": "", "venue":"BINANCEUS",
+        "quote":"USDT", "liquidity": 1_000_000, "cooldown_min": 0
+      }
+    """
+    ws = get_ws_cached(POLICY_LOG_WS, ttl_s=30)
+    _ensure_header(ws)
+    ts = decision.get("ts") or int(time.time())
+    row = [
+      datetime.utcfromtimestamp(int(ts)).isoformat(timespec="seconds")+"Z",
+      decision.get("token",""),
+      decision.get("action",""),
+      float(decision.get("amount_usd") or 0),
+      "TRUE" if decision.get("ok") else "FALSE",
+      decision.get("reason",""),
+      decision.get("patched",""),
+      decision.get("venue",""),
+      decision.get("quote",""),
+      float(decision.get("liquidity") or 0),
+      int(decision.get("cooldown_min") or 0),
+    ]
+    ws.append_row(row)
