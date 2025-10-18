@@ -1,32 +1,37 @@
-# nova_trigger_watcher.py — cache-first + zero chatter
-import os, time, random
-from utils import get_values_cached, with_sheet_backoff, str_or_empty
+# nova_trigger_watcher.py — reads NovaTrigger!A1 and routes manual commands
+import os, time, random, gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from nova_trigger import route_manual
 
-TAB = os.getenv("NOVA_TRIGGER_TAB", "NovaTrigger")   # simple 2-cell sheet
-TTL = int(os.getenv("NOVA_TRIGGER_TTL_SEC", "120"))  # cache 2m
-JIT_MIN = float(os.getenv("NOVA_TRIGGER_JITTER_MIN_S", "0.3"))
-JIT_MAX = float(os.getenv("NOVA_TRIGGER_JITTER_MAX_S", "1.2"))
+TAB    = os.getenv("NOVA_TRIGGER_TAB","NovaTrigger")
+SHEET  = os.getenv("SHEET_URL")
+JIT_MIN = float(os.getenv("NOVA_TRIGGER_JITTER_MIN_S","0.3"))
+JIT_MAX = float(os.getenv("NOVA_TRIGGER_JITTER_MAX_S","1.2"))
 
-@with_sheet_backoff
+def _open():
+    scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+    return gspread.authorize(creds).open_by_url(SHEET)
+
 def check_nova_trigger():
     print("▶ Nova trigger check …")
-    time.sleep(random.uniform(JIT_MIN, JIT_MAX))  # de-sync from neighbors
+    time.sleep(random.uniform(JIT_MIN,JIT_MAX))
+    sh = _open()
+    ws = sh.worksheet(TAB)
 
-    # Values-only, single read (then TTL-cached by utils)
-    vals = get_values_cached(TAB, ttl_s=TTL) or []
-    if not vals:
+    raw = (ws.acell("A1").value or "").strip()
+    if not raw:
         print(f"ℹ️ {TAB} empty; no trigger.")
-        return False, ""
+        return
 
-    # Minimal schema:
-    # A1 = "Enabled" / "On" / "1" to fire
-    # B1 = optional message
-    flag = str_or_empty(vals[0][0] if vals[0] else "").strip().lower()
-    msg  = str_or_empty(vals[0][1] if len(vals[0]) > 1 else "")
+    # Route manual commands only when line starts with MANUAL_REBUY
+    if raw.upper().startswith("MANUAL_REBUY"):
+        out = route_manual(raw)
+        print(f"✅ Manual routed: policy_ok={out['decision'].get('ok')} enq={out['enqueue'].get('ok')}")
+        # clear after handling
+        ws.update_acell("A1", "")
+        return
 
-    is_on = flag in {"1","on","true","enabled","yes","y"}
-    if is_on:
-        print("✅ NovaTrigger ON")
-        return True, msg
-    print("✅ NovaTrigger OFF")
-    return False, ""
+    # Keep other values for your internal flows (e.g., SOS/FYI); just clear after a ping
+    ws.update_acell("A1", "")
+    print(f"ℹ️ Cleared non-manual trigger: {raw}")
