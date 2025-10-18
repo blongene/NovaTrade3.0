@@ -106,6 +106,36 @@ for mod_name, label in [
 ]:
     _import_and_register(mod_name, "bp", label)
 
+from vault_intelligence import run_vault_intelligence
+from rebuy_driver import run_rebuy_driver
+from daily_summary import daily_phase5_summary
+from ops_api import OPS
+app.register_blueprint(OPS)
+
+import schedule, threading, time, os
+
+def _run_scheduled_job(fn):
+    try:
+        fn()
+    except Exception as e:
+        print(f"[scheduler] job error in {getattr(fn,'__name__','fn')}: {e}")
+
+schedule.every(int(os.getenv("VAULT_INTELLIGENCE_INTERVAL_MIN","60"))).minutes.do(lambda: _run_scheduled_job(run_vault_intelligence))
+schedule.every(int(os.getenv("REBUY_INTERVAL_MIN","180"))).minutes.do(lambda: _run_scheduled_job(run_rebuy_driver))
+# Daily summary at 09:00 ET; if your container is UTC, adjust to match 13:00 UTC.
+schedule.every().day.at("09:10").do(lambda: _run_scheduled_job(daily_phase5_summary))
+
+def _schedule_loop():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+t = threading.Thread(target=_schedule_loop, daemon=True)
+t.start()
+
+print("✅ Phase‑5 schedulers active (Vault Intelligence, Rebuy Driver, Daily Summary).")
+
+
 # -----------------------------
 # Receipts / Telemetry endpoints
 # Prefer the NEW receipt_bus over legacy receipts_api if both exist.
