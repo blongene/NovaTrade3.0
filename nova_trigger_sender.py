@@ -1,38 +1,24 @@
-import os
-import requests
-from utils import send_telegram_message_dedup
+# nova_trigger_sender.py — simple Telegram sender (optional)
+import os, requests
 
-def trigger_nova_ping(trigger_type="SOS"):
+def trigger_nova_ping(trigger_type="NOVA UPDATE"):
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     bot_token = os.getenv("BOT_TOKEN")
-
-    if not chat_id or not bot_token:
-        print("⚠️ Missing TELEGRAM_CHAT_ID or BOT_TOKEN in environment.")
+    if not (chat_id and bot_token):
+        print("⚠️ Missing TELEGRAM_CHAT_ID/BOT_TOKEN")
         return
-
-    messages = {
-        "SOS": "🚨 *NovaTrade SOS*\nThis is a test alert to confirm outbound messaging is working.",
-        "PRESALE ALERT": "📈 *NovaTrade Presale Alert*\nA new high-score presale has been detected.",
-        "ROTATION COMPLETE": "🔁 *NovaTrade Rotation Complete*\nA portfolio rebalancing event has been executed.",
-        "SYNC NEEDED": "🧩 *NovaTrade Sync Needed*\nPlease review the latest responses or re-run the sync loop.",
-        "FYI ONLY": "📘 *NovaTrade FYI*\nNon-urgent update: system status or data refreshed.",
-        "NOVA UPDATE": "🧠 *NovaTrade Intelligence*\nA logic update or system improvement has been deployed."
+    presets = {
+        "SOS": "🚨 *NovaTrade SOS*\nTesting alert path.",
+        "PRESALE ALERT": "🚀 *Presale Alert*\nNew high-score presale detected.",
+        "ROTATION COMPLETE": "🔁 *Rotation Complete*\nVault rotation executed.",
+        "SYNC NEEDED": "🧩 *Sync Needed*\nPlease review latest responses.",
+        "FYI ONLY": "📘 *FYI*\nNon-urgent update.",
+        "NOVA UPDATE": "🧠 *Nova Update*\nSystem improvement deployed.",
     }
-
-    msg = messages.get(trigger_type.upper())
-    if not msg:
-        print(f"⚠️ Unrecognized trigger type: {trigger_type}")
-        return
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": msg,
-        "parse_mode": "Markdown"
-    }
-
+    text = presets.get(trigger_type.upper(), f"🔔 *{trigger_type}*")
     try:
-        r = requests.post(url, json=payload)
-        print(f"✅ NovaTrigger sent: {trigger_type} → {r.json()}")
+        r = requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                          json={"chat_id":chat_id,"text":text,"parse_mode":"Markdown"}, timeout=15)
+        print(f"✅ sent: {trigger_type} ({r.status_code})")
     except Exception as e:
-        print(f"❌ Failed to send NovaTrigger alert: {e}")
+        print(f"❌ telegram send failed: {e}")
