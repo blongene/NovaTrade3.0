@@ -1,24 +1,44 @@
-# policy_engine.py
-import os, time, hmac, hashlib, json
+# policy_engine.py — Phase-5 policy + logging + symbol mapping
+import os, time, json
 from datetime import datetime, timedelta
 
+# Sheets
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-POLICY_FILE = os.getenv("POLICY_FILE", "policy.yaml")
-POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
+POLICY_FILE    = os.getenv("POLICY_FILE", "policy.yaml")
+POLICY_LOG_WS  = os.getenv("POLICY_LOG_WS", "Policy_Log")
+SHEET_URL      = os.getenv("SHEET_URL")
 
-def _load_yaml(path):
-    # Minimal YAML subset loader; safe for the provided policy.yaml template.
-    txt = ""
+MAJORS = {"BTC","ETH"}
+
+def _open_sheet():
+    scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
+    return gspread.authorize(creds).open_by_url(SHEET_URL)
+
+def _ensure_policy_log(ws):
+    header = ["Timestamp","Token","Action","Amount_USD","OK","Reason","Patched","Venue","Quote","Liquidity","Cooldown_Min"]
+    vals = ws.get_all_values()
+    if not vals or vals[0] != header:
+        ws.clear()
+        ws.append_row(header)
+
+def _append_policy_row(sh, row):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            txt = f.read()
-    except Exception:
-        pass
+        try:
+            ws = sh.worksheet(POLICY_LOG_WS)
+        except Exception:
+            ws = sh.add_worksheet(title=POLICY_LOG_WS, rows=1000, cols=12)
+        _ensure_policy_log(ws)
+        ws.append_row(row)
+    except Exception as e:
+        print(f"⚠️ Policy log append failed: {e}")
 
+def _load_policy_yaml(path):
+    # Minimal YAML subset loader aligned to your template
     default = {
-        "policy":{
+        "policy": {
             "max_per_coin_usd": 25,
             "min_quote_reserve_usd": 10,
             "min_liquidity_usd": 50000,
@@ -29,184 +49,141 @@ def _load_yaml(path):
             "blocked_symbols": ["BARK","BONK"]
         }
     }
-    if not txt.strip():
+    try:
+        with open(path,"r",encoding="utf-8") as f:
+            txt = f.read()
+    except Exception:
         return default
 
-    data = default
-    cur = data["policy"]
-    lines = [ln.rstrip() for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-
-    def _parse_list(v):
-        v=v.strip()
-        if v.startswith("[") and v.endswith("]"):
-            inner = v[1:-1].strip()
-            if not inner: return []
-            return [x.strip() for x in inner.split(",")]
-        return v
-
-    # Super naive parser matching the provided template
+    cur = dict(default["policy"])
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith("#")]
     in_policy = False
     for ln in lines:
         if ln.startswith("policy:"):
             in_policy = True
             continue
-        if not in_policy:
+        if not in_policy or ":" not in ln:
             continue
-        if ":" in ln:
-            k, v = ln.split(":", 1)
-            k = k.strip()
-            v = v.strip()
-            if v.lower() in ("true","false"):
-                cur[k] = (v.lower()=="true")
-            elif v.replace(".","",1).isdigit():
-                cur[k] = float(v) if "." in v else int(v)
-            elif v.startswith("["):
-                cur[k] = _parse_list(v)
-            else:
-                # nested maps (prefer_quotes) handled explicitly
-                if k == "prefer_quotes":
-                    cur[k] = {}
-                elif k in ("BINANCEUS","COINBASE","KRAKEN"):
-                    # assume belongs to prefer_quotes
-                    if "prefer_quotes" not in cur: cur["prefer_quotes"] = {}
-                    cur["prefer_quotes"][k] = v
-                else:
-                    cur[k] = v
-    return data
+        k, v = ln.split(":",1); k=k.strip(); v=v.strip()
+        if k == "prefer_quotes": cur[k] = {}
+        elif k in ("BINANCEUS","COINBASE","KRAKEN"):
+            cur.setdefault("prefer_quotes", {})[k] = v
+        elif v.lower() in ("true","false"): cur[k] = (v.lower()=="true")
+        elif v.startswith("[") and v.endswith("]"):
+            inner = v[1:-1].strip()
+            cur[k] = [x.strip() for x in inner.split(",")] if inner else []
+        elif v.replace(".","",1).isdigit():
+            cur[k] = float(v) if "." in v else int(v)
+        else:
+            cur[k] = v
+    return {"policy": cur}
 
-def _open_sheet():
-    scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    client = gspread.authorize(creds)
-    return client.open_by_url(os.getenv("SHEET_URL"))
-
-def _append_policy_log(sh, row):
-    try:
-        try:
-            ws = sh.worksheet(POLICY_LOG_WS)
-        except Exception:
-            ws = sh.add_worksheet(title=POLICY_LOG_WS, rows=1000, cols=12)
-            ws.append_row(["Timestamp","Token","Action","Amount_USD","OK","Reason","Patched","Venue","Quote","Liquidity","Cooldown_Min"])
-        ws.append_row(row)
-    except Exception as e:
-        print(f"⚠️ Policy log append failed: {e}")
+def _symbol_for_venue(token:str, venue:str, quote:str):
+    token = token.upper(); venue = (venue or "").upper(); quote = (quote or "").upper()
+    if venue in ("COINBASE","COINBASEADV","CBADV"):
+        return f"{token}-USD" if (quote in ("","USD","USDC")) else f"{token}-{quote}"
+    if venue in ("BINANCEUS","BUSA"):
+        return f"{token}{quote or 'USDT'}"
+    if venue == "KRAKEN":
+        # Kraken symbols vary; assume quote USDT and uppercase
+        return f"{token}{quote or 'USDT'}"
+    return token
 
 class PolicyEngine:
     def __init__(self):
-        self.cfg = _load_yaml(POLICY_FILE)["policy"]
-        self.sh = _open_sheet()
-        self.cooldown_min = int(self.cfg.get("cool_off_minutes_after_trade", 30))
+        self.cfg = _load_policy_yaml(POLICY_FILE)["policy"]
+        self.sh  = _open_sheet()
+        self.cooldown_min = int(self.cfg.get("cool_off_minutes_after_trade",30))
 
-    def _get_last_trade_ts(self, token:str):
+    def _last_ok_trade_ts(self, token:str):
         try:
             ws = self.sh.worksheet(POLICY_LOG_WS)
             rows = ws.get_all_records()
             latest = None
             for r in rows:
-                if str(r.get("Token","")).strip().upper() == token.upper() and str(r.get("OK","")).upper() in ("TRUE","YES"):
-                    ts = str(r.get("Timestamp","")).strip()
+                if str(r.get("Token","")).upper()==token.upper() and str(r.get("OK","")).upper() in ("TRUE","YES"):
+                    ts = str(r.get("Timestamp","")).replace("Z","")
                     try:
-                        t = datetime.fromisoformat(ts.replace("Z",""))
-                    except:
+                        t = datetime.fromisoformat(ts)
+                    except Exception:
                         continue
-                    if (latest is None) or (t>latest):
-                        latest = t
+                    if latest is None or t>latest: latest = t
             return latest
-        except:
+        except Exception:
             return None
 
-    def validate(self, intent:dict, asset_state:dict):
+    def validate(self, intent:dict, asset_state:dict|None=None) -> dict:
         """
-        intent: { token, action, amount_usd, venue, quote }
-        asset_state: { token, liquidity_usd, memory_score, roi_7d, unlock_days, last_action_ts, ... }
-
-        returns: (ok:bool, reason:str, patched_intent:dict)
+        Intent: {source, token, action, amount_usd, venue, quote, ts?}
+        asset_state: optional metrics (liquidity_usd, roi_7d, unlock_days...)
+        Returns a 'decision' dict with fields used for logging and enqueue.
         """
-        token = intent.get("token","").upper()
-        action = intent.get("action","").upper()
-        amt    = float(intent.get("amount_usd", 0) or 0)
-        venue  = intent.get("venue","")
-        quote  = intent.get("quote","")
-
+        asset_state = asset_state or {}
         cfg = self.cfg
-        blocked = [s.upper() for s in cfg.get("blocked_symbols",[])]
-        min_liq = float(cfg.get("min_liquidity_usd", 0) or 0)
-        max_per = float(cfg.get("max_per_coin_usd", 0) or 0)
 
-        if token in blocked:
-            r="blocked symbol"
-            _append_policy_log(self.sh, [datetime.utcnow().isoformat(), token, action, amt, "FALSE", r, "", venue, quote, asset_state.get("liquidity_usd",""), self.cooldown_min])
-            return False, r, intent
+        token = (intent.get("token") or "").upper()
+        action = (intent.get("action") or "").upper()
+        amt  = float(intent.get("amount_usd") or 0)
+        venue = (intent.get("venue") or "").upper()
+        quote = (intent.get("quote") or "").upper()
+        ts    = int(intent.get("ts") or time.time())
 
-        liq = asset_state.get("liquidity_usd")
-        if liq not in ("", None):
-            try:
-                liq_f = float(liq)
-                if liq_f < min_liq:
-                    r="below liquidity threshold"
-                    _append_policy_log(self.sh, [datetime.utcnow().isoformat(), token, action, amt, "FALSE", r, "", venue, quote, liq_f, self.cooldown_min])
-                    return False, r, intent
-            except:
-                pass
-
-        patched = dict(intent)
-        if max_per and amt > max_per:
-            patched["amount_usd"] = max_per
-
-        last_ts = self._get_last_trade_ts(token)
-        if last_ts:
-            delta = datetime.utcnow() - last_ts
-            if delta < timedelta(minutes=self.cooldown_min):
-                r=f"cooldown active ({int((timedelta(minutes=self.cooldown_min)-delta).total_seconds()/60)} min left)"
-                _append_policy_log(self.sh, [datetime.utcnow().isoformat(), token, action, amt, "FALSE", r, json.dumps(patched), venue, quote, asset_state.get("liquidity_usd",""), self.cooldown_min])
-                return False, r, patched
-
-        prefer = cfg.get("prefer_quotes",{}).get(venue, "")
+        # prefer quote
+        prefer = cfg.get("prefer_quotes",{}).get(venue,"")
         if prefer and quote != prefer:
-            patched["quote"] = prefer
+            quote = prefer
 
-        _append_policy_log(self.sh, [datetime.utcnow().isoformat(), token, action, patched.get("amount_usd", amt), "TRUE", "ok", json.dumps(patched), venue, patched.get("quote", quote), asset_state.get("liquidity_usd",""), self.cooldown_min])
-        return True, "ok", patched
+        # map symbol
+        symbol = intent.get("symbol") or _symbol_for_venue(token, venue, quote)
 
-# policy_utils.py (new) OR inside policy_engine.py
-import os, time
-from datetime import datetime
-from utils import get_ws_cached, with_sheet_backoff
+        # blocked
+        if token in [s.upper() for s in cfg.get("blocked_symbols",[])]:
+            return self._log_and_build(ts, token, action, amt, False, "blocked symbol", venue, quote, asset_state, patched={"symbol":symbol})
 
-POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
+        # liquidity floor (skip for manual majors)
+        liq = float(asset_state.get("liquidity_usd") or 0)
+        min_liq = float(cfg.get("min_liquidity_usd") or 0)
+        if not (intent.get("source")=="manual_rebuy" and token in MAJORS):
+            if liq and liq < min_liq:
+                return self._log_and_build(ts, token, action, amt, False, "below liquidity threshold", venue, quote, asset_state, patched={"symbol":symbol})
 
-HEADERS = ["Timestamp","Token","Action","Amount_USD","OK","Reason","Patched","Venue","Quote","Liquidity","Cooldown_Min"]
+        # cap notional
+        max_per = float(cfg.get("max_per_coin_usd") or 0)
+        patched_amt = min(amt, max_per) if max_per else amt
 
-@with_sheet_backoff
-def _ensure_header(ws):
-    vals = ws.get_all_values()
-    if not vals or (vals and vals[0] != HEADERS):
-        ws.clear()
-        ws.append_row(HEADERS)
+        # cooldown
+        last = self._last_ok_trade_ts(token)
+        if last:
+            delta = datetime.utcnow() - last
+            if delta < timedelta(minutes=self.cooldown_min):
+                left_min = int((timedelta(minutes=self.cooldown_min)-delta).total_seconds()/60)
+                return self._log_and_build(ts, token, action, amt, False, f"cooldown active ({left_min} min left)", venue, quote, asset_state,
+                                           patched={"amount_usd":patched_amt,"symbol":symbol})
 
-def write_policy_log(decision: dict):
-    """
-    decision is expected to look like:
-      {
-        "ts": 1699999999, "token":"BTC", "action":"BUY", "amount_usd":5.0,
-        "ok": True, "reason":"", "patched": "", "venue":"BINANCEUS",
-        "quote":"USDT", "liquidity": 1_000_000, "cooldown_min": 0
-      }
-    """
-    ws = get_ws_cached(POLICY_LOG_WS, ttl_s=30)
-    _ensure_header(ws)
-    ts = decision.get("ts") or int(time.time())
-    row = [
-      datetime.utcfromtimestamp(int(ts)).isoformat(timespec="seconds")+"Z",
-      decision.get("token",""),
-      decision.get("action",""),
-      float(decision.get("amount_usd") or 0),
-      "TRUE" if decision.get("ok") else "FALSE",
-      decision.get("reason",""),
-      decision.get("patched",""),
-      decision.get("venue",""),
-      decision.get("quote",""),
-      float(decision.get("liquidity") or 0),
-      int(decision.get("cooldown_min") or 0),
-    ]
-    ws.append_row(row)
+        # OK
+        return self._log_and_build(ts, token, action, patched_amt, True, "ok", venue, quote, asset_state,
+                                   patched={"amount_usd":patched_amt,"symbol":symbol})
+
+    # — helpers —
+    def _log_and_build(self, ts, token, action, amount_usd, ok, reason, venue, quote, asset_state, patched=None):
+        patched = patched or {}
+        row = [
+            datetime.utcfromtimestamp(int(ts)).isoformat(timespec="seconds")+"Z",
+            token, action, float(amount_usd),
+            "TRUE" if ok else "FALSE",
+            reason,
+            json.dumps(patched) if patched else "",
+            venue, quote,
+            float(asset_state.get("liquidity_usd") or 0),
+            int(self.cooldown_min)
+        ]
+        _append_policy_row(self.sh, row)
+        return {
+            "ts": ts, "token": token, "action": action,
+            "amount_usd": float(amount_usd),
+            "ok": bool(ok), "reason": reason,
+            "patched": patched, "venue": venue, "quote": quote,
+            "liquidity": float(asset_state.get("liquidity_usd") or 0),
+            "cooldown_min": int(self.cooldown_min),
+            "symbol": patched.get("symbol") or None
+        }
