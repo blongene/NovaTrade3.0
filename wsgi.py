@@ -26,10 +26,9 @@ except Exception as err:
 if app is None:
     app = Flask(__name__)
 
-from flask import Flask
-from ops_api import OPS
-app = Flask(__name__)
-print("[WEB] Command Bus API registrered.")
+from ops_api_sqlite import OPS
+app.register_blueprint(OPS)
+
 
 # -----------------------------
 # Health (ALWAYS 200)
@@ -96,8 +95,6 @@ def _import_and_register(mod_name: str, attr_name: str = "bp", label: str = ""):
     except Exception as err:
         print(f"[WEB] {label or mod_name} not available: {err}")
 
-app = Flask(__name__)
-app.register_blueprint(ops_bp) 
 
 # -----------------------------
 # Command Bus + Ops + helpers
