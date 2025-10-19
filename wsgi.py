@@ -95,7 +95,7 @@ def _import_and_register(mod_name: str, attr_name: str = "bp", label: str = ""):
     except Exception as err:
         print(f"[WEB] {label or mod_name} not available: {err}")
 
-from web.bus_telemetry_wallet_monitor import bp as telemetry_wallet_bp
+from bus_telemetry_wallet_monitor import bp as telemetry_wallet_bp
 app.register_blueprint(telemetry_wallet_bp)
 
 # -----------------------------
