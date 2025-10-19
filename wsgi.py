@@ -242,6 +242,13 @@ try:
 except Exception as err:
     print(f"[WEB] daily scheduler not available: {err}")
 
+from unified_snapshot import run_unified_snapshot
+from wallet_harmonizer import run_wallet_harmonizer
+
+schedule.every(30).minutes.do(run_unified_snapshot)
+schedule.every(30).minutes.do(run_wallet_harmonizer)
+run_unified_snapshot(); run_wallet_harmonizer()
+
 # -----------------------------
 # Boot sequence (background)
 # -----------------------------
