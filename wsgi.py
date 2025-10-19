@@ -28,7 +28,7 @@ if app is None:
 
 from ops_api_sqlite import OPS
 app.register_blueprint(OPS)
-
+print("[WEB] Command Bus API registered.")
 
 # -----------------------------
 # Health (ALWAYS 200)
