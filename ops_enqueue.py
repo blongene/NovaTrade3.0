@@ -13,7 +13,7 @@ ops_bp = Blueprint("ops_bp", __name__, url_prefix="/api/ops")
 REQUIRE_HMAC = os.getenv("REQUIRE_HMAC_OPS", "1").strip().lower() in {"1","true","yes"}
 ALLOW = {a.strip() for a in (os.getenv("OUTBOX_AGENT_ALLOW") or "").split(",") if a.strip()}
 PAIR_GUARD_MODE = (os.getenv("PAIR_GUARD_MODE") or "rewrite").strip().lower()  # rewrite|warn|off
-OUTBOX_SECRET_FILE=/etc/secrets/outbox_secret
+OUTBOX_SECRET = os.getenv("OUTBOX_SECRET","3f36e385d5b3c83e66209cdac0d815788e1459b49cc67b6a6159cfa4de34511b8")
 
 try:
     from utils import get_sheet
