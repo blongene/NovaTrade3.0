@@ -107,7 +107,7 @@ except Exception as err:
 
 # Optional ops helpers (if present)
 for mod_name, attr, label in [
-    ("ops_api", "OPS", "Ops api"),         
+    ("ops_api", "bp", "Ops api"),         
     ("ops_venue", "bp", "Ops venue checker"),
 ]:
     _import_and_register(mod_name, attr, label)
