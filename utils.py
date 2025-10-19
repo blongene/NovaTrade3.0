@@ -1,11 +1,19 @@
-# utils.py — NT3.0 Phase-1 Polish (quota-proof + quiet + cached reads/values + legacy shims)
-import os, time, json, threading, functools, hashlib, hmac, random
+# utils.py — NovaTrade 3.0 (Phase 5 hardened)
+# - Bullet-proof gspread auth resolution (env JSON, env file, common secret paths)
+# - Token-bucket + exponential backoff to survive 429s / intermittent errors
+# - Cached reads (worksheets, rows, values)
+# - Telegram de-duped notifications + prompts
+# - Legacy shims preserved (names/behaviors used by prior modules)
+# - Helpers used by receipts_bridge.py and Phase-5 jobs
+
+from __future__ import annotations
+import os, time, json, threading, functools, hashlib, hmac, random, traceback
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
+import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import requests
 
 # ========= Env / Config =========
 SHEET_URL = os.getenv("SHEET_URL", "")
@@ -24,9 +32,9 @@ BACKOFF_MAX_S  = float(os.getenv("SHEETS_BACKOFF_MAX_S",  "24"))
 BACKOFF_JIT_S  = float(os.getenv("SHEETS_BACKOFF_JIT_S",  "0.35"))  # small jitter to desync callers
 
 # Cache TTL defaults (tunable via env)
-DEFAULT_ROWS_TTL_S   = int(os.getenv("ROWS_TTL_S",   "240"))  # was 120
-DEFAULT_VALUES_TTL_S = int(os.getenv("VALUES_TTL_S", "120"))  # was 60
-DEFAULT_WS_TTL_S     = int(os.getenv("WS_TTL_S",     "180"))  # worksheet handle
+DEFAULT_ROWS_TTL_S   = int(os.getenv("ROWS_TTL_S",   "240"))  # rows cache
+DEFAULT_VALUES_TTL_S = int(os.getenv("VALUES_TTL_S", "120"))  # values cache
+DEFAULT_WS_TTL_S     = int(os.getenv("WS_TTL_S",     "180"))  # worksheet handle cache
 
 # ========= Logging (quiet, single-line) =========
 def _ts(): return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -222,30 +230,79 @@ def mark_warm_boot():
     global _BOOT_STARTED_AT
     _BOOT_STARTED_AT = 0
 
-# ========= Service / Sheets helpers =========
+# ========= Google credentials resolution (bullet-proof) =========
 _SCOPE = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
 _gs_lock = threading.Lock()
 _gs_client = None
 
-def _load_service_account():
-    svc = os.getenv("SVC_JSON") or "sentiment-log-service.json"
-    if os.path.isfile(svc):
-        return ServiceAccountCredentials.from_json_keyfile_name(svc, _SCOPE)
+def _resolve_service_account_path() -> str | None:
+    # 1) Explicit env path(s)
+    for env_name in ("GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CREDS_JSON_PATH"):
+        p = (os.getenv(env_name) or "").strip()
+        if p and os.path.isfile(p):
+            info(f"[WEB] using {env_name}={p}")
+            return p
+
+    # 2) Common Render secret-file paths
+    for p in (
+        "/etc/secrets/service_account.json",
+        "/etc/secrets/sentiment-log-service.json",
+        "/opt/render/.config/gspread/service_account.json",
+        "./service_account.json",
+        "./sentiment-log-service.json",
+    ):
+        if os.path.isfile(p):
+            info(f"[WEB] using fallback creds at {p}")
+            return p
+
+    return None
+
+def _make_gspread_client():
+    # Highest precedence: full JSON blob in env
+    js = (
+        os.getenv("GSPREAD_SERVICE_ACCOUNT_JSON")
+        or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        or os.getenv("SVC_JSON")
+    )
+    if js:
+        try:
+            data = json.loads(js)
+            return gspread.service_account_from_dict(data)
+        except Exception as e:
+            warn(f"[WEB] service_account_from_dict failed: {e}")
+
+    # Next: a real filename from env or known secret locations
+    path = _resolve_service_account_path()
+    if path:
+        try:
+            return gspread.service_account(filename=path)
+        except Exception as e:
+            warn(f"[WEB] gspread.service_account(filename={path}) failed: {e}")
+
+    # Final: oauth2client fallback to legacy file name if present
     try:
-        data = json.loads(svc)
-        return ServiceAccountCredentials.from_json_keyfile_dict(data, _SCOPE)
-    except Exception:
-        return ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", _SCOPE)
+        svc_path = path or "sentiment-log-service.json"
+        if os.path.isfile(svc_path):
+            creds = ServiceAccountCredentials.from_json_keyfile_name(svc_path, __SCOPE)
+        else:
+            # Try parsing SVC_JSON as dict (if it's not valid JSON, this will raise)
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(os.getenv("SVC_JSON", "{}")), __SCOPE)
+        return gspread.authorize(creds)
+    except Exception as e:
+        # Last-ditch: default lookup (will raise if nothing is configured)
+        warn(f"[WEB] oauth2client fallback failed: {e}; trying gspread default lookup.")
+        return gspread.service_account()
 
 def get_gspread_client():
     global _gs_client
     with _gs_lock:
         if _gs_client is None:
-            creds = _load_service_account()
-            _gs_client = gspread.authorize(creds)
+            _gs_client = _make_gspread_client()
         return _gs_client
 
 def get_sheet():
+    if not SHEET_URL:
+        raise RuntimeError("SHEET_URL env is not set.")
     return get_gspread_client().open_by_url(SHEET_URL)
 
 # ========= Backoff + Budget decorator for Sheets =========
@@ -280,7 +337,7 @@ def with_sheet_backoff(fn):
                 raise
     return wrapper
 
-# ========= Cached reads (TTL) =========
+# ========= Cached handles/rows/values =========
 _cached_ws = {}
 _cached_rows = {}
 _values_cache = {}
@@ -339,12 +396,12 @@ def _ws_get(ws, range_a1: str):
     return ws.get(range_a1)
 
 def get_values_cached(sheet_name: str, range_a1: str | None = None, ttl_s: int | None = None):
-    ttl_s = DEFAULT_VALUES_TTL_S if ttl_s is None else ttl_s
     """
     Returns a 2D list.
       - If range_a1 is provided: uses ws.get(range_a1)
       - If None: uses ws.get_all_values()
     """
+    ttl_s = DEFAULT_VALUES_TTL_S if ttl_s is None else ttl_s
     key = f"vals::{sheet_name}::{range_a1 or '__ALL__'}"
     with _cache_lock:
         item = _values_cache.get(key)
@@ -390,49 +447,6 @@ def sanitize_range(a1: str) -> str:
 def ws_update(ws, range_a1, values):
     ws.update(sanitize_range(range_a1), values)
 
-# ========= A1 helpers / parsing =========
-def str_or_empty(v):
-    return str(v).strip() if v is not None else ""
-
-def to_float(v, default=None):
-    s = str_or_empty(v).replace("%", "").replace(",", "")
-    if s == "": return default
-    try:
-        return float(s)
-    except Exception:
-        return default
-
-# Safe length
-def safe_len(x) -> int:
-    try:
-        return len(x)
-    except TypeError:
-        return len(str(x))
-
-# Legacy-safe parsing helpers
-def safe_float(v, default=None):
-    s = str_or_empty(v).strip()
-    if s == "" or s in {"-", "—", "N/A", "n/a", "NA", "na", "None", "null"}:
-        return default
-    s = s.replace("%", "").replace(",", "")
-    try:
-        return float(s)
-    except Exception:
-        return default
-
-def safe_int(v, default=None):
-    f = safe_float(v, default=None)
-    if f is None:
-        return default
-    try:
-        return int(float(f))
-    except Exception:
-        return default
-
-def safe_str(v, default=""):
-    s = str_or_empty(v)
-    return s if s != "" else default
-
 # ========= Sheet header hygiene =========
 def ensure_sheet_headers(tab: str, required_headers: list[str]) -> list[str]:
     """
@@ -446,7 +460,6 @@ def ensure_sheet_headers(tab: str, required_headers: list[str]) -> list[str]:
         if not header:
             return header
         existing = {h.strip() for h in header}
-        writes = []
         changed = False
         for name in required_headers:
             if name not in existing:
@@ -460,13 +473,10 @@ def ensure_sheet_headers(tab: str, required_headers: list[str]) -> list[str]:
         return []
 
 # ========= Legacy compat shims =========
-# --- Compat shims expected by gspread_guard / legacy modules ------------------
 def ws_get_all_records_cached(name: str, ttl_s: int = 120):
-    # old name → new implementation
     return get_all_records_cached(name, ttl_s)
 
 def ws_get_values_cached(name: str, ttl_s: int = 60):
-    # old name → new implementation (ALL values)
     return get_values_cached(name, range_a1=None, ttl_s=ttl_s)
 
 def ping_webhook_debug(message: str):
@@ -477,7 +487,6 @@ def ping_webhook_debug(message: str):
     try:
         ws = get_ws_cached("Webhook_Debug", ttl_s=30)
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        # gspread update expects a 2D list
         ws_update(ws, "A1", [[f"{ts}Z — {message}"]])
     except Exception:
         pass
@@ -485,17 +494,13 @@ def ping_webhook_debug(message: str):
 def ping_webhook(message: str):
     ping_webhook_debug(message)
 
-# ——— shims requested by older modules ———
 def safe_get_all_records(sheet_name: str, ttl_s: int = 120):
     """Compatibility shim used by legacy modules (e.g., top_token_summary)."""
     return get_all_records_cached(sheet_name, ttl_s=ttl_s)
 
-# --- Sheets helpers used by receipts_bridge.py ---
-
-import time
+# ========= Simple retry decorator =========
 from functools import wraps
-
-def backoff_guard(tries=5, base=2.0, first_sleep=1.0):
+def backoff_guard(tries=5, base=1.8, first_sleep=1.0):
     """Retry decorator with exponential backoff."""
     def _wrap(fn):
         @wraps(fn)
@@ -507,25 +512,25 @@ def backoff_guard(tries=5, base=2.0, first_sleep=1.0):
                 except Exception as e:
                     if i == tries - 1:
                         raise
+                    warn(f"{fn.__name__} retry {i+1}/{tries}: {e}")
                     time.sleep(sleep)
                     sleep *= base
         return _run
     return _wrap
 
+# ========= Helper used by receipts_bridge & others =========
 @backoff_guard(tries=6, base=1.6, first_sleep=1.0)
 def sheets_append_rows(sheet_url: str, worksheet_name: str, rows: list[list]):
     """
     Append rows to a Google Sheet worksheet.
-    Expects your existing gspread auth (service account / gspread_guard) to be set up.
+    Auth is resolved via the same robust logic as the rest of this module.
     """
-    import gspread
-    gc = gspread.service_account()  # uses GOOGLE_APPLICATION_CREDENTIALS on Render
+    gc = get_gspread_client()
     sh = gc.open_by_url(sheet_url)
     try:
         ws = sh.worksheet(worksheet_name)
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title=worksheet_name, rows=200, cols=20)
-    # USER_ENTERED keeps numbers/dates friendly
     ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 # ========= Watchdog helpers =========
@@ -536,6 +541,9 @@ WATCHDOG_TIME_HEADERS = [h.strip() for h in os.getenv(
     "Last Updated,Updated At,Timestamp,Last_Alerted,Last Alerted,Last Seen"
 ).split(",")]
 STALLED_THRESHOLD_HOURS = float(os.getenv("WATCHDOG_STALLED_THRESHOLD_HOURS", "12"))
+
+def str_or_empty(v):
+    return str(v).strip() if v is not None else ""
 
 def _parse_dt(val):
     s = str_or_empty(val)
@@ -589,7 +597,45 @@ def detect_stalled_tokens(
         return []
     return stalled
 
-# ========= HMAC =========
+# ========= Number parsing helpers (legacy-safe) =========
+def to_float(v, default=None):
+    s = str_or_empty(v).replace("%", "").replace(",", "")
+    if s == "": return default
+    try:
+        return float(s)
+    except Exception:
+        return default
+
+def safe_float(v, default=None):
+    s = str_or_empty(v)
+    if s == "" or s in {"-", "—", "N/A", "n/a", "NA", "na", "None", "null"}:
+        return default
+    s = s.replace("%", "").replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return default
+
+def safe_int(v, default=None):
+    f = safe_float(v, default=None)
+    if f is None:
+        return default
+    try:
+        return int(float(f))
+    except Exception:
+        return default
+
+def safe_str(v, default=""):
+    s = str_or_empty(v)
+    return s if s != "" else default
+
+def safe_len(x) -> int:
+    try:
+        return len(x)
+    except TypeError:
+        return len(str(x))
+
+# ========= HMAC (for signed Edge/Bus messages) =========
 def hmac_hex(secret: str, payload: dict) -> str:
     key = secret.encode()
     msg = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
