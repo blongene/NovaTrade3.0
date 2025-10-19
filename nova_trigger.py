@@ -72,3 +72,18 @@ def route_manual(msg:str) -> dict:
     # Telegram notice (brief)
     send_telegram(f"🔔 Orion voice triggered: {msg}\nPolicy: {'OK' if decision.get('ok') else 'DENY'} ({decision.get('reason')})\nEnqueued: {enq.get('ok')} mode={REBUY_MODE}")
     return {"intent": intent, "decision": decision, "enqueue": enq}
+
+# --- shim: trigger_nova_ping, expected by Nova ping ---
+def trigger_nova_ping(trigger_type: str = "NOVA UPDATE"):
+    presets = {
+        "SOS": "🚨 *NovaTrade SOS*\nTesting alert path.",
+        "PRESALE ALERT": "🚀 *Presale Alert*\nNew high-score presale detected.",
+        "ROTATION COMPLETE": "🔁 *Rotation Complete*\nVault rotation executed.",
+        "SYNC NEEDED": "🧩 *Sync Needed*\nPlease review latest responses.",
+        "FYI ONLY": "📘 *FYI*\nNon-urgent update.",
+        "NOVA UPDATE": "🧠 *Nova Update*\nSystem improvement deployed.",
+    }
+    text = presets.get(trigger_type.upper(), f"🔔 *{trigger_type}*")
+    # reuse the helper already in nova_trigger.py
+    send_telegram(text)
+    return {"ok": True, "type": trigger_type}
