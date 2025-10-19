@@ -106,11 +106,11 @@ except Exception as err:
     print(f"[WEB] Command Bus API not available: {err}")
 
 # Optional ops helpers (if present)
-for mod_name, label in [
-    ("ops_api", "Ops api"),
-    ("ops_venue",   "Ops venue checker"),
+for mod_name, attr, label in [
+    ("ops_api", "OPS", "Ops api"),         
+    ("ops_venue", "bp", "Ops venue checker"),
 ]:
-    _import_and_register(mod_name, "bp", label)
+    _import_and_register(mod_name, attr, label)
 
 from vault_intelligence import run_vault_intelligence
 from rebuy_driver import run_rebuy_driver
