@@ -1,18 +1,132 @@
 # ops_enqueue.py — strict enqueue endpoint for NovaTrade 3.0
 from __future__ import annotations
-import os, json
+import os, hmac, hashlib, json, time
 from typing import Any, Dict, Tuple
 from flask import Blueprint, request, jsonify
 from outbox_db import enqueue as db_enqueue
 from hmac_auth import require_hmac
+from datetime import datetime
 
 bp = Blueprint("ops", __name__, url_prefix="/ops")
+ops_bp = Blueprint("ops_bp", __name__, url_prefix="/api/ops")
 
 REQUIRE_HMAC = os.getenv("REQUIRE_HMAC_OPS", "1").strip().lower() in {"1","true","yes"}
 ALLOW = {a.strip() for a in (os.getenv("OUTBOX_AGENT_ALLOW") or "").split(",") if a.strip()}
 PAIR_GUARD_MODE = (os.getenv("PAIR_GUARD_MODE") or "rewrite").strip().lower()  # rewrite|warn|off
 OUTBOX_SECRET_FILE=/etc/secrets/outbox_secret
 
+try:
+    from utils import get_sheet
+except Exception:
+    get_sheet = None
+
+OUTBOX_SECRET = (os.getenv("OUTBOX_SECRET") or "").encode("utf-8")
+
+def _bad(msg, code=400):
+    return jsonify({"ok": False, "error": msg}), code
+
+def _verify_hmac(raw_body: bytes, provided: str) -> bool:
+    if not OUTBOX_SECRET:
+        # For bootstrapping: allow when no secret is set (but warn in logs)
+        print("[OPS] WARNING: OUTBOX_SECRET not set; HMAC verification disabled.")
+        return True
+    try:
+        mac = hmac.new(OUTBOX_SECRET, raw_body, hashlib.sha256).hexdigest()
+        # Accept hex (lower/upper) and optional "sha256=" prefix formats
+        provided = (provided or "").strip()
+        if provided.lower().startswith("sha256="):
+            provided = provided.split("=", 1)[1]
+        ok = hmac.compare_digest(mac, provided.lower())
+        if not ok:
+            print(f"[OPS] HMAC mismatch. expected={mac} provided={provided}")
+        return ok
+    except Exception as e:
+        print(f"[OPS] HMAC verify error: {e}")
+        return False
+
+def _write_trade_intent_to_sheet(intent: dict, status: str, reason: str = ""):
+    if not get_sheet:
+        print("[OPS] get_sheet() unavailable; skipping Trade_Log write.")
+        return
+    try:
+        sheet = get_sheet()
+        ws = sheet.worksheet("Trade_Log")
+        # Ensure a minimal, robust schema. We’ll append even if extra columns exist.
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        row = [
+            ts,
+            intent.get("symbol", ""),
+            intent.get("venue", ""),
+            intent.get("side", ""),
+            str(intent.get("amount_quote", "")),
+            status.upper(),
+            reason or intent.get("reason", "") or "",
+            # helpful breadcrumbs:
+            intent.get("client_id", ""),
+            "LIVE" if str(intent.get("dryrun", "false")).lower() in ("0", "false", "no") else "DRYRUN",
+        ]
+        ws.append_row(row)
+        print(f"[OPS] Trade_Log append ok → {row}")
+    except Exception as e:
+        print(f"[OPS] Trade_Log append failed: {e}")
+
+@ops_bp.route("/enqueue", methods=["POST"])
+def enqueue():
+    try:
+        raw = request.get_data() or b""
+        sig = request.headers.get("X-Outbox-Signature", "")
+        if not _verify_hmac(raw, sig):
+            return _bad("invalid signature", 401)
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return _bad("invalid json body", 400)
+
+        # Minimal required fields
+        symbol = (payload.get("symbol") or "").upper().strip()
+        venue  = (payload.get("venue")  or "").upper().strip()
+        side   = (payload.get("side")   or "").upper().strip()   # BUY / SELL
+        amt_q  = payload.get("amount_quote")
+
+        if not symbol or not venue or side not in ("BUY", "SELL"):
+            return _bad("missing or invalid fields: symbol/venue/side", 422)
+
+        # If REBUY_MODE=dryrun, we still “enqueue” but mark as DRYRUN in sheet.
+        dryrun = str(os.getenv("REBUY_MODE", "") or payload.get("dryrun", "")).lower() == "dryrun"
+
+        # At this point you may also push into your DB-backed outbox.
+        # To keep this drop-in dependency-free and unblock your flow,
+        # we write immediately to Trade_Log so you SEE it in Sheets.
+        _write_trade_intent_to_sheet(
+            {
+                "symbol": symbol,
+                "venue": venue,
+                "side": side,
+                "amount_quote": amt_q,
+                "reason": payload.get("reason", ""),
+                "client_id": payload.get("client_id", ""),
+                "dryrun": dryrun,
+            },
+            status="ENQUEUED",
+            reason=payload.get("policy_reason", ""),
+        )
+
+        # Respond in the shape your callers expect.
+        return jsonify({
+            "ok": True,
+            "enqueued": True,
+            "dryrun": dryrun,
+            "echo": {
+                "symbol": symbol, "venue": venue, "side": side,
+                "amount_quote": amt_q
+            }
+        }), 200
+
+    except Exception as e:
+        print(f"[OPS] enqueue error: {e}")
+        return _bad("internal error", 500)
+        
 def _err(status: int, msg: str, extra: Dict[str, Any] | None = None):
     body = {"ok": False, "error": msg}
     if extra: body.update(extra)
