@@ -1,132 +1,232 @@
 # receipts_bridge.py — mirror DB receipts into Google Sheets (Trade_Log)
-# Run this as a scheduled job on Bus every few minutes.
+# CLEAN • LEAN • QUIET • EFFICIENT
 #
 # Env:
 #   OUTBOX_DB_PATH=/data/outbox.db
-#   SHEET_URL=...
-#   GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json  (or your existing auth flow)
-import time, gspread, json, sqlite3, os
-from datetime import datetime
-from utils import sheets_append_rows, backoff_guard
+#   SHEET_URL=<your tracker>
+#   TRADE_LOG_WS=Trade_Log                (optional; default Trade_Log)
+#   RECEIPTS_BRIDGE_STATE=/data/receipts_bridge.state
+#   BRIDGE_MAX_PER_TICK=200               (optional; max receipts processed in one run)
+#   BRIDGE_BATCH_SIZE=100                 (optional; rows per Sheets append)
+#   BRIDGE_MIN_INTERVAL_SEC=300           (optional; scheduler handles cadence; this is just a guard)
+#
+# Sheets auth:
+#   Uses utils.sheets_append_rows(), which supports:
+#     - GSPREAD_SERVICE_ACCOUNT_JSON / GOOGLE_SERVICE_ACCOUNT_JSON (inline JSON)
+#     - GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/service_account.json
+#     - fallbacks (/etc/secrets/service_account.json, /opt/render/.config/gspread/service_account.json)
 
-WRITE_BATCH_SIZE = 5          # rows per write
-WRITE_COOLDOWN_SEC = 8        # pause between writes
-MAX_RETRIES = 5
+from __future__ import annotations
+import os, sqlite3, json, time, sys, traceback
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple, Optional
 
-def run_once():
-    db = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
-    sheet_url = os.getenv("SHEET_URL")
-    ws_name = "Trade_Log"
-    if not sheet_url:
-        print("[bridge] SHEET_URL missing")
-        return
+# Our utils provides rate-limited, budgeted appends + auth fallbacks
+from utils import sheets_append_rows
 
-    con = sqlite3.connect(db)
-    cur = con.cursor()
-    cur.execute("select id, payload from receipts order by id asc")
-    rows = cur.fetchall()
-    con.close()
+# ----------- config ----------
+DB_PATH                = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
+SHEET_URL              = os.getenv("SHEET_URL", "")
+TRADE_LOG_WS           = os.getenv("TRADE_LOG_WS", "Trade_Log")
+STATE_PATH             = os.getenv("RECEIPTS_BRIDGE_STATE", "/data/receipts_bridge.state")
+MAX_PER_TICK           = int(os.getenv("BRIDGE_MAX_PER_TICK", "200"))
+BATCH_SIZE             = int(os.getenv("BRIDGE_BATCH_SIZE", "100"))
+MIN_INTERVAL_SEC       = int(os.getenv("BRIDGE_MIN_INTERVAL_SEC", "300"))  # guard; scheduler is source of truth
+ROW_SHAPE = [
+    "Timestamp","Venue","Symbol","Side","Amount_Quote","Executed_Qty","Avg_Price","Status",
+    "Notes","Cmd_ID","Receipt_ID","Note","Source","requested_symbol","resolved_symbol","post_balances_compact"
+]
+SOURCE_LABEL = "EdgeBus"
 
-    print(f"[bridge] syncing {len(rows)} receipts → {ws_name}")
+# ----------- helpers ----------
 
-    # Prepare data for writing
-    batch, written = [], 0
-    for rid, payload in rows:
-        j = json.loads(payload)
-        rcp = j.get("receipt", {})
-        data_row = [
-            time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(rcp.get("ts", 0))),
-            rcp.get("venue"),
-            rcp.get("symbol"),
-            rcp.get("side"),
-            rcp.get("amount_quote"),
-            rcp.get("executed_qty"),
-            rcp.get("avg_price"),
-            j.get("status"),
-            rcp.get("note"),
-            j.get("id"),
-            rid,
-        ]
-        batch.append(data_row)
+def _now_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-        # When batch full → write
-        if len(batch) >= WRITE_BATCH_SIZE:
-            for attempt in range(MAX_RETRIES):
-                try:
-                    sheets_append_rows(sheet_url, ws_name, batch)
-                    print(f"[bridge] wrote batch of {len(batch)} rows")
-                    written += len(batch)
-                    batch.clear()
-                    time.sleep(WRITE_COOLDOWN_SEC)
-                    break
-                except Exception as e:
-                    print(f"[bridge] batch write error: {e}")
-                    time.sleep(WRITE_COOLDOWN_SEC * (attempt + 1))
+def _parse_iso(ts: Any) -> Optional[datetime]:
+    if ts is None: return None
+    try:
+        s = str(ts)
+        if not s: return None
+        # Accept "Z"
+        s = s.replace("Z", "+00:00")
+        # Accept unix seconds
+        if s.isdigit():
+            return datetime.fromtimestamp(int(s), tz=timezone.utc)
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
 
-    if batch:
+def _read_state() -> Tuple[int, float]:
+    """Returns (last_id, last_run_epoch)."""
+    try:
+        with open(STATE_PATH, "r") as f:
+            raw = f.read().strip()
+        if not raw:
+            return 0, 0.0
+        parts = raw.split(",")
+        last_id = int(parts[0]) if parts else 0
+        last_run = float(parts[1]) if len(parts) > 1 else 0.0
+        return last_id, last_run
+    except Exception:
+        return 0, 0.0
+
+def _write_state(last_id: int) -> None:
+    tmp = STATE_PATH + ".tmp"
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    with open(tmp, "w") as f:
+        f.write(f"{last_id},{time.time():.3f}")
+    os.replace(tmp, STATE_PATH)
+
+def _connect_sqlite() -> sqlite3.Connection:
+    # generous timeout for locked db, read-only pattern
+    return sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
+
+def _fetch_new_receipts(after_id: int, limit: int) -> List[Dict[str, Any]]:
+    """Returns list of {id, ts, payload} dicts."""
+    try:
+        con = _connect_sqlite()
+        cur = con.cursor()
+        # receipts schema: id, payload, ts (ts may not exist on very old builds -> handle)
         try:
-            sheets_append_rows(sheet_url, ws_name, batch)
-            written += len(batch)
-        except Exception as e:
-            print(f"[bridge] final batch error: {e}")
+            cur.execute("SELECT id, ts, payload FROM receipts WHERE id > ? ORDER BY id ASC LIMIT ?", (after_id, limit))
+            rows = cur.fetchall()
+        except sqlite3.OperationalError:
+            # very old schema without ts
+            cur.execute("SELECT id, payload FROM receipts WHERE id > ? ORDER BY id ASC LIMIT ?", (after_id, limit))
+            rows = [(r[0], None, r[1]) for r in cur.fetchall()]
+        finally:
+            con.close()
+        items = [{"id": r[0], "ts": r[1], "payload": r[2]} for r in rows]
+        return items
+    except Exception as e:
+        print(f"[bridge] fetch error: {e}")
+        traceback.print_exc()
+        return []
 
-    print(f"[bridge] done ok={written}")
+def _is_ack_only(j: Dict[str, Any]) -> bool:
+    """True if this is an ACK mirror with no trade metadata (don’t write)."""
+    rec = j.get("receipt") or {}
+    cmd = j.get("command") or {}
+    venue  = rec.get("venue") or cmd.get("venue")
+    symbol = rec.get("symbol") or cmd.get("symbol") or cmd.get("pair")
+    side   = rec.get("side")   or cmd.get("side")
+    note   = rec.get("note") or rec.get("message") or rec.get("error") or ""
+    status = (rec.get("status") or j.get("status") or "").lower()
+    minimal_fields = not (venue or symbol or side)
+    return minimal_fields and status in {"ok","held","error"} and not note
 
-DB_PATH = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
+def _build_row(rcp_id: int, j: Dict[str, Any]) -> Optional[List[Any]]:
+    """Build one Trade_Log row from a receipt payload. Return None if we should skip."""
+    if _is_ack_only(j):
+        return None
 
-def load_new_receipts(last_id_path="/data/receipt_checkpoint.txt"):
-    os.makedirs(os.path.dirname(last_id_path), exist_ok=True)
-    last_id = 0
-    if os.path.exists(last_id_path):
+    rec  = j.get("receipt") or {}
+    cmd  = j.get("command") or {}
+    meta = j.get("meta")    or {}
+
+    # timestamp preference: receipt.ts → receipt.timestamp → meta.ts → cmd.ts → now (NOT epoch)
+    ts = rec.get("ts") or rec.get("timestamp") or meta.get("ts") or cmd.get("ts")
+    dt = _parse_iso(ts) or datetime.now(timezone.utc)
+    ts_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    venue   = rec.get("venue") or cmd.get("venue") or ""
+    symbol  = rec.get("symbol") or cmd.get("symbol") or cmd.get("pair") or ""
+    side    = rec.get("side") or cmd.get("side") or ""
+    status  = rec.get("status") or j.get("status") or ""
+    # textual notes / reasons
+    notes   = rec.get("note") or rec.get("message") or rec.get("error") or ""
+    # amounts
+    amt_q   = rec.get("amount_quote") or cmd.get("amount_quote") or cmd.get("amount_usd") or ""
+    exec_q  = rec.get("executed_qty") or ""
+    avg_px  = rec.get("avg_price") or ""
+
+    cmd_id  = j.get("cmd_id") or meta.get("cmd_id") or cmd.get("id") or j.get("id") or ""
+    rcpid   = rcp_id
+    rq_sym  = cmd.get("symbol") or cmd.get("pair") or ""
+    rs_sym  = rec.get("resolved_symbol") or rec.get("symbol") or ""
+    post_bal = rec.get("post_balances_compact") or rec.get("post_balances") or ""
+
+    # Produce full, stable row in your column order
+    return [
+        ts_str, venue, symbol, side, amt_q, exec_q, avg_px, status,
+        notes, cmd_id, rcpid, "", SOURCE_LABEL, rq_sym, rs_sym, post_bal
+    ]
+
+def _append_rows(rows: List[List[Any]]) -> int:
+    if not rows:
+        return 0
+    if not SHEET_URL:
+        print("[bridge] SHEET_URL missing; skip write")
+        return 0
+    # User-entered mode keeps numbers/dates friendly (handled inside utils.sheets_append_rows)
+    sheets_append_rows(SHEET_URL, TRADE_LOG_WS, rows)
+    return len(rows)
+
+# ----------- main tick ----------
+
+def run_once() -> Tuple[int, int]:
+    """
+    Returns (processed, written)
+    - processed: # receipts examined
+    - written  : # rows actually appended to sheet
+    """
+    last_id, last_run_epoch = _read_state()
+    # quiet guard against accidental rapid looping; scheduler should control cadence
+    if time.time() - last_run_epoch < max(0, MIN_INTERVAL_SEC // 2):
+        # still allow if brand new instance, but stay quiet
+        pass
+
+    items = _fetch_new_receipts(last_id, MAX_PER_TICK)
+    if not items:
+        print("[bridge] no new receipts")
+        _write_state(last_id)  # refresh heartbeat
+        return (0, 0)
+
+    to_write: List[List[Any]] = []
+    new_last_id = last_id
+    for it in items:
+        new_last_id = max(new_last_id, int(it["id"]))
         try:
-            last_id = int(open(last_id_path).read().strip() or "0")
+            j = json.loads(it["payload"])
         except Exception:
-            last_id = 0
-    c = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cur = c.cursor()
-    cur.execute("select id, ts, payload from receipts where id > ? order by id asc", [last_id])
-    rows = cur.fetchall()
-    c.close()
-    return last_id, rows, last_id_path
+            # Bad JSON payload — skip but move state forward to avoid loop
+            continue
+        row = _build_row(it["id"], j)
+        if row:
+            to_write.append(row)
 
-def append_trade_log(rows):
-    if not get_sheet:
-        print("[bridge] get_sheet() unavailable; skipping Trade_Log write.")
-        return 0, 0
-    sheet = get_sheet()
-    ws = sheet.worksheet("Trade_Log")
-    ok = 0; err = 0
-    for rid, ts, payload in rows:
-        try:
-            j = json.loads(payload)
-            rec = j.get("receipt", {})
-            ts_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            row = [
-                ts_utc,
-                rec.get("symbol",""),
-                rec.get("venue",""),
-                rec.get("side",""),
-                str(rec.get("amount_quote","")),
-                (j.get("status","") or "").upper(),
-                rec.get("reason",""),
-                f"cmd:{j.get('id','')}",
-                f"rcp:{rid}",
-            ]
-            ws.append_row(row)
-            ok += 1
-        except Exception as e:
-            print("[bridge] append error:", e)
-            err += 1
-    return ok, err
+    written = 0
+    # batch quietly (single append if <= BATCH_SIZE)
+    if to_write:
+        # chunk into batches only if huge backlog
+        for i in range(0, len(to_write), BATCH_SIZE):
+            chunk = to_write[i:i+BATCH_SIZE]
+            try:
+                written += _append_rows(chunk)
+            except Exception as e:
+                print(f"[bridge] append error: {e}")
+                traceback.print_exc()
+                # Do not roll back state—avoid infinite rewrites. Just log.
+    # update state no matter what to prevent re-backfilling spam
+    _write_state(new_last_id)
+    print(f"[bridge] processed={len(items)} wrote={written} last_id={new_last_id}")
+    return (len(items), written)
+
+# ----------- cli ----------
 
 if __name__ == "__main__":
-    last_id, rows, path = load_new_receipts()
-    if not rows:
-        print("[bridge] no new receipts")
-        raise SystemExit(0)
-    ok, err = append_trade_log(rows)
-    if ok:
-        new_last = rows[-1][0]
-        with open(path, "w") as fp:
-            fp.write(str(new_last))
-    print(f"[bridge] done ok={ok} err={err}")
+    once = "--once" in sys.argv or "-1" in sys.argv
+    if once:
+        run_once()
+    else:
+        # polite loop (fallback); production uses scheduler in wsgi.py
+        interval = max(MIN_INTERVAL_SEC, 300)
+        print(f"[bridge] running loop every {interval}s")
+        while True:
+            try:
+                run_once()
+            except Exception as e:
+                print(f"[bridge] tick error: {e}")
+                traceback.print_exc()
+            time.sleep(interval)
