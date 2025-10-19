@@ -1,77 +1,192 @@
-# ops_api.py — Durable outbox + commands API (Postgres, HMAC)
-import os, json, hmac, hashlib, time
-from datetime import datetime
-import psycopg2, psycopg2.extras
+# ops_api.py — Command Bus API (SQLite edition)
+# CLEAN • QUIET • WAL • SAFE
+#
+# Endpoints:
+#   POST /api/commands/pull   -> edge pulls NEW commands
+#   POST /api/commands/ack    -> edge acks with receipt payload (mirrored into receipts)
+#
+# Env:
+#   OUTBOX_DB_PATH=/data/outbox.db         (SQLite path)
+#   OUTBOX_SECRET=<hmac key>               (optional verify on ack; if unset, skip verify)
+#   MAX_PULL=50                            (optional; default 50)
+
+from __future__ import annotations
+import os, json, hmac, hashlib, sqlite3, time, traceback
+from typing import Any, Dict, List
 from flask import Blueprint, request, jsonify
 
-OPS = Blueprint("ops_api_v1", __name__, url_prefix="/api")
+bp = Blueprint("ops_api", __name__, url_prefix="/api")
 
-DB_URL = os.getenv("OUTBOX_DB_URL")
-SECRET = (os.getenv("OUTBOX_SECRET") or "").encode("utf-8")
+OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
+OUTBOX_SECRET  = os.getenv("OUTBOX_SECRET", "")  # if empty => no signature required
+MAX_PULL       = int(os.getenv("MAX_PULL", "50"))
 
-def _conn():
-    if not DB_URL:
-        raise RuntimeError("OUTBOX_DB_URL not set")
-    return psycopg2.connect(DB_URL, sslmode=os.getenv("PGSSLMODE","require"))
+# ------------ SQLite helpers ------------
 
-def _init_db():
-    with _conn() as c, c.cursor() as cur:
-        cur.execute("""
-        create table if not exists outbox(
-          id bigserial primary key,
-          ts timestamptz not null default now(),
-          status text not null default 'NEW',
-          payload jsonb not null
-        );
-        create index if not exists outbox_status_idx on outbox(status);
-        create table if not exists receipts(
-          id bigserial primary key,
-          ts timestamptz not null default now(),
-          payload jsonb not null
-        );
-        """)
-    print("[WEB] Outbox/receipts tables ready.")
-
-@OPS.record_once
-def _bootstrap(state):
+def _open_db() -> sqlite3.Connection:
+    con = sqlite3.connect(OUTBOX_DB_PATH, timeout=10, isolation_level=None, check_same_thread=False)
+    cur = con.cursor()
+    # Harden for concurrent readers/writers
     try:
-        _init_db()
-    except Exception as e:
-        print(f"[API] outbox db init skipped: {e}")
-
-def _bad(msg, code=400):
-    return jsonify({"ok": False, "error": msg}), code
-
-def _canon(d: dict) -> bytes:
-    return json.dumps(d, separators=(",", ":"), sort_keys=False).encode("utf-8")
-
-def _verify_hmac(raw: bytes, provided: str) -> bool:
-    if not SECRET:
-        print("[API] WARNING: OUTBOX_SECRET not set; HMAC disabled.")
-        return True
-    mac = hmac.new(SECRET, raw, hashlib.sha256).hexdigest()
-    if provided.lower().startswith("sha256="):
-        provided = provided.split("=",1)[1]
-    return hmac.compare_digest(mac, provided.lower())
-
-@OPS.route("/ops/enqueue", methods=["POST"])
-def ops_enqueue():
-    raw = request.get_data() or b""
-    sig = request.headers.get("X-Outbox-Signature", "")
-    if not _verify_hmac(raw, sig):
-        return _bad("invalid signature", 401)
-    try:
-        body = json.loads(raw.decode("utf-8"))
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA busy_timeout=5000")
     except Exception:
-        return _bad("invalid json body", 400)
-    venue = (body.get("venue") or "").upper()
-    symbol = body.get("symbol") or ""
-    side = (body.get("side") or "").upper()
-    amt_q = body.get("amount_quote")
-    if not (venue and symbol and side in ("BUY","SELL")):
-        return _bad("missing or invalid fields: venue/symbol/side", 422)
-    with _conn() as c, c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("insert into outbox (payload) values (%s) returning id, ts",
-                    [json.dumps(body)])
-        row = cur.fetchone()
-    return jsonify({"ok": True, "enqueued": True, "id": row["id"], "ts": row["ts"].isoformat()}), 200
+        pass
+    return con
+
+def _ensure_schema(con: sqlite3.Connection) -> None:
+    cur = con.cursor()
+    # Outbox exists in legacy; just ensure newer columns exist
+    cur.execute("CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+    # add columns if missing
+    cur.execute("PRAGMA table_info(outbox)")
+    have = {r[1] for r in cur.fetchall()}
+    def add(col, ddl):
+        if col not in have:
+            cur.execute(f"ALTER TABLE outbox ADD COLUMN {col} {ddl}")
+            have.add(col)
+
+    for col, ddl in [
+        ("status","TEXT"),("venue","TEXT"),("symbol","TEXT"),("side","TEXT"),
+        ("amount_usd","REAL"),("amount_base","REAL"),("note","TEXT"),
+        ("mode","TEXT"),("agent_id","TEXT"),("cmd_id","INTEGER"),
+        ("payload","TEXT"), # optional blob of original cmd
+        ("created_ts","TEXT"),("updated_ts","TEXT")
+    ]:
+        try: add(col, ddl)
+        except Exception: pass
+
+    # Receipts table (for bridge)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS receipts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      payload TEXT NOT NULL,              -- full JSON {cmd_id, command, receipt, meta}
+      ts TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+# ---------- HMAC verify (optional) ----------
+
+def _verify_signature(raw: bytes) -> bool:
+    if not OUTBOX_SECRET:
+        return True
+    sig = request.headers.get("X-OUTBOX-SIGN","")
+    if not sig:
+        return False
+    mac = hmac.new(OUTBOX_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    try:
+        return hmac.compare_digest(mac, sig)
+    except Exception:
+        return False
+
+# ---------- Serializers ----------
+
+CMD_FIELDS = ("id","venue","symbol","side","amount_usd","amount_base","note","mode","agent_id","cmd_id")
+
+def _row_to_cmd(row: sqlite3.Row) -> Dict[str, Any]:
+    d = {}
+    for k in CMD_FIELDS:
+        try:
+            d[k] = row[k]
+        except Exception:
+            d[k] = None
+    # Backward-compat: symbol/pair naming used by some edges
+    if d.get("symbol") and "/" in str(d["symbol"]):
+        d["pair"] = d["symbol"]
+    return d
+
+# ---------- Routes ----------
+
+@bp.route("/commands/pull", methods=["POST"])
+def commands_pull():
+    """
+    Input:  {"limit": 10}  (optional)
+    Output: [{"id":..., "venue":..., "symbol":..., ...}, ...]
+    """
+    try:
+        raw = request.get_data(cache=False) or b"{}"
+        try:
+            j = json.loads(raw.decode("utf-8"))
+        except Exception:
+            j = {}
+        limit = int(j.get("limit") or MAX_PULL)
+        limit = max(1, min(limit, MAX_PULL))
+
+        con = _open_db(); con.row_factory = sqlite3.Row
+        _ensure_schema(con)
+        cur = con.cursor()
+
+        # pick NEW first; if you prefer queued, add additional status here
+        cur.execute("""
+            SELECT id, venue, symbol, side, amount_usd, amount_base, note, mode, agent_id, cmd_id
+            FROM outbox
+            WHERE status='NEW'
+            ORDER BY id ASC
+            LIMIT ?
+        """, (limit,))
+        rows = cur.fetchall()
+        cmds = [_row_to_cmd(r) for r in rows]
+
+        return jsonify(cmds), 200
+    except Exception as e:
+        print(f"[ops_api] pull error: {e}")
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@bp.route("/commands/ack", methods=["POST"])
+def commands_ack():
+    """
+    Edge returns execution receipts.
+    Body:
+      {
+        "id": <cmd_id>,
+        "status": "ok|error|held",
+        "receipt": { ... exchange/broker payload ... },
+        "meta": {"agent_id":"edge-primary", "ts": "..."},
+        "command": { optional echo of the command fields }
+      }
+    """
+    try:
+        raw = request.get_data(cache=False) or b"{}"
+        if not _verify_signature(raw):
+            return jsonify({"ok": False, "error": "invalid signature"}), 401
+
+        j = json.loads(raw.decode("utf-8"))
+        cid     = int(j.get("id") or j.get("cmd_id") or 0)
+        status  = str(j.get("status") or "").lower() or "ok"
+        receipt = j.get("receipt") or {}
+        meta    = j.get("meta") or {}
+        command = j.get("command") or {}
+
+        if not cid:
+            return jsonify({"ok": False, "error": "missing id"}), 400
+
+        # mirror for bridge
+        payload = json.dumps({
+            "cmd_id": cid,
+            "status": status,
+            "receipt": receipt,
+            "meta": meta,
+            "command": command
+        })
+
+        con = _open_db()
+        _ensure_schema(con)
+        cur = con.cursor()
+
+        # write receipt first (never blocks the outbox state update)
+        cur.execute("INSERT INTO receipts (payload) VALUES (?)", [payload])
+
+        # update outbox row if present
+        try:
+            cur.execute("UPDATE outbox SET status=?, updated_ts=datetime('now') WHERE id=?", [status.upper(), cid])
+        except sqlite3.OperationalError:
+            # tolerate legacy outbox without status column (should be fixed by ensure_schema)
+            pass
+
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        print(f"[ops_api] ack error: {e}")
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
