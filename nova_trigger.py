@@ -3,7 +3,11 @@ import os, json, time, hmac, hashlib, re
 from policy_engine import PolicyEngine
 import requests
 
-BASE_URL      = os.getenv("CLOUD_BASE_URL","http://localhost:10000").rstrip("/")
+BASE_URL = (
+    os.getenv("OPS_BASE_URL") or          # optional new var just for enqueue calls
+    os.getenv("CLOUD_BASE_URL") or
+    "https://novatrade3-0.onrender.com"   # your service URL
+).rstrip("/")
 REBUY_MODE    = os.getenv("REBUY_MODE","dryrun").lower()
 OUTBOX_SECRET = os.getenv("OUTBOX_SECRET","")
 
@@ -62,7 +66,9 @@ def route_manual(msg:str) -> dict:
             "ts": decision["ts"]
         }
         enq = _enqueue(payload)
-
+    print(f"[manual_enq] base={BASE_URL} mode={REBUY_MODE} "
+    f"status={enq.get('status')} ok={enq.get('ok')} text={enq.get('text')[:160]}")
+    
     # Telegram notice (brief)
     send_telegram(f"🔔 Orion voice triggered: {msg}\nPolicy: {'OK' if decision.get('ok') else 'DENY'} ({decision.get('reason')})\nEnqueued: {enq.get('ok')} mode={REBUY_MODE}")
     return {"intent": intent, "decision": decision, "enqueue": enq}
