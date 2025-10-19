@@ -5,13 +5,72 @@
 #   OUTBOX_DB_PATH=/data/outbox.db
 #   SHEET_URL=...
 #   GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json  (or your existing auth flow)
-import os, json, sqlite3, time
+import time, gspread, json, sqlite3, os
 from datetime import datetime
+from utils import sheets_append_rows, backoff_guard
 
-try:
-    from utils import get_sheet
-except Exception:
-    get_sheet = None
+WRITE_BATCH_SIZE = 5          # rows per write
+WRITE_COOLDOWN_SEC = 8        # pause between writes
+MAX_RETRIES = 5
+
+def run_once():
+    db = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
+    sheet_url = os.getenv("SHEET_URL")
+    ws_name = "Trade_Log"
+    if not sheet_url:
+        print("[bridge] SHEET_URL missing")
+        return
+
+    con = sqlite3.connect(db)
+    cur = con.cursor()
+    cur.execute("select id, payload from receipts order by id asc")
+    rows = cur.fetchall()
+    con.close()
+
+    print(f"[bridge] syncing {len(rows)} receipts → {ws_name}")
+
+    # Prepare data for writing
+    batch, written = [], 0
+    for rid, payload in rows:
+        j = json.loads(payload)
+        rcp = j.get("receipt", {})
+        data_row = [
+            time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(rcp.get("ts", 0))),
+            rcp.get("venue"),
+            rcp.get("symbol"),
+            rcp.get("side"),
+            rcp.get("amount_quote"),
+            rcp.get("executed_qty"),
+            rcp.get("avg_price"),
+            j.get("status"),
+            rcp.get("note"),
+            j.get("id"),
+            rid,
+        ]
+        batch.append(data_row)
+
+        # When batch full → write
+        if len(batch) >= WRITE_BATCH_SIZE:
+            for attempt in range(MAX_RETRIES):
+                try:
+                    sheets_append_rows(sheet_url, ws_name, batch)
+                    print(f"[bridge] wrote batch of {len(batch)} rows")
+                    written += len(batch)
+                    batch.clear()
+                    time.sleep(WRITE_COOLDOWN_SEC)
+                    break
+                except Exception as e:
+                    print(f"[bridge] batch write error: {e}")
+                    time.sleep(WRITE_COOLDOWN_SEC * (attempt + 1))
+
+    if batch:
+        try:
+            sheets_append_rows(sheet_url, ws_name, batch)
+            written += len(batch)
+        except Exception as e:
+            print(f"[bridge] final batch error: {e}")
+
+    print(f"[bridge] done ok={written}")
 
 DB_PATH = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
 
