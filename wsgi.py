@@ -2,7 +2,7 @@
 from __future__ import annotations
 import os, threading, sqlite3
 from flask import Flask, jsonify, request
-from ops_enqueue import ops_bp
+
 
 # -----------------------------
 # Base app: try Telegram app; else bare Flask
@@ -25,6 +25,10 @@ except Exception as err:
 
 if app is None:
     app = Flask(__name__)
+
+from ops_api import OPS
+app.register_blueprint(OPS)
+print("[WEB] Command Bus API registered.")
 
 # -----------------------------
 # Health (ALWAYS 200)
@@ -105,7 +109,7 @@ except Exception as err:
 
 # Optional ops helpers (if present)
 for mod_name, label in [
-    ("ops_enqueue", "Ops enqueue"),
+    ("ops_api", "Ops api"),
     ("ops_venue",   "Ops venue checker"),
 ]:
     _import_and_register(mod_name, "bp", label)
@@ -139,10 +143,6 @@ print("✅ Phase‑5 schedulers active (Vault Intelligence, Rebuy Driver, Daily 
 
 from nova_trigger_watcher import check_nova_trigger
 schedule.every(2).minutes.do(lambda: _run_scheduled_job(check_nova_trigger))
-
-from ops_api import OPS
-app.register_blueprint(OPS)
-print("[WEB] Command Bus API registered.")
 
 # -----------------------------
 # Receipts / Telemetry endpoints
