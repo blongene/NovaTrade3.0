@@ -140,6 +140,10 @@ print("✅ Phase‑5 schedulers active (Vault Intelligence, Rebuy Driver, Daily 
 from nova_trigger_watcher import check_nova_trigger
 schedule.every(2).minutes.do(lambda: _run_scheduled_job(check_nova_trigger))
 
+from ops_api import OPS
+app.register_blueprint(OPS)
+print("[WEB] Command Bus API registered.")
+
 # -----------------------------
 # Receipts / Telemetry endpoints
 # Prefer the NEW receipt_bus over legacy receipts_api if both exist.
