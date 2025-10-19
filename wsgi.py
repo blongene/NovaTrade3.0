@@ -26,9 +26,10 @@ except Exception as err:
 if app is None:
     app = Flask(__name__)
 
+from flask import Flask
 from ops_api import OPS
-app.register_blueprint(OPS)
-print("[WEB] Command Bus API registered.")
+app = Flask(__name__)
+print("[WEB] Command Bus API registrered.")
 
 # -----------------------------
 # Health (ALWAYS 200)
