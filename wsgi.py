@@ -140,7 +140,7 @@ t.start()
 print("✅ Phase‑5 schedulers active (Vault Intelligence, Rebuy Driver, Daily Summary).")
 
 from nova_trigger_watcher import check_nova_trigger
-schedule.every(2).minutes.do(lambda: _run_scheduled_job(check_nova_trigger))
+schedule.every(12).hours.do(lambda: _run_scheduled_job(check_nova_trigger))
 
 # -----------------------------
 # Receipts / Telemetry endpoints
