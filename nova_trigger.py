@@ -24,11 +24,24 @@ def _hmac(sig_payload:dict) -> str:
     raw = json.dumps(sig_payload, separators=(",",":"), sort_keys=True).encode("utf-8")
     return hmac.new(OUTBOX_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
 
-def _enqueue(payload:dict) -> dict:
-    body = {"payload": payload, "sig": _hmac(payload)} if OUTBOX_SECRET else {"payload": payload}
-    r = requests.post(f"{BASE_URL}/ops/enqueue", json=body, timeout=20)
+def _enqueue(payload: dict) -> dict:
+    """
+    Sends raw JSON body to OPS_ENQUEUE_URL (or BASE_URL + /api/ops/enqueue)
+    with X-Outbox-Signature: sha256=<hex(hmac(body))>
+    """
+    import requests, json, hmac, hashlib, os
+    url = (
+        os.getenv("OPS_ENQUEUE_URL")
+        or (BASE_URL.rstrip("/") + "/api/ops/enqueue")
+    )
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if OUTBOX_SECRET:
+        mac = hmac.new(OUTBOX_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+        headers["X-Outbox-Signature"] = f"sha256={mac}"
+    r = requests.post(url, data=raw, headers=headers, timeout=20)
     ok = r.ok
-    return {"ok": ok, "status": r.status_code, "text": r.text[:200]}
+    return {"ok": ok, "status": r.status_code, "text": r.text[:200], "url": url}
 
 def parse_manual(msg:str) -> dict|None:
     """
@@ -65,9 +78,19 @@ def route_manual(msg:str) -> dict:
             "amount_usd": decision["amount_usd"],
             "ts": decision["ts"]
         }
+        quote_amt = float(decision["amount_usd"])
+        symbol = decision["symbol"]
+        payload = {
+            "venue":  decision["venue"],
+            "symbol": symbol,
+            "side":   "BUY",
+            # ops_enqueue expects amount in the quote currency (USD/USDT/USDC)
+            "amount_quote": quote_amt,
+            "client_id": f"manual-{decision['token']}-{int(decision['ts'])}",
+            "policy_reason": decision.get("reason","ok"),
+        }
         enq = _enqueue(payload)
-    print(f"[manual_enq] base={BASE_URL} mode={REBUY_MODE} "
-    f"status={enq.get('status')} ok={enq.get('ok')} text={enq.get('text')[:160]}")
+        print(f"[manual_enq] url={enq.get('url')} status={enq.get('status')} ok={enq.get('ok')} text={enq.get('text')}")
     
     # Telegram notice (brief)
     send_telegram(f"🔔 Orion voice triggered: {msg}\nPolicy: {'OK' if decision.get('ok') else 'DENY'} ({decision.get('reason')})\nEnqueued: {enq.get('ok')} mode={REBUY_MODE}")
