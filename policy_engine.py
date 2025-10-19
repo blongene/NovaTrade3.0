@@ -1,6 +1,7 @@
 # policy_engine.py — Phase-5 policy + logging + symbol mapping
 import os, time, json
 from datetime import datetime, timedelta
+from policy_logger import log_policy_decision
 
 # Sheets
 import gspread
@@ -78,6 +79,17 @@ def _load_policy_yaml(path):
             cur[k] = v
     return {"policy": cur}
 
+def gate_intent(intent):
+    reasons = []
+    # ... run your checks, add to reasons on block/hold ...
+    # examples:
+    # if below_liquidity_floor: reasons.append("liquidity_floor")
+    # if cooldown_active: reasons.append("cooldown_active")
+
+    decision = "pass" if not reasons else "block"
+    log_policy_decision(intent, decision, reasons)
+    return decision == "pass"
+    
 def _symbol_for_venue(token:str, venue:str, quote:str):
     token = token.upper(); venue = (venue or "").upper(); quote = (quote or "").upper()
     if venue in ("COINBASE","COINBASEADV","CBADV"):
