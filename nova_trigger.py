@@ -30,18 +30,30 @@ def _enqueue(payload: dict) -> dict:
     with X-Outbox-Signature: sha256=<hex(hmac(body))>
     """
     import requests, json, hmac, hashlib, os
+
+    # ✅ Always prefer the correct API path
     url = (
         os.getenv("OPS_ENQUEUE_URL")
         or (BASE_URL.rstrip("/") + "/api/ops/enqueue")
     )
+
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
+
     if OUTBOX_SECRET:
         mac = hmac.new(OUTBOX_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
         headers["X-Outbox-Signature"] = f"sha256={mac}"
-    r = requests.post(url, data=raw, headers=headers, timeout=20)
-    ok = r.ok
-    return {"ok": ok, "status": r.status_code, "text": r.text[:200], "url": url}
+
+    try:
+        r = requests.post(url, data=raw, headers=headers, timeout=20)
+        return {
+            "ok": r.ok,
+            "status": r.status_code,
+            "text": r.text[:200],
+            "url": url
+        }
+    except Exception as e:
+        return {"ok": False, "status": 0, "text": str(e), "url": url}
 
 def parse_manual(msg:str) -> dict|None:
     """
