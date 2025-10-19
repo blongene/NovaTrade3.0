@@ -1,4 +1,14 @@
 # ops_api_sqlite.py — Durable outbox + receipts using SQLite (local disk)
+# Endpoints:
+#   POST /api/ops/enqueue      (HMAC header)
+#   POST /api/commands/pull
+#   POST /api/commands/ack     (HMAC header)
+#   POST /api/receipts/ack     (HMAC header, optional)
+#
+# Env (Bus):
+#   OUTBOX_DB_PATH=/data/outbox.db
+#   OUTBOX_SECRET=<shared secret with Edge>
+#
 import os, json, hmac, hashlib, sqlite3
 from flask import Blueprint, request, jsonify
 
@@ -60,8 +70,7 @@ def ops_enqueue():
     side   = (body.get("side") or "").upper()
     if not (venue and symbol and side in ("BUY","SELL")):
         return _bad("missing or invalid fields: venue/symbol/side", 422)
-    c = _conn()
-    cur = c.cursor()
+    c = _conn(); cur = c.cursor()
     cur.execute("insert into outbox (payload) values (?)", [json.dumps(body)])
     oid = cur.lastrowid
     c.commit(); c.close()
