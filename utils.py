@@ -490,6 +490,44 @@ def safe_get_all_records(sheet_name: str, ttl_s: int = 120):
     """Compatibility shim used by legacy modules (e.g., top_token_summary)."""
     return get_all_records_cached(sheet_name, ttl_s=ttl_s)
 
+# --- Sheets helpers used by receipts_bridge.py ---
+
+import time
+from functools import wraps
+
+def backoff_guard(tries=5, base=2.0, first_sleep=1.0):
+    """Retry decorator with exponential backoff."""
+    def _wrap(fn):
+        @wraps(fn)
+        def _run(*a, **k):
+            sleep = first_sleep
+            for i in range(tries):
+                try:
+                    return fn(*a, **k)
+                except Exception as e:
+                    if i == tries - 1:
+                        raise
+                    time.sleep(sleep)
+                    sleep *= base
+        return _run
+    return _wrap
+
+@backoff_guard(tries=6, base=1.6, first_sleep=1.0)
+def sheets_append_rows(sheet_url: str, worksheet_name: str, rows: list[list]):
+    """
+    Append rows to a Google Sheet worksheet.
+    Expects your existing gspread auth (service account / gspread_guard) to be set up.
+    """
+    import gspread
+    gc = gspread.service_account()  # uses GOOGLE_APPLICATION_CREDENTIALS on Render
+    sh = gc.open_by_url(sheet_url)
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=worksheet_name, rows=200, cols=20)
+    # USER_ENTERED keeps numbers/dates friendly
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+
 # ========= Watchdog helpers =========
 WATCHDOG_TAB = os.getenv("WATCHDOG_TAB", "Rotation_Log")
 WATCHDOG_TOKEN_COL = os.getenv("WATCHDOG_TOKEN_COL", "Token")
