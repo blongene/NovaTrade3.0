@@ -266,3 +266,18 @@ def _start_boot_once():
 
 if os.getenv("RUN_BOOT_IN_WSGI", "1").strip().lower() in {"1", "true", "yes"}:
     _start_boot_once()
+
+from threading import Thread
+import time, receipts_bridge
+
+def _bridge_loop():
+    time.sleep(15)
+    while True:
+        try:
+            receipts_bridge.run_once()
+        except Exception as e:
+            print(f"[bridge-loop] error: {e}")
+        time.sleep(300)  # every 5 minutes
+
+Thread(target=_bridge_loop, daemon=True).start()
+print("[WEB] receipts_bridge scheduled every 5m.")
