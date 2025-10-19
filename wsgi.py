@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os, threading, sqlite3
 from flask import Flask, jsonify, request
+from ops_enqueue import ops_bp
 
 # -----------------------------
 # Base app: try Telegram app; else bare Flask
@@ -89,6 +90,9 @@ def _import_and_register(mod_name: str, attr_name: str = "bp", label: str = ""):
         _register_bp_once(bp, label or mod_name)
     except Exception as err:
         print(f"[WEB] {label or mod_name} not available: {err}")
+
+app = Flask(__name__)
+app.register_blueprint(ops_bp) 
 
 # -----------------------------
 # Command Bus + Ops + helpers
