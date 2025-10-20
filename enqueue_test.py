@@ -8,11 +8,11 @@ SECRET = os.environ.get("SECRET", "3f36e385d5b3c83e66209cdac0d815788e1459b49cc67
 # ⚠️ The body *must* be compact JSON (no spaces) if you sign it
 payload = {
     "intent": {
-        "action": "BUY",
-        "venue": "KRAKEN",
-        "symbol": "BTC-USDT",
+        "side": "BUY",               # <-- was `action`
+        "venue": "KRAKEN",           # keep exactly as supported by your Bus
+        "symbol": "BTC-USDT",        # or whatever exact symbol your Bus expects
         "amount_usd": 5,
-        "source": "smoke",
+        "source": "smoke"
     }
 }
 BODY = json.dumps(payload, separators=(",", ":")).encode("utf-8")
