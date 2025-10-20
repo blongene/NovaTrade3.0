@@ -1,26 +1,29 @@
-# utils_logging.py (or at top of utils.py)
-import logging, os, sys
+# src/logging_setup.py
+import logging
+import os
 
-def init_logging():
-    level = os.getenv("NOVA_LOG_LEVEL", "INFO").upper()
-    root = logging.getLogger()
-    root.setLevel(level)
+# Default to WARNING globally unless explicitly overridden by env.
+root_level = os.getenv("LOG_LEVEL", "WARNING").upper()
 
-    # stdout handler: INFO and below
-    h_out = logging.StreamHandler(sys.stdout)
-    h_out.setLevel(logging.DEBUG)
-    h_out.addFilter(lambda r: r.levelno <= logging.INFO)
+# Configure the root logger once.
+logging.basicConfig(
+    level=getattr(logging, root_level, logging.WARNING),
+    format="%(levelname)s %(name)s: %(message)s",
+)
 
-    # stderr handler: WARNING and above
-    h_err = logging.StreamHandler(sys.stderr)
-    h_err.setLevel(logging.WARNING)
+# Silence chatty third-party loggers unless you need them.
+for noisy, level in {
+    "gspread": "WARNING",
+    "googleapiclient": "WARNING",
+    "google": "WARNING",
+    "urllib3": "WARNING",
+    "httpx": "WARNING",
+    "asyncio": "WARNING",
+    "apscheduler": "WARNING",
+}.items():
+    logging.getLogger(noisy).setLevel(getattr(logging, level, logging.WARNING))
 
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    h_out.setFormatter(fmt)
-    h_err.setFormatter(fmt)
-
-    # reset handlers (avoid dupes on redeploy)
-    root.handlers[:] = [h_out, h_err]
-
-    # convenience child logger
-    return logging.getLogger("nova")
+# Optional: silence your own “boot thread”/“receipts_bridge” module unless it’s an error.
+# Change 'nova' and 'receipts_bridge' to your actual module names if different.
+for app_mod in ("nova", "receipts_bridge"):
+    logging.getLogger(app_mod).setLevel(logging.WARNING)
