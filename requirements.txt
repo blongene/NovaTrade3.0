@@ -13,4 +13,6 @@ python-telegram-bot==13.15
 python-dotenv
 gunicorn>=21.2
 psycopg2-binary>=2.9
-uvicorn[standard]==0.30.6
+flask>=2.3
+uvicorn>=0.30
+asgiref>=3.8
