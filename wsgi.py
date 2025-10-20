@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request
 
 # ---------------------------------------------------------------------
 # Logging: quiet by default. Only WARNING+ goes to stdout.
-# You can raise verbosity by NOVA_LOG_LEVEL=INFO or DEBUG if needed.
+# Raise verbosity by setting NOVA_LOG_LEVEL=INFO or DEBUG if needed.
 # ---------------------------------------------------------------------
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "WARNING").upper()
 logging.basicConfig(
@@ -42,21 +42,18 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
         return None
     try:
         from telegram_webhook import telegram_app, set_telegram_webhook  # type: ignore
-        # mount telegram blueprint/app under /tg if it's a Flask blueprint/app
         try:
             app.register_blueprint(telegram_app, url_prefix="/tg")  # type: ignore
         except Exception:
-            # If it’s a Flask app, mount via WSGI midleware style
+            # If it’s a WSGI app, mount via Dispatcher
             from werkzeug.middleware.dispatcher import DispatcherMiddleware
             app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/tg": telegram_app})  # type: ignore
         try:
             set_telegram_webhook()
         except Exception as e:
-            # webhook is optional; keep quiet unless you asked for INFO/DEBUG
             log.info("Telegram webhook degraded: %s", e)
         return None
     except Exception as e:
-        # Feature unavailable or failed; report in /healthz but don’t break boot
         log.debug("Telegram init failed: %s", e)
         return str(e)
 
@@ -77,33 +74,25 @@ def healthz():
         info["telegram"] = {"status": "degraded", "reason": telegram_status}
     else:
         info["telegram"] = {"status": "ok"}
-    # Include version/db path if available (optional, quiet on failure)
+    # Optional extras
     try:
-        def _read_version() -> str:
-            for name in ("VERSION", "version.txt", ".version"):
-                p = os.path.join(os.getcwd(), name)
-                if os.path.exists(p):
-                    with open(p, "r", encoding="utf-8") as fh:
-                        return fh.read().strip()
-            return "unknown"
-        info["version"] = _read_version()
+        for name in ("VERSION", "version.txt", ".version"):
+            p = os.path.join(os.getcwd(), name)
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as fh:
+                    info["version"] = fh.read().strip()
+                    break
     except Exception as e:
         log.debug("version read failed: %s", e)
-    try:
-        info["db"] = os.environ.get("OUTBOX_DB_PATH", "unset")
-    except Exception:
-        pass
+    info["db"] = os.environ.get("OUTBOX_DB_PATH", "unset")
     return jsonify(info), 200
 
 @flask_app.get("/readyz")
 def readyz():
-    # If you want to block readiness on some dependency, check it here.
-    # Keep it quiet and fast; only WARNING+ logs will show by default.
+    # If you want to gate readiness, do it here (keep it quiet & fast)
     return jsonify(ok=True), 200
 
-# ---------------------------------------------------------------------
 # Minimal JSON error handlers (quiet)
-# ---------------------------------------------------------------------
 @flask_app.errorhandler(404)
 def _not_found(_e):
     return jsonify(error="not_found"), 404
@@ -131,8 +120,7 @@ def _start_receipts_bridge():
         return
 
     def _loop():
-        # small defer so boot doesn’t race with cold starts
-        time.sleep(15)
+        time.sleep(15)  # small defer so cold boots don’t race
         while True:
             try:
                 receipts_bridge.run_once()  # type: ignore
@@ -151,19 +139,9 @@ _start_receipts_bridge()
 # Export symbol `app` for `uvicorn wsgi:app …`
 # ---------------------------------------------------------------------
 try:
-    from asgiref.wsgi import WsgiToAsgi  # lightweight and reliable
+    from asgiref.wsgi import WsgiToAsgi  # tiny, reliable
     app = WsgiToAsgi(flask_app)
 except Exception as e:
-    # Fallback: expose raw Flask app (still works under gunicorn/WSGI)
+    # Fallback: raw Flask app (works under gunicorn/WSGI)
     log.warning("ASGI adapter unavailable; falling back to WSGI: %s", e)
     app = flask_app  # type: ignore
-
-# ---------------------------------------------------------------------
-# Notes for Render (keep here for reference, not executed):
-# - Use this start command (no access log & warning level):
-#   uvicorn wsgi:app --host 0.0.0.0 --port $PORT --log-level warning --no-access-log
-# - To quiet app further, keep NOVA_LOG_LEVEL at WARNING (default).
-# - To disable optional parts:
-#     ENABLE_TELEGRAM=false
-#     DISABLE_RECEIPTS_BRIDGE=true
-# ---------------------------------------------------------------------
