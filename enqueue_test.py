@@ -1,49 +1,39 @@
-#!/usr/bin/env python3
-"""
-enqueue_test.py  –  quick smoke test for NovaTrade Bus /api/ops/enqueue
+# enqueue_test.py — prints the REAL error message from /api/ops/enqueue
 
-Usage:
-    python enqueue_test.py
-"""
+import json, os, hmac, hashlib, urllib.request, urllib.error
 
-import json, hmac, hashlib, urllib.request
+HOST   = os.environ.get("HOST",   "https://novatrade3-0.onrender.com")
+SECRET = os.environ.get("SECRET", "3f36e385d5b3c83e66209cdac0d815788e1459b49cc67b6a6159cfa4de34511b8")
 
-# === CONFIG ===
-BUS_URL   = "https://novatrade3-0.onrender.com/api/ops/enqueue"   # your Bus endpoint
-OUTBOX_SECRET = "3f36e385d5b3c83e66209cdac0d815788e1459b49cc67b6a6159cfa4de34511b8"  # <-- paste your Bus OUTBOX_SECRET here
-
-# Simple intent to verify the path + signature + Policy_Log
-intent = {
+# ⚠️ The body *must* be compact JSON (no spaces) if you sign it
+payload = {
     "intent": {
         "action": "BUY",
         "venue": "KRAKEN",
         "symbol": "BTC-USDT",
         "amount_usd": 5,
-        "source": "smoke-test"
+        "source": "smoke",
     }
 }
+BODY = json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
-# Canonical JSON → bytes
-raw = json.dumps(intent, separators=(",", ":"), sort_keys=False).encode()
+# Compute HMAC SHA-256 over the *exact* BODY bytes and send it in the header
+sig = hmac.new(SECRET.encode("utf-8"), BODY, hashlib.sha256).hexdigest()
+headers = {
+    "Content-Type": "application/json",
+    "X-Outbox-Signature": f"sha256={sig}",
+}
 
-# HMAC-SHA256 using your secret
-sig = hmac.new(OUTBOX_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-
-# HTTP request
-req = urllib.request.Request(
-    BUS_URL,
-    data=raw,
-    headers={
-        "Content-Type": "application/json",
-        "X-Outbox-Signature": f"sha256={sig}"
-    },
-    method="POST"
-)
+req = urllib.request.Request(f"{HOST}/api/ops/enqueue", data=BODY, headers=headers, method="POST")
 
 print("📡 Sending intent to Bus...")
 try:
-    with urllib.request.urlopen(req, timeout=20) as r:
-        print(f"✅ Response {r.status}:")
-        print(r.read().decode())
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        print("✅ OK", resp.status, resp.read().decode())
+except urllib.error.HTTPError as e:
+    # 💡 THIS is the important bit — print the server’s 422 details
+    body = e.read().decode(errors="replace")
+    print(f"❌ HTTP {e.code}")
+    print(body)
 except Exception as e:
-    print(f"❌ Error: {e}")
+    print("❌", repr(e))
