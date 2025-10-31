@@ -80,6 +80,9 @@ def telemetry_push():
 
 # ---- Compatibility aliases for older agents ----
 @flask_app.post("/api/telemetry/push_balances")
+def telemetry_push_compat():
+    # Reuse the same handler
+    return telemetry_push()
 @flask_app.post("/bus/push_balances")
 @flask_app.post("/api/edge/balances")
 def telemetry_push_alias():
