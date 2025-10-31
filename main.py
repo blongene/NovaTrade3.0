@@ -250,6 +250,7 @@ def _set_schedules():
     _schedule("Sentiment Summary",             "sentiment_summary",          "run_sentiment_summary",   every=3,  unit="hours")
 
     # Daily (spread to avoid spikes)
+    _schedule("Health Summary",                "health_summary",             "run_health_summary",          when="13:00")
     _schedule("ROI Threshold Validator",       "roi_threshold_validator",    "run_roi_threshold_validator", when="01:00")
     _schedule("Rebuy Weight Calculator",       "rebuy_weight_calculator",    "run_rebuy_weight_calculator", when="01:10")
     _schedule("Memory Score Sync",             "memory_score_sync",          "run_memory_score_sync",       when="01:15")
