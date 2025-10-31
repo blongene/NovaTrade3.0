@@ -65,55 +65,97 @@ def readyz():
     return jsonify(ok=True), 200
 
 # ---------------------------------------------------------------------
-# EDGE AGENT API ENDPOINTS
+# EDGE AGENT API ENDPOINTS  (final, hardened version)
 # ---------------------------------------------------------------------
+from flask import request
+
 @flask_app.post("/api/telemetry/push")
 def telemetry_push():
-    """Edge Agent posts wallet snapshots and telemetry here."""
+    """
+    Edge Agent posts wallet snapshots, venue balances, and telemetry here.
+    Always safe-casts floats and never throws—returns ok even on partial data.
+    """
     data = request.get_json(silent=True) or {}
-    summary = {
-        "source": data.get("agent_id", "edge"),
-        "balances": {k: round(v, 4) for k, v in (data.get("balances") or {}).items()},
-    }
+    agent_id = data.get("agent_id", "edge")
+    raw_balances = data.get("balances") or {}
+
+    # Safe float cast + rounding
+    balances = {}
+    for k, v in raw_balances.items():
+        try:
+            balances[k] = round(float(v), 6)
+        except Exception:
+            balances[k] = 0.0
+
+    summary = {"source": agent_id, "balances": balances}
     log.info("📡 Telemetry push received: %s", summary)
-    return jsonify(ok=True, received=len(data or {})), 200
+    return jsonify(ok=True, received=len(balances)), 200
+
 
 # ---- Compatibility aliases for older agents ----
 @flask_app.post("/api/telemetry/push_balances")
-def telemetry_push_compat():
-    # Reuse the same handler
-    return telemetry_push()
 @flask_app.post("/bus/push_balances")
 @flask_app.post("/api/edge/balances")
 def telemetry_push_alias():
-    """Allow older edge agents to push via legacy endpoints."""
+    """Legacy aliases routed to the same telemetry handler."""
     return telemetry_push()
 
+
+# ---------------------------------------------------------------------
+# COMMAND BUS ENDPOINTS
+# ---------------------------------------------------------------------
 @flask_app.post("/api/commands/pull")
 def commands_pull():
-    """Edge polls here for new trade instructions."""
+    """
+    Edge Agent polls for work.
+    Returns an empty list when idle.
+    In the future, this will read from outbox.db or command queue.
+    """
+    log.debug("🪙 Edge poll → ok (no commands queued)")
     return jsonify(ok=True, commands=[]), 200
+
 
 @flask_app.post("/api/commands/ack")
 def commands_ack():
-    """Edge acknowledges completed commands."""
+    """
+    Edge Agent acknowledges completed commands.
+    Accepts JSON: { "agent_id": "...", "command_id": "...", "status": "done", ... }
+    """
     data = request.get_json(silent=True) or {}
-    log.info("✅ ACK from edge: %s", data)
+    cmd_id = data.get("command_id", "?")
+    agent = data.get("agent_id", "edge")
+    status = data.get("status", "ok")
+    log.info("✅ ACK from %s → %s (%s)", agent, cmd_id, status)
     return jsonify(ok=True), 200
 
+
+# ---------------------------------------------------------------------
+# HEARTBEAT + READINESS
+# ---------------------------------------------------------------------
 @flask_app.post("/api/heartbeat")
 def heartbeat():
-    """Edge heartbeat."""
+    """Simple ping endpoint so Edge knows Bus is alive."""
     return jsonify(ok=True, service="Bus", alive=True), 200
+
+
+@flask_app.get("/readyz")
+def readyz():
+    """Fast readiness probe for Render or external monitors."""
+    return jsonify(ok=True, service="Bus", ready=True), 200
+
 
 # ---------------------------------------------------------------------
 # ERROR HANDLERS
 # ---------------------------------------------------------------------
 @flask_app.errorhandler(404)
-def not_found(_e): return jsonify(error="not_found"), 404
+def not_found(_e):
+    return jsonify(error="not_found"), 404
+
 
 @flask_app.errorhandler(405)
-def method_not_allowed(_e): return jsonify(error="method_not_allowed"), 405
+def method_not_allowed(_e):
+    return jsonify(error="method_not_allowed"), 405
+
 
 @flask_app.errorhandler(500)
 def server_error(e):
