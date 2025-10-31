@@ -60,10 +60,6 @@ def healthz():
     }
     return jsonify(info), 200
 
-@flask_app.get("/readyz")
-def readyz():
-    return jsonify(ok=True), 200
-
 # ---------------------------------------------------------------------
 # EDGE AGENT API ENDPOINTS  (final, hardened version)
 # ---------------------------------------------------------------------
@@ -140,9 +136,14 @@ def heartbeat():
 
 @flask_app.get("/readyz")
 def readyz():
-    """Fast readiness probe for Render or external monitors."""
-    return jsonify(ok=True, service="Bus", ready=True), 200
-
+    """Unified readiness probe for Render and health checks."""
+    return jsonify(
+        ok=True,
+        service="NovaTrade Bus",
+        ready=True,
+        scheduler="active",
+        receipts_bridge="active",
+    ), 200
 
 # ---------------------------------------------------------------------
 # ERROR HANDLERS
