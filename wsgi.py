@@ -86,6 +86,14 @@ telegram_status = _maybe_init_telegram(flask_app)
 # ============================================================================
 OUTBOX_SECRET = os.getenv("OUTBOX_SECRET", "")
 
+# --- HMAC flags (honor your env) ---
+REQUIRE_HMAC_OPS = os.getenv("REQUIRE_HMAC_OPS", "0").lower() in ("1","true","yes")
+REQUIRE_HMAC_PULL = os.getenv("REQUIRE_HMAC_PULL", "0").lower() in ("1","true","yes")
+REQUIRE_HMAC_TELEMETRY = os.getenv("REQUIRE_HMAC_TELEMETRY", "0").lower() in ("1","true","yes")
+
+# Allow a separate secret for telemetry if desired (falls back to OUTBOX_SECRET)
+TELEMETRY_SECRET = os.getenv("TELEMETRY_SECRET", OUTBOX_SECRET)
+
 def _canonical(body: dict) -> bytes:
     return json.dumps(body, separators=(",",":"), sort_keys=True).encode("utf-8")
 
@@ -112,10 +120,35 @@ def _require_json():
     except Exception:
         return None, ("malformed JSON", 400)
 
-def _maybe_require_hmac(body):
-    if OUTBOX_SECRET:
+def _hmac_verify_with(secret: str, body: dict, provided_sig: str) -> bool:
+    if not secret:  # dev lenience
+        return True
+    try:
+        expected = hmac.new(secret.encode("utf-8"),
+                            json.dumps(body, separators=(",",":"), sort_keys=True).encode("utf-8"),
+                            hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, provided_sig or "")
+    except Exception:
+        return False
+
+def _maybe_require_hmac_ops(body):
+    if REQUIRE_HMAC_OPS:
         sig = request.headers.get("X-NT-Sig","")
-        if not _hmac_verify(body, sig):
+        if not _hmac_verify_with(OUTBOX_SECRET, body, sig):
+            return ("invalid signature", 401)
+    return None
+
+def _maybe_require_hmac_pull(body):
+    if REQUIRE_HMAC_PULL:
+        sig = request.headers.get("X-NT-Sig","")
+        if not _hmac_verify_with(OUTBOX_SECRET, body, sig):
+            return ("invalid signature", 401)
+    return None
+
+def _maybe_require_hmac_tel(body):
+    if REQUIRE_HMAC_TELEMETRY:
+        sig = request.headers.get("X-NT-Sig","")
+        if not _hmac_verify_with(TELEMETRY_SECRET, body, sig):
             return ("invalid signature", 401)
     return None
 
@@ -297,6 +330,8 @@ def _normalize_balances(raw) -> tuple[dict, dict]:
 @flask_app.post("/api/telemetry/push")
 def api_telemetry_push():
     data = request.get_json(silent=True) or {}
+    e = _maybe_require_hmac_tel(data)
+    if e: return e
     agent_id = data.get("agent_id", "edge")
     raw_balances = data.get("balances") or {}
     flat, by_venue = _normalize_balances(raw_balances)
@@ -336,7 +371,7 @@ def _now_ts() -> int:
 def intent_enqueue():
     body, err = _require_json()
     if err: return err
-    e = _maybe_require_hmac(body)
+    e = _maybe_require_hmac_ops(body)
     if e: return e
 
     # minimal validation
@@ -376,11 +411,16 @@ def intent_enqueue():
         send_telegram(f"⚠️ <b>Enqueue failed</b>\n{ex}")
         return (f"enqueue error: {ex}", 500)
 
+@BUS_ROUTES.route("/ops/enqueue", methods=["POST"])
+def ops_enqueue_alias():
+    # exact alias to maintain backward-compat with OPS_ENQUEUE_URL
+    return intent_enqueue()
+
 @BUS_ROUTES.route("/commands/pull", methods=["POST"])
 def commands_pull():
     body, err = _require_json()
     if err: return err
-    e = _maybe_require_hmac(body)
+    e = _maybe_require_hmac_pull(body)
     if e: return e
 
     agent_id = str(body.get("agent_id","")).strip() or "edge-primary"
@@ -394,7 +434,7 @@ def commands_pull():
 def commands_ack():
     body, err = _require_json()
     if err: return err
-    e = _maybe_require_hmac(body)
+    e = _maybe_require_hmac_pull(body)
     if e: return e
 
     cmd_id = str(body.get("command_id","")).strip()
