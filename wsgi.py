@@ -86,6 +86,35 @@ def healthz():
         log.debug("version read failed: %s", e)
     info["db"] = os.environ.get("OUTBOX_DB_PATH", "unset")
     return jsonify(info), 200
+    
+# ---------------------------------------------------------------------
+# Minimal Command Bus + Telemetry endpoints for Edge Agent
+# ---------------------------------------------------------------------
+from flask import request
+
+@flask_app.post("/api/commands/pull")
+def api_commands_pull():
+    # Edge Agent polls here to ask for work
+    return jsonify(ok=True, commands=[]), 200
+
+@flask_app.post("/api/commands/ack")
+def api_commands_ack():
+    # Edge Agent acknowledges completed commands
+    data = request.get_json(silent=True) or {}
+    log.info("ACK from edge: %s", data)
+    return jsonify(ok=True), 200
+
+@flask_app.post("/api/telemetry/push")
+def api_telemetry_push():
+    # Edge Agent sends health/telemetry here
+    data = request.get_json(silent=True) or {}
+    log.debug("Telemetry: %s", data)
+    return jsonify(ok=True), 200
+
+@flask_app.post("/api/heartbeat")
+def api_heartbeat():
+    # Simple "ping" endpoint so Edge knows the Bus is alive
+    return jsonify(ok=True, service="Bus", alive=True), 200
 
 @flask_app.get("/readyz")
 def readyz():
