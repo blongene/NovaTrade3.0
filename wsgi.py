@@ -1,66 +1,48 @@
-# wsgi.py — quiet, ASGI-ready web entrypoint for Render
+# wsgi.py — quiet, ASGI-ready NovaTrade Bus for Render
 from __future__ import annotations
-
-import os
-import logging
-import threading
-import time
+import os, logging, threading, time
 from typing import Optional
-
 from flask import Flask, jsonify, request
 
 # ---------------------------------------------------------------------
-# Logging: quiet by default. Only WARNING+ goes to stdout.
-# Raise verbosity by setting NOVA_LOG_LEVEL=INFO or DEBUG if needed.
+# Logging setup (INFO shows lifecycle events; WARNING hides chatter)
 # ---------------------------------------------------------------------
-LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "WARNING").upper()
+LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.WARNING),
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("web")
+log = logging.getLogger("bus")
 
-# Silence Werkzeug’s request logs unless you explicitly set INFO/DEBUG
-werkzeug_log = logging.getLogger("werkzeug")
-if LOG_LEVEL not in ("INFO", "DEBUG"):
-    werkzeug_log.setLevel(logging.ERROR)
+# Silence noisy libs
+for name in ("werkzeug", "gunicorn.access", "uvicorn.access",
+             "schedule", "gspread", "googleapiclient"):
+    logging.getLogger(name).setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------
-# Create base Flask app
+# Flask app
 # ---------------------------------------------------------------------
 flask_app = Flask(__name__)
 
 # ---------------------------------------------------------------------
-# Optional: Telegram webhook integration (quiet & safe)
+# Optional Telegram integration
 # ---------------------------------------------------------------------
 def _maybe_init_telegram(app: Flask) -> Optional[str]:
-    """
-    Try to import and attach telegram blueprint. Return error string on failure,
-    None on success, and None if feature is simply unavailable.
-    """
     if os.environ.get("ENABLE_TELEGRAM", "").lower() not in ("1", "true", "yes"):
         return None
     try:
         from telegram_webhook import telegram_app, set_telegram_webhook  # type: ignore
-        try:
-            app.register_blueprint(telegram_app, url_prefix="/tg")  # type: ignore
-        except Exception:
-            # If it’s a WSGI app, mount via Dispatcher
-            from werkzeug.middleware.dispatcher import DispatcherMiddleware
-            app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/tg": telegram_app})  # type: ignore
-        try:
-            set_telegram_webhook()
-        except Exception as e:
-            log.info("Telegram webhook degraded: %s", e)
+        app.register_blueprint(telegram_app, url_prefix="/tg")  # type: ignore
+        set_telegram_webhook()
         return None
     except Exception as e:
-        log.debug("Telegram init failed: %s", e)
+        log.warning("Telegram init failed: %s", e)
         return str(e)
 
 telegram_status = _maybe_init_telegram(flask_app)
 
 # ---------------------------------------------------------------------
-# Routes
+# Core endpoints
 # ---------------------------------------------------------------------
 @flask_app.get("/")
 def index():
@@ -68,76 +50,63 @@ def index():
 
 @flask_app.get("/healthz")
 def healthz():
-    # Keep this endpoint FAST and always 200 for Render health checks.
-    info = {"ok": True, "web": "up"}
-    if telegram_status:
-        info["telegram"] = {"status": "degraded", "reason": telegram_status}
-    else:
-        info["telegram"] = {"status": "ok"}
-    # Optional extras
-    try:
-        for name in ("VERSION", "version.txt", ".version"):
-            p = os.path.join(os.getcwd(), name)
-            if os.path.exists(p):
-                with open(p, "r", encoding="utf-8") as fh:
-                    info["version"] = fh.read().strip()
-                    break
-    except Exception as e:
-        log.debug("version read failed: %s", e)
-    info["db"] = os.environ.get("OUTBOX_DB_PATH", "unset")
+    info = {"ok": True, "web": "up",
+            "telegram": {"status": "ok" if not telegram_status else "degraded"}}
     return jsonify(info), 200
-    
-# ---------------------------------------------------------------------
-# Minimal Command Bus + Telemetry endpoints for Edge Agent
-# ---------------------------------------------------------------------
-from flask import request
-
-@flask_app.post("/api/commands/pull")
-def api_commands_pull():
-    # Edge Agent polls here to ask for work
-    return jsonify(ok=True, commands=[]), 200
-
-@flask_app.post("/api/commands/ack")
-def api_commands_ack():
-    # Edge Agent acknowledges completed commands
-    data = request.get_json(silent=True) or {}
-    log.info("ACK from edge: %s", data)
-    return jsonify(ok=True), 200
-
-@flask_app.post("/api/telemetry/push")
-def api_telemetry_push():
-    # Edge Agent sends health/telemetry here
-    data = request.get_json(silent=True) or {}
-    log.debug("Telemetry: %s", data)
-    return jsonify(ok=True), 200
-
-@flask_app.post("/api/heartbeat")
-def api_heartbeat():
-    # Simple "ping" endpoint so Edge knows the Bus is alive
-    return jsonify(ok=True, service="Bus", alive=True), 200
 
 @flask_app.get("/readyz")
 def readyz():
-    # If you want to gate readiness, do it here (keep it quiet & fast)
     return jsonify(ok=True), 200
 
-# Minimal JSON error handlers (quiet)
+# ---------------------------------------------------------------------
+# Edge Agent API endpoints
+# ---------------------------------------------------------------------
+@flask_app.post("/api/telemetry/push")
+def telemetry_push():
+    """Edge Agent posts wallet snapshots and health telemetry here."""
+    data = request.get_json(silent=True) or {}
+    summary = {
+        "source": data.get("agent_id", "edge"),
+        "balances": {k: round(v, 4) for k, v in (data.get("balances") or {}).items()},
+    }
+    log.info("📡 Telemetry push received: %s", summary)
+    return jsonify(ok=True, received=len(data or {})), 200
+
+
+@flask_app.post("/api/commands/pull")
+def commands_pull():
+    """Edge polls here for new trade instructions."""
+    return jsonify(ok=True, commands=[]), 200
+
+
+@flask_app.post("/api/commands/ack")
+def commands_ack():
+    """Edge acknowledges completed commands."""
+    data = request.get_json(silent=True) or {}
+    log.info("✅ ACK from edge: %s", data)
+    return jsonify(ok=True), 200
+
+
+@flask_app.post("/api/heartbeat")
+def heartbeat():
+    return jsonify(ok=True, service="Bus", alive=True), 200
+
+# ---------------------------------------------------------------------
+# Error handlers
+# ---------------------------------------------------------------------
 @flask_app.errorhandler(404)
-def _not_found(_e):
-    return jsonify(error="not_found"), 404
+def not_found(_e): return jsonify(error="not_found"), 404
 
 @flask_app.errorhandler(405)
-def _method_not_allowed(_e):
-    return jsonify(error="method_not_allowed"), 405
+def method_not_allowed(_e): return jsonify(error="method_not_allowed"), 405
 
 @flask_app.errorhandler(500)
-def _server_error(e):
+def server_error(e):
     log.warning("Unhandled error: %s", e)
     return jsonify(error="internal_error"), 500
 
 # ---------------------------------------------------------------------
-# Optional: background receipts bridge (quiet & safe)
-# Runs every 5 minutes if module present and not disabled
+# Background receipts bridge (optional)
 # ---------------------------------------------------------------------
 def _start_receipts_bridge():
     if os.environ.get("DISABLE_RECEIPTS_BRIDGE", "").lower() in ("1", "true", "yes"):
@@ -149,28 +118,45 @@ def _start_receipts_bridge():
         return
 
     def _loop():
-        time.sleep(15)  # small defer so cold boots don’t race
+        time.sleep(15)
         while True:
             try:
                 receipts_bridge.run_once()  # type: ignore
             except Exception as err:
                 log.info("receipts_bridge error: %s", err)
-            time.sleep(300)  # 5 minutes
+            time.sleep(300)
 
-    t = threading.Thread(target=_loop, name="receipts-bridge", daemon=True)
-    t.start()
+    threading.Thread(target=_loop, name="receipts-bridge", daemon=True).start()
     log.info("receipts_bridge scheduled every 5m")
 
 _start_receipts_bridge()
 
 # ---------------------------------------------------------------------
-# ASGI adapter: make Flask (WSGI) app runnable under Uvicorn on Render
-# Export symbol `app` for `uvicorn wsgi:app …`
+# Scheduler loop (to run hourly/daily jobs)
+# ---------------------------------------------------------------------
+def _start_scheduler():
+    try:
+        import schedule
+    except ImportError:
+        log.warning("schedule lib not found; skipping scheduler thread")
+        return
+
+    def _loop():
+        log.info("⏰ Scheduler thread active.")
+        while True:
+            schedule.run_pending()
+            time.sleep(5)
+
+    threading.Thread(target=_loop, name="scheduler", daemon=True).start()
+
+_start_scheduler()
+
+# ---------------------------------------------------------------------
+# ASGI adapter (so Uvicorn can serve Flask cleanly)
 # ---------------------------------------------------------------------
 try:
-    from asgiref.wsgi import WsgiToAsgi  # tiny, reliable
+    from asgiref.wsgi import WsgiToAsgi
     app = WsgiToAsgi(flask_app)
 except Exception as e:
-    # Fallback: raw Flask app (works under gunicorn/WSGI)
     log.warning("ASGI adapter unavailable; falling back to WSGI: %s", e)
     app = flask_app  # type: ignore
