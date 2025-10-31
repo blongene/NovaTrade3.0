@@ -1,11 +1,11 @@
-# wsgi.py — quiet, ASGI-ready NovaTrade Bus for Render
+# wsgi.py — NovaTrade Bus (quiet, resilient, ASGI-ready for Render)
 from __future__ import annotations
 import os, logging, threading, time
 from typing import Optional
 from flask import Flask, jsonify, request
 
 # ---------------------------------------------------------------------
-# Logging setup (INFO shows lifecycle events; WARNING hides chatter)
+# LOGGING SETUP
 # ---------------------------------------------------------------------
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -14,18 +14,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("bus")
 
-# Silence noisy libs
-for name in ("werkzeug", "gunicorn.access", "uvicorn.access",
-             "schedule", "gspread", "googleapiclient"):
+# Silence noisy third-party modules
+for name in (
+    "werkzeug", "gunicorn.access", "uvicorn.access",
+    "schedule", "gspread", "googleapiclient", "urllib3"
+):
     logging.getLogger(name).setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------
-# Flask app
+# FLASK APP INIT
 # ---------------------------------------------------------------------
 flask_app = Flask(__name__)
 
 # ---------------------------------------------------------------------
-# Optional Telegram integration
+# TELEGRAM (optional, safe auto-skip)
 # ---------------------------------------------------------------------
 def _maybe_init_telegram(app: Flask) -> Optional[str]:
     if os.environ.get("ENABLE_TELEGRAM", "").lower() not in ("1", "true", "yes"):
@@ -34,6 +36,7 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
         from telegram_webhook import telegram_app, set_telegram_webhook  # type: ignore
         app.register_blueprint(telegram_app, url_prefix="/tg")  # type: ignore
         set_telegram_webhook()
+        log.info("Telegram webhook registered.")
         return None
     except Exception as e:
         log.warning("Telegram init failed: %s", e)
@@ -42,7 +45,7 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
 telegram_status = _maybe_init_telegram(flask_app)
 
 # ---------------------------------------------------------------------
-# Core endpoints
+# CORE ENDPOINTS
 # ---------------------------------------------------------------------
 @flask_app.get("/")
 def index():
@@ -50,8 +53,11 @@ def index():
 
 @flask_app.get("/healthz")
 def healthz():
-    info = {"ok": True, "web": "up",
-            "telegram": {"status": "ok" if not telegram_status else "degraded"}}
+    info = {"ok": True, "web": "up"}
+    info["telegram"] = {
+        "status": "ok" if not telegram_status else "degraded",
+        "reason": telegram_status or None,
+    }
     return jsonify(info), 200
 
 @flask_app.get("/readyz")
@@ -59,11 +65,11 @@ def readyz():
     return jsonify(ok=True), 200
 
 # ---------------------------------------------------------------------
-# Edge Agent API endpoints
+# EDGE AGENT API ENDPOINTS
 # ---------------------------------------------------------------------
 @flask_app.post("/api/telemetry/push")
 def telemetry_push():
-    """Edge Agent posts wallet snapshots and health telemetry here."""
+    """Edge Agent posts wallet snapshots and telemetry here."""
     data = request.get_json(silent=True) or {}
     summary = {
         "source": data.get("agent_id", "edge"),
@@ -72,12 +78,18 @@ def telemetry_push():
     log.info("📡 Telemetry push received: %s", summary)
     return jsonify(ok=True, received=len(data or {})), 200
 
+# ---- Compatibility aliases for older agents ----
+@flask_app.post("/api/telemetry/push_balances")
+@flask_app.post("/bus/push_balances")
+@flask_app.post("/api/edge/balances")
+def telemetry_push_alias():
+    """Allow older edge agents to push via legacy endpoints."""
+    return telemetry_push()
 
 @flask_app.post("/api/commands/pull")
 def commands_pull():
     """Edge polls here for new trade instructions."""
     return jsonify(ok=True, commands=[]), 200
-
 
 @flask_app.post("/api/commands/ack")
 def commands_ack():
@@ -86,13 +98,13 @@ def commands_ack():
     log.info("✅ ACK from edge: %s", data)
     return jsonify(ok=True), 200
 
-
 @flask_app.post("/api/heartbeat")
 def heartbeat():
+    """Edge heartbeat."""
     return jsonify(ok=True, service="Bus", alive=True), 200
 
 # ---------------------------------------------------------------------
-# Error handlers
+# ERROR HANDLERS
 # ---------------------------------------------------------------------
 @flask_app.errorhandler(404)
 def not_found(_e): return jsonify(error="not_found"), 404
@@ -106,10 +118,11 @@ def server_error(e):
     return jsonify(error="internal_error"), 500
 
 # ---------------------------------------------------------------------
-# Background receipts bridge (optional)
+# BACKGROUND RECEIPTS BRIDGE
 # ---------------------------------------------------------------------
 def _start_receipts_bridge():
     if os.environ.get("DISABLE_RECEIPTS_BRIDGE", "").lower() in ("1", "true", "yes"):
+        log.info("receipts_bridge disabled via env.")
         return
     try:
         import receipts_bridge  # type: ignore
@@ -132,7 +145,7 @@ def _start_receipts_bridge():
 _start_receipts_bridge()
 
 # ---------------------------------------------------------------------
-# Scheduler loop (to run hourly/daily jobs)
+# SCHEDULER LOOP (for hourly/daily Nova jobs)
 # ---------------------------------------------------------------------
 def _start_scheduler():
     try:
@@ -152,7 +165,7 @@ def _start_scheduler():
 _start_scheduler()
 
 # ---------------------------------------------------------------------
-# ASGI adapter (so Uvicorn can serve Flask cleanly)
+# ASGI ADAPTER (Uvicorn support)
 # ---------------------------------------------------------------------
 try:
     from asgiref.wsgi import WsgiToAsgi
