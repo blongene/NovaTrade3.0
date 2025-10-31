@@ -88,58 +88,100 @@ def readyz():
 # ---------------------------------------------------------------------
 # EDGE AGENT API ENDPOINTS (final, hardened, single definition each)
 # ---------------------------------------------------------------------
-def _safe_floats(d: Dict[str, Any]) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    for k, v in (d or {}).items():
-        try:
-            out[k] = round(float(v), 8)
-        except Exception:
-            out[k] = 0.0
-    return out
+_last_telemetry = {"agent_id": None, "flat": {}, "by_venue": {}}
+
+def _safe_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+def _normalize_balances(raw) -> tuple[dict, dict]:
+    """
+    Returns (flat_tokens, by_venue) from raw balances which may be:
+      - flat tokens: {"USDC": 12.3, "BTC": 0.001}
+      - nested by venue: {"COINBASE": {"USDC": 19.3, ...}, "KRAKEN": {...}}
+    """
+    if not isinstance(raw, dict):
+        return {}, {}
+
+    # Detect nested (venue -> tokens)
+    nested = all(isinstance(v, dict) for v in raw.values())
+    if nested:
+        by_venue: dict[str, dict[str, float]] = {}
+        flat: dict[str, float] = {}
+        for venue, token_map in raw.items():
+            vmap: dict[str, float] = {}
+            for token, amt in (token_map or {}).items():
+                val = round(_safe_float(amt), 8)
+                vmap[token] = val
+                flat[token] = round(flat.get(token, 0.0) + val, 8)
+            by_venue[venue] = vmap
+        return flat, by_venue
+    else:
+        # Already flat token map
+        flat = {t: round(_safe_float(a), 8) for t, a in raw.items()}
+        return flat, {}
 
 @flask_app.post("/api/telemetry/push")
-def telemetry_push():
+def api_telemetry_push():
     """
-    Edge Agent posts wallet snapshots & telemetry here.
-    Always safe-casts and never raises.
+    Edge Agent posts wallet snapshots/telemetry.
+    Accepts:
+      {"agent_id": "...", "balances": { ... flat or nested ... }, ...}
     """
     data = request.get_json(silent=True) or {}
     agent_id = data.get("agent_id", "edge")
-    balances = _safe_floats(data.get("balances") or {})
-    # concise, useful line
-    log.info("📡 Telemetry from %s: %s", agent_id, balances)
-    return jsonify(ok=True, received=len(balances)), 200
+    raw_balances = data.get("balances") or {}
 
-# Legacy compatibility aliases
+    flat, by_venue = _normalize_balances(raw_balances)
+
+    # Store last snapshot (in-memory)
+    _last_telemetry["agent_id"] = agent_id
+    _last_telemetry["flat"] = flat
+    _last_telemetry["by_venue"] = by_venue
+
+    # Concise log: per-venue token counts or flat summary
+    if by_venue:
+        venue_counts = {v: len(tokens) for v, tokens in by_venue.items()}
+        log.info("📡 Telemetry from %s: venues=%s | flat_tokens=%d",
+                 agent_id, venue_counts, len(flat))
+    else:
+        # Log up to a few tokens to keep noise low
+        preview = dict(list(flat.items())[:4])
+        log.info("📡 Telemetry from %s: %s%s",
+                 agent_id, preview, " …" if len(flat) > 4 else "")
+
+    return jsonify(ok=True, received=(len(by_venue) or len(flat))), 200
+
+# Legacy aliases → same handler
 @flask_app.post("/api/telemetry/push_balances")
-@flask_app.post("/bus/push_balances")
 @flask_app.post("/api/edge/balances")
-def telemetry_push_alias():
-    return telemetry_push()
+@flask_app.post("/bus/push_balances")
+def api_telemetry_push_aliases():
+    return api_telemetry_push()
+
+@flask_app.get("/api/telemetry/last")
+def api_telemetry_last():
+    """Debug endpoint to view last normalized snapshot (flat + by_venue)."""
+    return jsonify(ok=True, **_last_telemetry), 200
 
 @flask_app.post("/api/commands/pull")
-def commands_pull():
-    """
-    Edge polls for commands. Empty until outbox/queue is wired.
-    """
-    log.debug("Edge poll ok (no commands queued)")
+def api_commands_pull():
+    log.debug("🪙 Edge poll → ok (empty queue)")
     return jsonify(ok=True, commands=[]), 200
 
 @flask_app.post("/api/commands/ack")
-def commands_ack():
-    """
-    Edge acknowledges command execution.
-    JSON: {agent_id, command_id, status, ...}
-    """
+def api_commands_ack():
     data = request.get_json(silent=True) or {}
-    agent = data.get("agent_id", "edge")
-    cmd_id = data.get("command_id", "?")
-    status = data.get("status", "ok")
-    log.info("✅ ACK from %s → %s (%s)", agent, cmd_id, status)
+    log.info("✅ ACK from %s → %s (%s)",
+             data.get("agent_id", "edge"),
+             data.get("command_id", "?"),
+             data.get("status", "ok"))
     return jsonify(ok=True), 200
 
 @flask_app.post("/api/heartbeat")
-def heartbeat():
+def api_heartbeat():
     return jsonify(ok=True, service="Bus", alive=True), 200
 
 # ---------------------------------------------------------------------
