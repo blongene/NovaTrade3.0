@@ -542,6 +542,19 @@ def _server_error(e):
     log.warning("Unhandled error: %s", e)
     return jsonify(error="internal_error"), 500
 
+@flask_app.get("/api/debug/selftest")
+def api_debug_selftest():
+    # Prove DB is usable and schema is present
+    try:
+        test_id = f"selftest-{uuid.uuid4()}"
+        payload = {"id": test_id, "ts": int(time.time()), "source": "selftest"}
+        _enqueue_command(test_id, payload)  # uses the same insert as /intent/enqueue
+        q = _queue_depth()
+        return jsonify(ok=True, test_id=test_id, queue=q, db=DB_PATH), 200
+    except Exception as e:
+        log.warning("selftest failed: %s", e)
+        return jsonify(ok=False, error=str(e), db=DB_PATH), 500
+
 # ============================================================================
 # Receipts bridge (optional background loop)
 # ============================================================================
