@@ -1,17 +1,9 @@
 # wsgi.py — NovaTrade Bus (drop-in, single file)
-# - Quiet logging (INFO by default)
-# - Health: /, /healthz, /readyz, /api/health/summary
-# - Telemetry: /api/telemetry/push (+ legacy aliases), /api/telemetry/last
-# - Command Bus: /api/intent/enqueue, /api/commands/pull, /api/commands/ack  (HMAC-capable)
-# - Durable SQLite outbox (WAL), leases & receipts (embedded here)
-# - Optional Telegram notices (ENABLE_TELEGRAM=true)
-# - Receipts bridge thread (if receipts_bridge.run_once present)
-# - ASGI shim (WsgiToAsgi) for uvicorn
 
 from __future__ import annotations
 import os, logging, threading, time, json, uuid, hmac, hashlib, sqlite3
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 from flask import Flask, jsonify, request, Blueprint
 
 # ============================================================================
@@ -23,8 +15,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("bus")
-
-# keep werkzeug quiet unless DEBUG
 logging.getLogger("werkzeug").setLevel(logging.WARNING if LOG_LEVEL != "DEBUG" else logging.DEBUG)
 
 # ============================================================================
@@ -33,10 +23,10 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING if LOG_LEVEL != "DEBUG" e
 flask_app = Flask(__name__)
 
 # ============================================================================
-# Embedded: Telegram helper (quiet, optional)
+# Telegram (quiet, optional; never crashes the Bus)
 # ============================================================================
 def send_telegram(text: str):
-    if os.getenv("ENABLE_TELEGRAM", "").lower() not in ("1", "true", "yes"):
+    if os.getenv("ENABLE_TELEGRAM","").lower() not in ("1","true","yes"):
         return
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -47,93 +37,75 @@ def send_telegram(text: str):
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"},
-            timeout=8,
+            timeout=8
         )
     except Exception as e:
         log.debug("telegram send degraded: %s", e)
 
-# Try to mount a Telegram webhook at /tg if provided by the user, without ever crashing the Bus.
 def _maybe_init_telegram(app: Flask) -> Optional[str]:
     if os.environ.get("ENABLE_TELEGRAM", "").lower() not in ("1", "true", "yes"):
         return None
-
     try:
-        # We accept any of these export styles from telegram_webhook.py:
-        #   tg_blueprint (Blueprint), telegram_bp (Blueprint), telegram_app (Flask), create_blueprint() (factory)
-        import types
-        import telegram_webhook as tgmod
+        import telegram_webhook as tgmod  # user-provided module (optional)
 
         tg_bp = None
         if hasattr(tgmod, "tg_blueprint"):
             tg_bp = getattr(tgmod, "tg_blueprint")
         elif hasattr(tgmod, "telegram_bp"):
             tg_bp = getattr(tgmod, "telegram_bp")
-        elif hasattr(tgmod, "create_blueprint") and callable(getattr(tgmod, "create_blueprint")):
+        elif hasattr(tgmod, "create_blueprint") and callable(tgmod.create_blueprint):
             tg_bp = tgmod.create_blueprint()
 
         if tg_bp is not None:
-            from flask import Blueprint
-            if isinstance(tg_bp, Blueprint):
+            from flask import Blueprint as _BP
+            if isinstance(tg_bp, _BP):
                 app.register_blueprint(tg_bp, url_prefix="/tg")
                 log.info("Telegram blueprint mounted at /tg")
             else:
-                # Not a Blueprint — fall back to WSGI mount if it's a Flask app
+                # If it's a Flask app, mount it under /tg using DispatcherMiddleware
                 try:
                     from werkzeug.middleware.dispatcher import DispatcherMiddleware
-                    # If this is a Flask() instance, it exposes .wsgi_app
                     subapp = getattr(tg_bp, "wsgi_app", None)
                     if subapp is None:
                         raise TypeError("telegram object is neither Blueprint nor Flask.wsgi_app")
                     app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/tg": subapp})
                     log.info("Telegram Flask app mounted at /tg")
                 except Exception as e:
-                    log.warning("Telegram mount degraded (not a Blueprint/Flask app): %s", e)
+                    log.warning("Telegram mount degraded: %s", e)
                     return str(e)
 
-        # Optional: best-effort webhook setter
-        if hasattr(tgmod, "set_telegram_webhook") and callable(getattr(tgmod, "set_telegram_webhook")):
+        setter = getattr(tgmod, "set_telegram_webhook", None)
+        if callable(setter):
             try:
-                tgmod.set_telegram_webhook()
+                setter()
             except Exception as e:
                 log.info("Telegram webhook setter degraded: %s", e)
 
         return None
-
     except Exception as e:
-        # Never crash the Bus because of Telegram wiring
         log.warning("Telegram init failed: %s", e)
         return str(e)
 
 telegram_status = _maybe_init_telegram(flask_app)
 
 # ============================================================================
-# Embedded: HMAC helpers
+# HMAC helpers & policy flags
 # ============================================================================
 OUTBOX_SECRET = os.getenv("OUTBOX_SECRET", "")
-
-# --- HMAC flags (honor your env) ---
-REQUIRE_HMAC_OPS = os.getenv("REQUIRE_HMAC_OPS", "0").lower() in ("1","true","yes")
-REQUIRE_HMAC_PULL = os.getenv("REQUIRE_HMAC_PULL", "0").lower() in ("1","true","yes")
-REQUIRE_HMAC_TELEMETRY = os.getenv("REQUIRE_HMAC_TELEMETRY", "0").lower() in ("1","true","yes")
-
-# Allow a separate secret for telemetry if desired (falls back to OUTBOX_SECRET)
+REQUIRE_HMAC_OPS = os.getenv("REQUIRE_HMAC_OPS","0").lower() in ("1","true","yes")
+REQUIRE_HMAC_PULL = os.getenv("REQUIRE_HMAC_PULL","0").lower() in ("1","true","yes")
+REQUIRE_HMAC_TELEMETRY = os.getenv("REQUIRE_HMAC_TELEMETRY","0").lower() in ("1","true","yes")
 TELEMETRY_SECRET = os.getenv("TELEMETRY_SECRET", OUTBOX_SECRET)
 
-def _canonical(body: dict) -> bytes:
-    return json.dumps(body, separators=(",",":"), sort_keys=True).encode("utf-8")
+def _canonical(d: dict) -> bytes:
+    return json.dumps(d, separators=(",",":"), sort_keys=True).encode("utf-8")
 
-def _hmac_sign(body: dict) -> str:
-    if not OUTBOX_SECRET:
-        return ""
-    return hmac.new(OUTBOX_SECRET.encode("utf-8"), _canonical(body), hashlib.sha256).hexdigest()
-
-def _hmac_verify(body: dict, provided_sig: str) -> bool:
-    if not OUTBOX_SECRET:
-        # dev mode (no secret) — accept
+def _verify_with(secret: str, body: dict, sig: str) -> bool:
+    if not secret:
         return True
     try:
-        expected = _hmac_sign(body)
-        return hmac.compare_digest(expected, provided_sig or "")
+        exp = hmac.new(secret.encode("utf-8"), _canonical(body), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(exp, sig or "")
     except Exception:
         return False
 
@@ -145,58 +117,33 @@ def _require_json():
     except Exception:
         return None, ("malformed JSON", 400)
 
-def _hmac_verify_with(secret: str, body: dict, provided_sig: str) -> bool:
-    if not secret:  # dev lenience
-        return True
-    try:
-        expected = hmac.new(secret.encode("utf-8"),
-                            json.dumps(body, separators=(",",":"), sort_keys=True).encode("utf-8"),
-                            hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, provided_sig or "")
-    except Exception:
-        return False
-
 def _maybe_require_hmac_ops(body):
-    if REQUIRE_HMAC_OPS:
-        sig = request.headers.get("X-NT-Sig","")
-        if not _hmac_verify_with(OUTBOX_SECRET, body, sig):
-            return ("invalid signature", 401)
+    if REQUIRE_HMAC_OPS and not _verify_with(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
+        return ("invalid signature", 401)
     return None
 
 def _maybe_require_hmac_pull(body):
-    if REQUIRE_HMAC_PULL:
-        sig = request.headers.get("X-NT-Sig","")
-        if not _hmac_verify_with(OUTBOX_SECRET, body, sig):
-            return ("invalid signature", 401)
+    if REQUIRE_HMAC_PULL and not _verify_with(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
+        return ("invalid signature", 401)
     return None
 
 def _maybe_require_hmac_tel(body):
-    if REQUIRE_HMAC_TELEMETRY:
-        sig = request.headers.get("X-NT-Sig","")
-        if not _hmac_verify_with(TELEMETRY_SECRET, body, sig):
-            return ("invalid signature", 401)
+    if REQUIRE_HMAC_TELEMETRY and not _verify_with(TELEMETRY_SECRET, body, request.headers.get("X-NT-Sig","")):
+        return ("invalid signature", 401)
     return None
 
 # ============================================================================
-# Embedded: SQLite outbox store (WAL)
+# SQLite durable store (WAL)
 # ============================================================================
-# --- SQLite outbox path ------------------------------------------------------
 DB_PATH = os.getenv("OUTBOX_DB_PATH", "./outbox.sqlite")
-
-# Ensure the directory exists (avoids "unable to open database file" 500s)
-import os
-try:
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-except Exception as e:
-    import logging
-    logging.warning("Could not create DB directory for %s: %s", DB_PATH, e)
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS commands (
   id TEXT PRIMARY KEY,
   payload TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'queued',     -- queued|leased|acked|failed
+  status TEXT NOT NULL DEFAULT 'queued',   -- queued|leased|acked|failed
   created_at TEXT NOT NULL,
   leased_at TEXT,
   lease_expires_at TEXT,
@@ -206,7 +153,7 @@ CREATE TABLE IF NOT EXISTS receipts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   command_id TEXT NOT NULL,
   agent_id TEXT,
-  status TEXT NOT NULL,                      -- ok|error|skipped
+  status TEXT NOT NULL,                    -- ok|error|skipped
   detail TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY(command_id) REFERENCES commands(id)
@@ -223,10 +170,8 @@ def _connect():
 def _init_db():
     conn = _connect()
     try:
-        for stmt in SCHEMA.strip().split(";"):
-            s = stmt.strip()
-            if s:
-                conn.execute(s)
+        for stmt in [s.strip() for s in SCHEMA.strip().split(";") if s.strip()]:
+            conn.execute(stmt)
     finally:
         conn.close()
 
@@ -259,10 +204,8 @@ def _pull_commands(agent_id: str, max_items: int = 10, lease_seconds: int = 90) 
             """,
             (now_iso, max_items)
         ).fetchall()
-
         if not rows:
             return []
-
         ids = [r[0] for r in rows]
         qmarks = ",".join("?" for _ in ids)
         conn.execute(
@@ -304,7 +247,7 @@ def _queue_depth() -> Dict[str,int]:
         conn.close()
 
 # ============================================================================
-# Health / basic endpoints
+# Health
 # ============================================================================
 @flask_app.get("/")
 def index():
@@ -314,17 +257,11 @@ def index():
 def healthz():
     info: Dict[str, Any] = {"ok": True, "web": "up"}
     info["telegram"] = {"status": "ok" if not telegram_status else "degraded", "reason": telegram_status}
+    info["db"] = DB_PATH
     try:
-        for name in ("VERSION", "version.txt", ".version"):
-            p = os.path.join(os.getcwd(), name)
-            if os.path.exists(p):
-                with open(p, "r", encoding="utf-8") as fh:
-                    info["version"] = fh.read().strip()
-                break
+        info["queue"] = _queue_depth()
     except Exception as e:
-        log.debug("version read failed: %s", e)
-    info["db"] = os.environ.get("OUTBOX_DB_PATH", "unset")
-    info["queue"] = _queue_depth()
+        info["queue_error"] = str(e)
     return jsonify(info), 200
 
 @flask_app.get("/readyz")
@@ -408,7 +345,6 @@ def intent_enqueue():
     e = _maybe_require_hmac_ops(body)
     if e: return e
 
-    # minimal validation
     required = ["agent_target","venue","symbol","side","amount"]
     missing = [k for k in required if not str(body.get(k,"")).strip()]
     if missing:
@@ -447,7 +383,6 @@ def intent_enqueue():
 
 @BUS_ROUTES.route("/ops/enqueue", methods=["POST"])
 def ops_enqueue_alias():
-    # exact alias to maintain backward-compat with OPS_ENQUEUE_URL
     return intent_enqueue()
 
 @BUS_ROUTES.route("/commands/pull", methods=["POST"])
@@ -502,24 +437,17 @@ def health_summary():
         "queue": q,
     })
 
-# mount blueprint
 flask_app.register_blueprint(BUS_ROUTES)
 
 # ============================================================================
-# Minimal legacy endpoints kept for compatibility (noop/quiet)
+# Legacy shims (quiet)
 # ============================================================================
-@flask_app.post("/api/commands/pull")  # legacy shim (kept; will not be reached if blueprint registered first)
+@flask_app.post("/api/commands/pull")
 def _legacy_pull():
-    log.debug("🪙 Edge poll → ok (legacy empty)")
     return jsonify(ok=True, commands=[]), 200
 
-@flask_app.post("/api/commands/ack")   # legacy shim
+@flask_app.post("/api/commands/ack")
 def _legacy_ack():
-    data = request.get_json(silent=True) or {}
-    log.info("✅ ACK (legacy) from %s → %s (%s)",
-             data.get("agent_id", "edge"),
-             data.get("command_id", "?"),
-             data.get("status", "ok"))
     return jsonify(ok=True), 200
 
 @flask_app.post("/api/heartbeat")
@@ -527,7 +455,7 @@ def api_heartbeat():
     return jsonify(ok=True, service="Bus", alive=True), 200
 
 # ============================================================================
-# Error handlers
+# Error handlers & debug selftest
 # ============================================================================
 @flask_app.errorhandler(404)
 def _not_found(_e):
@@ -544,11 +472,10 @@ def _server_error(e):
 
 @flask_app.get("/api/debug/selftest")
 def api_debug_selftest():
-    # Prove DB is usable and schema is present
     try:
         test_id = f"selftest-{uuid.uuid4()}"
         payload = {"id": test_id, "ts": int(time.time()), "source": "selftest"}
-        _enqueue_command(test_id, payload)  # uses the same insert as /intent/enqueue
+        _enqueue_command(test_id, payload)
         q = _queue_depth()
         return jsonify(ok=True, test_id=test_id, queue=q, db=DB_PATH), 200
     except Exception as e:
@@ -556,10 +483,10 @@ def api_debug_selftest():
         return jsonify(ok=False, error=str(e), db=DB_PATH), 500
 
 # ============================================================================
-# Receipts bridge (optional background loop)
+# Receipts bridge (optional)
 # ============================================================================
 def _start_receipts_bridge():
-    if os.environ.get("DISABLE_RECEIPTS_BRIDGE", "").lower() in ("1", "true", "yes"):
+    if os.environ.get("DISABLE_RECEIPTS_BRIDGE","").lower() in ("1","true","yes"):
         return
     try:
         import receipts_bridge  # user module providing run_once()
@@ -581,13 +508,11 @@ def _start_receipts_bridge():
 
 _start_receipts_bridge()
 
-# tiny banner to prove scheduler thread works (no cron here)
-def _scheduler_banner():
-    log.info("⏰ Scheduler thread active.")
-threading.Thread(target=_scheduler_banner, daemon=True).start()
+# Simple banner to prove thread scheduling works
+threading.Thread(target=lambda: log.info("⏰ Scheduler thread active."), daemon=True).start()
 
 # ============================================================================
-# ASGI adapter for uvicorn
+# ASGI adapter (uvicorn)
 # ============================================================================
 try:
     from asgiref.wsgi import WsgiToAsgi
