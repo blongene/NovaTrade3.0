@@ -1,4 +1,4 @@
-# wsgi.py — NovaTrade Bus (drop-in, single file)
+# wsgi.py — NovaTrade Bus (drop-in, single file, receipts-bridge compatible)
 
 from __future__ import annotations
 import os, logging, threading, time, json, uuid, hmac, hashlib, sqlite3
@@ -154,8 +154,8 @@ CREATE TABLE IF NOT EXISTS receipts (
   command_id TEXT NOT NULL,
   agent_id TEXT,
   status TEXT NOT NULL,                    -- ok|error|skipped
-  detail TEXT,
-  created_at TEXT NOT NULL,
+  detail TEXT,                             -- JSON
+  created_at TEXT NOT NULL,                -- ISO8601
   FOREIGN KEY(command_id) REFERENCES commands(id)
 );
 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
@@ -167,11 +167,30 @@ def _connect():
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
+def _ensure_receipts_compat(conn: sqlite3.Connection) -> None:
+    """Make 'receipts' compatible with old readers (want columns: ts, payload)."""
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(receipts)").fetchall()}
+        changed = False
+        if "ts" not in cols:
+            conn.execute("ALTER TABLE receipts ADD COLUMN ts TEXT")
+            changed = True
+        if "payload" not in cols:
+            conn.execute("ALTER TABLE receipts ADD COLUMN payload TEXT")
+            changed = True
+        if changed:
+            conn.execute("UPDATE receipts SET ts = COALESCE(ts, created_at)")
+            conn.execute("UPDATE receipts SET payload = COALESCE(payload, detail)")
+            conn.commit()
+    except Exception as e:
+        log.info("receipts compat check degraded: %s", e)
+
 def _init_db():
     conn = _connect()
     try:
         for stmt in [s.strip() for s in SCHEMA.strip().split(";") if s.strip()]:
             conn.execute(stmt)
+        _ensure_receipts_compat(conn)
     finally:
         conn.close()
 
@@ -225,11 +244,16 @@ def _pull_commands(agent_id: str, max_items: int = 10, lease_seconds: int = 90) 
 
 def _ack_command(cmd_id: str, agent_id: str, status: str, detail: Optional[Dict] = None) -> None:
     now = datetime.utcnow().isoformat()
+    jdetail = json.dumps(detail or {}, separators=(",",":"))
     conn = _connect()
     try:
+        _ensure_receipts_compat(conn)  # ensure legacy cols present
         conn.execute(
-            "INSERT INTO receipts(command_id, agent_id, status, detail, created_at) VALUES (?,?,?,?,?)",
-            (cmd_id, agent_id, status.lower(), json.dumps(detail or {}, separators=(",",":")), now)
+            """
+            INSERT INTO receipts(command_id, agent_id, status, detail, created_at, ts, payload)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (cmd_id, agent_id, status.lower(), jdetail, now, now, jdetail),
         )
         conn.execute("UPDATE commands SET status='acked' WHERE id=?", (cmd_id,))
     finally:
