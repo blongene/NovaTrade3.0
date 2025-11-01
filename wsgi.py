@@ -155,7 +155,16 @@ def _maybe_require_hmac_tel(body):
 # ============================================================================
 # Embedded: SQLite outbox store (WAL)
 # ============================================================================
+# --- SQLite outbox path ------------------------------------------------------
 DB_PATH = os.getenv("OUTBOX_DB_PATH", "./outbox.sqlite")
+
+# Ensure the directory exists (avoids "unable to open database file" 500s)
+import os
+try:
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+except Exception as e:
+    import logging
+    logging.warning("Could not create DB directory for %s: %s", DB_PATH, e)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
