@@ -62,6 +62,10 @@ def tg_webhook():
         msg  = (data.get("message") or data.get("edited_message") or {}) or {}
         text = (msg.get("text") or "").strip()
         chat = (msg.get("chat") or {}).get("id")
+      
+        if text.lower() in ("/id", "id"):
+            _send_telegram(f"chat_id = <code>{chat}</code>", chat_id=str(chat) if chat else None)
+            return _ok(received=True)
 
         # simple ops: respond to /ping
         if text.lower() in ("/ping", "ping"):
