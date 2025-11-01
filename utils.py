@@ -1,17 +1,22 @@
-# utils.py — NovaTrade 3.0 (Phase 5 hardened)
+# utils.py — NovaTrade 3.0 (Phase 5/6 hardened)
 # - Bullet-proof gspread auth resolution (env JSON, env file, common secret paths)
 # - Token-bucket + exponential backoff to survive 429s / intermittent errors
-# - Cached reads (worksheets, rows, values)
-# - Telegram de-duped notifications + prompts
+# - Cached reads (worksheets, rows, values) with simple invalidation helpers
+# - Telegram de-duped notifications + prompts (quiet failure)
 # - Legacy shims preserved (names/behaviors used by prior modules)
-# - Helpers used by receipts_bridge.py and Phase-5 jobs
+# - Small reliability polish: requests Session with retries for Telegram
+#
+# NOTE: This file is a drop-in replacement for your current utils.py.
 
 from __future__ import annotations
 import os, time, json, threading, functools, hashlib, hmac, random, traceback
 from datetime import datetime, timezone
 from contextlib import contextmanager
+from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter, Retry
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -41,6 +46,20 @@ def _ts(): return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 def info(msg):  print(f"[{_ts()}] INFO  {msg}")
 def warn(msg):  print(f"[{_ts()}] WARN  {msg}")
 def error(msg): print(f"[{_ts()}] ERROR {msg}")
+
+# ========= Requests Session (Telegram reliability) =========
+def _requests_session():
+    s = requests.Session()
+    retry = Retry(
+        total=4, connect=4, read=4, backoff_factor=0.4,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET","POST"])
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter); s.mount("http://", adapter)
+    return s
+
+_REQ = _requests_session()
 
 # ========= Token Bucket (global budgets) =========
 class TokenBucket:
@@ -106,25 +125,26 @@ def sheets_gate(mode: str = "read", tokens: int = 1):
         pass
 
 # ========= Telegram (de-duped) =========
-_dedup_cache = {}
+_dedup_cache: dict[str, float] = {}
 _dedup_lock = threading.Lock()
 _boot_once_key = "_boot_once_sent"
 
 def _tg_send_raw(text):
     if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        warn("Telegram disabled (BOT_TOKEN/TELEGRAM_CHAT_ID missing)")
+        # Do not warn constantly; keep quiet if not configured.
         return
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-        requests.post(url, json=data, timeout=10)
+        _REQ.post(url, json=data, timeout=10)
     except Exception as e:
+        # quiet failure; log at WARN just once per process if needed
         warn(f"Telegram send failed: {e}")
 
 def send_telegram_message_dedup(message: str, key: str, ttl_min: int = TG_DEDUP_TTL_MIN):
     now = time.time()
     with _dedup_lock:
-        last = _dedup_cache.get(key, 0)
+        last = _dedup_cache.get(key, 0.0)
         if now - last < ttl_min * 60:
             return
         _dedup_cache[key] = now
@@ -156,12 +176,11 @@ def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_T
     if key:
         now = time.time()
         with _dedup_lock:
-            last = _dedup_cache.get(key, 0)
+            last = _dedup_cache.get(key, 0.0)
             if now - last < ttl_min * 60:
                 return
             _dedup_cache[key] = now
     if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        warn("Telegram disabled; cannot send prompt.")
         return
     if not buttons:
         buttons = ["YES", "NO"]
@@ -173,7 +192,7 @@ def send_telegram_prompt(text, buttons=None, key=None, ttl_min: int = TG_DEDUP_T
             "parse_mode": "Markdown",
             "reply_markup": _build_inline_keyboard(buttons),
         }
-        requests.post(url, json=payload, timeout=10)
+        _REQ.post(url, json=payload, timeout=10)
     except Exception as e:
         warn(f"Telegram prompt send failed: {e}")
 
@@ -187,7 +206,7 @@ def tg_should_send(key_or_message: str, key: str = None, ttl_min: int = TG_DEDUP
     k = key or _tg_key_from_message(key_or_message)
     now = time.time()
     with _dedup_lock:
-        last = _dedup_cache.get(k, 0)
+        last = _dedup_cache.get(k, 0.0)
         if now - last < ttl_min * 60:
             return False
         if consume:
@@ -283,10 +302,10 @@ def _make_gspread_client():
     try:
         svc_path = path or "sentiment-log-service.json"
         if os.path.isfile(svc_path):
-            creds = ServiceAccountCredentials.from_json_keyfile_name(svc_path, __SCOPE)
+            creds = ServiceAccountCredentials.from_json_keyfile_name(svc_path, _SCOPE)  # FIXED: __SCOPE -> _SCOPE
         else:
             # Try parsing SVC_JSON as dict (if it's not valid JSON, this will raise)
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(os.getenv("SVC_JSON", "{}")), __SCOPE)
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(os.getenv("SVC_JSON", "{}")), _SCOPE)
         return gspread.authorize(creds)
     except Exception as e:
         # Last-ditch: default lookup (will raise if nothing is configured)
@@ -338,10 +357,27 @@ def with_sheet_backoff(fn):
     return wrapper
 
 # ========= Cached handles/rows/values =========
-_cached_ws = {}
-_cached_rows = {}
-_values_cache = {}
+_cached_ws: dict[str, tuple[float, Any]] = {}
+_cached_rows: dict[str, tuple[float, Any]] = {}
+_values_cache: dict[str, tuple[float, Any]] = {}
 _cache_lock = threading.Lock()
+
+def clear_sheet_caches():
+    """Global cache clear (worksheet handles, rows, values)."""
+    with _cache_lock:
+        _cached_ws.clear()
+        _cached_rows.clear()
+        _values_cache.clear()
+
+def invalidate_tab(tab: str):
+    """Invalidate caches for a particular tab/sheet name."""
+    with _cache_lock:
+        _cached_ws.pop(f"ws::{tab}", None)
+        # values keys: 'vals::<tab>::...'
+        for k in list(_values_cache.keys()):
+            if k.startswith(f"vals::{tab}::"):
+                _values_cache.pop(k, None)
+        _cached_rows.pop(f"rows::{tab}", None)
 
 @with_sheet_backoff
 def get_ws(name: str):
@@ -467,6 +503,7 @@ def ensure_sheet_headers(tab: str, required_headers: list[str]) -> list[str]:
                 changed = True
         if changed:
             ws_update(ws, "A1", [header])
+            invalidate_tab(tab)
         return header
     except Exception as e:
         warn(f"ensure_sheet_headers({tab}) skipped: {e}")
