@@ -25,22 +25,31 @@ flask_app = Flask(__name__)
 # ============================================================================
 # Telegram (quiet, optional; never crashes the Bus)
 # ============================================================================
-def send_telegram(text: str):
-    if os.getenv("ENABLE_TELEGRAM","").lower() not in ("1","true","yes"):
-        return
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return
-    try:
-        import requests
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"},
-            timeout=8
-        )
-    except Exception as e:
-        log.debug("telegram send degraded: %s", e)
+
+try:
+    from telegram_webhook import _send_telegram as send_telegram
+    log.info("Telegram send_telegram imported from telegram_webhook.py")
+except Exception as e:
+    log.warning("telegram_webhook import degraded, using fallback: %s", e)
+    import requests
+    def send_telegram(text: str):
+        if os.getenv("ENABLE_TELEGRAM","").lower() not in ("1","true","yes"):
+            return
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        if not token or not chat_id:
+            log.debug("Telegram not configured; skipping message.")
+            return
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"},
+                timeout=8
+            )
+            if not r.ok:
+                log.warning("Telegram send failed: %s", r.text)
+        except Exception as e2:
+            log.warning("Telegram send degraded: %s", e2)
 
 def _maybe_init_telegram(app: Flask) -> Optional[str]:
     if os.environ.get("ENABLE_TELEGRAM", "").lower() not in ("1", "true", "yes"):
