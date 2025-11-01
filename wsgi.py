@@ -36,7 +36,7 @@ flask_app = Flask(__name__)
 # Embedded: Telegram helper (quiet, optional)
 # ============================================================================
 def send_telegram(text: str):
-    if os.getenv("ENABLE_TELEGRAM","").lower() not in ("1","true","yes"):
+    if os.getenv("ENABLE_TELEGRAM", "").lower() not in ("1", "true", "yes"):
         return
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -47,37 +47,62 @@ def send_telegram(text: str):
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"},
-            timeout=8
+            timeout=8,
         )
     except Exception as e:
         log.debug("telegram send degraded: %s", e)
 
-# Try to mount the user’s telegram webhook blueprint at /tg (if present)
+# Try to mount a Telegram webhook at /tg if provided by the user, without ever crashing the Bus.
 def _maybe_init_telegram(app: Flask) -> Optional[str]:
     if os.environ.get("ENABLE_TELEGRAM", "").lower() not in ("1", "true", "yes"):
         return None
+
     try:
-        from telegram_webhook import telegram_app, set_telegram_webhook  # user-provided module
+        # We accept any of these export styles from telegram_webhook.py:
+        #   tg_blueprint (Blueprint), telegram_bp (Blueprint), telegram_app (Flask), create_blueprint() (factory)
+        import types
+        import telegram_webhook as tgmod
+
+        tg_bp = None
+        if hasattr(tgmod, "tg_blueprint"):
+            tg_bp = getattr(tgmod, "tg_blueprint")
+        elif hasattr(tgmod, "telegram_bp"):
+            tg_bp = getattr(tgmod, "telegram_bp")
+        elif hasattr(tgmod, "create_blueprint") and callable(getattr(tgmod, "create_blueprint")):
+            tg_bp = tgmod.create_blueprint()
+
+        if tg_bp is not None:
+            from flask import Blueprint
+            if isinstance(tg_bp, Blueprint):
+                app.register_blueprint(tg_bp, url_prefix="/tg")
+                log.info("Telegram blueprint mounted at /tg")
+            else:
+                # Not a Blueprint — fall back to WSGI mount if it's a Flask app
+                try:
+                    from werkzeug.middleware.dispatcher import DispatcherMiddleware
+                    # If this is a Flask() instance, it exposes .wsgi_app
+                    subapp = getattr(tg_bp, "wsgi_app", None)
+                    if subapp is None:
+                        raise TypeError("telegram object is neither Blueprint nor Flask.wsgi_app")
+                    app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/tg": subapp})
+                    log.info("Telegram Flask app mounted at /tg")
+                except Exception as e:
+                    log.warning("Telegram mount degraded (not a Blueprint/Flask app): %s", e)
+                    return str(e)
+
+        # Optional: best-effort webhook setter
+        if hasattr(tgmod, "set_telegram_webhook") and callable(getattr(tgmod, "set_telegram_webhook")):
+            try:
+                tgmod.set_telegram_webhook()
+            except Exception as e:
+                log.info("Telegram webhook setter degraded: %s", e)
+
+        return None
+
     except Exception as e:
-        log.warning("Telegram init failed (import): %s", e)
+        # Never crash the Bus because of Telegram wiring
+        log.warning("Telegram init failed: %s", e)
         return str(e)
-
-    try:
-        # NOTE: telegram_app can be a Flask app or a Blueprint; register as blueprint when possible
-        app.register_blueprint(telegram_app, url_prefix="/tg")  # type: ignore
-    except Exception as e:
-        log.warning("Telegram blueprint mount failed: %s", e)
-        return str(e)
-
-    try:
-        # Best-effort webhook set
-        if callable(set_telegram_webhook):
-            set_telegram_webhook()
-        log.info("Telegram webhook mounted at /tg")
-    except Exception as e:
-        log.info("Telegram webhook degraded: %s", e)
-
-    return None
 
 telegram_status = _maybe_init_telegram(flask_app)
 
