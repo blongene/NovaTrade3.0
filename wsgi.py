@@ -389,13 +389,14 @@ def intent_enqueue():
     }
     try:
         _enqueue_command(cmd_id, payload)
+        log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s",
+         cmd_id, payload["venue"], payload["symbol"], payload["side"], payload["amount"])
         send_telegram(f"✅ <b>Intent enqueued</b>\n<code>{json.dumps(payload,indent=2)}</code>")
         return jsonify({"ok": True, "id": cmd_id})
     except Exception as ex:
         send_telegram(f"⚠️ <b>Enqueue failed</b>\n{ex}")
         return (f"enqueue error: {ex}", 500)
-    log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s",
-         cmd_id, payload["venue"], payload["symbol"], payload["side"], payload["amount"])
+    
     
 @BUS_ROUTES.route("/ops/enqueue", methods=["POST"])
 def ops_enqueue_alias():
@@ -411,9 +412,9 @@ def commands_pull():
     max_items = int(body.get("max", 5) or 5)
     lease_seconds = int(body.get("lease_seconds", 90) or 90)
     cmds = _pull_commands(agent_id, max_items=max_items, lease_seconds=lease_seconds)
-    return jsonify({"ok": True, "commands": cmds})
     log.info("pull agent=%s count=%d lease=%ds", agent_id, len(cmds), lease_seconds)
-    
+    return jsonify({"ok": True, "commands": cmds})
+        
 @BUS_ROUTES.route("/commands/ack", methods=["POST"])
 def commands_ack():
     body, err = _require_json()
@@ -429,13 +430,13 @@ def commands_ack():
         _ack_command(cmd_id, agent_id, status, detail)
         if status == "ok":
             send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>")
+        log.info("ack id=%s agent=%s status=%s", cmd_id, agent_id, status)
         else:
             send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>\n<code>{json.dumps(detail,indent=2)}</code>")
         return jsonify({"ok": True})
     except Exception as ex:
         return (f"ack error: {ex}", 500)
-    log.info("ack id=%s agent=%s status=%s", cmd_id, agent_id, status)
-    
+        
 @BUS_ROUTES.route("/health/summary", methods=["GET"])
 def health_summary():
     try: q = _queue_depth()
@@ -457,6 +458,11 @@ flask_app.register_blueprint(BUS_ROUTES)
 # ============================================================================
 # Debug helpers
 # ============================================================================
+@flask_app.get("/api/debug/log")
+def api_debug_log():
+    log.info("debug-log: hello from bus")
+    return jsonify(ok=True), 200
+
 @flask_app.post("/api/debug/tg/send")
 def api_debug_tg_send():
     # Optional protection with TELEGRAM_WEBHOOK_SECRET
