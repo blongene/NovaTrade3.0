@@ -1,9 +1,8 @@
-# wsgi.py — NovaTrade Bus (drop-in, single file, receipts-bridge compatible)
-
+# wsgi.py — NovaTrade Bus (final drop-in)
 from __future__ import annotations
 import os, logging, threading, time, json, uuid, hmac, hashlib, sqlite3
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, jsonify, request, Blueprint
 
 # ============================================================================
@@ -25,8 +24,8 @@ flask_app = Flask(__name__)
 # ============================================================================
 # Telegram (quiet, optional; never crashes the Bus)
 # ============================================================================
-
 try:
+    # Prefer the helper inside your telegram_webhook module
     from telegram_webhook import _send_telegram as send_telegram
     log.info("Telegram send_telegram imported from telegram_webhook.py")
 except Exception as e:
@@ -55,8 +54,7 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
     if os.environ.get("ENABLE_TELEGRAM", "").lower() not in ("1", "true", "yes"):
         return None
     try:
-        import telegram_webhook as tgmod  # user-provided module (optional)
-
+        import telegram_webhook as tgmod  # optional user module
         tg_bp = None
         if hasattr(tgmod, "tg_blueprint"):
             tg_bp = getattr(tgmod, "tg_blueprint")
@@ -64,14 +62,12 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
             tg_bp = getattr(tgmod, "telegram_bp")
         elif hasattr(tgmod, "create_blueprint") and callable(tgmod.create_blueprint):
             tg_bp = tgmod.create_blueprint()
-
         if tg_bp is not None:
             from flask import Blueprint as _BP
             if isinstance(tg_bp, _BP):
                 app.register_blueprint(tg_bp, url_prefix="/tg")
                 log.info("Telegram blueprint mounted at /tg")
             else:
-                # If it's a Flask app, mount it under /tg using DispatcherMiddleware
                 try:
                     from werkzeug.middleware.dispatcher import DispatcherMiddleware
                     subapp = getattr(tg_bp, "wsgi_app", None)
@@ -82,14 +78,12 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
                 except Exception as e:
                     log.warning("Telegram mount degraded: %s", e)
                     return str(e)
-
         setter = getattr(tgmod, "set_telegram_webhook", None)
         if callable(setter):
             try:
                 setter()
             except Exception as e:
                 log.info("Telegram webhook setter degraded: %s", e)
-
         return None
     except Exception as e:
         log.warning("Telegram init failed: %s", e)
@@ -100,11 +94,11 @@ telegram_status = _maybe_init_telegram(flask_app)
 # ============================================================================
 # HMAC helpers & policy flags
 # ============================================================================
-OUTBOX_SECRET = os.getenv("OUTBOX_SECRET", "")
-REQUIRE_HMAC_OPS = os.getenv("REQUIRE_HMAC_OPS","0").lower() in ("1","true","yes")
-REQUIRE_HMAC_PULL = os.getenv("REQUIRE_HMAC_PULL","0").lower() in ("1","true","yes")
-REQUIRE_HMAC_TELEMETRY = os.getenv("REQUIRE_HMAC_TELEMETRY","0").lower() in ("1","true","yes")
-TELEMETRY_SECRET = os.getenv("TELEMETRY_SECRET", OUTBOX_SECRET)
+OUTBOX_SECRET         = os.getenv("OUTBOX_SECRET", "")
+REQUIRE_HMAC_OPS      = os.getenv("REQUIRE_HMAC_OPS","0").lower() in ("1","true","yes")
+REQUIRE_HMAC_PULL     = os.getenv("REQUIRE_HMAC_PULL","0").lower() in ("1","true","yes")
+REQUIRE_HMAC_TELEMETRY= os.getenv("REQUIRE_HMAC_TELEMETRY","0").lower() in ("1","true","yes")
+TELEMETRY_SECRET      = os.getenv("TELEMETRY_SECRET", OUTBOX_SECRET)
 
 def _canonical(d: dict) -> bytes:
     return json.dumps(d, separators=(",",":"), sort_keys=True).encode("utf-8")
@@ -164,7 +158,7 @@ CREATE TABLE IF NOT EXISTS receipts (
   agent_id TEXT,
   status TEXT NOT NULL,                    -- ok|error|skipped
   detail TEXT,                             -- JSON
-  created_at TEXT NOT NULL,                -- ISO8601
+  created_at TEXT NOT NULL,
   FOREIGN KEY(command_id) REFERENCES commands(id)
 );
 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
@@ -177,7 +171,7 @@ def _connect():
     return conn
 
 def _ensure_receipts_compat(conn: sqlite3.Connection) -> None:
-    """Make 'receipts' compatible with old readers (want columns: ts, payload)."""
+    # Add legacy columns some readers expect (ts, payload)
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(receipts)").fetchall()}
         changed = False
@@ -256,7 +250,7 @@ def _ack_command(cmd_id: str, agent_id: str, status: str, detail: Optional[Dict]
     jdetail = json.dumps(detail or {}, separators=(",",":"))
     conn = _connect()
     try:
-        _ensure_receipts_compat(conn)  # ensure legacy cols present
+        _ensure_receipts_compat(conn)
         conn.execute(
             """
             INSERT INTO receipts(command_id, agent_id, status, detail, created_at, ts, payload)
@@ -304,17 +298,14 @@ def readyz():
 # ============================================================================
 # Telemetry (Edge) — with legacy aliases
 # ============================================================================
-_last_telemetry: Dict[str, Any] = {"agent_id": None, "flat": {}, "by_venue": {}}
+_last_telemetry: Dict[str, Any] = {"agent_id": None, "flat": {}, "by_venue": {}, "ts": 0}
 
 def _safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
+    try: return float(x)
+    except Exception: return 0.0
 
-def _normalize_balances(raw) -> tuple[dict, dict]:
-    if not isinstance(raw, dict):
-        return {}, {}
+def _normalize_balances(raw) -> Tuple[dict, dict]:
+    if not isinstance(raw, dict): return {}, {}
     nested = all(isinstance(v, dict) for v in raw.values())
     if nested:
         by_venue: dict[str, dict[str, float]] = {}
@@ -339,18 +330,16 @@ def api_telemetry_push():
     agent_id = data.get("agent_id", "edge")
     raw_balances = data.get("balances") or {}
     flat, by_venue = _normalize_balances(raw_balances)
-
     _last_telemetry["agent_id"] = agent_id
     _last_telemetry["flat"] = flat
     _last_telemetry["by_venue"] = by_venue
-
+    _last_telemetry["ts"] = int(time.time())
     if by_venue:
         venue_counts = {v: len(tokens) for v, tokens in by_venue.items()}
         log.info("📡 Telemetry from %s: venues=%s | flat_tokens=%d", agent_id, venue_counts, len(flat))
     else:
         preview = dict(list(flat.items())[:4])
         log.info("📡 Telemetry from %s: %s%s", agent_id, preview, " …" if len(flat) > 4 else "")
-
     return jsonify(ok=True, received=(len(by_venue) or len(flat))), 200
 
 @flask_app.post("/api/telemetry/push_balances")
@@ -368,8 +357,7 @@ def api_telemetry_last():
 # ============================================================================
 BUS_ROUTES = Blueprint("bus_routes", __name__, url_prefix="/api")
 
-def _now_ts() -> int:
-    return int(time.time())
+def _now_ts() -> int: return int(time.time())
 
 @BUS_ROUTES.route("/intent/enqueue", methods=["POST"])
 def intent_enqueue():
@@ -377,22 +365,16 @@ def intent_enqueue():
     if err: return err
     e = _maybe_require_hmac_ops(body)
     if e: return e
-
     required = ["agent_target","venue","symbol","side","amount"]
     missing = [k for k in required if not str(body.get(k,"")).strip()]
-    if missing:
-        return (f"missing fields: {', '.join(missing)}", 400)
-
+    if missing: return (f"missing fields: {', '.join(missing)}", 400)
     side = str(body["side"]).lower()
-    if side not in ("buy","sell"):
-        return ("side must be buy|sell", 400)
+    if side not in ("buy","sell"): return ("side must be buy|sell", 400)
     try:
         amount = float(body["amount"])
-        if amount <= 0:
-            return ("amount must be > 0", 400)
+        if amount <= 0: return ("amount must be > 0", 400)
     except Exception:
         return ("amount must be numeric", 400)
-
     cmd_id = body.get("id") or str(uuid.uuid4())
     payload = {
         "id": cmd_id,
@@ -405,7 +387,6 @@ def intent_enqueue():
         "amount": amount,
         "flags": body.get("flags", []),
     }
-
     try:
         _enqueue_command(cmd_id, payload)
         send_telegram(f"✅ <b>Intent enqueued</b>\n<code>{json.dumps(payload,indent=2)}</code>")
@@ -424,11 +405,9 @@ def commands_pull():
     if err: return err
     e = _maybe_require_hmac_pull(body)
     if e: return e
-
     agent_id = str(body.get("agent_id","")).strip() or "edge-primary"
     max_items = int(body.get("max", 5) or 5)
     lease_seconds = int(body.get("lease_seconds", 90) or 90)
-
     cmds = _pull_commands(agent_id, max_items=max_items, lease_seconds=lease_seconds)
     return jsonify({"ok": True, "commands": cmds})
 
@@ -438,15 +417,11 @@ def commands_ack():
     if err: return err
     e = _maybe_require_hmac_pull(body)
     if e: return e
-
-    cmd_id = str(body.get("command_id","")).strip()
-    agent_id = str(body.get("agent_id","")).strip() or "edge-primary"
-    status = str(body.get("status","")).strip().lower() or "ok"
-    detail = body.get("detail", {})
-
-    if not cmd_id:
-        return ("command_id required", 400)
-
+    cmd_id  = str(body.get("command_id","")).strip()
+    agent_id= str(body.get("agent_id","")).strip() or "edge-primary"
+    status  = str(body.get("status","")).strip().lower() or "ok"
+    detail  = body.get("detail", {})
+    if not cmd_id: return ("command_id required", 400)
     try:
         _ack_command(cmd_id, agent_id, status, detail)
         if status == "ok":
@@ -459,44 +434,42 @@ def commands_ack():
 
 @BUS_ROUTES.route("/health/summary", methods=["GET"])
 def health_summary():
-    try:
-        q = _queue_depth()
-    except Exception:
-        q = {}
+    try: q = _queue_depth()
+    except Exception: q = {}
+    age = "-"
+    if _last_telemetry.get("ts"):
+        age = f"{int(time.time())-int(_last_telemetry['ts'])}s"
     return jsonify({
         "ok": True,
         "service": os.getenv("SERVICE_NAME","bus"),
-        "env": os.getenv("ENV","dev"),
+        "env": os.getenv("ENV","prod"),
         "queue": q,
+        "telemetry_age": age,
+        "agent": _last_telemetry.get("agent_id"),
     })
 
 flask_app.register_blueprint(BUS_ROUTES)
 
 # ============================================================================
-# Legacy shims (quiet)
+# Debug helpers
 # ============================================================================
-@flask_app.post("/api/commands/pull")
-def _legacy_pull():
-    return jsonify(ok=True, commands=[]), 200
-
-@flask_app.post("/api/commands/ack")
-def _legacy_ack():
+@flask_app.post("/api/debug/tg/send")
+def api_debug_tg_send():
+    # Optional protection with TELEGRAM_WEBHOOK_SECRET
+    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET","")
+    if secret:
+        got = request.args.get("secret") or request.headers.get("X-TG-Secret")
+        if (got or "") != secret:
+            return jsonify(ok=False, error="forbidden"), 403
+    text = (request.get_json(silent=True) or {}).get("text") or "NovaTrade test ✅"
+    send_telegram(text)
     return jsonify(ok=True), 200
 
-@flask_app.post("/api/heartbeat")
-def api_heartbeat():
-    return jsonify(ok=True, service="Bus", alive=True), 200
-
-# ============================================================================
-# Error handlers & debug selftest
-# ============================================================================
 @flask_app.errorhandler(404)
-def _not_found(_e):
-    return jsonify(error="not_found"), 404
+def _not_found(_e): return jsonify(error="not_found"), 404
 
 @flask_app.errorhandler(405)
-def _method_not_allowed(_e):
-    return jsonify(error="method_not_allowed"), 405
+def _method_not_allowed(_e): return jsonify(error="method_not_allowed"), 405
 
 @flask_app.errorhandler(500)
 def _server_error(e):
@@ -513,7 +486,7 @@ def api_debug_selftest():
         return jsonify(ok=True, test_id=test_id, queue=q, db=DB_PATH), 200
     except Exception as e:
         log.warning("selftest failed: %s", e)
-        return jsonify(ok=False, error=str(e), db=DB_PATH), 500
+        return jsonify(ok=False, error=str(e), db=DB_PATH), 200
 
 # ============================================================================
 # Receipts bridge (optional)
@@ -526,7 +499,6 @@ def _start_receipts_bridge():
     except Exception as e:
         log.debug("receipts_bridge unavailable: %s", e)
         return
-
     def _loop():
         time.sleep(15)
         while True:
@@ -535,13 +507,64 @@ def _start_receipts_bridge():
             except Exception as err:
                 log.info("receipts_bridge error: %s", err)
             time.sleep(300)
-
     threading.Thread(target=_loop, name="receipts-bridge", daemon=True).start()
     log.info("receipts_bridge scheduled every 5m")
 
 _start_receipts_bridge()
 
-# Simple banner to prove thread scheduling works
+# ============================================================================
+# Daily report scheduler (Phase-5 style)
+# ============================================================================
+DAILY_ENABLED   = os.getenv("DAILY_ENABLED","1").lower() in ("1","true","yes")
+DAILY_UTC_HOUR  = int(os.getenv("DAILY_UTC_HOUR","9"))   # default 09:00 UTC
+DAILY_UTC_MIN   = int(os.getenv("DAILY_UTC_MIN","0"))
+
+def _compose_daily() -> str:
+    # Simple “system” daily report using telemetry + queue
+    q = {}
+    try: q = _queue_depth()
+    except Exception: pass
+    age_s = "-"
+    if _last_telemetry.get("ts"):
+        age_s = f"{int(time.time())-int(_last_telemetry['ts'])}s"
+    venues_line = ", ".join(f"{v}:{len(t)}" for v,t in _last_telemetry.get("by_venue",{}).items()) or "—"
+    msg = (
+        "☀️ <b>NovaTrade Daily Report</b>\n"
+        f"as of {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        "<b>Heartbeats</b>\n"
+        f"• {_last_telemetry.get('agent_id') or 'edge-primary'}: last {age_s} ago\n\n"
+        "<b>Queue</b>\n"
+        f"• queued:{q.get('queued',0)} leased:{q.get('leased',0)} acked:{q.get('acked',0)} failed:{q.get('failed',0)}\n\n"
+        "<b>Balances (venues → tokenCount)</b>\n"
+        f"• {venues_line}\n"
+        f"Mode: <code>{os.getenv('EDGE_MODE','live')}</code>"
+    )
+    return msg
+
+def _sleep_until(hour:int, minute:int):
+    while True:
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(days=1)
+        time.sleep((target - now).total_seconds())
+        yield
+
+def _start_daily():
+    if not DAILY_ENABLED or os.getenv("ENABLE_TELEGRAM","").lower() not in ("1","true","yes"):
+        return
+    def _loop():
+        for _ in _sleep_until(DAILY_UTC_HOUR, DAILY_UTC_MIN):
+            try:
+                send_telegram(_compose_daily())
+            except Exception as e:
+                log.debug("daily send degraded: %s", e)
+    threading.Thread(target=_loop, name="daily-report", daemon=True).start()
+    log.info("Daily report scheduled for %02d:%02d UTC", DAILY_UTC_HOUR, DAILY_UTC_MIN)
+
+_start_daily()
+
+# Simple banner to prove scheduling thread is active
 threading.Thread(target=lambda: log.info("⏰ Scheduler thread active."), daemon=True).start()
 
 # ============================================================================
