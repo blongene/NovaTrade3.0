@@ -352,6 +352,27 @@ def api_telemetry_push_aliases():
 def api_telemetry_last():
     return jsonify(ok=True, **_last_telemetry), 200
 
+@flask_app.get("/dash")
+def dash():
+    try: q = _queue_depth()
+    except Exception: q = {}
+    age = "-"
+    if _last_telemetry.get("ts"):
+        age = f"{int(time.time())-int(_last_telemetry['ts'])}s"
+    html = f"""
+    <html><head><meta charset="utf-8"><title>NovaTrade Dash</title>
+    <style>
+      body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto; margin:24px; }}
+      .card {{ padding:16px; border:1px solid #e5e7eb; border-radius:12px; margin-bottom:12px; }}
+      code {{ background:#f3f4f6; padding:2px 6px; border-radius:6px; }}
+    </style></head><body>
+      <h2>NovaTrade Bus</h2>
+      <div class='card'><b>Telemetry age:</b> <code>{age}</code></div>
+      <div class='card'><b>Queue</b><br>queued:{q.get('queued',0)} · leased:{q.get('leased',0)} · acked:{q.get('acked',0)} · failed:{q.get('failed',0)}</div>
+      <div class='card'><b>Agent:</b> <code>{_last_telemetry.get('agent_id') or '-'}</code></div>
+    </body></html>"""
+    return html, 200, {"Content-Type":"text/html; charset=utf-8"}
+
 # ============================================================================
 # Command Bus (enqueue / pull / ack)
 # ============================================================================
@@ -363,6 +384,7 @@ def _now_ts() -> int: return int(time.time())
 def intent_enqueue():
     body, err = _require_json()
     if err: return err
+    if os.getenv("NOVA_KILL","").lower() in ("1","true","yes"): return jsonify(ok=False, error="bus_killed"), 503
     e = _maybe_require_hmac_ops(body)
     if e: return e
     required = ["agent_target","venue","symbol","side","amount"]
