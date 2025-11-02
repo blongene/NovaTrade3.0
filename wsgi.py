@@ -394,7 +394,9 @@ def intent_enqueue():
     except Exception as ex:
         send_telegram(f"⚠️ <b>Enqueue failed</b>\n{ex}")
         return (f"enqueue error: {ex}", 500)
-
+    log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s",
+         cmd_id, payload["venue"], payload["symbol"], payload["side"], payload["amount"])
+    
 @BUS_ROUTES.route("/ops/enqueue", methods=["POST"])
 def ops_enqueue_alias():
     return intent_enqueue()
@@ -410,7 +412,8 @@ def commands_pull():
     lease_seconds = int(body.get("lease_seconds", 90) or 90)
     cmds = _pull_commands(agent_id, max_items=max_items, lease_seconds=lease_seconds)
     return jsonify({"ok": True, "commands": cmds})
-
+    log.info("pull agent=%s count=%d lease=%ds", agent_id, len(cmds), lease_seconds)
+    
 @BUS_ROUTES.route("/commands/ack", methods=["POST"])
 def commands_ack():
     body, err = _require_json()
@@ -431,7 +434,8 @@ def commands_ack():
         return jsonify({"ok": True})
     except Exception as ex:
         return (f"ack error: {ex}", 500)
-
+    log.info("ack id=%s agent=%s status=%s", cmd_id, agent_id, status)
+    
 @BUS_ROUTES.route("/health/summary", methods=["GET"])
 def health_summary():
     try: q = _queue_depth()
