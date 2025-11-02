@@ -430,9 +430,9 @@ def commands_ack():
         _ack_command(cmd_id, agent_id, status, detail)
         if status == "ok":
             send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>")
-        log.info("ack id=%s agent=%s status=%s", cmd_id, agent_id, status)
         else:
             send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>\n<code>{json.dumps(detail,indent=2)}</code>")
+        log.info("ack id=%s agent=%s status=%s", cmd_id, agent_id, status)
         return jsonify({"ok": True})
     except Exception as ex:
         return (f"ack error: {ex}", 500)
