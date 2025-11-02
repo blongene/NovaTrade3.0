@@ -435,7 +435,7 @@ def commands_pull():
     lease_seconds = int(body.get("lease_seconds", 90) or 90)
     cmds = _pull_commands(agent_id, max_items=max_items, lease_seconds=lease_seconds)
     log.info("pull agent=%s count=%d lease=%ds", agent_id, len(cmds), lease_seconds)
-    return jsonify({"ok": True, "commands": cmds})
+    return jsonify({"ok": True, "commands": cmds, "lease_ttl_sec": lease_seconds})
         
 @BUS_ROUTES.route("/commands/ack", methods=["POST"])
 def commands_ack():
