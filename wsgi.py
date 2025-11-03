@@ -262,6 +262,33 @@ def _ack_command(cmd_id: str, agent_id: str, status: str, detail: Optional[Dict]
     finally:
         conn.close()
 
+
+def _last_receipts(n: int = 10):
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT command_id, agent_id, status, detail, created_at FROM receipts ORDER BY created_at DESC LIMIT ?",
+            (int(n),)
+        ).fetchall()
+        out = []
+        for cid, aid, st, detail, ts in rows:
+            try:
+                import json as _json
+                payload = _json.loads(detail) if detail else None
+            except Exception:
+                payload = {"raw": detail}
+            out.append({
+                "command_id": cid,
+                "agent_id": aid,
+                "status": st,
+                "payload": payload,
+                "ts": ts
+            })
+        return out
+    finally:
+        conn.close()
+
+
 def _queue_depth() -> Dict[str,int]:
     conn = _connect()
     try:
@@ -435,7 +462,7 @@ def commands_pull():
     lease_seconds = int(body.get("lease_seconds", 90) or 90)
     cmds = _pull_commands(agent_id, max_items=max_items, lease_seconds=lease_seconds)
     log.info("pull agent=%s count=%d lease=%ds", agent_id, len(cmds), lease_seconds)
-    return jsonify({"ok": True, "commands": cmds, "lease_ttl_sec": lease_seconds})
+    return jsonify({"ok": True, "commands": cmds})
         
 @BUS_ROUTES.route("/commands/ack", methods=["POST"])
 def commands_ack():
@@ -459,6 +486,19 @@ def commands_ack():
     except Exception as ex:
         return (f"ack error: {ex}", 500)
         
+
+@BUS_ROUTES.route("/receipts/last", methods=["GET"])
+def receipts_last():
+    try:
+        n = int(request.args.get("n", "10"))
+    except Exception:
+        n = 10
+    try:
+        rows = _last_receipts(n)
+        return jsonify({"ok": True, "receipts": rows})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @BUS_ROUTES.route("/health/summary", methods=["GET"])
 def health_summary():
     try: q = _queue_depth()
@@ -466,14 +506,21 @@ def health_summary():
     age = "-"
     if _last_telemetry.get("ts"):
         age = f"{int(time.time())-int(_last_telemetry['ts'])}s"
-    return jsonify({
+    data = { 
         "ok": True,
         "service": os.getenv("SERVICE_NAME","bus"),
         "env": os.getenv("ENV","prod"),
         "queue": q,
         "telemetry_age": age,
         "agent": _last_telemetry.get("agent_id"),
-    })
+     }
+    include = request.args.get("include_receipts","0").lower() in ("1","true","yes")
+    if include:
+        try:
+            data["receipts"] = _last_receipts(int(request.args.get("n","10")))
+        except Exception as e:
+            data["receipts_error"] = str(e)
+    return jsonify(data)
 
 flask_app.register_blueprint(BUS_ROUTES)
 
