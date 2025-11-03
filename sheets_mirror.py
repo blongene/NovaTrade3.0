@@ -1,7 +1,7 @@
 
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, sqlite3, json, time
+import os, sqlite3, json
 from datetime import datetime, timezone
 
 OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "/opt/render/project/src/outbox.sqlite")
@@ -10,7 +10,7 @@ RANGE_QUEUE    = os.getenv("SHEETS_RANGE_QUEUE", "NovaHeartbeat!B2:E2")
 MAX_ROWS       = int(os.getenv("SHEETS_MIRROR_MAX_ROWS", "200"))
 
 def _utc(ts):
-    if not ts and ts != 0:
+    if ts is None or ts == "":
         return ""
     try:
         return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat(timespec="seconds")
@@ -31,19 +31,15 @@ def fetch_data():
         conn = sqlite3.connect(OUTBOX_DB_PATH)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        # receipts table is required
-        cur.execute("""SELECT id, command_id, agent_id, status, ts, detail
-                       FROM receipts ORDER BY ts DESC LIMIT ?""", (MAX_ROWS,))
+        cur.execute("SELECT id, command_id, agent_id, status, ts, detail FROM receipts ORDER BY ts DESC LIMIT ?", (MAX_ROWS,))
         rcpts = [dict(r) for r in cur.fetchall()]
-
-        # queue table is optional in some snapshots; try to compute if present
         if _table_exists(conn, "queue"):
             cur.execute("""SELECT
-                              SUM(CASE WHEN status='acked'  THEN 1 ELSE 0 END) AS acked,
-                              SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
-                              SUM(CASE WHEN status='leased' THEN 1 ELSE 0 END) AS leased,
-                              SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued
-                           FROM queue""")
+                            SUM(CASE WHEN status='acked'  THEN 1 ELSE 0 END) AS acked,
+                            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                            SUM(CASE WHEN status='leased' THEN 1 ELSE 0 END) AS leased,
+                            SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued
+                         FROM queue""")
             row = cur.fetchone()
             if row:
                 qm.update({k: row[k] or 0 for k in row.keys()})
@@ -89,21 +85,20 @@ def flatten_receipts(rcpts):
             d = {}
         p = d.get("payload") or {}
         rows.append([
-            r.get("command_id",""),                           # A
-            (p.get("venue") or d.get("venue") or ""),         # B
-            (p.get("symbol") or d.get("symbol") or ""),       # C
-            (p.get("side") or d.get("side") or ""),           # D
-            p.get("executed_qty") or d.get("executed_qty") or "",  # E
-            p.get("avg_price")   or d.get("avg_price")   or "",    # F
-            d.get("status",""),                               # G
-            p.get("note") or d.get("note") or "",             # H
-            _utc(r.get("ts")),                                # I
-            (p.get("mode") or d.get("mode") or ""),           # J
+            r.get("command_id",""),
+            (p.get("venue") or d.get("venue") or ""),
+            (p.get("symbol") or d.get("symbol") or ""),
+            (p.get("side") or d.get("side") or ""),
+            p.get("executed_qty") or d.get("executed_qty") or "",
+            p.get("avg_price")   or d.get("avg_price")   or "",
+            d.get("status",""),
+            p.get("note") or d.get("note") or "",
+            _utc(r.get("ts")),
+            (p.get("mode") or d.get("mode") or ""),
         ])
     return rows
 
-# ----------- Writers ----------------
-
+# ---------- Writers ----------
 def _gw_write(range_a1, values):
     try:
         from sheets_gateway import build_gateway_from_env
@@ -115,7 +110,6 @@ def _gw_write(range_a1, values):
         return False, f"gateway not available: {e}"
 
 def _gspread_client():
-    # Use existing env: GOOGLE_CREDS_JSON_PATH / GOOGLE_APPLICATION_CREDENTIALS / SVC_JSON
     import json, pathlib
     try:
         import gspread
@@ -132,11 +126,11 @@ def _gspread_client():
             if pathlib.Path(svc).exists():
                 raw = pathlib.Path(svc).read_text(encoding="utf-8")
             else:
-                # assume raw json
                 raw = svc
     if not raw:
         raise RuntimeError("service JSON not found in GOOGLE_CREDS_JSON_PATH / GOOGLE_APPLICATION_CREDENTIALS / SVC_JSON")
     data = json.loads(raw)
+    import gspread
     gc = gspread.service_account_from_dict(data)  # type: ignore
     return gc
 
@@ -172,26 +166,25 @@ def _http_write(range_a1, values):
         return False, str(e)
 
 def write_values(range_a1, values):
-    # 1) try local gateway
+    # If set, skip gateway/HTTP and write straight to Google Sheets via gspread
+    if os.getenv("FORCE_GSPREAD_DIRECT","").lower() in {"1","true","yes"}:
+        return _direct_write(range_a1, values)
+    # Otherwise: gateway -> direct -> HTTP
     ok, res = _gw_write(range_a1, values)
-    if ok: return ok, res
-    # 2) try direct gspread
+    if ok:
+        return ok, res
     ok, res = _direct_write(range_a1, values)
-    if ok: return ok, res
-    # 3) try HTTP to /sheets endpoints
+    if ok:
+        return ok, res
     return _http_write(range_a1, values)
 
 def main():
     rcpts, qm = fetch_data()
-    # If queue metrics missing (no queue table), fetch from /api/health/summary
     if not any(qm.values()):
         qm = fetch_queue_from_health(qm)
-
     rows = flatten_receipts(rcpts)
 
-    # Write receipts
-    ok1, res1 = write_values(RANGE_RECEIPTS, rows if rows else [["", "", "", "", "", "", "", "", "", ""]])
-    # Write queue metrics (acked, failed, leased, queued)
+    ok1, res1 = write_values(RANGE_RECEIPTS, rows if rows else [["","","","","","","","","",""]])
     qrow = [[qm.get("acked",0), qm.get("failed",0), qm.get("leased",0), qm.get("queued",0)]]
     ok2, res2 = write_values(RANGE_QUEUE, qrow)
 
