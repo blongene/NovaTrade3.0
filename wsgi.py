@@ -4,6 +4,8 @@ import os, logging, threading, time, json, uuid, hmac, hashlib, sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, jsonify, request, Blueprint
+import sheets_mirror_plus as _pd
+import receipts_compactor as _rc
 
 # ============================================================================
 # Logging
@@ -700,6 +702,18 @@ def _start_nt_scheduler(app):
                 if now >= next_mirror:
                     _run_sheets_mirror_once()
                     next_mirror = now + mirror_iv
+                # run PD mirror every 10m along with the receipts mirror
+                try:
+                    _pd.main()
+                except Exception as e:
+                    _tg_send_raw(f"PD mirror error: {e}")
+                
+                # once a day, compact receipts (2:15 UTC)
+                if int(datetime.utcnow().strftime("%H%M")) == 215:
+                    try:
+                        _rc.compact_once()
+                    except Exception as e:
+                        _tg_send_raw(f"Compactor error: {e}")
                 if now >= next_daily:
                     _tg_send(_compose_daily_summary())
                     next_daily = now + 24*3600
