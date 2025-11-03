@@ -1,11 +1,11 @@
 # wsgi.py — NovaTrade Bus (final drop-in)
 from __future__ import annotations
+import sheets_mirror_plus as _pd
+import receipts_compactor as _rc
 import os, logging, threading, time, json, uuid, hmac, hashlib, sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, jsonify, request, Blueprint
-import sheets_mirror_plus as _pd
-import receipts_compactor as _rc
 
 # ============================================================================
 # Logging
@@ -92,33 +92,11 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
         return str(e)
 
 telegram_status = _maybe_init_telegram(flask_app)
-# Optional Sheets Gateway mount (uses existing GOOGLE_* / SVC_JSON / SHEET_URL)
-try:
-    from sheets_bp import SHEETS_ROUTES, start_background_flusher
-    flask_app.register_blueprint(SHEETS_ROUTES, url_prefix='/sheets')
-    try:
-        start_background_flusher()
-    except Exception as e:
-        log.info('Sheets flusher not started: %s', e)
-    log.info('SheetsGateway mounted at /sheets')
-except Exception as e:
-    log.info('SheetsGateway not mounted: %s', e)
-
 
 # ============================================================================
 # HMAC helpers & policy flags
-def _read_secret() -> str:
-    import os
-    pf = os.getenv('OUTBOX_SECRET_FILE','').strip()
-    if pf:
-        try:
-            return Path(pf).read_text(encoding='utf-8').strip()
-        except Exception:
-            pass
-    return os.getenv('OUTBOX_SECRET','').strip()
-
 # ============================================================================
-OUTBOX_SECRET = _read_secret()
+OUTBOX_SECRET         = os.getenv("OUTBOX_SECRET", "")
 REQUIRE_HMAC_OPS      = os.getenv("REQUIRE_HMAC_OPS","0").lower() in ("1","true","yes")
 REQUIRE_HMAC_PULL     = os.getenv("REQUIRE_HMAC_PULL","0").lower() in ("1","true","yes")
 REQUIRE_HMAC_TELEMETRY= os.getenv("REQUIRE_HMAC_TELEMETRY","0").lower() in ("1","true","yes")
@@ -615,127 +593,60 @@ def _start_receipts_bridge():
 
 _start_receipts_bridge()
 
-# === NovaTrade lightweight scheduler (no Render Cron) =======================
-import os, threading, time
-from datetime import datetime, timedelta, timezone
+# ============================================================================
+# Daily report scheduler (Phase-5 style)
+# ============================================================================
+DAILY_ENABLED   = os.getenv("DAILY_ENABLED","1").lower() in ("1","true","yes")
+DAILY_UTC_HOUR  = int(os.getenv("DAILY_UTC_HOUR","9"))   # default 09:00 UTC
+DAILY_UTC_MIN   = int(os.getenv("DAILY_UTC_MIN","0"))
 
-def _tg_send(text: str) -> bool:
-    """Minimal Telegram sender using existing BOT_TOKEN/TELEGRAM_CHAT_ID."""
-    try:
-        token = os.getenv("BOT_TOKEN", "").strip()
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        if not token or not chat_id:
-            return False
-        import requests
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=10,
-        )
-        return r.ok
-    except Exception:
-        return False
-
-def _compose_daily_summary():
-    """Calls our own /api/health/summary and composes a one-line report."""
-    import requests, os
-    bases = [
-        os.getenv("RENDER_EXTERNAL_URL","").strip(),
-        os.getenv("BUS_BASE_URL","").strip(),
-        os.getenv("BASE_URL","").strip(),
-        "http://127.0.0.1:10000",
-        "http://localhost:10000",
-    ]
-    j = None
-    for b in bases:
-        if not b:
-            continue
-        try:
-            r = requests.get(b.rstrip("/") + "/api/health/summary", timeout=8)
-            if r.ok:
-                j = r.json(); break
-        except Exception:
-            continue
-    if not j:
-        return "☀️ NovaTrade Daily Report\nhealth endpoint unavailable"
-    q = j.get("queue", {})
-    return (
-        "☀️ NovaTrade Daily Report\n"
-        f"service: {j.get('service','bus')} | agent: {j.get('agent','?')} | ok: {j.get('ok')}\n"
-        f"queue: acked={q.get('acked',0)} failed={q.get('failed',0)} "
-        f"leased={q.get('leased',0)} queued={q.get('queued',0)}\n"
-        f"telemetry_age: {j.get('telemetry_age','n/a')}"
+def _compose_daily() -> str:
+    # Simple “system” daily report using telemetry + queue
+    q = {}
+    try: q = _queue_depth()
+    except Exception: pass
+    age_s = "-"
+    if _last_telemetry.get("ts"):
+        age_s = f"{int(time.time())-int(_last_telemetry['ts'])}s"
+    venues_line = ", ".join(f"{v}:{len(t)}" for v,t in _last_telemetry.get("by_venue",{}).items()) or "—"
+    msg = (
+        "☀️ <b>NovaTrade Daily Report</b>\n"
+        f"as of {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        "<b>Heartbeats</b>\n"
+        f"• {_last_telemetry.get('agent_id') or 'edge-primary'}: last {age_s} ago\n\n"
+        "<b>Queue</b>\n"
+        f"• queued:{q.get('queued',0)} leased:{q.get('leased',0)} acked:{q.get('acked',0)} failed:{q.get('failed',0)}\n\n"
+        "<b>Balances (venues → tokenCount)</b>\n"
+        f"• {venues_line}\n"
+        f"Mode: <code>{os.getenv('EDGE_MODE','live')}</code>"
     )
+    return msg
 
-def _run_sheets_mirror_once():
-    """Best-effort call to your sheets mirror job if present."""
-    try:
-        import sheets_mirror  # your existing module
-        sheets_mirror.main()
-        return True
-    except Exception as e:
-        _tg_send(f"Sheets mirror failed: {e}")
-        return False
+def _sleep_until(hour:int, minute:int):
+    while True:
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(days=1)
+        time.sleep((target - now).total_seconds())
+        yield
 
-def _seconds_until(hour: int, minute: int) -> int:
-    now = datetime.now(timezone.utc)
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return max(1, int((target - now).total_seconds()))
-
-def _start_nt_scheduler(app):
-    """Start a daemon thread that does: mirror every X sec + daily TG summary."""
-    mirror_iv = int(os.getenv("MIRROR_INTERVAL_SEC", "600"))     # default 10m
-    daily_h   = int(os.getenv("HEALTH_UTC_HOUR", "13"))          # default 13:00 UTC
-    daily_m   = int(os.getenv("HEALTH_UTC_MIN",  "0"))
-
-    stop = threading.Event()
-
-    def loop():
-        next_mirror = time.time() + mirror_iv
-        next_daily  = time.time() + _seconds_until(daily_h, daily_m)
-        _tg_send("🕰️ NovaTrade scheduler started")
-        while not stop.is_set():
-            now = time.time()
+def _start_daily():
+    if not DAILY_ENABLED or os.getenv("ENABLE_TELEGRAM","").lower() not in ("1","true","yes"):
+        return
+    def _loop():
+        for _ in _sleep_until(DAILY_UTC_HOUR, DAILY_UTC_MIN):
             try:
-                if now >= next_mirror:
-                    _run_sheets_mirror_once()
-                    next_mirror = now + mirror_iv
-                # run PD mirror every 10m along with the receipts mirror
-                try:
-                    _pd.main()
-                except Exception as e:
-                    _tg_send_raw(f"PD mirror error: {e}")
-                
-                # once a day, compact receipts (2:15 UTC)
-                if int(datetime.utcnow().strftime("%H%M")) == 215:
-                    try:
-                        _rc.compact_once()
-                    except Exception as e:
-                        _tg_send_raw(f"Compactor error: {e}")
-                if now >= next_daily:
-                    _tg_send(_compose_daily_summary())
-                    next_daily = now + 24*3600
-            except Exception:
-                pass
-            stop.wait(2.0)
+                send_telegram(_compose_daily())
+            except Exception as e:
+                log.debug("daily send degraded: %s", e)
+    threading.Thread(target=_loop, name="daily-report", daemon=True).start()
+    log.info("Daily report scheduled for %02d:%02d UTC", DAILY_UTC_HOUR, DAILY_UTC_MIN)
 
-    threading.Thread(target=loop, name="NovaScheduler", daemon=True).start()
-    return stop
+_start_daily()
 
-# Manual mirror trigger
-@flask_app.route("/api/cron/mirror", methods=["POST"])
-def _cron_mirror():
-    ok = _run_sheets_mirror_once()
-    return {"ok": bool(ok)}, (200 if ok else 500)
-
-# kick it off after the app exists
-try:
-    _nt_sched_stop = _start_nt_scheduler(flask_app)
-except Exception:
-    pass
-# =======================================================================
+# Simple banner to prove scheduling thread is active
+threading.Thread(target=lambda: log.info("⏰ Scheduler thread active."), daemon=True).start()
 
 # ============================================================================
 # ASGI adapter (uvicorn)
@@ -746,3 +657,22 @@ try:
 except Exception as e:
     log.warning("ASGI adapter unavailable; falling back to WSGI: %s", e)
     app = flask_app  # type: ignore
+
+
+# -- Manual trigger to run receipts mirror and PD mirror
+@flask_app.route("/api/cron/mirror", methods=["POST"])
+def _cron_mirror_combined():
+    ok1 = ok2 = False
+    try:
+        import sheets_mirror as _m
+        _m.main()
+        ok1 = True
+    except Exception as e:
+        pass
+    try:
+        import sheets_mirror_plus as _pd
+        _pd.main()
+        ok2 = True
+    except Exception as e:
+        pass
+    return {"ok": bool(ok1 or ok2)}
