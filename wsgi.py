@@ -90,11 +90,33 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
         return str(e)
 
 telegram_status = _maybe_init_telegram(flask_app)
+# Optional Sheets Gateway mount (uses existing GOOGLE_* / SVC_JSON / SHEET_URL)
+try:
+    from sheets_bp import SHEETS_ROUTES, start_background_flusher
+    flask_app.register_blueprint(SHEETS_ROUTES, url_prefix='/sheets')
+    try:
+        start_background_flusher()
+    except Exception as e:
+        log.info('Sheets flusher not started: %s', e)
+    log.info('SheetsGateway mounted at /sheets')
+except Exception as e:
+    log.info('SheetsGateway not mounted: %s', e)
+
 
 # ============================================================================
 # HMAC helpers & policy flags
+def _read_secret() -> str:
+    import os
+    pf = os.getenv('OUTBOX_SECRET_FILE','').strip()
+    if pf:
+        try:
+            return Path(pf).read_text(encoding='utf-8').strip()
+        except Exception:
+            pass
+    return os.getenv('OUTBOX_SECRET','').strip()
+
 # ============================================================================
-OUTBOX_SECRET         = os.getenv("OUTBOX_SECRET", "")
+OUTBOX_SECRET = _read_secret()
 REQUIRE_HMAC_OPS      = os.getenv("REQUIRE_HMAC_OPS","0").lower() in ("1","true","yes")
 REQUIRE_HMAC_PULL     = os.getenv("REQUIRE_HMAC_PULL","0").lower() in ("1","true","yes")
 REQUIRE_HMAC_TELEMETRY= os.getenv("REQUIRE_HMAC_TELEMETRY","0").lower() in ("1","true","yes")
