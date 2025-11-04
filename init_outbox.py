@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""
-init_outbox.py — ensures outbox.sqlite schema exists
-(run once on boot or manually from shell)
-"""
-import sqlite3, os
+"""init_outbox.py — ensure outbox.sqlite schema exists (idempotent)"""
+import os, sqlite3
 
 DB = os.getenv("OUTBOX_DB_PATH", "/opt/render/project/src/outbox.sqlite")
 os.makedirs(os.path.dirname(DB), exist_ok=True)
 
-schema = """
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS queue (
     id TEXT PRIMARY KEY,
     payload TEXT,
@@ -17,6 +14,9 @@ CREATE TABLE IF NOT EXISTS queue (
     failed INTEGER DEFAULT 0,
     created REAL DEFAULT (strftime('%s','now'))
 );
+CREATE INDEX IF NOT EXISTS idx_queue_acked ON queue(acked);
+CREATE INDEX IF NOT EXISTS idx_queue_lease ON queue(lease_expiry);
+
 CREATE TABLE IF NOT EXISTS receipts (
     id TEXT PRIMARY KEY,
     command_id TEXT,
@@ -24,16 +24,20 @@ CREATE TABLE IF NOT EXISTS receipts (
     status TEXT,
     ts REAL DEFAULT (strftime('%s','now'))
 );
+CREATE INDEX IF NOT EXISTS idx_receipts_ts ON receipts(ts);
+CREATE INDEX IF NOT EXISTS idx_receipts_status ON receipts(status);
+
 CREATE TABLE IF NOT EXISTS commands (
     id TEXT PRIMARY KEY,
     payload TEXT,
     status TEXT,
     created REAL DEFAULT (strftime('%s','now'))
 );
+CREATE INDEX IF NOT EXISTS idx_commands_created ON commands(created);
 """
 
 conn = sqlite3.connect(DB)
-conn.executescript(schema)
+conn.executescript(SCHEMA)
 conn.commit()
 conn.close()
 print(f"✅ ensured schema in {DB}")
