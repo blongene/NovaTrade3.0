@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # sheets_mirror_plus.py — publish a compact Performance_Dashboard row each run.
 from __future__ import annotations
@@ -39,12 +38,14 @@ def summarize():
     ts_now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return [[ts_now, len(rcpts), ok_cnt, err_cnt, last_ok, last_err]]
 
+# ---------- writers ----------
 def _gspread_client():
-    import json, pathlib
+    import json as _json, pathlib
     try:
         import gspread
     except Exception as e:
         raise RuntimeError("gspread not installed") from e
+
     raw = None
     for key in ("GOOGLE_CREDS_JSON_PATH","GOOGLE_APPLICATION_CREDENTIALS"):
         p = os.getenv(key, "").strip()
@@ -59,19 +60,18 @@ def _gspread_client():
                 raw = svc
     if not raw:
         raise RuntimeError("service JSON not found in GOOGLE_CREDS_JSON_PATH / GOOGLE_APPLICATION_CREDENTIALS / SVC_JSON")
-    data = json.loads(raw)
+    data = _json.loads(raw)
     import gspread
     gc = gspread.service_account_from_dict(data)  # type: ignore
     return gc
 
-
 def _direct_write(range_a1, values):
+    """Write using Google Sheets Values API via gspread."""
     try:
         gc = _gspread_client()
         sh = gc.open_by_url(os.getenv("SHEET_URL","").strip())
         if "!" not in range_a1:
             raise RuntimeError("Range must include worksheet name, e.g., 'Sheet1!A2'")
-        # Use gspread's values_update (Values API), not batchUpdate (Drive batchUpdate schema)
         res = sh.values_update(
             range_a1,
             params={"valueInputOption": "USER_ENTERED"},
@@ -82,7 +82,6 @@ def _direct_write(range_a1, values):
         return False, f"direct gspread write failed: {e}"
 
 def _gw_write(range_a1, values):
-(range_a1, values):
     try:
         from sheets_gateway import build_gateway_from_env
         gw = build_gateway_from_env()
