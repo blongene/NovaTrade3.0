@@ -35,7 +35,7 @@ except Exception as e:
     def send_telegram(text: str):
         if os.getenv("ENABLE_TELEGRAM","").lower() not in ("1","true","yes"):
             return
-        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if not token or not chat_id:
             log.debug("Telegram not configured; skipping message.")
