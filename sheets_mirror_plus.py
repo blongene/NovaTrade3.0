@@ -64,21 +64,25 @@ def _gspread_client():
     gc = gspread.service_account_from_dict(data)  # type: ignore
     return gc
 
+
 def _direct_write(range_a1, values):
     try:
         gc = _gspread_client()
         sh = gc.open_by_url(os.getenv("SHEET_URL","").strip())
         if "!" not in range_a1:
             raise RuntimeError("Range must include worksheet name, e.g., 'Sheet1!A2'")
-        ws_name, rng = range_a1.split("!",1)
-        ws = sh.worksheet(ws_name)
-        body = {"valueInputOption":"USER_ENTERED","data":[{"range": f"{ws_name}!{rng}", "values": values}]}
-        res = sh.batch_update(body)  # type: ignore
+        # Use gspread's values_update (Values API), not batchUpdate (Drive batchUpdate schema)
+        res = sh.values_update(
+            range_a1,
+            params={"valueInputOption": "USER_ENTERED"},
+            body={"values": values},
+        )
         return True, res
     except Exception as e:
         return False, f"direct gspread write failed: {e}"
 
 def _gw_write(range_a1, values):
+(range_a1, values):
     try:
         from sheets_gateway import build_gateway_from_env
         gw = build_gateway_from_env()
