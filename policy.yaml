@@ -1,12 +1,18 @@
+
+# policy.yaml — NovaTrade 3.0 Policy (Phase 6B)
 policy:
+  # sizing & risk
   max_per_coin_usd: 25
   min_quote_reserve_usd: 10
   min_liquidity_usd: 50000
-  rebuy_if_roi_drawdown_pct: 15
   cool_off_minutes_after_trade: 30
+
+  # strategic preferences
   prefer_quotes:
     BINANCEUS: USDT
     COINBASE:  USDC
     KRAKEN:    USDT
   venue_order: [BINANCEUS, COINBASE, KRAKEN]
+
+  # controls
   blocked_symbols: [BARK, BONK]
