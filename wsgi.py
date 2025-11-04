@@ -1,8 +1,7 @@
-# wsgi.py — NovaTrade Bus (final drop-in)
+
+# wsgi.py — NovaTrade Bus (policy-wired drop-in)
 from __future__ import annotations
-import sheets_mirror_plus as _pd
-import receipts_compactor as _rc
-import os, logging, threading, time, json, uuid, hmac, hashlib, sqlite3
+import os, logging, threading, time, json, uuid, hmac, hashlib, sqlite3, traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, jsonify, request, Blueprint
@@ -28,7 +27,7 @@ flask_app = Flask(__name__)
 # ============================================================================
 try:
     # Prefer the helper inside your telegram_webhook module
-    from telegram_webhook import _send_telegram as send_telegram
+    from telegram_webhook import _send_telegram as send_telegram  # type: ignore
     log.info("Telegram send_telegram imported from telegram_webhook.py")
 except Exception as e:
     log.warning("telegram_webhook import degraded, using fallback: %s", e)
@@ -96,11 +95,17 @@ telegram_status = _maybe_init_telegram(flask_app)
 # ============================================================================
 # HMAC helpers & policy flags
 # ============================================================================
-OUTBOX_SECRET         = os.getenv("OUTBOX_SECRET", "")
-REQUIRE_HMAC_OPS      = os.getenv("REQUIRE_HMAC_OPS","0").lower() in ("1","true","yes")
-REQUIRE_HMAC_PULL     = os.getenv("REQUIRE_HMAC_PULL","0").lower() in ("1","true","yes")
-REQUIRE_HMAC_TELEMETRY= os.getenv("REQUIRE_HMAC_TELEMETRY","0").lower() in ("1","true","yes")
-TELEMETRY_SECRET      = os.getenv("TELEMETRY_SECRET", OUTBOX_SECRET)
+OUTBOX_SECRET          = os.getenv("OUTBOX_SECRET", "")
+REQUIRE_HMAC_OPS       = os.getenv("REQUIRE_HMAC_OPS","0").lower() in ("1","true","yes")
+REQUIRE_HMAC_PULL      = os.getenv("REQUIRE_HMAC_PULL","0").lower() in ("1","true","yes")
+REQUIRE_HMAC_TELEMETRY = os.getenv("REQUIRE_HMAC_TELEMETRY","0").lower() in ("1","true","yes")
+TELEMETRY_SECRET       = os.getenv("TELEMETRY_SECRET", OUTBOX_SECRET)
+
+# Policy integration env (new)
+ENABLE_POLICY          = os.getenv("ENABLE_POLICY","1").lower() in ("1","true","yes")
+POLICY_ENFORCE         = os.getenv("POLICY_ENFORCE","1").lower() in ("1","true","yes")
+POLICY_PATH            = os.getenv("POLICY_PATH","policy.yaml")
+CLOUD_HOLD             = os.getenv("CLOUD_HOLD","0").lower() in ("1","true","yes")  # dual kill-switch with NOVA_KILL
 
 def _canonical(d: dict) -> bytes:
     return json.dumps(d, separators=(",",":"), sort_keys=True).encode("utf-8")
@@ -136,6 +141,106 @@ def _maybe_require_hmac_tel(body):
     if REQUIRE_HMAC_TELEMETRY and not _verify_with(TELEMETRY_SECRET, body, request.headers.get("X-NT-Sig","")):
         return ("invalid signature", 401)
     return None
+
+# ============================================================================
+# Policy Engine wiring (soft dependency)
+# ============================================================================
+class _PolicyState:
+    def __init__(self):
+        self.loaded = False
+        self.load_error: Optional[str] = None
+        self.path = POLICY_PATH
+        self.mtime = 0.0
+        self.engine = None  # type: ignore
+
+    def _import_engine(self):
+        try:
+            import importlib
+            pe = importlib.import_module("policy_engine")
+            return pe
+        except Exception as e:
+            self.load_error = f"import failed: {e}"
+            return None
+
+    def maybe_load(self, force: bool=False):
+        if not ENABLE_POLICY:
+            self.loaded = False
+            self.engine = None
+            self.load_error = "policy disabled"
+            return
+
+        pe = self._import_engine()
+        if pe is None:
+            self.loaded = False
+            return
+
+        try:
+            st = None
+            try:
+                st = os.stat(self.path)
+            except FileNotFoundError:
+                pass
+            needs_reload = force or (st and st.st_mtime != self.mtime) or (not self.loaded)
+            if needs_reload:
+                loader = getattr(pe, "load_policy", None)
+                if callable(loader):
+                    self.engine = loader(self.path)  # expected to return callable/context
+                else:
+                    # Fallback: engine module itself will look for POLICY_PATH
+                    self.engine = pe
+                self.mtime = st.st_mtime if st else 0.0
+                self.loaded = True
+                self.load_error = None
+                log.info("policy loaded from %s (mtime=%s)", self.path, self.mtime)
+        except Exception as e:
+            self.loaded = False
+            self.engine = None
+            self.load_error = f"load error: {e}"
+            log.warning("policy load error: %s", e)
+
+    def evaluate(self, intent: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Expected policy_engine interface:
+          evaluate(intent: dict) -> dict {
+            allowed: bool,
+            reason: str,
+            patched: dict (optional),
+            flags: list[str] (optional)
+          }
+        """
+        self.maybe_load()
+        default = {"allowed": True, "reason": "policy not loaded", "patched": {}, "flags": []}
+        if not ENABLE_POLICY or not self.loaded or self.engine is None:
+            return default
+        try:
+            pe = self.engine
+            fn = getattr(pe, "evaluate", None)
+            if callable(fn):
+                return fn(intent) or default
+            # If engine exposes a class/context with .evaluate
+            ctx = getattr(pe, "policy", None)
+            if ctx and hasattr(ctx, "evaluate"):
+                return ctx.evaluate(intent) or default  # type: ignore
+            return default
+        except Exception as e:
+            self.load_error = f"eval error: {e}"
+            log.warning("policy eval error: %s\n%s", e, traceback.format_exc())
+            return default
+
+_policy = _PolicyState()
+
+# Optional policy_logger integration (soft dependency)
+def _policy_log(decision: Dict[str, Any], intent: Dict[str, Any]):
+    try:
+        import policy_logger  # type: ignore
+        writer = getattr(policy_logger, "log_decision", None)
+        if callable(writer):
+            writer(decision=decision, intent=intent, when=datetime.utcnow().isoformat())
+            return
+    except Exception:
+        pass
+    # Fallback: basic log
+    log.info("policy decision: %s", json.dumps({"decision": decision, "intent": intent}, separators=(",",":")))
 
 # ============================================================================
 # SQLite durable store (WAL)
@@ -314,6 +419,13 @@ def healthz():
     info: Dict[str, Any] = {"ok": True, "web": "up"}
     info["telegram"] = {"status": "ok" if not telegram_status else "degraded", "reason": telegram_status}
     info["db"] = DB_PATH
+    info["policy"] = {
+        "enabled": ENABLE_POLICY,
+        "enforce": POLICY_ENFORCE,
+        "path": POLICY_PATH,
+        "loaded": _policy.loaded,
+        "error": _policy.load_error,
+    }
     try:
         info["queue"] = _queue_depth()
     except Exception as e:
@@ -399,11 +511,12 @@ def dash():
       <div class='card'><b>Telemetry age:</b> <code>{age}</code></div>
       <div class='card'><b>Queue</b><br>queued:{q.get('queued',0)} · leased:{q.get('leased',0)} · acked:{q.get('acked',0)} · failed:{q.get('failed',0)}</div>
       <div class='card'><b>Agent:</b> <code>{_last_telemetry.get('agent_id') or '-'}</code></div>
+      <div class='card'><b>Policy:</b> <code>{"ENABLED" if ENABLE_POLICY else "DISABLED"} / {"ENFORCE" if POLICY_ENFORCE else "WARN"}</code></div>
     </body></html>"""
     return html, 200, {"Content-Type":"text/html; charset=utf-8"}
 
 # ============================================================================
-# Command Bus (enqueue / pull / ack)
+# Command Bus (enqueue / pull / ack) + Policy
 # ============================================================================
 BUS_ROUTES = Blueprint("bus_routes", __name__, url_prefix="/api")
 
@@ -413,7 +526,8 @@ def _now_ts() -> int: return int(time.time())
 def intent_enqueue():
     body, err = _require_json()
     if err: return err
-    if os.getenv("NOVA_KILL","").lower() in ("1","true","yes"): return jsonify(ok=False, error="bus_killed"), 503
+    if os.getenv("NOVA_KILL","").lower() in ("1","true","yes") or CLOUD_HOLD:
+        return jsonify(ok=False, error="bus_killed"), 503
     e = _maybe_require_hmac_ops(body)
     if e: return e
     required = ["agent_target","venue","symbol","side","amount"]
@@ -426,6 +540,7 @@ def intent_enqueue():
         if amount <= 0: return ("amount must be > 0", 400)
     except Exception:
         return ("amount must be numeric", 400)
+
     cmd_id = body.get("id") or str(uuid.uuid4())
     payload = {
         "id": cmd_id,
@@ -438,17 +553,59 @@ def intent_enqueue():
         "amount": amount,
         "flags": body.get("flags", []),
     }
+
+    # ---- POLICY EVAL (pre-enqueue) ----------------------------------------
+    decision = {"allowed": True, "reason": "no policy", "patched": {}, "flags": []}
+    if ENABLE_POLICY:
+        try:
+            decision = _policy.evaluate(payload)
+        except Exception as ex:
+            log.warning("policy evaluation exception: %s", ex)
+    # patch payload if policy returned changes (e.g., clamped amount, new venue, flags)
+    patched = decision.get("patched") or {}
+    if patched:
+        for k,v in patched.items():
+            payload[k] = v
+    # attach policy flags (avoid duplicates)
+    pol_flags = list(decision.get("flags") or [])
+    if pol_flags:
+        payload["flags"] = sorted(set(list(payload.get("flags", [])) + pol_flags))
+
+    # enforce or warn depending on POLICY_ENFORCE
+    if ENABLE_POLICY and not decision.get("allowed", True):
+        _policy_log(decision, payload)
+        msg = f"❌ <b>Policy blocked</b> — {decision.get('reason','')}".strip()
+        if POLICY_ENFORCE:
+            try:
+                send_telegram(f"{msg}\n<code>{json.dumps(payload,indent=2)}</code>")
+            except Exception:
+                pass
+            return jsonify(ok=False, policy="blocked", reason=decision.get("reason","")), 403
+        else:
+            # warn-only mode: continue to enqueue with a warning flag
+            payload.setdefault("flags", []).append("policy_warn")
+            try:
+                send_telegram(f"⚠️ <b>Policy warning</b> — {decision.get('reason','')}\n<code>{json.dumps(payload,indent=2)}</code>")
+            except Exception:
+                pass
+
+    # -----------------------------------------------------------------------
     try:
         _enqueue_command(cmd_id, payload)
-        log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s",
-         cmd_id, payload["venue"], payload["symbol"], payload["side"], payload["amount"])
-        send_telegram(f"✅ <b>Intent enqueued</b>\\n<code>{json.dumps(payload,indent=2)}</code>")
-        return jsonify({"ok": True, "id": cmd_id})
+        log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s", cmd_id, payload["venue"], payload["symbol"], payload["side"], payload["amount"])
+        try:
+            send_telegram(f"✅ <b>Intent enqueued</b>\n<code>{json.dumps(payload,indent=2)}</code>")
+        except Exception:
+            pass
+        return jsonify({"ok": True, "id": cmd_id, "policy": decision}), 200
     except Exception as ex:
-        send_telegram(f"⚠️ <b>Enqueue failed</b>\\n{ex}")
+        try:
+            send_telegram(f"⚠️ <b>Enqueue failed</b>\n{ex}")
+        except Exception:
+            pass
         return (f"enqueue error: {ex}", 500)
-    
-    
+
+
 @BUS_ROUTES.route("/ops/enqueue", methods=["POST"])
 def ops_enqueue_alias():
     return intent_enqueue()
@@ -465,7 +622,7 @@ def commands_pull():
     cmds = _pull_commands(agent_id, max_items=max_items, lease_seconds=lease_seconds)
     log.info("pull agent=%s count=%d lease=%ds", agent_id, len(cmds), lease_seconds)
     return jsonify({"ok": True, "commands": cmds})
-        
+
 @BUS_ROUTES.route("/commands/ack", methods=["POST"])
 def commands_ack():
     body, err = _require_json()
@@ -480,14 +637,19 @@ def commands_ack():
     try:
         _ack_command(cmd_id, agent_id, status, detail)
         if status == "ok":
-            send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>")
+            try:
+                send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>")
+            except Exception:
+                pass
         else:
-            send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>\\n<code>{json.dumps(detail,indent=2)}</code>")
+            try:
+                send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>\n<code>{json.dumps(detail,indent=2)}</code>")
+            except Exception:
+                pass
         log.info("ack id=%s agent=%s status=%s", cmd_id, agent_id, status)
         return jsonify({"ok": True})
     except Exception as ex:
         return (f"ack error: {ex}", 500)
-        
 
 @BUS_ROUTES.route("/receipts/last", methods=["GET"])
 def receipts_last():
@@ -508,13 +670,20 @@ def health_summary():
     age = "-"
     if _last_telemetry.get("ts"):
         age = f"{int(time.time())-int(_last_telemetry['ts'])}s"
-    data = { 
+    data = {
         "ok": True,
         "service": os.getenv("SERVICE_NAME","bus"),
         "env": os.getenv("ENV","prod"),
         "queue": q,
         "telemetry_age": age,
         "agent": _last_telemetry.get("agent_id"),
+        "policy": {
+            "enabled": ENABLE_POLICY,
+            "enforce": POLICY_ENFORCE,
+            "path": POLICY_PATH,
+            "loaded": _policy.loaded,
+            "error": _policy.load_error,
+        }
      }
     include = request.args.get("include_receipts","0").lower() in ("1","true","yes")
     if include:
@@ -523,6 +692,26 @@ def health_summary():
         except Exception as e:
             data["receipts_error"] = str(e)
     return jsonify(data)
+
+# ---- Policy control endpoints ----------------------------------------------
+@BUS_ROUTES.route("/policy/reload", methods=["POST"])
+def policy_reload():
+    _policy.maybe_load(force=True)
+    status = {
+        "enabled": ENABLE_POLICY,
+        "enforce": POLICY_ENFORCE,
+        "path": POLICY_PATH,
+        "loaded": _policy.loaded,
+        "error": _policy.load_error
+    }
+    return jsonify(ok=True, **status), 200
+
+@BUS_ROUTES.route("/policy/evaluate", methods=["POST"])
+def policy_evaluate():
+    body, err = _require_json()
+    if err: return err
+    decision = _policy.evaluate(body or {})
+    return jsonify(ok=True, decision=decision), 200
 
 flask_app.register_blueprint(BUS_ROUTES)
 
@@ -610,14 +799,14 @@ def _compose_daily() -> str:
         age_s = f"{int(time.time())-int(_last_telemetry['ts'])}s"
     venues_line = ", ".join(f"{v}:{len(t)}" for v,t in _last_telemetry.get("by_venue",{}).items()) or "—"
     msg = (
-        "☀️ <b>NovaTrade Daily Report</b>\\n"
-        f"as of {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\\n\\n"
-        "<b>Heartbeats</b>\\n"
-        f"• {_last_telemetry.get('agent_id') or 'edge-primary'}: last {age_s} ago\\n\\n"
-        "<b>Queue</b>\\n"
-        f"• queued:{q.get('queued',0)} leased:{q.get('leased',0)} acked:{q.get('acked',0)} failed:{q.get('failed',0)}\\n\\n"
-        "<b>Balances (venues → tokenCount)</b>\\n"
-        f"• {venues_line}\\n"
+        "☀️ <b>NovaTrade Daily Report</b>\n"
+        f"as of {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        "<b>Heartbeats</b>\n"
+        f"• {_last_telemetry.get('agent_id') or 'edge-primary'}: last {age_s} ago\n\n"
+        "<b>Queue</b>\n"
+        f"• queued:{q.get('queued',0)} leased:{q.get('leased',0)} acked:{q.get('acked',0)} failed:{q.get('failed',0)}\n\n"
+        "<b>Balances (venues → tokenCount)</b>\n"
+        f"• {venues_line}\n"
         f"Mode: <code>{os.getenv('EDGE_MODE','live')}</code>"
     )
     return msg
@@ -657,22 +846,3 @@ try:
 except Exception as e:
     log.warning("ASGI adapter unavailable; falling back to WSGI: %s", e)
     app = flask_app  # type: ignore
-
-
-# -- Manual trigger to run receipts mirror and PD mirror
-@flask_app.route("/api/cron/mirror", methods=["POST"])
-def _cron_mirror_combined():
-    ok1 = ok2 = False
-    try:
-        import sheets_mirror as _m
-        _m.main()
-        ok1 = True
-    except Exception as e:
-        pass
-    try:
-        import sheets_mirror_plus as _pd
-        _pd.main()
-        ok2 = True
-    except Exception as e:
-        pass
-    return {"ok": bool(ok1 or ok2)}
