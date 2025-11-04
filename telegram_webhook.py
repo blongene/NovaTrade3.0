@@ -8,11 +8,12 @@ from flask import Blueprint, request, jsonify
 log = logging.getLogger("tg")
 
 # --- Env ---------------------------------------------------------------------
-BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
-CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID", "")
-WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")  # optional but recommended
-TIMEOUT_SEC = int(os.getenv("TELEGRAM_HTTP_TIMEOUT", "8"))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM","0").lower() in ("1","true","yes")
+DEDUP_TTL_MIN   = int(os.getenv("TG_DEDUP_TTL_MIN","1"))
+SUMMARIES_ENABLED = os.getenv("TELEGRAM_SUMMARIES_ENABLED","0").lower() in ("1","true","yes")
+SUMMARIES_TTL_MIN = int(os.getenv("TELEGRAM_SUMMARIES_TTL_MIN","720"))
 
 # --- Blueprint ---------------------------------------------------------------
 tg_blueprint = Blueprint("tg", __name__)
