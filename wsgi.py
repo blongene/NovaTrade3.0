@@ -442,10 +442,10 @@ def intent_enqueue():
         _enqueue_command(cmd_id, payload)
         log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s",
          cmd_id, payload["venue"], payload["symbol"], payload["side"], payload["amount"])
-        send_telegram(f"✅ <b>Intent enqueued</b>\n<code>{json.dumps(payload,indent=2)}</code>")
+        send_telegram(f"✅ <b>Intent enqueued</b>\\n<code>{json.dumps(payload,indent=2)}</code>")
         return jsonify({"ok": True, "id": cmd_id})
     except Exception as ex:
-        send_telegram(f"⚠️ <b>Enqueue failed</b>\n{ex}")
+        send_telegram(f"⚠️ <b>Enqueue failed</b>\\n{ex}")
         return (f"enqueue error: {ex}", 500)
     
     
@@ -482,7 +482,7 @@ def commands_ack():
         if status == "ok":
             send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>")
         else:
-            send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>\n<code>{json.dumps(detail,indent=2)}</code>")
+            send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>\\n<code>{json.dumps(detail,indent=2)}</code>")
         log.info("ack id=%s agent=%s status=%s", cmd_id, agent_id, status)
         return jsonify({"ok": True})
     except Exception as ex:
@@ -610,14 +610,14 @@ def _compose_daily() -> str:
         age_s = f"{int(time.time())-int(_last_telemetry['ts'])}s"
     venues_line = ", ".join(f"{v}:{len(t)}" for v,t in _last_telemetry.get("by_venue",{}).items()) or "—"
     msg = (
-        "☀️ <b>NovaTrade Daily Report</b>\n"
-        f"as of {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-        "<b>Heartbeats</b>\n"
-        f"• {_last_telemetry.get('agent_id') or 'edge-primary'}: last {age_s} ago\n\n"
-        "<b>Queue</b>\n"
-        f"• queued:{q.get('queued',0)} leased:{q.get('leased',0)} acked:{q.get('acked',0)} failed:{q.get('failed',0)}\n\n"
-        "<b>Balances (venues → tokenCount)</b>\n"
-        f"• {venues_line}\n"
+        "☀️ <b>NovaTrade Daily Report</b>\\n"
+        f"as of {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\\n\\n"
+        "<b>Heartbeats</b>\\n"
+        f"• {_last_telemetry.get('agent_id') or 'edge-primary'}: last {age_s} ago\\n\\n"
+        "<b>Queue</b>\\n"
+        f"• queued:{q.get('queued',0)} leased:{q.get('leased',0)} acked:{q.get('acked',0)} failed:{q.get('failed',0)}\\n\\n"
+        "<b>Balances (venues → tokenCount)</b>\\n"
+        f"• {venues_line}\\n"
         f"Mode: <code>{os.getenv('EDGE_MODE','live')}</code>"
     )
     return msg
