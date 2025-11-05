@@ -486,7 +486,8 @@ def intent_enqueue():
     decision = {"ok": True, "reason": "no policy", "patched_intent": {}, "flags": []}
     if ENABLE_POLICY:
         try:
-            decision = _policy.evaluate(intent)
+            context = {"telemetry": _last_tel}
+            decision = _policy.evaluate_intent(intent, context=context)
         except Exception as ex:
             log.warning("policy evaluation exception: %s", ex)
     patched = decision.get("patched_intent") or decision.get("patched") or {}
