@@ -755,6 +755,10 @@ def api_debug_log():
 
 @flask_app.post("/api/debug/tg/send")
 def api_debug_tg_send():
+    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+    got = request.args.get("secret") or request.headers.get("X-TG-Secret")
+    if secret and (got or "") != secret:
+        return jsonify(ok=False, error="forbidden"), 403
     body = request.get_json(silent=True) or {}
     text = body.get("text") or "NovaTrade test ✅"
     chat_id = body.get("chat_id")  # optional override
@@ -800,11 +804,19 @@ def api_debug_selftest():
 # === Telegram webhook diagnostics ===========================================
 @flask_app.get("/api/debug/tg/webhook_info")
 def api_tg_webhook_info():
+    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+    got = request.args.get("secret") or request.headers.get("X-TG-Secret")
+    if secret and (got or "") != secret:
+        return jsonify(ok=False, error="forbidden"), 403
     """Return Telegram getWebhookInfo result for quick diagnostics."""
     return jsonify(_get_webhook_info()), 200
 
 @flask_app.post("/api/debug/tg/set_webhook")
 def api_tg_set_webhook():
+    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+    got = request.args.get("secret") or request.headers.get("X-TG-Secret")
+    if secret and (got or "") != secret:
+        return jsonify(ok=False, error="forbidden"), 403
     """Manually set the Telegram webhook to /tg/<TELEGRAM_WEBHOOK_SECRET>."""
     res = _set_webhook_now()
     return jsonify(res), (200 if res.get("ok") else 400)
