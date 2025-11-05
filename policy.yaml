@@ -1,18 +1,22 @@
-
-# policy.yaml — NovaTrade 3.0 Policy (Phase 6B)
+# policy.yaml — NovaTrade 3.0 Policy (Phase 7A Context-Aware)
 policy:
-  # sizing & risk
-  max_per_coin_usd: 25
-  min_quote_reserve_usd: 10
-  min_liquidity_usd: 50000
-  cool_off_minutes_after_trade: 30
 
-  # strategic preferences
+  # ── sizing & risk ────────────────────────────────────────────────
+  max_per_coin_usd:        25        # per-intent cap (unchanged)
+  min_quote_reserve_usd:   25        # upgraded from 10 → 25 for safety
+  keepback_usd:             5        # always leave this untouched
+  canary_max_usd:          10        # cap for first fills
+  min_liquidity_usd:    50000        # same as before
+  on_short_quote:      resize        # resize|deny if reserve too small
+  allow_price_unknown:  false        # block if no price available
+  cool_off_minutes_after_trade: 30   # cooldown between rotations
+
+  # ── strategic preferences ────────────────────────────────────────
   prefer_quotes:
     BINANCEUS: USDT
     COINBASE:  USDC
     KRAKEN:    USDT
   venue_order: [BINANCEUS, COINBASE, KRAKEN]
 
-  # controls
+  # ── controls ────────────────────────────────────────────────────
   blocked_symbols: [BARK, BONK]
