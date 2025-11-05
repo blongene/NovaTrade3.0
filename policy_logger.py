@@ -1,24 +1,24 @@
-# policy_logger.py — NovaTrade policy decision logger (Sheets + local fallback)
+# policy_logger.py — robust policy logging (Sheets or local JSONL)
 from __future__ import annotations
 import os, time, json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-SHEET_URL     = os.getenv("SHEET_URL")
-POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
-LOG_ENABLED   = os.getenv("POLICY_LOG_ENABLE","1").lower() in ("1","true","yes")
+SHEET_URL           = os.getenv("SHEET_URL")
+POLICY_LOG_WS       = os.getenv("POLICY_LOG_WS", "Policy_Log")
+LOG_ENABLED         = os.getenv("POLICY_LOG_ENABLE","1").lower() in ("1","true","yes","on")
 LOCAL_FALLBACK_PATH = os.getenv("POLICY_LOG_LOCAL","./policy_log.jsonl")
-MAX_RETRIES = 3
-RETRY_BASE  = 0.75
+MAX_RETRIES         = 2
+RETRY_BASE          = 0.75
 
-def _ts_human(dt: Optional[datetime]=None) -> str:
+def _ts(dt: Optional[datetime]=None) -> str:
     return (dt or datetime.utcnow()).strftime("%Y-%m-%d %H:%M:%S")
 
 def _to_json(obj: Any) -> str:
     try: return json.dumps(obj, separators=(",",":"), ensure_ascii=False)
     except Exception: return "{}"
 
-def _append_local_fallback(row: Dict[str, Any]) -> None:
+def _append_local(row: Dict[str, Any]) -> None:
     try:
         with open(LOCAL_FALLBACK_PATH, "a", encoding="utf-8") as f:
             f.write(_to_json(row) + "\n")
@@ -44,13 +44,16 @@ def _open_sheet():
         ws = sh.add_worksheet(title=POLICY_LOG_WS, rows=4000, cols=20)
         ws.append_row(
             ["Timestamp","Intent_ID","Agent_Target","Venue","Symbol","Side",
-             "Amount","Flags","Allowed","Reason","Patched_JSON","Decision_JSON","Source"],
+             "Amount","Flags","Allowed","Reason","Patched_JSON","Decision_JSON","Source","Policy_ID"],
             value_input_option="USER_ENTERED")
     return ws
 
 def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str]=None) -> None:
     if not LOG_ENABLED: return
-    ts = when or _ts_human()
+    ts = when or _ts()
+    ok = decision.get("ok")
+    allowed = decision.get("allowed")
+    allowed_norm = bool(allowed if allowed is not None else ok if ok is not None else True)
     row = {
         "Timestamp": ts,
         "Intent_ID": str(intent.get("id","")),
@@ -60,19 +63,20 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str]=None
         "Side": str(intent.get("side","")).upper(),
         "Amount": intent.get("amount",""),
         "Flags": ",".join([str(f) for f in (decision.get("flags") or [])]),
-        "Allowed": "YES" if decision.get("allowed",True) else "NO",
+        "Allowed": "YES" if allowed_norm else "NO",
         "Reason": decision.get("reason",""),
-        "Patched_JSON": _to_json(decision.get("patched") or {}),
+        "Patched_JSON": _to_json(decision.get("patched_intent") or decision.get("patched") or {}),
         "Decision_JSON": _to_json(decision),
-        "Source": intent.get("source","")
+        "Source": intent.get("source",""),
+        "Policy_ID": decision.get("policy_id",""),
     }
     try:
-        import gspread
+        import gspread  # noqa
     except Exception:
-        _append_local_fallback(row)
+        _append_local(row)
         return
     if not SHEET_URL:
-        _append_local_fallback(row)
+        _append_local(row)
         return
     delay = RETRY_BASE
     for attempt in range(MAX_RETRIES):
@@ -82,13 +86,13 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str]=None
             return
         except Exception as e:
             if attempt == MAX_RETRIES - 1:
-                _append_local_fallback({"error": str(e), **row})
+                _append_local({"error": str(e), **row})
                 return
             time.sleep(delay)
             delay *= 2
 
 def log_policy_decision(intent: dict, decision: str, reasons: List[str]):
-    dec = {"allowed": decision.lower() in ("pass","allow","ok","true","yes"),
+    dec = {"ok": decision.lower() in ("pass","allow","ok","true","yes"),
            "reason": "; ".join(reasons or []),
-           "flags": [], "patched": {}}
+           "flags": [], "patched_intent": {}}
     log_decision(decision=dec, intent=intent)
