@@ -1,4 +1,3 @@
-
 # wsgi.py — NovaTrade Bus (policy-wired drop-in)
 from __future__ import annotations
 import os, logging, threading, time, json, uuid, hmac, hashlib, sqlite3, traceback
@@ -6,9 +5,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, jsonify, request, Blueprint
 
-# ============================================================================
-# Logging
-# ============================================================================
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -17,16 +13,10 @@ logging.basicConfig(
 log = logging.getLogger("bus")
 logging.getLogger("werkzeug").setLevel(logging.WARNING if LOG_LEVEL != "DEBUG" else logging.DEBUG)
 
-# ============================================================================
-# Flask app
-# ============================================================================
 flask_app = Flask(__name__)
 
-# ============================================================================
-# Telegram (quiet, optional; never crashes the Bus)
-# ============================================================================
+# --- Telegram ---
 try:
-    # Prefer the helper inside your telegram_webhook module
     from telegram_webhook import _send_telegram as send_telegram  # type: ignore
     log.info("Telegram send_telegram imported from telegram_webhook.py")
 except Exception as e:
@@ -55,7 +45,7 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
     if os.environ.get("ENABLE_TELEGRAM", "").lower() not in ("1", "true", "yes"):
         return None
     try:
-        import telegram_webhook as tgmod  # optional user module
+        import telegram_webhook as tgmod
         tg_bp = None
         if hasattr(tgmod, "tg_blueprint"):
             tg_bp = getattr(tgmod, "tg_blueprint")
@@ -92,21 +82,19 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
 
 telegram_status = _maybe_init_telegram(flask_app)
 
-# ============================================================================
-# HMAC helpers & policy flags
-# ============================================================================
+# --- Env / Feature Flags ---
 OUTBOX_SECRET          = os.getenv("OUTBOX_SECRET", "")
 REQUIRE_HMAC_OPS       = os.getenv("REQUIRE_HMAC_OPS","0").lower() in ("1","true","yes")
 REQUIRE_HMAC_PULL      = os.getenv("REQUIRE_HMAC_PULL","0").lower() in ("1","true","yes")
 REQUIRE_HMAC_TELEMETRY = os.getenv("REQUIRE_HMAC_TELEMETRY","0").lower() in ("1","true","yes")
 TELEMETRY_SECRET       = os.getenv("TELEMETRY_SECRET", OUTBOX_SECRET)
 
-# Policy integration env (new)
 ENABLE_POLICY          = os.getenv("ENABLE_POLICY","1").lower() in ("1","true","yes")
 POLICY_ENFORCE         = os.getenv("POLICY_ENFORCE","1").lower() in ("1","true","yes")
 POLICY_PATH            = os.getenv("POLICY_PATH","policy.yaml")
-CLOUD_HOLD             = os.getenv("CLOUD_HOLD","0").lower() in ("1","true","yes")  # dual kill-switch with NOVA_KILL
+CLOUD_HOLD             = os.getenv("CLOUD_HOLD","0").lower() in ("1","true","yes")
 
+# --- HMAC helpers ---
 def _canonical(d: dict) -> bytes:
     return json.dumps(d, separators=(",",":"), sort_keys=True).encode("utf-8")
 
@@ -142,9 +130,7 @@ def _maybe_require_hmac_tel(body):
         return ("invalid signature", 401)
     return None
 
-# ============================================================================
-# Policy Engine wiring (soft dependency)
-# ============================================================================
+# --- Policy loader / evaluator ---
 class _PolicyState:
     def __init__(self):
         self.loaded = False
@@ -184,9 +170,8 @@ class _PolicyState:
             if needs_reload:
                 loader = getattr(pe, "load_policy", None)
                 if callable(loader):
-                    self.engine = loader(self.path)  # expected to return callable/context
+                    self.engine = loader(self.path)
                 else:
-                    # Fallback: engine module itself will look for POLICY_PATH
                     self.engine = pe
                 self.mtime = st.st_mtime if st else 0.0
                 self.loaded = True
@@ -199,15 +184,6 @@ class _PolicyState:
             log.warning("policy load error: %s", e)
 
     def evaluate(self, intent: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Expected policy_engine interface:
-          evaluate(intent: dict) -> dict {
-            allowed: bool,
-            reason: str,
-            patched: dict (optional),
-            flags: list[str] (optional)
-          }
-        """
         self.maybe_load()
         default = {"allowed": True, "reason": "policy not loaded", "patched": {}, "flags": []}
         if not ENABLE_POLICY or not self.loaded or self.engine is None:
@@ -217,7 +193,6 @@ class _PolicyState:
             fn = getattr(pe, "evaluate", None)
             if callable(fn):
                 return fn(intent) or default
-            # If engine exposes a class/context with .evaluate
             ctx = getattr(pe, "policy", None)
             if ctx and hasattr(ctx, "evaluate"):
                 return ctx.evaluate(intent) or default  # type: ignore
@@ -229,7 +204,6 @@ class _PolicyState:
 
 _policy = _PolicyState()
 
-# Optional policy_logger integration (soft dependency)
 def _policy_log(decision: Dict[str, Any], intent: Dict[str, Any]):
     try:
         import policy_logger  # type: ignore
@@ -239,12 +213,9 @@ def _policy_log(decision: Dict[str, Any], intent: Dict[str, Any]):
             return
     except Exception:
         pass
-    # Fallback: basic log
     log.info("policy decision: %s", json.dumps({"decision": decision, "intent": intent}, separators=(",",":")))
 
-# ============================================================================
-# SQLite durable store (WAL)
-# ============================================================================
+# --- DB / Outbox ---
 DB_PATH = os.getenv("OUTBOX_DB_PATH", "./outbox.sqlite")
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
@@ -253,7 +224,7 @@ PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS commands (
   id TEXT PRIMARY KEY,
   payload TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'queued',   -- queued|leased|acked|failed
+  status TEXT NOT NULL DEFAULT 'queued',
   created_at TEXT NOT NULL,
   leased_at TEXT,
   lease_expires_at TEXT,
@@ -263,10 +234,9 @@ CREATE TABLE IF NOT EXISTS receipts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   command_id TEXT NOT NULL,
   agent_id TEXT,
-  status TEXT NOT NULL,                    -- ok|error|skipped
-  detail TEXT,                             -- JSON
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(command_id) REFERENCES commands(id)
+  status TEXT NOT NULL,
+  detail TEXT,
+  created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
 CREATE INDEX IF NOT EXISTS idx_commands_lease_exp ON commands(lease_expires_at);
@@ -278,7 +248,6 @@ def _connect():
     return conn
 
 def _ensure_receipts_compat(conn: sqlite3.Connection) -> None:
-    # Add legacy columns some readers expect (ts, payload)
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(receipts)").fetchall()}
         changed = False
@@ -312,7 +281,7 @@ def _enqueue_command(cmd_id: str, payload: Dict[str, Any]) -> None:
     try:
         conn.execute(
             "INSERT INTO commands(id, payload, status, created_at) VALUES (?,?, 'queued', ?)",
-            (cmd_id, json.dumps(payload, separators=(",",":")), now)
+            (cmd_id, json.dumps(payload, separators=(',',':')), now)
         )
     finally:
         conn.close()
@@ -369,7 +338,6 @@ def _ack_command(cmd_id: str, agent_id: str, status: str, detail: Optional[Dict]
     finally:
         conn.close()
 
-
 def _last_receipts(n: int = 10):
     conn = _connect()
     try:
@@ -380,8 +348,7 @@ def _last_receipts(n: int = 10):
         out = []
         for cid, aid, st, detail, ts in rows:
             try:
-                import json as _json
-                payload = _json.loads(detail) if detail else None
+                payload = json.loads(detail) if detail else None
             except Exception:
                 payload = {"raw": detail}
             out.append({
@@ -395,7 +362,6 @@ def _last_receipts(n: int = 10):
     finally:
         conn.close()
 
-
 def _queue_depth() -> Dict[str,int]:
     conn = _connect()
     try:
@@ -407,9 +373,7 @@ def _queue_depth() -> Dict[str,int]:
     finally:
         conn.close()
 
-# ============================================================================
-# Health
-# ============================================================================
+# --- Basic Routes ---
 @flask_app.get("/")
 def index():
     return jsonify(ok=True, service="NovaTrade Bus", status="ready"), 200
@@ -436,9 +400,7 @@ def healthz():
 def readyz():
     return jsonify(ok=True, service="Bus", ready=True), 200
 
-# ============================================================================
-# Telemetry (Edge) — with legacy aliases
-# ============================================================================
+# --- Telemetry intake ---
 _last_telemetry: Dict[str, Any] = {"agent_id": None, "flat": {}, "by_venue": {}, "ts": 0}
 
 def _safe_float(x) -> float:
@@ -515,9 +477,7 @@ def dash():
     </body></html>"""
     return html, 200, {"Content-Type":"text/html; charset=utf-8"}
 
-# ============================================================================
-# Command Bus (enqueue / pull / ack) + Policy
-# ============================================================================
+# --- Bus API (enqueue, pull, ack) ---
 BUS_ROUTES = Blueprint("bus_routes", __name__, url_prefix="/api")
 
 def _now_ts() -> int: return int(time.time())
@@ -554,24 +514,20 @@ def intent_enqueue():
         "flags": body.get("flags", []),
     }
 
-    # ---- POLICY EVAL (pre-enqueue) ----------------------------------------
     decision = {"allowed": True, "reason": "no policy", "patched": {}, "flags": []}
     if ENABLE_POLICY:
         try:
             decision = _policy.evaluate(payload)
         except Exception as ex:
             log.warning("policy evaluation exception: %s", ex)
-    # patch payload if policy returned changes (e.g., clamped amount, new venue, flags)
     patched = decision.get("patched") or {}
     if patched:
         for k,v in patched.items():
             payload[k] = v
-    # attach policy flags (avoid duplicates)
     pol_flags = list(decision.get("flags") or [])
     if pol_flags:
         payload["flags"] = sorted(set(list(payload.get("flags", [])) + pol_flags))
 
-    # enforce or warn depending on POLICY_ENFORCE
     if ENABLE_POLICY and not decision.get("allowed", True):
         _policy_log(decision, payload)
         msg = f"❌ <b>Policy blocked</b> — {decision.get('reason','')}".strip()
@@ -582,14 +538,12 @@ def intent_enqueue():
                 pass
             return jsonify(ok=False, policy="blocked", reason=decision.get("reason","")), 403
         else:
-            # warn-only mode: continue to enqueue with a warning flag
             payload.setdefault("flags", []).append("policy_warn")
             try:
                 send_telegram(f"⚠️ <b>Policy warning</b> — {decision.get('reason','')}\n<code>{json.dumps(payload,indent=2)}</code>")
             except Exception:
                 pass
 
-    # -----------------------------------------------------------------------
     try:
         _enqueue_command(cmd_id, payload)
         log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s", cmd_id, payload["venue"], payload["symbol"], payload["side"], payload["amount"])
@@ -604,7 +558,6 @@ def intent_enqueue():
         except Exception:
             pass
         return (f"enqueue error: {ex}", 500)
-
 
 @BUS_ROUTES.route("/ops/enqueue", methods=["POST"])
 def ops_enqueue_alias():
@@ -693,7 +646,6 @@ def health_summary():
             data["receipts_error"] = str(e)
     return jsonify(data)
 
-# ---- Policy control endpoints ----------------------------------------------
 @BUS_ROUTES.route("/policy/reload", methods=["POST"])
 def policy_reload():
     _policy.maybe_load(force=True)
@@ -715,9 +667,6 @@ def policy_evaluate():
 
 flask_app.register_blueprint(BUS_ROUTES)
 
-# ============================================================================
-# Debug helpers
-# ============================================================================
 @flask_app.get("/api/debug/log")
 def api_debug_log():
     log.info("debug-log: hello from bus")
@@ -725,7 +674,6 @@ def api_debug_log():
 
 @flask_app.post("/api/debug/tg/send")
 def api_debug_tg_send():
-    # Optional protection with TELEGRAM_WEBHOOK_SECRET
     secret = os.getenv("TELEGRAM_WEBHOOK_SECRET","")
     if secret:
         got = request.args.get("secret") or request.headers.get("X-TG-Secret")
@@ -758,14 +706,12 @@ def api_debug_selftest():
         log.warning("selftest failed: %s", e)
         return jsonify(ok=False, error=str(e), db=DB_PATH), 200
 
-# ============================================================================
-# Receipts bridge (optional)
-# ============================================================================
+# --- Background helpers (receipts bridge + daily) ---
 def _start_receipts_bridge():
     if os.environ.get("DISABLE_RECEIPTS_BRIDGE","").lower() in ("1","true","yes"):
         return
     try:
-        import receipts_bridge  # user module providing run_once()
+        import receipts_bridge
     except Exception as e:
         log.debug("receipts_bridge unavailable: %s", e)
         return
@@ -782,15 +728,11 @@ def _start_receipts_bridge():
 
 _start_receipts_bridge()
 
-# ============================================================================
-# Daily report scheduler (Phase-5 style)
-# ============================================================================
 DAILY_ENABLED   = os.getenv("DAILY_ENABLED","1").lower() in ("1","true","yes")
-DAILY_UTC_HOUR  = int(os.getenv("DAILY_UTC_HOUR","9"))   # default 09:00 UTC
+DAILY_UTC_HOUR  = int(os.getenv("DAILY_UTC_HOUR","9"))
 DAILY_UTC_MIN   = int(os.getenv("DAILY_UTC_MIN","0"))
 
 def _compose_daily() -> str:
-    # Simple “system” daily report using telemetry + queue
     q = {}
     try: q = _queue_depth()
     except Exception: pass
@@ -833,13 +775,9 @@ def _start_daily():
     log.info("Daily report scheduled for %02d:%02d UTC", DAILY_UTC_HOUR, DAILY_UTC_MIN)
 
 _start_daily()
-
-# Simple banner to prove scheduling thread is active
 threading.Thread(target=lambda: log.info("⏰ Scheduler thread active."), daemon=True).start()
 
-# ============================================================================
-# ASGI adapter (uvicorn)
-# ============================================================================
+# --- ASGI adapter (works on Render) ---
 try:
     from asgiref.wsgi import WsgiToAsgi
     app = WsgiToAsgi(flask_app)
