@@ -4,6 +4,7 @@ import os, logging, threading, time, json, uuid, hmac, hashlib, sqlite3, traceba
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, jsonify, request, Blueprint
+import requests
 
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -79,8 +80,88 @@ def _maybe_init_telegram(app: Flask) -> Optional[str]:
     except Exception as e:
         log.warning("Telegram init failed: %s", e)
         return str(e)
+# === Telegram minimal helpers ===============================================
+# Build webhook URL and call Telegram setWebhook/getWebhookInfo safely.
+# Uses your existing envs: BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, OPS_BASE_URL (fallbacks to RENDER_EXTERNAL_HOSTNAME).
+
+def _bot_token() -> Optional[str]:
+    # Prefer BOT_TOKEN (your env) but accept TELEGRAM_BOT_TOKEN too
+    return os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+
+def _tg_api(path: str) -> str:
+    token = _bot_token()
+    if not token:
+        raise RuntimeError("BOT_TOKEN missing")
+    return f"https://api.telegram.org/bot{token}/{path}"
+
+def _guess_base_url() -> Optional[str]:
+    """
+    Priority for webhook base:
+      1) TELEGRAM_WEBHOOK_BASE  (e.g., https://novatrade3-0.onrender.com)
+      2) OPS_BASE_URL           (your Bus base URL)
+      3) RENDER_EXTERNAL_HOSTNAME (Render provides host)
+    """
+    explicit = os.getenv("TELEGRAM_WEBHOOK_BASE")
+    if explicit:
+        return explicit.rstrip("/")
+    ops = os.getenv("OPS_BASE_URL")
+    if ops:
+        return ops.rstrip("/")
+    rend = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+    if rend:
+        return f"https://{rend}".rstrip("/")
+    return None
+
+def _compute_webhook_url() -> Optional[str]:
+    """Construct https://<base>/tg/<TELEGRAM_WEBHOOK_SECRET>"""
+    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+    base = _guess_base_url()
+    if not (secret and base):
+        return None
+    return f"{base}/tg/{secret}"
+
+def _set_webhook_now() -> dict:
+    """Call Telegram setWebhook → our /tg/<secret> path (idempotent)."""
+    url = _compute_webhook_url()
+    if not url:
+        return {"ok": False, "reason": "missing TELEGRAM_WEBHOOK_SECRET or base url"}
+    try:
+        resp = requests.post(_tg_api("setWebhook"), json={"url": url}, timeout=10)
+        data = resp.json() if resp.content else {}
+        return {"ok": bool(data.get("ok")), "result": data}
+    except Exception as e:
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+
+def _get_webhook_info() -> dict:
+    try:
+        r = requests.get(_tg_api("getWebhookInfo"), timeout=10)
+        data = r.json() if r.content else {}
+        return {"ok": bool(data.get("ok")), "result": data.get("result", data)}
+    except Exception as e:
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+
+def _maybe_autoset_webhook_on_boot(logger=None):
+    """
+    If TELEGRAM_WEBHOOK_AUTOCONFIG=1 and token+secret exist, set webhook at boot.
+    Safe to run repeatedly; Telegram treats setWebhook idempotently.
+    """
+    flag = os.getenv("TELEGRAM_WEBHOOK_AUTOCONFIG","").lower() in ("1","true","yes")
+    if not flag:
+        return
+    if not _bot_token() or not os.getenv("TELEGRAM_WEBHOOK_SECRET"):
+        return
+    res = _set_webhook_now()
+    if logger:
+        try:
+            logger.info("telegram webhook autoconfig: %s", json.dumps(res, ensure_ascii=False))
+        except Exception:
+            logger.info("telegram webhook autoconfig executed.")
 
 telegram_status = _maybe_init_telegram(flask_app)
+try:
+    _maybe_autoset_webhook_on_boot(logger=log)
+except Exception as _e:
+    log.warning("telegram webhook autoconfig failed: %s", _e)
 
 # --- Env / Feature Flags ---
 OUTBOX_SECRET          = os.getenv("OUTBOX_SECRET", "")
@@ -674,12 +755,22 @@ def api_debug_log():
 
 @flask_app.post("/api/debug/tg/send")
 def api_debug_tg_send():
-    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET","")
-    if secret:
-        got = request.args.get("secret") or request.headers.get("X-TG-Secret")
-        if (got or "") != secret:
-            return jsonify(ok=False, error="forbidden"), 403
-    text = (request.get_json(silent=True) or {}).get("text") or "NovaTrade test ✅"
+    body = request.get_json(silent=True) or {}
+    text = body.get("text") or "NovaTrade test ✅"
+    chat_id = body.get("chat_id")  # optional override
+    if chat_id:
+        # direct send with override
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')}/sendMessage",
+                json={"chat_id": chat_id, "text": text[:4000]},
+                timeout=8
+            )
+            j = r.json() if r.content else {"ok": False}
+            return jsonify(j if isinstance(j, dict) else {"ok": False}), 200
+        except Exception as e:
+            return jsonify(ok=False, error=str(e)), 500
+    # fallback to your existing helper which uses TELEGRAM_CHAT_ID
     send_telegram(text)
     return jsonify(ok=True), 200
 
@@ -705,6 +796,18 @@ def api_debug_selftest():
     except Exception as e:
         log.warning("selftest failed: %s", e)
         return jsonify(ok=False, error=str(e), db=DB_PATH), 200
+
+# === Telegram webhook diagnostics ===========================================
+@flask_app.get("/api/debug/tg/webhook_info")
+def api_tg_webhook_info():
+    """Return Telegram getWebhookInfo result for quick diagnostics."""
+    return jsonify(_get_webhook_info()), 200
+
+@flask_app.post("/api/debug/tg/set_webhook")
+def api_tg_set_webhook():
+    """Manually set the Telegram webhook to /tg/<TELEGRAM_WEBHOOK_SECRET>."""
+    res = _set_webhook_now()
+    return jsonify(res), (200 if res.get("ok") else 400)
 
 # --- Background helpers (receipts bridge + daily) ---
 def _start_receipts_bridge():
