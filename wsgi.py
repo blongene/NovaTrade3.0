@@ -1,11 +1,11 @@
-# wsgi.py — NovaTrade Bus (policy-wired drop-in)
+# wsgi.py — NovaTrade Bus (Phase 7A+: policy-wired, clean HMAC, dual kills, Telegram)
 from __future__ import annotations
-import os, logging, threading, time, json, uuid, hmac, hashlib, sqlite3, traceback
+import os, json, hmac, hashlib, logging, threading, time, uuid, traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
-from flask import Flask, jsonify, request, Blueprint
-import requests
+from flask import Flask, request, jsonify, Blueprint
 
+# ========================= Logging =========================
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -14,114 +14,69 @@ logging.basicConfig(
 log = logging.getLogger("bus")
 logging.getLogger("werkzeug").setLevel(logging.WARNING if LOG_LEVEL != "DEBUG" else logging.DEBUG)
 
+# ========================= Flask ==========================
 flask_app = Flask(__name__)
 
-# --- Telegram ---
-try:
-    from telegram_webhook import _send_telegram as send_telegram  # type: ignore
-    log.info("Telegram send_telegram imported from telegram_webhook.py")
-except Exception as e:
-    log.warning("telegram_webhook import degraded, using fallback: %s", e)
-    import requests
-    def send_telegram(text: str):
-        if os.getenv("ENABLE_TELEGRAM","").lower() not in ("1","true","yes"):
-            return
-        token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        if not token or not chat_id:
-            log.debug("Telegram not configured; skipping message.")
-            return
-        try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"},
-                timeout=8
-            )
-            if not r.ok:
-                log.warning("Telegram send failed: %s", r.text)
-        except Exception as e2:
-            log.warning("Telegram send degraded: %s", e2)
+# ====================== Telegram ==========================
+def _env_true(k: str) -> bool:
+    return os.environ.get(k, "").lower() in ("1","true","yes","on")
 
-def _maybe_init_telegram(app: Flask) -> Optional[str]:
-    if os.environ.get("ENABLE_TELEGRAM", "").lower() not in ("1", "true", "yes"):
-        return None
-    try:
-        import telegram_webhook as tgmod
-        tg_bp = None
-        if hasattr(tgmod, "tg_blueprint"):
-            tg_bp = getattr(tgmod, "tg_blueprint")
-        elif hasattr(tgmod, "telegram_bp"):
-            tg_bp = getattr(tgmod, "telegram_bp")
-        elif hasattr(tgmod, "create_blueprint") and callable(tgmod.create_blueprint):
-            tg_bp = tgmod.create_blueprint()
-        if tg_bp is not None:
-            from flask import Blueprint as _BP
-            if isinstance(tg_bp, _BP):
-                app.register_blueprint(tg_bp, url_prefix="/tg")
-                log.info("Telegram blueprint mounted at /tg")
-            else:
-                try:
-                    from werkzeug.middleware.dispatcher import DispatcherMiddleware
-                    subapp = getattr(tg_bp, "wsgi_app", None)
-                    if subapp is None:
-                        raise TypeError("telegram object is neither Blueprint nor Flask.wsgi_app")
-                    app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/tg": subapp})
-                    log.info("Telegram Flask app mounted at /tg")
-                except Exception as e:
-                    log.warning("Telegram mount degraded: %s", e)
-                    return str(e)
-        setter = getattr(tgmod, "set_telegram_webhook", None)
-        if callable(setter):
-            try:
-                setter()
-            except Exception as e:
-                log.info("Telegram webhook setter degraded: %s", e)
-        return None
-    except Exception as e:
-        log.warning("Telegram init failed: %s", e)
-        return str(e)
-# === Telegram minimal helpers ===============================================
-# Build webhook URL and call Telegram setWebhook/getWebhookInfo safely.
-# Uses your existing envs: BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, OPS_BASE_URL (fallbacks to RENDER_EXTERNAL_HOSTNAME).
+ENABLE_TELEGRAM = _env_true("ENABLE_TELEGRAM")
 
 def _bot_token() -> Optional[str]:
-    # Prefer BOT_TOKEN (your env) but accept TELEGRAM_BOT_TOKEN too
+    # prefer BOT_TOKEN (your env), fallback to TELEGRAM_BOT_TOKEN
     return os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 
+_TELEGRAM_TOKEN = _bot_token()
+_TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_telegram(text: str):
+    if not (ENABLE_TELEGRAM and _TELEGRAM_TOKEN and _TELEGRAM_CHAT):
+        return
+    try:
+        import requests
+        r = requests.post(
+            f"https://api.telegram.org/bot{_TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": _TELEGRAM_CHAT, "text": text[:4000], "parse_mode": "HTML"},
+            timeout=8
+        )
+        if not r.ok:
+            log.warning("Telegram send failed: %s", r.text)
+    except Exception as e:
+        log.warning("Telegram degraded: %s", e)
+
+# Try to mount your existing telegram_webhook module at /tg (optional)
+try:
+    import telegram_webhook as _tg
+    if hasattr(_tg, "tg_blueprint"):
+        flask_app.register_blueprint(_tg.tg_blueprint, url_prefix="/tg")
+        log.info("Telegram blueprint mounted at /tg")
+    if hasattr(_tg, "set_telegram_webhook"):
+        try: _tg.set_telegram_webhook()
+        except Exception as e: log.info("Telegram webhook setter degraded: %s", e)
+except Exception as e:
+    log.info("telegram_webhook not mounted: %s", e)
+
+# Helpers to set/get webhook directly (diagnostics)
 def _tg_api(path: str) -> str:
-    token = _bot_token()
-    if not token:
-        raise RuntimeError("BOT_TOKEN missing")
-    return f"https://api.telegram.org/bot{token}/{path}"
+    tok = _bot_token()
+    if not tok: raise RuntimeError("BOT_TOKEN missing")
+    return f"https://api.telegram.org/bot{tok}/{path}"
 
 def _guess_base_url() -> Optional[str]:
-    """
-    Priority for webhook base:
-      1) TELEGRAM_WEBHOOK_BASE  (e.g., https://novatrade3-0.onrender.com)
-      2) OPS_BASE_URL           (your Bus base URL)
-      3) RENDER_EXTERNAL_HOSTNAME (Render provides host)
-    """
-    explicit = os.getenv("TELEGRAM_WEBHOOK_BASE")
-    if explicit:
-        return explicit.rstrip("/")
-    ops = os.getenv("OPS_BASE_URL")
-    if ops:
-        return ops.rstrip("/")
-    rend = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-    if rend:
-        return f"https://{rend}".rstrip("/")
-    return None
+    base = os.getenv("TELEGRAM_WEBHOOK_BASE") or os.getenv("OPS_BASE_URL")
+    if base: return base.rstrip("/")
+    host = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+    return f"https://{host}".rstrip("/") if host else None
 
 def _compute_webhook_url() -> Optional[str]:
-    """Construct https://<base>/tg/<TELEGRAM_WEBHOOK_SECRET>"""
     secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
     base = _guess_base_url()
-    if not (secret and base):
-        return None
+    if not (secret and base): return None
     return f"{base}/tg/{secret}"
 
 def _set_webhook_now() -> dict:
-    """Call Telegram setWebhook → our /tg/<secret> path (idempotent)."""
+    import requests
     url = _compute_webhook_url()
     if not url:
         return {"ok": False, "reason": "missing TELEGRAM_WEBHOOK_SECRET or base url"}
@@ -133,6 +88,7 @@ def _set_webhook_now() -> dict:
         return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
 
 def _get_webhook_info() -> dict:
+    import requests
     try:
         r = requests.get(_tg_api("getWebhookInfo"), timeout=10)
         data = r.json() if r.content else {}
@@ -140,48 +96,27 @@ def _get_webhook_info() -> dict:
     except Exception as e:
         return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
 
-def _maybe_autoset_webhook_on_boot(logger=None):
-    """
-    If TELEGRAM_WEBHOOK_AUTOCONFIG=1 and token+secret exist, set webhook at boot.
-    Safe to run repeatedly; Telegram treats setWebhook idempotently.
-    """
-    flag = os.getenv("TELEGRAM_WEBHOOK_AUTOCONFIG","").lower() in ("1","true","yes")
-    if not flag:
-        return
-    if not _bot_token() or not os.getenv("TELEGRAM_WEBHOOK_SECRET"):
-        return
-    res = _set_webhook_now()
-    if logger:
-        try:
-            logger.info("telegram webhook autoconfig: %s", json.dumps(res, ensure_ascii=False))
-        except Exception:
-            logger.info("telegram webhook autoconfig executed.")
+def _maybe_autoset_webhook_on_boot():
+    if _env_true("TELEGRAM_WEBHOOK_AUTOCONFIG") and _bot_token() and os.getenv("TELEGRAM_WEBHOOK_SECRET"):
+        res = _set_webhook_now()
+        try: log.info("telegram webhook autoconfig: %s", json.dumps(res, ensure_ascii=False))
+        except Exception: log.info("telegram webhook autoconfig executed.")
 
-telegram_status = _maybe_init_telegram(flask_app)
-try:
-    _maybe_autoset_webhook_on_boot(logger=log)
-except Exception as _e:
-    log.warning("telegram webhook autoconfig failed: %s", _e)
+try: _maybe_autoset_webhook_on_boot()
+except Exception as _e: log.warning("telegram webhook autoconfig failed: %s", _e)
 
-# --- Env / Feature Flags ---
+# ==================== HMAC / Security =====================
 OUTBOX_SECRET          = os.getenv("OUTBOX_SECRET", "")
-REQUIRE_HMAC_OPS       = os.getenv("REQUIRE_HMAC_OPS","0").lower() in ("1","true","yes")
-REQUIRE_HMAC_PULL      = os.getenv("REQUIRE_HMAC_PULL","0").lower() in ("1","true","yes")
-REQUIRE_HMAC_TELEMETRY = os.getenv("REQUIRE_HMAC_TELEMETRY","0").lower() in ("1","true","yes")
 TELEMETRY_SECRET       = os.getenv("TELEMETRY_SECRET", OUTBOX_SECRET)
+REQUIRE_HMAC_OPS       = _env_true("REQUIRE_HMAC_OPS")        # enqueue + ack
+REQUIRE_HMAC_PULL      = _env_true("REQUIRE_HMAC_PULL")       # pull
+REQUIRE_HMAC_TELEMETRY = _env_true("REQUIRE_HMAC_TELEMETRY")  # telemetry push
 
-ENABLE_POLICY          = os.getenv("ENABLE_POLICY","1").lower() in ("1","true","yes")
-POLICY_ENFORCE         = os.getenv("POLICY_ENFORCE","1").lower() in ("1","true","yes")
-POLICY_PATH            = os.getenv("POLICY_PATH","policy.yaml")
-CLOUD_HOLD             = os.getenv("CLOUD_HOLD","0").lower() in ("1","true","yes")
-
-# --- HMAC helpers ---
 def _canonical(d: dict) -> bytes:
     return json.dumps(d, separators=(",",":"), sort_keys=True).encode("utf-8")
 
-def _verify_with(secret: str, body: dict, sig: str) -> bool:
-    if not secret:
-        return True
+def _verify(secret: str, body: dict, sig: str) -> bool:
+    if not secret: return True
     try:
         exp = hmac.new(secret.encode("utf-8"), _canonical(body), hashlib.sha256).hexdigest()
         return hmac.compare_digest(exp, sig or "")
@@ -189,114 +124,96 @@ def _verify_with(secret: str, body: dict, sig: str) -> bool:
         return False
 
 def _require_json():
-    if not request.is_json:
-        return None, ("invalid or missing JSON body", 400)
-    try:
-        return request.get_json(force=True, silent=False), None
-    except Exception:
-        return None, ("malformed JSON", 400)
+    if not request.is_json: return None, (jsonify(ok=False, error="invalid_or_missing_json"), 400)
+    try: return request.get_json(force=True, silent=False), None
+    except Exception: return None, (jsonify(ok=False, error="malformed_json"), 400)
 
-def _maybe_require_hmac_ops(body):
-    if REQUIRE_HMAC_OPS and not _verify_with(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
-        return ("invalid signature", 401)
-    return None
+# ================= Kill Switches & Policy =================
+CLOUD_HOLD     = _env_true("CLOUD_HOLD")
+NOVA_KILL      = _env_true("NOVA_KILL")
+ENABLE_POLICY  = _env_true("ENABLE_POLICY")
+POLICY_ENFORCE = _env_true("POLICY_ENFORCE")
+POLICY_PATH    = os.getenv("POLICY_PATH","policy.yaml")
 
-def _maybe_require_hmac_pull(body):
-    if REQUIRE_HMAC_PULL and not _verify_with(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
-        return ("invalid signature", 401)
-    return None
-
-def _maybe_require_hmac_tel(body):
-    if REQUIRE_HMAC_TELEMETRY and not _verify_with(TELEMETRY_SECRET, body, request.headers.get("X-NT-Sig","")):
-        return ("invalid signature", 401)
-    return None
-
-# --- Policy loader / evaluator ---
 class _PolicyState:
     def __init__(self):
-        self.loaded = False
-        self.load_error: Optional[str] = None
         self.path = POLICY_PATH
         self.mtime = 0.0
-        self.engine = None  # type: ignore
+        self.loaded = False
+        self.engine = None
+        self.load_error: Optional[str] = None
 
-    def _import_engine(self):
-        try:
-            import importlib
-            pe = importlib.import_module("policy_engine")
-            return pe
-        except Exception as e:
-            self.load_error = f"import failed: {e}"
-            return None
+    def _mtime(self) -> float:
+        try: return os.stat(self.path).st_mtime
+        except FileNotFoundError: return 0.0
 
     def maybe_load(self, force: bool=False):
         if not ENABLE_POLICY:
-            self.loaded = False
-            self.engine = None
+            self.loaded, self.engine = False, None
             self.load_error = "policy disabled"
             return
-
-        pe = self._import_engine()
-        if pe is None:
-            self.loaded = False
-            return
-
         try:
-            st = None
-            try:
-                st = os.stat(self.path)
-            except FileNotFoundError:
-                pass
-            needs_reload = force or (st and st.st_mtime != self.mtime) or (not self.loaded)
-            if needs_reload:
+            m = self._mtime()
+            if force or (not self.loaded) or (m != self.mtime):
+                import importlib
+                pe = importlib.import_module("policy_engine")
                 loader = getattr(pe, "load_policy", None)
-                if callable(loader):
-                    self.engine = loader(self.path)
-                else:
-                    self.engine = pe
-                self.mtime = st.st_mtime if st else 0.0
-                self.loaded = True
-                self.load_error = None
-                log.info("policy loaded from %s (mtime=%s)", self.path, self.mtime)
+                self.engine = loader(self.path) if callable(loader) else pe
+                self.mtime = m
+                self.loaded, self.load_error = True, None
+                log.info("policy loaded: %s (mtime=%s)", self.path, self.mtime)
         except Exception as e:
-            self.loaded = False
-            self.engine = None
+            self.loaded, self.engine = False, None
             self.load_error = f"load error: {e}"
             log.warning("policy load error: %s", e)
 
     def evaluate(self, intent: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Expected responses (any of):
+          { "ok": True/False, "reason": str, "patched_intent": {...}, "policy_id": str, "flags": [...] }
+        Backward compat: { "allowed": bool, "patched": {...} }
+        """
         self.maybe_load()
-        default = {"allowed": True, "reason": "policy not loaded", "patched": {}, "flags": []}
-        if not ENABLE_POLICY or not self.loaded or self.engine is None:
-            return default
+        if not (ENABLE_POLICY and self.loaded and self.engine):
+            return {"ok": True, "reason": "policy disabled or not loaded"}
         try:
-            pe = self.engine
-            fn = getattr(pe, "evaluate", None)
-            if callable(fn):
-                return fn(intent) or default
-            ctx = getattr(pe, "policy", None)
-            if ctx and hasattr(ctx, "evaluate"):
-                return ctx.evaluate(intent) or default  # type: ignore
-            return default
+            eng = self.engine
+            # prefer evaluate_intent()
+            if hasattr(eng, "evaluate_intent"):
+                res = eng.evaluate_intent(intent)
+            elif hasattr(eng, "evaluate"):
+                res = eng.evaluate(intent)
+            elif hasattr(getattr(eng, "policy", None), "evaluate"):
+                res = eng.policy.evaluate(intent)  # type: ignore
+            else:
+                return {"ok": True, "reason": "no evaluate function"}
+            if not isinstance(res, dict):
+                return {"ok": True, "reason": "policy returned non-dict"}
+            # normalize legacy shape
+            if "ok" not in res and "allowed" in res:
+                res["ok"] = bool(res.get("allowed"))
+            if "patched_intent" not in res and "patched" in res:
+                res["patched_intent"] = res.get("patched") or {}
+            return res
         except Exception as e:
-            self.load_error = f"eval error: {e}"
-            log.warning("policy eval error: %s\n%s", e, traceback.format_exc())
-            return default
+            msg = f"policy exception: {e}"
+            log.warning(msg)
+            return {"ok": (not POLICY_ENFORCE), "reason": msg}
 
 _policy = _PolicyState()
+_policy.maybe_load(force=True)
 
-def _policy_log(decision: Dict[str, Any], intent: Dict[str, Any]):
+def _policy_log(intent: dict, decision: dict):
     try:
-        import policy_logger  # type: ignore
-        writer = getattr(policy_logger, "log_decision", None)
-        if callable(writer):
-            writer(decision=decision, intent=intent, when=datetime.utcnow().isoformat())
+        import policy_logger
+        if hasattr(policy_logger, "log_decision"):
+            policy_logger.log_decision(decision=decision, intent=intent, when=datetime.utcnow().isoformat())
             return
     except Exception:
         pass
     log.info("policy decision: %s", json.dumps({"decision": decision, "intent": intent}, separators=(",",":")))
 
-# --- DB / Outbox ---
+# ================= Outbox (SQLite) ======================
 DB_PATH = os.getenv("OUTBOX_DB_PATH", "./outbox.sqlite")
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
@@ -324,33 +241,16 @@ CREATE INDEX IF NOT EXISTS idx_commands_lease_exp ON commands(lease_expires_at);
 """
 
 def _connect():
+    import sqlite3
     conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
-
-def _ensure_receipts_compat(conn: sqlite3.Connection) -> None:
-    try:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(receipts)").fetchall()}
-        changed = False
-        if "ts" not in cols:
-            conn.execute("ALTER TABLE receipts ADD COLUMN ts TEXT")
-            changed = True
-        if "payload" not in cols:
-            conn.execute("ALTER TABLE receipts ADD COLUMN payload TEXT")
-            changed = True
-        if changed:
-            conn.execute("UPDATE receipts SET ts = COALESCE(ts, created_at)")
-            conn.execute("UPDATE receipts SET payload = COALESCE(payload, detail)")
-            conn.commit()
-    except Exception as e:
-        log.info("receipts compat check degraded: %s", e)
 
 def _init_db():
     conn = _connect()
     try:
         for stmt in [s.strip() for s in SCHEMA.strip().split(";") if s.strip()]:
             conn.execute(stmt)
-        _ensure_receipts_compat(conn)
     finally:
         conn.close()
 
@@ -407,15 +307,14 @@ def _ack_command(cmd_id: str, agent_id: str, status: str, detail: Optional[Dict]
     jdetail = json.dumps(detail or {}, separators=(",",":"))
     conn = _connect()
     try:
-        _ensure_receipts_compat(conn)
         conn.execute(
             """
-            INSERT INTO receipts(command_id, agent_id, status, detail, created_at, ts, payload)
-            VALUES (?,?,?,?,?,?,?)
+            INSERT INTO receipts(command_id, agent_id, status, detail, created_at)
+            VALUES (?,?,?,?,?)
             """,
-            (cmd_id, agent_id, status.lower(), jdetail, now, now, jdetail),
+            (cmd_id, agent_id, status.lower(), jdetail, now),
         )
-        conn.execute("UPDATE commands SET status='acked' WHERE id=?", (cmd_id,))
+        conn.execute("UPDATE commands SET status=? WHERE id=?", ("acked" if status=="ok" else "failed", cmd_id))
     finally:
         conn.close()
 
@@ -432,13 +331,7 @@ def _last_receipts(n: int = 10):
                 payload = json.loads(detail) if detail else None
             except Exception:
                 payload = {"raw": detail}
-            out.append({
-                "command_id": cid,
-                "agent_id": aid,
-                "status": st,
-                "payload": payload,
-                "ts": ts
-            })
+            out.append({"command_id": cid, "agent_id": aid, "status": st, "payload": payload, "ts": ts})
         return out
     finally:
         conn.close()
@@ -454,7 +347,7 @@ def _queue_depth() -> Dict[str,int]:
     finally:
         conn.close()
 
-# --- Basic Routes ---
+# ================= Root/Health/Dash =====================
 @flask_app.get("/")
 def index():
     return jsonify(ok=True, service="NovaTrade Bus", status="ready"), 200
@@ -462,7 +355,6 @@ def index():
 @flask_app.get("/healthz")
 def healthz():
     info: Dict[str, Any] = {"ok": True, "web": "up"}
-    info["telegram"] = {"status": "ok" if not telegram_status else "degraded", "reason": telegram_status}
     info["db"] = DB_PATH
     info["policy"] = {
         "enabled": ENABLE_POLICY,
@@ -471,18 +363,15 @@ def healthz():
         "loaded": _policy.loaded,
         "error": _policy.load_error,
     }
-    try:
-        info["queue"] = _queue_depth()
-    except Exception as e:
-        info["queue_error"] = str(e)
+    try: info["queue"] = _queue_depth()
+    except Exception as e: info["queue_error"] = str(e)
     return jsonify(info), 200
 
 @flask_app.get("/readyz")
 def readyz():
     return jsonify(ok=True, service="Bus", ready=True), 200
 
-# --- Telemetry intake ---
-_last_telemetry: Dict[str, Any] = {"agent_id": None, "flat": {}, "by_venue": {}, "ts": 0}
+_last_tel: Dict[str, Any] = {"agent_id": None, "flat": {}, "by_venue": {}, "ts": 0}
 
 def _safe_float(x) -> float:
     try: return float(x)
@@ -506,18 +395,16 @@ def _normalize_balances(raw) -> Tuple[dict, dict]:
         flat = {t: round(_safe_float(a), 8) for t, a in raw.items()}
         return flat, {}
 
+# ================= Telemetry ============================
 @flask_app.post("/api/telemetry/push")
-def api_telemetry_push():
-    data = request.get_json(silent=True) or {}
-    e = _maybe_require_hmac_tel(data)
-    if e: return e
-    agent_id = data.get("agent_id", "edge")
-    raw_balances = data.get("balances") or {}
-    flat, by_venue = _normalize_balances(raw_balances)
-    _last_telemetry["agent_id"] = agent_id
-    _last_telemetry["flat"] = flat
-    _last_telemetry["by_venue"] = by_venue
-    _last_telemetry["ts"] = int(time.time())
+def telemetry_push():
+    body, err = _require_json()
+    if err: return err
+    if REQUIRE_HMAC_TELEMETRY and not _verify(TELEMETRY_SECRET, body, request.headers.get("X-NT-Sig","")):
+        return jsonify(ok=False, error="invalid_signature"), 401
+    agent_id = body.get("agent_id", "edge")
+    flat, by_venue = _normalize_balances(body.get("balances") or {})
+    _last_tel.update({"agent_id": agent_id, "flat": flat, "by_venue": by_venue, "ts": int(time.time())})
     if by_venue:
         venue_counts = {v: len(tokens) for v, tokens in by_venue.items()}
         log.info("📡 Telemetry from %s: venues=%s | flat_tokens=%d", agent_id, venue_counts, len(flat))
@@ -529,20 +416,20 @@ def api_telemetry_push():
 @flask_app.post("/api/telemetry/push_balances")
 @flask_app.post("/api/edge/balances")
 @flask_app.post("/bus/push_balances")
-def api_telemetry_push_aliases():
-    return api_telemetry_push()
+def telemetry_push_aliases():
+    return telemetry_push()
 
 @flask_app.get("/api/telemetry/last")
-def api_telemetry_last():
-    return jsonify(ok=True, **_last_telemetry), 200
+def telemetry_last():
+    return jsonify(ok=True, **_last_tel), 200
 
+# Simple HTML dash
 @flask_app.get("/dash")
 def dash():
     try: q = _queue_depth()
     except Exception: q = {}
-    age = "-"
-    if _last_telemetry.get("ts"):
-        age = f"{int(time.time())-int(_last_telemetry['ts'])}s"
+    age = "-" if not _last_tel.get("ts") else f"{int(time.time())-int(_last_tel['ts'])}s"
+    venues_line = ", ".join(f"{v}:{len(t)}" for v,t in _last_tel.get("by_venue",{}).items()) or "—"
     html = f"""
     <html><head><meta charset="utf-8"><title>NovaTrade Dash</title>
     <style>
@@ -553,38 +440,39 @@ def dash():
       <h2>NovaTrade Bus</h2>
       <div class='card'><b>Telemetry age:</b> <code>{age}</code></div>
       <div class='card'><b>Queue</b><br>queued:{q.get('queued',0)} · leased:{q.get('leased',0)} · acked:{q.get('acked',0)} · failed:{q.get('failed',0)}</div>
-      <div class='card'><b>Agent:</b> <code>{_last_telemetry.get('agent_id') or '-'}</code></div>
+      <div class='card'><b>Agent:</b> <code>{_last_tel.get('agent_id') or '-'}</code></div>
       <div class='card'><b>Policy:</b> <code>{"ENABLED" if ENABLE_POLICY else "DISABLED"} / {"ENFORCE" if POLICY_ENFORCE else "WARN"}</code></div>
     </body></html>"""
     return html, 200, {"Content-Type":"text/html; charset=utf-8"}
 
-# --- Bus API (enqueue, pull, ack) ---
-BUS_ROUTES = Blueprint("bus_routes", __name__, url_prefix="/api")
+# ================= Bus API (enqueue/pull/ack) ===========
+BUS = Blueprint("bus", __name__, url_prefix="/api")
 
 def _now_ts() -> int: return int(time.time())
 
-@BUS_ROUTES.route("/intent/enqueue", methods=["POST"])
+@BUS.route("/intent/enqueue", methods=["POST"])
 def intent_enqueue():
     body, err = _require_json()
     if err: return err
-    if os.getenv("NOVA_KILL","").lower() in ("1","true","yes") or CLOUD_HOLD:
+    if NOVA_KILL or CLOUD_HOLD:
         return jsonify(ok=False, error="bus_killed"), 503
-    e = _maybe_require_hmac_ops(body)
-    if e: return e
-    required = ["agent_target","venue","symbol","side","amount"]
-    missing = [k for k in required if not str(body.get(k,"")).strip()]
-    if missing: return (f"missing fields: {', '.join(missing)}", 400)
+    if REQUIRE_HMAC_OPS and not _verify(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
+        return jsonify(ok=False, error="invalid_signature"), 401
+
+    # schema
+    req = ["agent_target","venue","symbol","side","amount"]
+    missing = [k for k in req if not str(body.get(k,"")).strip()]
+    if missing: return jsonify(ok=False, error=f"missing: {', '.join(missing)}"), 400
     side = str(body["side"]).lower()
-    if side not in ("buy","sell"): return ("side must be buy|sell", 400)
+    if side not in ("buy","sell"): return jsonify(ok=False, error="side must be buy|sell"), 400
     try:
         amount = float(body["amount"])
-        if amount <= 0: return ("amount must be > 0", 400)
+        if amount <= 0: return jsonify(ok=False, error="amount must be > 0"), 400
     except Exception:
-        return ("amount must be numeric", 400)
+        return jsonify(ok=False, error="amount must be numeric"), 400
 
-    cmd_id = body.get("id") or str(uuid.uuid4())
-    payload = {
-        "id": cmd_id,
+    intent = {
+        "id": body.get("id") or str(uuid.uuid4()),
         "ts": body.get("ts", _now_ts()),
         "source": body.get("source","operator"),
         "agent_target": body["agent_target"],
@@ -595,122 +483,108 @@ def intent_enqueue():
         "flags": body.get("flags", []),
     }
 
-    decision = {"allowed": True, "reason": "no policy", "patched": {}, "flags": []}
+    decision = {"ok": True, "reason": "no policy", "patched_intent": {}, "flags": []}
     if ENABLE_POLICY:
         try:
-            decision = _policy.evaluate(payload)
+            decision = _policy.evaluate(intent)
         except Exception as ex:
             log.warning("policy evaluation exception: %s", ex)
-    patched = decision.get("patched") or {}
+    patched = decision.get("patched_intent") or decision.get("patched") or {}
     if patched:
-        for k,v in patched.items():
-            payload[k] = v
+        intent.update(patched)
     pol_flags = list(decision.get("flags") or [])
     if pol_flags:
-        payload["flags"] = sorted(set(list(payload.get("flags", [])) + pol_flags))
+        intent["flags"] = sorted(set(list(intent.get("flags", [])) + pol_flags))
 
-    if ENABLE_POLICY and not decision.get("allowed", True):
-        _policy_log(decision, payload)
-        msg = f"❌ <b>Policy blocked</b> — {decision.get('reason','')}".strip()
+    if ENABLE_POLICY and not decision.get("ok", True):
+        _policy_log(intent, decision)
         if POLICY_ENFORCE:
-            try:
-                send_telegram(f"{msg}\n<code>{json.dumps(payload,indent=2)}</code>")
-            except Exception:
-                pass
+            try: send_telegram(f"❌ <b>Policy blocked</b>\n<code>{json.dumps(intent,indent=2)}</code>\n<i>{decision.get('reason','')}</i>")
+            except Exception: pass
             return jsonify(ok=False, policy="blocked", reason=decision.get("reason","")), 403
         else:
-            payload.setdefault("flags", []).append("policy_warn")
-            try:
-                send_telegram(f"⚠️ <b>Policy warning</b> — {decision.get('reason','')}\n<code>{json.dumps(payload,indent=2)}</code>")
-            except Exception:
-                pass
+            # warn but proceed
+            intent.setdefault("flags", []).append("policy_warn")
+            try: send_telegram(f"⚠️ <b>Policy warning</b>\n<code>{json.dumps(intent,indent=2)}</code>\n<i>{decision.get('reason','')}</i>")
+            except Exception: pass
 
     try:
-        _enqueue_command(cmd_id, payload)
-        log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s", cmd_id, payload["venue"], payload["symbol"], payload["side"], payload["amount"])
-        try:
-            send_telegram(f"✅ <b>Intent enqueued</b>\n<code>{json.dumps(payload,indent=2)}</code>")
-        except Exception:
-            pass
-        return jsonify({"ok": True, "id": cmd_id, "policy": decision}), 200
+        _enqueue_command(intent["id"], intent)
+        log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s", intent["id"], intent["venue"], intent["symbol"], intent["side"], intent["amount"])
+        try: send_telegram(f"✅ <b>Intent enqueued</b>\n<code>{json.dumps(intent,indent=2)}</code>")
+        except Exception: pass
+        return jsonify(ok=True, id=intent["id"], decision=decision), 200
     except Exception as ex:
-        try:
-            send_telegram(f"⚠️ <b>Enqueue failed</b>\n{ex}")
-        except Exception:
-            pass
-        return (f"enqueue error: {ex}", 500)
+        try: send_telegram(f"⚠️ <b>Enqueue failed</b>\n{ex}")
+        except Exception: pass
+        return jsonify(ok=False, error=f"enqueue error: {ex}"), 500
 
-@BUS_ROUTES.route("/ops/enqueue", methods=["POST"])
+@BUS.route("/ops/enqueue", methods=["POST"])
 def ops_enqueue_alias():
     return intent_enqueue()
 
-@BUS_ROUTES.route("/commands/pull", methods=["POST"])
+@BUS.route("/commands/pull", methods=["POST"])
 def commands_pull():
     body, err = _require_json()
     if err: return err
-    e = _maybe_require_hmac_pull(body)
-    if e: return e
-    agent_id = str(body.get("agent_id","")).strip() or "edge-primary"
-    max_items = int(body.get("max", 5) or 5)
-    lease_seconds = int(body.get("lease_seconds", 90) or 90)
+    if REQUIRE_HMAC_PULL and not _verify(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
+        return jsonify(ok=False, error="invalid_signature"), 401
+    agent_id = (body or {}).get("agent_id") or "edge-primary"
+    max_items = int((body or {}).get("max", 5) or 5)
+    lease_seconds = int((body or {}).get("lease_seconds", 90) or 90)
     cmds = _pull_commands(agent_id, max_items=max_items, lease_seconds=lease_seconds)
     log.info("pull agent=%s count=%d lease=%ds", agent_id, len(cmds), lease_seconds)
-    return jsonify({"ok": True, "commands": cmds})
+    return jsonify(ok=True, commands=cmds), 200
 
-@BUS_ROUTES.route("/commands/ack", methods=["POST"])
+@BUS.route("/commands/ack", methods=["POST"])
 def commands_ack():
     body, err = _require_json()
     if err: return err
-    e = _maybe_require_hmac_pull(body)
-    if e: return e
-    cmd_id  = str(body.get("command_id","")).strip()
-    agent_id= str(body.get("agent_id","")).strip() or "edge-primary"
-    status  = str(body.get("status","")).strip().lower() or "ok"
-    detail  = body.get("detail", {})
-    if not cmd_id: return ("command_id required", 400)
+    # ACK is an operator-side action → use OPS HMAC
+    if REQUIRE_HMAC_OPS and not _verify(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
+        return jsonify(ok=False, error="invalid_signature"), 401
+    cmd_id   = str(body.get("command_id","")).strip()
+    agent_id = str(body.get("agent_id","")).strip() or "edge-primary"
+    status   = str(body.get("status","ok")).strip().lower() or "ok"
+    detail   = body.get("detail", {})
+    if not cmd_id: return jsonify(ok=False, error="command_id required"), 400
     try:
         _ack_command(cmd_id, agent_id, status, detail)
         if status == "ok":
-            try:
-                send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>")
-            except Exception:
-                pass
+            try: send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>")
+            except Exception: pass
         else:
-            try:
-                send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>\n<code>{json.dumps(detail,indent=2)}</code>")
-            except Exception:
-                pass
+            try: send_telegram(f"🧾 <b>ACK</b> {cmd_id} — <i>{status}</i>\n<code>{json.dumps(detail,indent=2)}</code>")
+            except Exception: pass
         log.info("ack id=%s agent=%s status=%s", cmd_id, agent_id, status)
-        return jsonify({"ok": True})
+        return jsonify(ok=True), 200
     except Exception as ex:
-        return (f"ack error: {ex}", 500)
+        return jsonify(ok=False, error=f"ack error: {ex}"), 500
 
-@BUS_ROUTES.route("/receipts/last", methods=["GET"])
+@BUS.route("/receipts/last", methods=["GET"])
 def receipts_last():
     try:
-        n = int(request.args.get("n", "10"))
+        n = int(request.args.get("n","10"))
     except Exception:
         n = 10
     try:
         rows = _last_receipts(n)
-        return jsonify({"ok": True, "receipts": rows})
+        return jsonify(ok=True, receipts=rows), 200
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify(ok=False, error=str(e)), 500
 
-@BUS_ROUTES.route("/health/summary", methods=["GET"])
+@BUS.route("/health/summary", methods=["GET"])
 def health_summary():
     try: q = _queue_depth()
     except Exception: q = {}
-    age = "-"
-    if _last_telemetry.get("ts"):
-        age = f"{int(time.time())-int(_last_telemetry['ts'])}s"
+    age = "-" if not _last_tel.get("ts") else f"{int(time.time())-int(_last_tel['ts'])}s"
     data = {
         "ok": True,
         "service": os.getenv("SERVICE_NAME","bus"),
         "env": os.getenv("ENV","prod"),
         "queue": q,
         "telemetry_age": age,
-        "agent": _last_telemetry.get("agent_id"),
+        "agent": _last_tel.get("agent_id"),
         "policy": {
             "enabled": ENABLE_POLICY,
             "enforce": POLICY_ENFORCE,
@@ -719,76 +593,27 @@ def health_summary():
             "error": _policy.load_error,
         }
      }
-    include = request.args.get("include_receipts","0").lower() in ("1","true","yes")
-    if include:
-        try:
-            data["receipts"] = _last_receipts(int(request.args.get("n","10")))
-        except Exception as e:
-            data["receipts_error"] = str(e)
-    return jsonify(data)
+    if (request.args.get("include_receipts","0").lower() in ("1","true","yes")):
+        try: data["receipts"] = _last_receipts(int(request.args.get("n","10")))
+        except Exception as e: data["receipts_error"] = str(e)
+    return jsonify(data), 200
 
-@BUS_ROUTES.route("/policy/reload", methods=["POST"])
+@BUS.route("/policy/reload", methods=["POST"])
 def policy_reload():
     _policy.maybe_load(force=True)
-    status = {
-        "enabled": ENABLE_POLICY,
-        "enforce": POLICY_ENFORCE,
-        "path": POLICY_PATH,
-        "loaded": _policy.loaded,
-        "error": _policy.load_error
-    }
-    return jsonify(ok=True, **status), 200
+    return jsonify(ok=True, enabled=ENABLE_POLICY, enforce=POLICY_ENFORCE, path=POLICY_PATH,
+                   loaded=_policy.loaded, error=_policy.load_error), 200
 
-@BUS_ROUTES.route("/policy/evaluate", methods=["POST"])
+@BUS.route("/policy/evaluate", methods=["POST"])
 def policy_evaluate():
     body, err = _require_json()
     if err: return err
     decision = _policy.evaluate(body or {})
     return jsonify(ok=True, decision=decision), 200
 
-flask_app.register_blueprint(BUS_ROUTES)
+flask_app.register_blueprint(BUS)
 
-@flask_app.get("/api/debug/log")
-def api_debug_log():
-    log.info("debug-log: hello from bus")
-    return jsonify(ok=True), 200
-
-@flask_app.post("/api/debug/tg/send")
-def api_debug_tg_send():
-    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
-    got = request.args.get("secret") or request.headers.get("X-TG-Secret")
-    if secret and (got or "") != secret:
-        return jsonify(ok=False, error="forbidden"), 403
-    body = request.get_json(silent=True) or {}
-    text = body.get("text") or "NovaTrade test ✅"
-    chat_id = body.get("chat_id")  # optional override
-    if chat_id:
-        # direct send with override
-        try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')}/sendMessage",
-                json={"chat_id": chat_id, "text": text[:4000]},
-                timeout=8
-            )
-            j = r.json() if r.content else {"ok": False}
-            return jsonify(j if isinstance(j, dict) else {"ok": False}), 200
-        except Exception as e:
-            return jsonify(ok=False, error=str(e)), 500
-    # fallback to your existing helper which uses TELEGRAM_CHAT_ID
-    send_telegram(text)
-    return jsonify(ok=True), 200
-
-@flask_app.errorhandler(404)
-def _not_found(_e): return jsonify(error="not_found"), 404
-
-@flask_app.errorhandler(405)
-def _method_not_allowed(_e): return jsonify(error="method_not_allowed"), 405
-
-@flask_app.errorhandler(500)
-def _server_error(e):
-    log.warning("Unhandled error: %s", e)
-    return jsonify(error="internal_error"), 500
-
+# ============== Debug & Telegram diag ====================
 @flask_app.get("/api/debug/selftest")
 def api_debug_selftest():
     try:
@@ -801,14 +626,12 @@ def api_debug_selftest():
         log.warning("selftest failed: %s", e)
         return jsonify(ok=False, error=str(e), db=DB_PATH), 200
 
-# === Telegram webhook diagnostics ===========================================
 @flask_app.get("/api/debug/tg/webhook_info")
 def api_tg_webhook_info():
     secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
     got = request.args.get("secret") or request.headers.get("X-TG-Secret")
     if secret and (got or "") != secret:
         return jsonify(ok=False, error="forbidden"), 403
-    """Return Telegram getWebhookInfo result for quick diagnostics."""
     return jsonify(_get_webhook_info()), 200
 
 @flask_app.post("/api/debug/tg/set_webhook")
@@ -817,33 +640,33 @@ def api_tg_set_webhook():
     got = request.args.get("secret") or request.headers.get("X-TG-Secret")
     if secret and (got or "") != secret:
         return jsonify(ok=False, error="forbidden"), 403
-    """Manually set the Telegram webhook to /tg/<TELEGRAM_WEBHOOK_SECRET>."""
     res = _set_webhook_now()
     return jsonify(res), (200 if res.get("ok") else 400)
 
-# --- Background helpers (receipts bridge + daily) ---
-def _start_receipts_bridge():
-    if os.environ.get("DISABLE_RECEIPTS_BRIDGE","").lower() in ("1","true","yes"):
-        return
-    try:
-        import receipts_bridge
-    except Exception as e:
-        log.debug("receipts_bridge unavailable: %s", e)
-        return
-    def _loop():
-        time.sleep(15)
-        while True:
-            try:
-                receipts_bridge.run_once()  # type: ignore
-            except Exception as err:
-                log.info("receipts_bridge error: %s", err)
-            time.sleep(300)
-    threading.Thread(target=_loop, name="receipts-bridge", daemon=True).start()
-    log.info("receipts_bridge scheduled every 5m")
+@flask_app.errorhandler(404)
+def _not_found(_e): return jsonify(error="not_found"), 404
 
-_start_receipts_bridge()
+@flask_app.errorhandler(405)
+def _method_not_allowed(_e): return jsonify(error="method_not_allowed"), 405
 
-DAILY_ENABLED   = os.getenv("DAILY_ENABLED","1").lower() in ("1","true","yes")
+@flask_app.errorhandler(500)
+def _server_error(e):
+    log.warning("Unhandled error: %s", e)
+    return jsonify(error="internal_error"), 500
+
+# ============== Background: policy watchdog =============
+def _policy_watchdog():
+    while True:
+        try: _policy.maybe_load()
+        except Exception as e: log.debug("policy watchdog err: %s", e)
+        time.sleep(10)
+
+if ENABLE_POLICY:
+    threading.Thread(target=_policy_watchdog, name="policy-watchdog", daemon=True).start()
+    log.info("Policy watchdog started.")
+
+# ============== Daily report (optional) ==================
+DAILY_ENABLED   = _env_true("DAILY_ENABLED") or _env_true("ENABLE_TELEGRAM")
 DAILY_UTC_HOUR  = int(os.getenv("DAILY_UTC_HOUR","9"))
 DAILY_UTC_MIN   = int(os.getenv("DAILY_UTC_MIN","0"))
 
@@ -851,15 +674,13 @@ def _compose_daily() -> str:
     q = {}
     try: q = _queue_depth()
     except Exception: pass
-    age_s = "-"
-    if _last_telemetry.get("ts"):
-        age_s = f"{int(time.time())-int(_last_telemetry['ts'])}s"
-    venues_line = ", ".join(f"{v}:{len(t)}" for v,t in _last_telemetry.get("by_venue",{}).items()) or "—"
+    age_s = "-" if not _last_tel.get("ts") else f"{int(time.time())-int(_last_tel['ts'])}s"
+    venues_line = ", ".join(f"{v}:{len(t)}" for v,t in _last_tel.get("by_venue",{}).items()) or "—"
     msg = (
         "☀️ <b>NovaTrade Daily Report</b>\n"
         f"as of {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
         "<b>Heartbeats</b>\n"
-        f"• {_last_telemetry.get('agent_id') or 'edge-primary'}: last {age_s} ago\n\n"
+        f"• {_last_tel.get('agent_id') or 'edge-primary'}: last {age_s} ago\n\n"
         "<b>Queue</b>\n"
         f"• queued:{q.get('queued',0)} leased:{q.get('leased',0)} acked:{q.get('acked',0)} failed:{q.get('failed',0)}\n\n"
         "<b>Balances (venues → tokenCount)</b>\n"
@@ -872,27 +693,24 @@ def _sleep_until(hour:int, minute:int):
     while True:
         now = datetime.now(timezone.utc)
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if target <= now:
-            target = target + timedelta(days=1)
+        if target <= now: target = target + timedelta(days=1)
         time.sleep((target - now).total_seconds())
         yield
 
 def _start_daily():
-    if not DAILY_ENABLED or os.getenv("ENABLE_TELEGRAM","").lower() not in ("1","true","yes"):
+    if not (DAILY_ENABLED and ENABLE_TELEGRAM and _TELEGRAM_TOKEN and _TELEGRAM_CHAT):
         return
     def _loop():
         for _ in _sleep_until(DAILY_UTC_HOUR, DAILY_UTC_MIN):
-            try:
-                send_telegram(_compose_daily())
-            except Exception as e:
-                log.debug("daily send degraded: %s", e)
+            try: send_telegram(_compose_daily())
+            except Exception as e: log.debug("daily send degraded: %s", e)
     threading.Thread(target=_loop, name="daily-report", daemon=True).start()
     log.info("Daily report scheduled for %02d:%02d UTC", DAILY_UTC_HOUR, DAILY_UTC_MIN)
 
 _start_daily()
 threading.Thread(target=lambda: log.info("⏰ Scheduler thread active."), daemon=True).start()
 
-# --- ASGI adapter (works on Render) ---
+# ================= ASGI adapter =========================
 try:
     from asgiref.wsgi import WsgiToAsgi
     app = WsgiToAsgi(flask_app)
