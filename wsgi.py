@@ -154,6 +154,16 @@ def _policy_log(intent: dict, decision: dict):
     except Exception:
         log.info("policy decision (non-json-serializable)")
 
+@flask_app.get("/api/policy/config")
+def policy_config():
+    cfg = {}
+    try:
+        eng = _policy.engine
+        cfg = getattr(eng, "cfg", {}) if eng else {}
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+    return jsonify(ok=True, config=cfg), 200
+
 # ========== Outbox (SQLite, inline) ==========
 DB_PATH = os.getenv("OUTBOX_DB_PATH", "./outbox.sqlite")
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
