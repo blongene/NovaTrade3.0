@@ -135,19 +135,29 @@ def _load_yaml(path: str) -> Dict[str, Any]:
     return {"policy": cfg, "_source": source}
 
 # --------------------------- Symbol helpers ---------------------------
-
-_PAIR_RE = re.compile(r"^([A-Z0-9]+)[-/]?([A-Z0-9]+)$")
+# Recognized quote suffixes (extend as needed)
+_KNOWN_QUOTES = ("USDT", "USDC", "USD", "EUR", "BTC", "ETH")
 
 def _split_symbol(symbol: str, venue: str) -> Tuple[str, str]:
     s = (symbol or "").upper().replace(":", "").replace(".", "")
-    m = _PAIR_RE.match(s)
-    if m:
-        return m.group(1), m.group(2)
+    # separators first
     if "-" in s:
         a, b = s.split("-", 1)
         return a, b
-    # naive fallback
-    return s, "USD"
+    if "/" in s:
+        a, b = s.split("/", 1)
+        return a, b
+    # compact suffix detection (prefer 4-char quotes first)
+    for q in ("USDT", "USDC", "BUSD", "TUSD"):   # common 4-char quotes
+        if s.endswith(q) and len(s) > len(q):
+            return s[:-len(q)], q
+    for q in ("USD", "EUR", "BTC", "ETH"):       # common 3-char quotes
+        if s.endswith(q) and len(s) > len(q):
+            return s[:-len(q)], q
+    # last resort: default quote by venue (if configured), else USD
+    default_q = {"COINBASE":"USDC","COINBASEADV":"USDC","CBADV":"USDC",
+                 "KRAKEN":"USDT","BINANCEUS":"USDT"}.get((venue or "").upper(), "USD")
+    return s, default_q
 
 def _join_symbol(base: str, quote: str, venue: str) -> str:
     v = (venue or "").upper()
@@ -201,7 +211,9 @@ class Engine:
                         "patched_intent": {}, "flags": ["blocked"]}
             _policy_log(decision=decision, intent=intent, when=None)
             return decision
-
+        # Normalize symbol early so base/quote are sane before any prefer-quote rewrite
+        base, quote = _split_symbol(symbol, venue)
+        symbol = _join_symbol(base, quote, venue)  # keep normalized form for downstream
         # Prefer quote per venue (e.g., COINBASE=USDC, KRAKEN=USDT)
         patched: Dict[str, Any] = {}
         flags: list = []
