@@ -55,6 +55,15 @@ def _env_override_map() -> dict:
         except Exception: pass
     return m
 
+def _get_min_qty_floor(cfg: dict, venue: str, symbol: str) -> Optional[float]:
+    floors = cfg.get("min_qty_floors") or {}
+    key = f"{venue.upper()}:{symbol.upper()}"
+    v = floors.get(key)
+    try:
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
 # --------------------------- Defaults ---------------------------
 
 _DEFAULT = {
@@ -287,6 +296,14 @@ class Engine:
                             return decision
                 else:
                     flags.append("price_unknown")
+        # ---- min qty floors (exchange constraints)
+        min_floor = _get_min_qty_floor(cfg, venue, _join_symbol(base, quote, venue))
+        if min_floor and side == "buy":
+            amt = _float(patched.get("amount", amount), amount)
+            if amt and amt < min_floor:
+                # nudge up to floor (respect precision)
+                patched["amount"] = float(f"{min_floor:.8f}")
+                flags.append("min_qty_floor")
 
         # Final decision
         decision = {"ok": True, "reason": "ok", "patched_intent": patched, "flags": flags}
