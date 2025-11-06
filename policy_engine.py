@@ -78,7 +78,7 @@ _DEFAULT = {
         "max_per_coin_usd": 25,      # hard cap per intent
         "min_quote_reserve_usd": 25, # deny/resize if quote below this floor
         "keepback_usd": 5,           # never breach this reserve
-        "canary_max_usd": 10,        # first sizing cap for safety
+        "canary_max_usd": 11,        # first sizing cap for safety
         "on_short_quote": "resize",  # resize | deny
 
         # Price/telemetry expectations
