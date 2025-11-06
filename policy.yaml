@@ -10,7 +10,8 @@ policy:
   on_short_quote:      resize        # resize|deny if reserve too small
   allow_price_unknown:  false        # block if no price available
   cool_off_minutes_after_trade: 30   # cooldown between rotations
-
+  min_qty_floors:
+    "KRAKEN:BTCUSDT": 0.0001
   # ── strategic preferences ────────────────────────────────────────
   prefer_quotes:
     BINANCEUS: USDT
