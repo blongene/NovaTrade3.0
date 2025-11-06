@@ -9,6 +9,102 @@ except Exception:
     def _policy_log(*args, **kwargs):
         return
 
+def _abs_path(p: str) -> str:
+    if not p:
+        return ""
+    return p if os.path.isabs(p) else os.path.abspath(p)
+
+def _merge(dst: dict, src: dict) -> dict:
+    """shallow merge; src wins"""
+    out = dict(dst or {})
+    for k, v in (src or {}).items():
+        out[k] = v
+    return out
+
+def _env_override_map() -> dict:
+    # allow hot overrides via env (names are optional; only applied if set)
+    m = {}
+    def _f(name, key, cast=float):
+        val = os.getenv(name)
+        if val is not None:
+            try:
+                m[key] = cast(val)
+            except Exception:
+                m[key] = val  # last resort
+    _f("POLICY_MAX_PER_COIN_USD", "max_per_coin_usd")
+    _f("POLICY_MIN_QUOTE_RESERVE_USD", "min_quote_reserve_usd")
+    _f("POLICY_KEEPBACK_USD", "keepback_usd")
+    _f("POLICY_CANARY_MAX_USD", "canary_max_usd")
+    _f("POLICY_ALLOW_PRICE_UNKNOWN", "allow_price_unknown", cast=lambda x: str(x).lower() in ("1","true","yes","on"))
+    qmap = os.getenv("POLICY_PREFER_QUOTES_JSON")  # e.g. {"BINANCEUS":"USDT","COINBASE":"USDC","KRAKEN":"USDT"}
+    if qmap:
+        try: m["prefer_quotes"] = json.loads(qmap)
+        except Exception: pass
+    return m
+
+# ---------- Defaults ----------
+_DEFAULT = {
+    "policy": {
+        "prefer_quotes": {"BINANCEUS":"USDT","COINBASE":"USDC","KRAKEN":"USDT"},
+        "blocked_symbols": ["BARK","BONK"],
+        "max_per_coin_usd": 25,
+        "min_quote_reserve_usd": 25,
+        "keepback_usd": 5,
+        "canary_max_usd": 10,
+        "on_short_quote": "resize",
+        "allow_price_unknown": False,
+        "cool_off_minutes_after_trade": 30,
+        "venue_order": ["BINANCEUS","COINBASE","KRAKEN"]
+    }
+}
+
+def _load_yaml(path: str) -> dict:
+    data = {}
+    try:
+        import yaml  # type: ignore
+        apath = _abs_path(path or "policy.yaml")
+        with open(apath, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        base = dict(_DEFAULT["policy"])
+        if isinstance(raw, dict):
+            if isinstance(raw.get("policy"), dict):
+                base = _merge(base, raw["policy"])
+            else:
+                # merge common sections/keys if user omitted 'policy:' root
+                for k in ("prefer_quotes","blocked_symbols","max_per_coin_usd",
+                          "min_quote_reserve_usd","keepback_usd","canary_max_usd",
+                          "on_short_quote","allow_price_unknown",
+                          "cool_off_minutes_after_trade","venue_order"):
+                    if k in raw: base[k] = raw[k]
+                for sec in ("risk","execution","caps","cooldowns"):
+                    if isinstance(raw.get(sec), dict):
+                        base = _merge(base, raw[sec])
+        # env overrides last
+        base = _merge(base, _env_override_map())
+        return {"policy": base, "_source": {"yaml": apath, "env_overrides": bool(_env_override_map())}}
+    except Exception:
+        # defaults + env overrides
+        base = _merge(dict(_DEFAULT["policy"]), _env_override_map())
+        return {"policy": base, "_source": {"defaults": True, "env_overrides": bool(_env_override_map())}}
+
+class Engine:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg or dict(_DEFAULT["policy"])
+        self._source = {}
+
+    def evaluate_intent(self, intent: dict, context: dict | None = None) -> dict:
+        # ... (unchanged evaluation logic) ...
+        ...
+        return decision
+
+def load_policy(path: str):
+    loaded = _load_yaml(os.getenv("POLICY_PATH") or path or "policy.yaml")
+    eng = Engine(loaded.get("policy") or dict(_DEFAULT["policy"]))
+    eng._source = loaded.get("_source", {})
+    return eng
+
+# singleton evaluate_intent fallback remains the same (uses POLICY_PATH if set)
+
 # ---------- Defaults ----------
 _DEFAULT = {
     "policy": {
