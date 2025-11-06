@@ -361,7 +361,27 @@ def intent_enqueue():
         "notional_usd": body.get("notional_usd"),
         "quote_reserve_usd": body.get("quote_reserve_usd"),
     }
-
+  
+    # 7B: route the intent to the best venue first (uses telemetry + policy cfg)
+    try:
+        import policy_engine
+        # extract active policy cfg if available
+        policy_cfg = getattr(getattr(_policy.engine, "cfg", {}), "copy", lambda: _policy.engine.cfg)()
+    except Exception:
+        policy_cfg = {}
+    
+    try:
+        import router
+        route_res = router.choose_venue(intent, _last_tel, policy_cfg if isinstance(policy_cfg, dict) else {})
+        if route_res.get("ok"):
+            intent.update(route_res.get("patched_intent") or {})
+            intent.setdefault("flags", []).extend(route_res.get("flags") or [])
+        else:
+            # hard-stop before policy if no venue has usable quote
+            return jsonify(ok=False, policy="blocked", reason=route_res.get("reason","routing_failed"), decision=route_res), 403
+    except Exception as e:
+        log.info("router degraded: %s", e)
+      
     # 🔴 policy evaluation with telemetry context (this is the key fix)
     context = {"telemetry": _last_tel}
     decision = _policy.evaluate_intent(intent, context=context)
