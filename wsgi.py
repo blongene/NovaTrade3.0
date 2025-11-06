@@ -354,11 +354,10 @@ def intent_enqueue():
     if REQUIRE_HMAC_OPS and not _verify(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
         return jsonify(ok=False, error="invalid_signature"), 401
 
-    # minimal schema (venue is now optional; router may choose)
+    # venue is OPTIONAL now; router may choose
     req = ["agent_target","symbol","side","amount"]
     missing = [k for k in req if not str(body.get(k,"")).strip()]
-    if missing:
-        return jsonify(ok=False, error=f"missing: {', '.join(missing)}"), 400
+    if missing: return jsonify(ok=False, error=f"missing: {', '.join(missing)}"), 400
 
     side = str(body["side"]).lower()
     if side not in ("buy","sell"):
@@ -366,8 +365,7 @@ def intent_enqueue():
 
     try:
         amount = float(body["amount"])
-        if amount <= 0:
-            return jsonify(ok=False, error="amount must be > 0"), 400
+        if amount <= 0: return jsonify(ok=False, error="amount must be > 0"), 400
     except Exception:
         return jsonify(ok=False, error="amount must be numeric"), 400
 
@@ -376,26 +374,23 @@ def intent_enqueue():
         "ts": body.get("ts", int(time.time())),
         "source": body.get("source","operator"),
         "agent_target": str(body["agent_target"]),
-        "venue": str(body.get("venue","")).upper(),          # optional
+        "venue": str(body.get("venue","")).upper(),  # optional
         "symbol": str(body["symbol"]).upper(),
         "side": side,
         "amount": amount,
         "flags": body.get("flags", []),
-
-        # optional hints the policy can use if provided:
         "price_usd": body.get("price_usd"),
         "notional_usd": body.get("notional_usd"),
         "quote_reserve_usd": body.get("quote_reserve_usd"),
     }
 
-    # ---- Policy cfg for router/policy context
+    # active policy cfg for router/policy
     try:
         policy_cfg = dict(getattr(_policy.engine, "cfg", {}) or {})
     except Exception:
         policy_cfg = {}
 
-    # ---- 7B Router (prefer-quote aware) — PERMISSIVE MODE
-    # If router can’t pick a venue (e.g., no telemetry), we continue to policy.
+    # --- Router (prefer-quote aware) — PERMISSIVE ---
     try:
         import router
         route_res = router.choose_venue(intent, _last_tel, policy_cfg if isinstance(policy_cfg, dict) else {})
@@ -403,13 +398,13 @@ def intent_enqueue():
             intent.update(route_res.get("patched_intent") or {})
             intent["flags"] = _uniq_extend(intent.get("flags", []), route_res.get("flags", []))
         else:
-            # permissive: add flags/reason and allow policy to make the final call
+            # permissive: let policy decide; record router flags
             intent["flags"] = _uniq_extend(intent.get("flags", []), route_res.get("flags", []))
             log.info("router: %s — continuing to policy", route_res.get("reason"))
     except Exception as e:
         log.info("router degraded: %s", e)
 
-    # ---- Policy evaluation with telemetry context
+    # --- Policy (telemetry-aware)
     context = {"telemetry": _last_tel}
     decision = _policy.evaluate_intent(intent, context=context)
     _policy_log(intent, decision)
@@ -419,23 +414,21 @@ def intent_enqueue():
         send_telegram(f"❌ Policy blocked\n<code>{json.dumps(intent,indent=2)}</code>\n<i>{reason}</i>")
         return jsonify(ok=False, policy="blocked", reason=reason, decision=decision), 403
 
-    # Apply policy patches (amount/symbol, etc.)
+    # apply policy patches
     patched = decision.get("patched_intent") or decision.get("patched") or {}
     if patched:
         intent.update(patched)
 
-    # Enqueue
     _enqueue_command(intent["id"], intent)
-    log.info(
-        "enqueue id=%s venue=%s symbol=%s side=%s amount=%s",
-        intent["id"], intent.get("venue"), intent.get("symbol"), intent["side"], intent["amount"]
-    )
+    log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s",
+             intent["id"], intent.get("venue"), intent.get("symbol"), intent["side"], intent["amount"])
     send_telegram(f"✅ Intent enqueued\n<code>{json.dumps(intent,indent=2)}</code>")
     return jsonify(ok=True, id=intent["id"], decision=decision), 200
 
 @BUS.route("/ops/enqueue", methods=["POST"])
 def ops_enqueue_alias():
     return intent_enqueue()
+
 
 @BUS.route("/commands/pull", methods=["POST"])
 def commands_pull():
