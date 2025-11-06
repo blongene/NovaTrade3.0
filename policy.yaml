@@ -2,8 +2,8 @@
 policy:
 
   # ── sizing & risk ────────────────────────────────────────────────
-  max_per_coin_usd:        25        # per-intent cap (unchanged)
-  min_quote_reserve_usd:   25        # upgraded from 10 → 25 for safety
+  max_per_coin_usd:       100        # per-intent cap (unchanged)
+  min_quote_reserve_usd:   10        # upgraded from 10 → 25 for safety
   keepback_usd:             5        # always leave this untouched
   canary_max_usd:          10        # cap for first fills
   min_liquidity_usd:    50000        # same as before
