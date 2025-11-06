@@ -12,6 +12,14 @@ policy:
   cool_off_minutes_after_trade: 30   # cooldown between rotations
   min_qty_floors:
     "KRAKEN:BTCUSDT": 0.0001
+  venue_min_notional_usd:
+    BINANCEUS: 10
+    COINBASE:  5     # treat as 5 USD/USDC; adjust if you want 10
+    KRAKEN:    25
+  venue_fees_bp:
+    BINANCEUS: 10
+    COINBASE:  20
+    KRAKEN:    26
   # ── strategic preferences ────────────────────────────────────────
   prefer_quotes:
     BINANCEUS: USDT
