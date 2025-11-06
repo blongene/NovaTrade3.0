@@ -335,6 +335,16 @@ def dash():
 # ========== Bus API ==========
 BUS = Blueprint("bus", __name__, url_prefix="/api")
 
+def _uniq_extend(dst, add):
+    if not isinstance(dst, list): dst = []
+    if not isinstance(add, list): add = [add] if add else []
+    seen, out = set(), []
+    for x in dst + add:
+        if x is None: continue
+        if x in seen: continue
+        seen.add(x); out.append(x)
+    return out
+
 @BUS.route("/intent/enqueue", methods=["POST"])
 def intent_enqueue():
     body, err = _require_json()
@@ -344,15 +354,20 @@ def intent_enqueue():
     if REQUIRE_HMAC_OPS and not _verify(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
         return jsonify(ok=False, error="invalid_signature"), 401
 
-    # minimal schema
-    req = ["agent_target","venue","symbol","side","amount"]
+    # minimal schema (venue is now optional; router may choose)
+    req = ["agent_target","symbol","side","amount"]
     missing = [k for k in req if not str(body.get(k,"")).strip()]
-    if missing: return jsonify(ok=False, error=f"missing: {', '.join(missing)}"), 400
+    if missing:
+        return jsonify(ok=False, error=f"missing: {', '.join(missing)}"), 400
+
     side = str(body["side"]).lower()
-    if side not in ("buy","sell"): return jsonify(ok=False, error="side must be buy|sell"), 400
+    if side not in ("buy","sell"):
+        return jsonify(ok=False, error="side must be buy|sell"), 400
+
     try:
         amount = float(body["amount"])
-        if amount <= 0: return jsonify(ok=False, error="amount must be > 0"), 400
+        if amount <= 0:
+            return jsonify(ok=False, error="amount must be > 0"), 400
     except Exception:
         return jsonify(ok=False, error="amount must be numeric"), 400
 
@@ -360,39 +375,41 @@ def intent_enqueue():
         "id": body.get("id") or str(uuid.uuid4()),
         "ts": body.get("ts", int(time.time())),
         "source": body.get("source","operator"),
-        "agent_target": body["agent_target"],
-        "venue": str(body["venue"]).upper(),
+        "agent_target": str(body["agent_target"]),
+        "venue": str(body.get("venue","")).upper(),          # optional
         "symbol": str(body["symbol"]).upper(),
         "side": side,
         "amount": amount,
         "flags": body.get("flags", []),
+
         # optional hints the policy can use if provided:
         "price_usd": body.get("price_usd"),
         "notional_usd": body.get("notional_usd"),
         "quote_reserve_usd": body.get("quote_reserve_usd"),
     }
-  
-    # 7B: route the intent to the best venue first (uses telemetry + policy cfg)
+
+    # ---- Policy cfg for router/policy context
     try:
-        import policy_engine
-        # extract active policy cfg if available
-        policy_cfg = getattr(getattr(_policy.engine, "cfg", {}), "copy", lambda: _policy.engine.cfg)()
+        policy_cfg = dict(getattr(_policy.engine, "cfg", {}) or {})
     except Exception:
         policy_cfg = {}
-    
+
+    # ---- 7B Router (prefer-quote aware) — PERMISSIVE MODE
+    # If router can’t pick a venue (e.g., no telemetry), we continue to policy.
     try:
         import router
         route_res = router.choose_venue(intent, _last_tel, policy_cfg if isinstance(policy_cfg, dict) else {})
         if route_res.get("ok"):
             intent.update(route_res.get("patched_intent") or {})
-            intent.setdefault("flags", []).extend(route_res.get("flags") or [])
+            intent["flags"] = _uniq_extend(intent.get("flags", []), route_res.get("flags", []))
         else:
-            # hard-stop before policy if no venue has usable quote
-            return jsonify(ok=False, policy="blocked", reason=route_res.get("reason","routing_failed"), decision=route_res), 403
+            # permissive: add flags/reason and allow policy to make the final call
+            intent["flags"] = _uniq_extend(intent.get("flags", []), route_res.get("flags", []))
+            log.info("router: %s — continuing to policy", route_res.get("reason"))
     except Exception as e:
         log.info("router degraded: %s", e)
-      
-    # 🔴 policy evaluation with telemetry context (this is the key fix)
+
+    # ---- Policy evaluation with telemetry context
     context = {"telemetry": _last_tel}
     decision = _policy.evaluate_intent(intent, context=context)
     _policy_log(intent, decision)
@@ -402,14 +419,17 @@ def intent_enqueue():
         send_telegram(f"❌ Policy blocked\n<code>{json.dumps(intent,indent=2)}</code>\n<i>{reason}</i>")
         return jsonify(ok=False, policy="blocked", reason=reason, decision=decision), 403
 
-    # apply patches if any (e.g., auto_resized amount, symbol changes)
+    # Apply policy patches (amount/symbol, etc.)
     patched = decision.get("patched_intent") or decision.get("patched") or {}
     if patched:
         intent.update(patched)
 
-    # enqueue
+    # Enqueue
     _enqueue_command(intent["id"], intent)
-    log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s", intent["id"], intent["venue"], intent["symbol"], intent["side"], intent["amount"])
+    log.info(
+        "enqueue id=%s venue=%s symbol=%s side=%s amount=%s",
+        intent["id"], intent.get("venue"), intent.get("symbol"), intent["side"], intent["amount"]
+    )
     send_telegram(f"✅ Intent enqueued\n<code>{json.dumps(intent,indent=2)}</code>")
     return jsonify(ok=True, id=intent["id"], decision=decision), 200
 
