@@ -12,6 +12,25 @@ except Exception:  # pragma: no cover
 
 # --------------------------- Helpers ---------------------------
 
+def _get(d, path, default=None):
+    cur = d
+    for p in path.split("."):
+        if not isinstance(cur, dict) or p not in cur: return default
+        cur = cur[p]
+    return cur
+
+def _venue_min_notional(cfg, venue: str) -> float:
+    return float(_get(cfg, f"venue_min_notional_usd", {}).get(venue, 0))
+
+def _notional_usd(intent: dict) -> float | None:
+    # prefer explicit notional, else price*amount if both present
+    n = intent.get("notional_usd")
+    if isinstance(n, (int, float)): return float(n)
+    p, a = intent.get("price_usd"), intent.get("amount")
+    if isinstance(p, (int, float)) and isinstance(a, (int, float)):
+        return float(p) * float(a)
+    return None
+
 def _abs_path(p: str) -> str:
     if not p:
         return ""
@@ -240,6 +259,18 @@ class Engine:
             notional = price * amount
         elif notional is None and price is None:
             flags.append("notional_unknown")
+
+        venue = (intent.get("venue") or "").upper()
+        min_notional = _venue_min_notional(cfg, venue)
+        n = _notional_usd(intent)
+        
+        if min_notional and n is not None and n < min_notional:
+            return {
+                "ok": False,
+                "reason": f"min notional {min_notional:.0f} USD not met (got {n:.2f})",
+                "patched_intent": {},
+                "flags": ["below_min_notional"]
+            }
 
         # Notional cap (max_per_coin_usd)
         notional, clamp_flags = _cap_notional(cfg, notional)
