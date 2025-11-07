@@ -1,20 +1,32 @@
-# telegram_webhook.py — Minimal, safe Telegram webhook for NovaTrade Bus
+# telegram_webhook.py — Safe Telegram webhook handler for NovaTrade Bus
 from __future__ import annotations
-import os
-import logging
+import os, logging
 from typing import Optional
 from flask import Blueprint, request, jsonify
 
 log = logging.getLogger("tg")
 
 # --- Env ---------------------------------------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+BOT_TOKEN  = os.getenv("BOT_TOKEN")
+CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
 ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM","0").lower() in ("1","true","yes")
-DEDUP_TTL_MIN   = int(os.getenv("TG_DEDUP_TTL_MIN","1"))
-SUMMARIES_ENABLED = os.getenv("TELEGRAM_SUMMARIES_ENABLED","0").lower() in ("1","true","yes")
-SUMMARIES_TTL_MIN = int(os.getenv("TELEGRAM_SUMMARIES_TTL_MIN","720"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+# Dedup / summaries
+DEDUP_TTL_MIN        = int(os.getenv("TG_DEDUP_TTL_MIN","1"))
+SUMMARIES_ENABLED    = os.getenv("TELEGRAM_SUMMARIES_ENABLED","0").lower() in ("1","true","yes")
+SUMMARIES_TTL_MIN    = int(os.getenv("TELEGRAM_SUMMARIES_TTL_MIN","720"))
+
+# Timeout + secrets
+TIMEOUT_SEC     = int(os.getenv("TG_TIMEOUT_SEC","10"))
+WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET") or os.getenv("TELEGRAM_WEBHOOK_SECRET")
+
+# Build or read full webhook URL
+BASE = os.getenv("TELEGRAM_WEBHOOK_BASE") or os.getenv("BASE_URL")
+WEBHOOK_URL = (
+    os.getenv("WEBHOOK_URL")
+    or (f"{BASE.rstrip('/')}/tg/webhook" if BASE else None)
+)
+
 # --- Blueprint ---------------------------------------------------------------
 tg_blueprint = Blueprint("tg", __name__)
 
@@ -44,11 +56,13 @@ def _send_telegram(text: str, chat_id: Optional[str] = None) -> bool:
         log.debug("send degraded: %s", e)
         return False
 
+# --- Health ------------------------------------------------------------------
 @tg_blueprint.get("/health")
 def tg_health():
     status = "ok" if BOT_TOKEN and (CHAT_ID or WEBHOOK_URL) else "degraded"
-    return _ok(service="telegram", status=status)
+    return _ok(service="telegram", status=status, webhook=WEBHOOK_URL)
 
+# --- Webhook -----------------------------------------------------------------
 @tg_blueprint.post("/webhook")
 def tg_webhook():
     """Webhook endpoint mounted at /tg/webhook by the Bus."""
@@ -63,29 +77,30 @@ def tg_webhook():
         msg  = (data.get("message") or data.get("edited_message") or {}) or {}
         text = (msg.get("text") or "").strip()
         chat = (msg.get("chat") or {}).get("id")
-      
+
         if text.lower() in ("/id", "id"):
             _send_telegram(f"chat_id = <code>{chat}</code>", chat_id=str(chat) if chat else None)
             return _ok(received=True)
 
-        # simple ops: respond to /ping
         if text.lower() in ("/ping", "ping"):
             _send_telegram("🏓 pong", chat_id=str(chat) if chat else None)
 
-        # You can extend here: route commands, etc.
+        # extend here if needed
         return _ok(received=bool(data))
     except Exception as e:
         log.info("webhook degraded: %s", e)
-        # Never 5xx Telegram; return ok so Telegram doesn’t disable webhook
         return _ok(received=False, degraded=str(e))
 
+# --- Webhook registration ----------------------------------------------------
 def set_telegram_webhook():
-    """Best-effort webhook registration using TELEGRAM_WEBHOOK_URL."""
+    """Best-effort webhook registration with Telegram."""
     token = BOT_TOKEN
     url   = WEBHOOK_URL
     if not token or not url:
+        log.info("Telegram webhook skipped (missing BOT_TOKEN or WEBHOOK_URL)")
         return
-    # Append secret if configured and missing
+
+    # Append secret query if configured
     if WEBHOOK_SECRET and "secret=" not in url:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}secret={WEBHOOK_SECRET}"
@@ -97,12 +112,10 @@ def set_telegram_webhook():
             json={"url": url},
             timeout=TIMEOUT_SEC,
         )
-        ok = False
-        try:
-            ok = r.json().get("ok", False)
-        except Exception:
-            pass
-        if not ok:
-            log.info("setWebhook degraded: %s", r.text)
+        ok = r.ok and r.json().get("ok", False)
+        if ok:
+            log.info("Telegram webhook set: %s", url)
+        else:
+            log.warning("setWebhook degraded: %s", r.text)
     except Exception as e:
-        log.info("setWebhook error: %s", e)
+        log.warning("setWebhook error: %s", e)
