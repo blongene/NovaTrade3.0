@@ -329,8 +329,4 @@ except Exception:
     from flask import Flask
     _flask_app = Flask(__name__)
 
-# Receipts API — register once
-if 'receipts' not in _flask_app.blueprints:
-    _flask_app.register_blueprint(_receipts_bp)
-
 app = _flask_app  # gunicorn loads this
