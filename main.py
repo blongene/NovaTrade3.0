@@ -126,67 +126,7 @@ def _schedule(label: str, module_path: str, func_name: str,
     else:
         _thread(job)
 
-# --- Receipts API (Edge → Cloud) ---------------------------------------------
-_receipts_bp = Blueprint("receipts", __name__)
-_SEEN_IDS = set()  # in-proc idempotency; move to Postgres later
 
-def _verify_hmac(sig: str, body: bytes) -> bool:
-    EDGE_SECRET = os.getenv("EDGE_SECRET", "")  # must match Edge
-    if not EDGE_SECRET:
-        return False
-    mac = hmac.new(EDGE_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(mac, sig or "")
-
-def _append_trade_row(norm: dict):
-    # Uses your utils.get_gspread_client + SHEET_URL env
-    from utils import get_gspread_client
-    SHEET_URL = os.getenv("SHEET_URL", "")
-    if not SHEET_URL:
-        raise RuntimeError("SHEET_URL missing")
-    gc = get_gspread_client()
-    sh = gc.open_by_url(SHEET_URL)
-    ws = sh.worksheet("Trade_Log")   # make sure this tab exists
-
-    row = [
-        norm.get("timestamp_utc",""),
-        norm.get("venue",""),
-        norm.get("symbol",""),
-        norm.get("side",""),
-        norm.get("executed_qty",""),
-        norm.get("avg_price",""),
-        norm.get("quote_spent",""),
-        norm.get("fee",""),
-        norm.get("fee_asset",""),
-        norm.get("order_id",""),
-        "",  # client_order_id (optional)
-        norm.get("txid",""),
-        norm.get("status",""),
-    ]
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-@_receipts_bp.post("/api/receipts/ack")
-def receipts_ack():
-    raw = request.get_data()
-    sig = request.headers.get("X-Nova-Signature","")
-    if not _verify_hmac(sig, raw):
-        return jsonify({"ok": False, "error": "bad signature"}), 401
-
-    j = request.get_json(force=True)
-    norm = (j.get("normalized") or {})
-    rid  = norm.get("receipt_id") or f"{j.get('agent_id')}:{j.get('cmd_id')}"
-
-    # idempotency in process
-    if rid in _SEEN_IDS:
-        return jsonify({"ok": True, "dedup": True})
-
-    try:
-        _append_trade_row(norm)
-        _SEEN_IDS.add(rid)
-        info(f"Trade logged → {norm.get('venue')} {norm.get('symbol')} {norm.get('side')} {norm.get('executed_qty')} @ {norm.get('avg_price')}")
-        return jsonify({"ok": True, "appended": True})
-    except Exception as e:
-        error(f"Trade log append failed: {e}")
-        return jsonify({"ok": False, "error": f"sheet append failed: {e}"}), 500
 
 # --- Optional background loop: staking yield (soft) --------------------------
 def _staking_yield_loop():
