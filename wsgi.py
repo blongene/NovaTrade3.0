@@ -17,6 +17,38 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING if LOG_LEVEL != "DEBUG" e
 flask_app = Flask(__name__)
 store = get_store()
 
+# ---- Outbox shims (route-safe; delegate to Postgres store) ----
+def _enqueue_command(cmd_id: str, payload: dict) -> None:
+    p = dict(payload or {})
+    p.setdefault("id", cmd_id)
+    agent = p.get("agent_id") or "cloud"
+    # idempotent enqueue by payload hash (handled in store)
+    store.enqueue(agent, p)
+
+def _pull_commands(agent_id: str, max_items: int = 10, lease_seconds: int = 90) -> list[dict]:
+    leased = store.lease(agent_id, max_items)
+    # normalize to the legacy shape used by your handlers
+    out = []
+    for row in leased:
+        out.append({"id": str(row.get("id")), "payload": row.get("intent")})
+    return out
+
+def _ack_command(cmd_id: str, agent_id: str, status: str, detail: dict | None = None) -> None:
+    ok = (str(status).lower() == "ok")
+    store.save_receipt(agent_id, int(cmd_id) if str(cmd_id).isdigit() else None, detail or {}, ok)
+    if ok and str(cmd_id).isdigit():
+        store.done(int(cmd_id))
+
+def _queue_depth() -> dict:
+    s = store.stats()
+    # map to keys your dash/health expect
+    return {
+        "queued": int(s.get("queued", 0)),
+        "leased": int(s.get("leased", 0)),
+        "acked":  int(s.get("done",   0)),
+        "failed": 0,
+    }
+
 # ========== Flags / helpers ==========
 def _env_true(k: str) -> bool:
     return os.environ.get(k, "").lower() in ("1","true","yes","on")
@@ -186,91 +218,6 @@ def policy_override():
     _policy_overrides["values"] = values
     _policy_overrides["ttl_expiry"] = time.time() + ttl
     return jsonify(ok=True, applied=values, ttl_sec=ttl), 200
-
-# ========== Outbox (SQLite, inline) ==========
-DB_PATH = os.getenv("OUTBOX_DB_PATH", "./outbox.sqlite")
-os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS commands (
-  id TEXT PRIMARY KEY,
-  payload TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'queued',
-  created_at TEXT NOT NULL,
-  leased_at TEXT,
-  lease_expires_at TEXT,
-  agent_id TEXT
-);
-CREATE TABLE IF NOT EXISTS receipts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  command_id TEXT NOT NULL,
-  agent_id TEXT,
-  status TEXT NOT NULL,
-  detail TEXT,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
-CREATE INDEX IF NOT EXISTS idx_commands_lease_exp ON commands(lease_expires_at);
-"""
-import sqlite3
-def _connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
-def _init_db():
-    with _connect() as c:
-        for stmt in [s.strip() for s in SCHEMA.strip().split(";") if s.strip()]:
-            c.execute(stmt)
-_init_db()
-def _enqueue_command(cmd_id: str, payload: Dict[str, Any]) -> None:
-    now = datetime.utcnow().isoformat()
-    with _connect() as c:
-        c.execute("INSERT INTO commands(id, payload, status, created_at) VALUES (?,?, 'queued', ?)",
-                  (cmd_id, json.dumps(payload, separators=(",",":")), now))
-def _pull_commands(agent_id: str, max_items: int = 10, lease_seconds: int = 90) -> List[Dict]:
-    now = datetime.utcnow()
-    with _connect() as c:
-        rows = c.execute(
-            """SELECT id, payload FROM commands
-               WHERE status IN ('queued','leased')
-                 AND (lease_expires_at IS NULL OR lease_expires_at < ?)
-               ORDER BY created_at ASC LIMIT ?""",
-            (now.isoformat(), max_items)
-        ).fetchall()
-        if not rows: return []
-        ids = [r[0] for r in rows]
-        qmarks = ",".join("?" for _ in ids)
-        c.execute(
-            f"""UPDATE commands
-                    SET status='leased', leased_at=?, lease_expires_at=?, agent_id=?
-                WHERE id IN ({qmarks})""",
-            (now.isoformat(), (now+timedelta(seconds=lease_seconds)).isoformat(), agent_id, *ids)
-        )
-        return [{"id": rid, "payload": json.loads(pay)} for rid, pay in rows]
-def _ack_command(cmd_id: str, agent_id: str, status: str, detail: Optional[Dict] = None) -> None:
-    now = datetime.utcnow().isoformat()
-    with _connect() as c:
-        c.execute("""INSERT INTO receipts(command_id, agent_id, status, detail, created_at)
-                     VALUES (?,?,?,?,?)""", (cmd_id, agent_id, status.lower(),
-                                             json.dumps(detail or {}, separators=(",",":")), now))
-        c.execute("UPDATE commands SET status=? WHERE id=?", ("acked" if status=="ok" else "failed", cmd_id))
-def _last_receipts(n: int = 10):
-    with _connect() as c:
-        rows = c.execute("""SELECT command_id, agent_id, status, detail, created_at
-                            FROM receipts ORDER BY created_at DESC LIMIT ?""", (int(n),)).fetchall()
-    out=[]
-    for cid, aid, st, detail, ts in rows:
-        try: payload = json.loads(detail) if detail else None
-        except Exception: payload = {"raw": detail}
-        out.append({"command_id": cid, "agent_id": aid, "status": st, "payload": payload, "ts": ts})
-    return out
-def _queue_depth() -> Dict[str,int]:
-    with _connect() as c:
-        out={}
-        for st in ("queued","leased","acked","failed"):
-            out[st] = int(c.execute("SELECT COUNT(1) FROM commands WHERE status=?", (st,)).fetchone()[0])
-    return out
 
 # ========== Health/root ==========
 @flask_app.get("/")
