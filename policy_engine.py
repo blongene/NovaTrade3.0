@@ -422,3 +422,79 @@ def evaluate_intent(intent: Dict[str, Any], context: Optional[dict]=None) -> Dic
 def evaluate(intent: Dict[str, Any]) -> Dict[str, Any]:
     """Compatibility wrapper (no context)."""
     return evaluate_intent(intent, context=None)
+
+# ---------- Backward-compat wrapper for older imports ----------
+class PolicyEngine:
+    """
+    Legacy wrapper so older code can keep: from policy_engine import PolicyEngine
+    API kept: pe = PolicyEngine(); ok, reason, patched = pe.validate(intent, asset_state)
+    """
+    def __init__(self, path: str = None):
+        loaded = _load_yaml(os.getenv("POLICY_PATH") or path or "policy.yaml")
+        self._eng = Engine(loaded.get("policy") or dict(_DEFAULT["policy"]))
+        self.cfg = self._eng.cfg
+        # preserve attribute used elsewhere
+        self.cooldown_min = int(self.cfg.get("cool_off_minutes_after_trade", 30))
+
+    def validate(self, intent: dict, asset_state: dict | None = None):
+        """
+        intent (legacy): { token, action, amount_usd?, amount?, venue, quote?, price_usd? }
+        asset_state (legacy): may include liquidity_usd, etc. (ignored here)
+        Returns: (ok:bool, reason:str, patched_intent:dict)
+        """
+        token = (intent.get("token") or "").upper()
+        venue = (intent.get("venue") or "").upper()
+        quote = (intent.get("quote") or "")
+        side  = (intent.get("action") or "").lower()
+
+        # Build a symbol for the new engine; prefer explicit 'symbol' if provided
+        symbol = intent.get("symbol")
+        if not symbol:
+            if token and quote:
+                symbol = f"{token}/{quote}"
+            elif token:
+                symbol = token
+
+        # Map legacy fields into the new engine's intent shape
+        new_intent = {
+            "venue": venue,
+            "symbol": symbol,
+            "side": side,  # 'buy' or 'sell'
+        }
+
+        # sizing: prefer explicit notional_usd, else amount & price
+        if "notional_usd" in intent:
+            new_intent["notional_usd"] = intent.get("notional_usd")
+        elif "amount_usd" in intent and "price_usd" in intent and intent.get("price_usd"):
+            # convert amount_usd to base 'amount' if price known
+            try:
+                new_intent["amount"] = float(intent["amount_usd"]) / float(intent["price_usd"])
+                new_intent["price_usd"] = float(intent["price_usd"])
+            except Exception:
+                pass
+        else:
+            # pass through raw fields if present
+            if "amount" in intent: new_intent["amount"] = intent.get("amount")
+            if "price_usd" in intent: new_intent["price_usd"] = intent.get("price_usd")
+
+        decision = self._eng.evaluate_intent(new_intent, context=None)
+        ok = bool(decision.get("ok"))
+        reason = decision.get("reason", "ok")
+        patched = dict(intent)
+
+        # propagate any patched fields back into legacy shape
+        p = decision.get("patched_intent") or {}
+        if "symbol" in p:
+            b, q = _split_symbol(p["symbol"], venue)
+            if b: patched["token"] = b
+            if q: patched["quote"] = q
+        if "amount" in p:
+            patched["amount"] = p["amount"]
+            # add convenience amount_usd if price known
+            try:
+                if "price_usd" in intent and intent["price_usd"]:
+                    patched["amount_usd"] = float(p["amount"]) * float(intent["price_usd"])
+            except Exception:
+                pass
+
+        return ok, reason, patched
