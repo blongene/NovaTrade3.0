@@ -550,6 +550,27 @@ def policy_evaluate():
 
 flask_app.register_blueprint(BUS)
 
+# --- Edge HMAC (uniform) -----------------------------------------------------
+import hmac, hashlib
+from functools import wraps
+from flask import request, jsonify
+
+def _edge_hmac_ok(sig: str, raw: bytes) -> bool:
+    secret = os.getenv("EDGE_SECRET", "")
+    if not secret or not sig:
+        return False
+    calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(calc, sig)
+
+def require_edge_hmac(fn):
+    @wraps(fn)
+    def _wrap(*args, **kwargs):
+        sig = request.headers.get("X-Nova-Signature", "")
+        if not _edge_hmac_ok(sig, request.get_data()):
+            return jsonify({"ok": False, "error": "invalid_signature"}), 401
+        return fn(*args, **kwargs)
+    return _wrap
+
 # Enqueue (cloud-side) — assumes your existing HMAC verify wrapper outside
 @flask_app.post("/ops/enqueue")
 def ops_enqueue():
@@ -561,6 +582,7 @@ def ops_enqueue():
 
 # Edge pulls leased commands
 @flask_app.post("/api/commands/pull")
+@require_edge_hmac
 def cmd_pull():
     j = request.get_json(force=True) or {}
     agent = (j.get("agent_id") or "edge").strip()
@@ -570,6 +592,7 @@ def cmd_pull():
 
 # Edge acks execution
 @flask_app.post("/api/commands/ack")
+@require_edge_hmac
 def cmd_ack():
     j = request.get_json(force=True) or {}
     agent = (j.get("agent_id") or "edge").strip()
