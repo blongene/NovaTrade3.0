@@ -4,8 +4,7 @@ import os, json, hmac, hashlib, logging, threading, time, uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, request, jsonify, Blueprint
-from bus_store_pg import get_store
-store = get_store()
+from bus_store_pg import get_store, OUTBOX_LEASE_SECONDS
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
@@ -16,6 +15,7 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING if LOG_LEVEL != "DEBUG" e
 
 # ========== Flask ==========
 flask_app = Flask(__name__)
+store = get_store()
 
 # ========== Flags / helpers ==========
 def _env_true(k: str) -> bool:
@@ -612,8 +612,17 @@ def ops_enqueue():
     res = store.enqueue(agent_id, payload)
     return jsonify(res)
 
-# edge pulls leased commands
-@app.post("/api/commands/pull")
+# Enqueue (cloud-side) — assumes your existing HMAC verify wrapper outside
+@flask_app.post("/ops/enqueue")
+def ops_enqueue():
+    j = request.get_json(force=True) or {}
+    payload = j.get("payload") or {}
+    agent_id = (payload.get("agent_id") or "cloud")
+    res = store.enqueue(agent_id, payload)
+    return jsonify(res)
+
+# Edge pulls leased commands
+@flask_app.post("/api/commands/pull")
 def cmd_pull():
     j = request.get_json(force=True) or {}
     agent = (j.get("agent_id") or "edge").strip()
@@ -621,8 +630,8 @@ def cmd_pull():
     out = store.lease(agent, n)
     return jsonify({"ok": True, "commands": out, "lease_seconds": OUTBOX_LEASE_SECONDS})
 
-# edge ACK after execution (save receipt + mark done)
-@app.post("/api/commands/ack")
+# Edge acks execution
+@flask_app.post("/api/commands/ack")
 def cmd_ack():
     j = request.get_json(force=True) or {}
     agent = (j.get("agent_id") or "edge").strip()
@@ -633,10 +642,6 @@ def cmd_ack():
     if ok and cmd_id:
         store.done(int(cmd_id))
     return jsonify({"ok": True})
-
-@app.get("/api/debug/outbox")
-def dbg_outbox():
-    return jsonify(store.stats())
 
 # --- Receipts API (Edge → Cloud) ---------------------------------------------
 from flask import Blueprint, request, jsonify
