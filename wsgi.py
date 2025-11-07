@@ -585,6 +585,19 @@ def cmd_ack():
 def dbg_outbox():
     return jsonify(store.stats())
 
+@flask_app.post("/api/debug/hmac_check")
+def hmac_check():
+    import os, hmac, hashlib
+    raw = request.get_data()  # exact bytes server sees
+    secret = os.getenv("EDGE_SECRET", "")
+    calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest() if secret else None
+    return jsonify({
+        "ok": bool(secret),
+        "calc": calc,                 # server's HMAC
+        "len": len(raw),              # byte length
+        "raw": raw.decode("utf-8","replace")  # for inspection (safe)
+    })
+
 # --- Receipts API (Edge → Cloud) ---------------------------------------------
 from flask import Blueprint, request, jsonify
 import os, hmac, hashlib
