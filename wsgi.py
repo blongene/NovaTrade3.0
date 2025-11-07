@@ -602,6 +602,11 @@ def policy_evaluate():
 flask_app.register_blueprint(BUS)
 
 # --- Receipts API (Edge → Cloud) ---------------------------------------------
+from flask import Blueprint, request, jsonify
+import os, hmac, hashlib
+from logging import getLogger
+log = getLogger("bus")
+
 _receipts_bp = Blueprint("receipts", __name__)
 _SEEN_IDS = set()  # in-proc idempotency; move to Postgres later
 
@@ -657,15 +662,29 @@ def receipts_ack():
     try:
         _append_trade_row(norm)
         _SEEN_IDS.add(rid)
-        info(f"Trade logged → {norm.get('venue')} {norm.get('symbol')} {norm.get('side')} {norm.get('executed_qty')} @ {norm.get('avg_price')}")
+        # (optional) Council Ledger
+        try:
+            from council_ledger import log_reckoning
+            log_reckoning("receipt", True, "appended",
+                          norm.get("symbol",""), norm.get("side",""),
+                          norm.get("quote_spent",""), norm.get("venue",""),
+                          "", "", norm.get("receipt_id",""))
+        except Exception:
+            pass
         return jsonify({"ok": True, "appended": True})
     except Exception as e:
-        error(f"Trade log append failed: {e}")
+        log.error(f"Trade log append failed: {e}")
+        try:
+            from council_ledger import log_reckoning
+            log_reckoning("receipt", False, f"sheet append failed: {e}")
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": f"sheet append failed: {e}"}), 500
 
+# Register the blueprint on the production Flask app
 flask_app.register_blueprint(_receipts_bp)
 
-# wsgi.py — start Nova loops once when the web app loads
+# --- Start Nova loops when the web app loads (once) -------------------------
 try:
     from main import boot as _nova_boot
     _ = _nova_boot()  # returns True on success
