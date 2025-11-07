@@ -82,6 +82,11 @@ NOVA_KILL      = _env_true("NOVA_KILL")
 ENABLE_POLICY  = _env_true("ENABLE_POLICY")
 POLICY_ENFORCE = _env_true("POLICY_ENFORCE")
 POLICY_PATH    = os.getenv("POLICY_PATH","policy.yaml")
+from collections import deque
+LAST_DECISIONS = deque(maxlen=5)
+COOLDOWN_MINUTES = int(os.getenv("POLICY_COOLDOWN_MINUTES", "30"))
+_last_intent_at = {}  # key: (venue,symbol,side) -> epoch seconds
+_policy_overrides = {"ttl_expiry": 0}
 
 # ========== Policy loader (with context) ==========
 class _PolicyState:
@@ -156,13 +161,29 @@ def _policy_log(intent: dict, decision: dict):
 
 @flask_app.get("/api/policy/config")
 def policy_config():
-    cfg = {}
     try:
         eng = _policy.engine
-        cfg = getattr(eng, "cfg", {}) if eng else {}
+        cfg = dict(getattr(eng, "cfg", {}) or {})
+        # apply live overrides if not expired
+        now = time.time()
+        if _policy_overrides.get("ttl_expiry", 0) > now:
+            for k, v in (_policy_overrides.get("values") or {}).items():
+                cfg[k] = v
+        return jsonify(ok=True, config=cfg), 200
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
-    return jsonify(ok=True, config=cfg), 200
+
+@flask_app.post("/api/policy/override")
+def policy_override():
+    body, err = _require_json()
+    if err: return err
+    if REQUIRE_HMAC_OPS and not _verify(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
+        return jsonify(ok=False, error="invalid_signature"), 401
+    values = body if isinstance(body, dict) else {}
+    ttl = int(values.pop("ttl_sec", 3600) or 3600)
+    _policy_overrides["values"] = values
+    _policy_overrides["ttl_expiry"] = time.time() + ttl
+    return jsonify(ok=True, applied=values, ttl_sec=ttl), 200
 
 # ========== Outbox (SQLite, inline) ==========
 DB_PATH = os.getenv("OUTBOX_DB_PATH", "./outbox.sqlite")
@@ -384,6 +405,22 @@ def intent_enqueue():
         "quote_reserve_usd": body.get("quote_reserve_usd"),
     }
 
+    # Cooldown gate (anti-thrash) — uses merged policy cfg
+    try:
+        effective_cfg = dict(getattr(_policy.engine, "cfg", {}) or {})
+        now = time.time()
+        cd_min = int(os.getenv("POLICY_COOLDOWN_MINUTES", str(effective_cfg.get("cool_off_minutes_after_trade", COOLDOWN_MINUTES))))
+        key = (intent["venue"], intent["symbol"], intent["side"])
+        last = _last_intent_at.get(key, 0)
+        if cd_min and (now - last) < cd_min * 60:
+            remain = int(cd_min*60 - (now - last))
+            decision = {"ok": False, "reason": f"cooldown active ({remain}s left)", "flags": ["cooldown"], "patched_intent": {}}
+            LAST_DECISIONS.append({"intent": intent, "decision": decision, "ts": int(now)})
+            return jsonify(ok=False, policy="blocked", reason=decision["reason"], decision=decision), 403
+        # pre-mark (we’ll update the timestamp only if we succeed routing)
+    except Exception:
+        pass
+
     # active policy cfg for router/policy
     try:
         policy_cfg = dict(getattr(_policy.engine, "cfg", {}) or {})
@@ -396,17 +433,23 @@ def intent_enqueue():
         route_res = router.choose_venue(intent, _last_tel, policy_cfg if isinstance(policy_cfg, dict) else {})
         if route_res.get("ok"):
             intent.update(route_res.get("patched_intent") or {})
-            intent["flags"] = _uniq_extend(intent.get("flags", []), route_res.get("flags", []))
+            intent.setdefault("flags", []).extend(route_res.get("flags") or [])
+            try:
+                _last_intent_at[(intent["venue"], intent["symbol"], intent["side"])] = time.time()
+            except Exception:
+                pass
         else:
-            # permissive: let policy decide; record router flags
-            intent["flags"] = _uniq_extend(intent.get("flags", []), route_res.get("flags", []))
-            log.info("router: %s — continuing to policy", route_res.get("reason"))
-    except Exception as e:
-        log.info("router degraded: %s", e)
-
+            LAST_DECISIONS.append({"intent": intent, "decision": route_res, "ts": int(time.time())})
+            return jsonify(ok=False, policy="blocked", reason=route_res.get("reason","routing_failed"), decision=route_res), 403
+    
     # --- Policy (telemetry-aware)
     context = {"telemetry": _last_tel}
     decision = _policy.evaluate_intent(intent, context=context)
+    try:
+        LAST_DECISIONS.append({"intent": intent, "decision": decision, "ts": int(time.time())})
+    except Exception:
+        pass
+    
     _policy_log(intent, decision)
 
     if not decision.get("ok", True) and POLICY_ENFORCE:
@@ -469,18 +512,60 @@ def receipts_last():
 
 @BUS.route("/health/summary", methods=["GET"])
 def health_summary():
-    try: q = _queue_depth()
-    except Exception: q = {}
-    age = "-" if not _last_tel.get("ts") else f"{int(time.time())-int(_last_tel['ts'])}s"
+    now = time.time()
+
+    try:
+        q = _queue_depth()
+    except Exception:
+        q = {}
+
+    tel = _last_tel or {}
+    ts = tel.get("ts") or 0
+    age_sec = (int(now - int(ts)) if ts else None)
+    age_str = (f"{age_sec}s" if age_sec is not None else "unknown")
+
+    venues_ct = len((tel.get("by_venue") or {}))
+    flat_tokens_ct = len((tel.get("flat") or {}))
+
+    # live override status (safe even if _policy_overrides not present)
+    try:
+        ov_expiry = _policy_overrides.get("ttl_expiry", 0)
+        ov_active = bool(ov_expiry and ov_expiry > now)
+        ov_vals = (_policy_overrides.get("values") if ov_active else None)
+    except Exception:
+        ov_active, ov_vals = False, None
+
+    # recent decisions (safe even if LAST_DECISIONS missing)
+    try:
+        recent = list(LAST_DECISIONS)
+    except Exception:
+        recent = []
+
     return jsonify({
         "ok": True,
-        "service": os.getenv("SERVICE_NAME","bus"),
-        "env": os.getenv("ENV","prod"),
+        "service": os.getenv("SERVICE_NAME", "bus"),
+        "env": os.getenv("ENV", "prod"),
         "queue": q,
-        "telemetry_age": age,
-        "agent": _last_tel.get("agent_id"),
-        "policy": {"enabled": ENABLE_POLICY, "enforce": POLICY_ENFORCE,
-                   "path": POLICY_PATH, "loaded": _policy.loaded, "error": _policy.load_error}
+
+        "telemetry": {
+            "agent": tel.get("agent_id"),
+            "age": age_str,
+            "age_sec": age_sec,
+            "venues": venues_ct,
+            "flat_tokens": flat_tokens_ct,
+        },
+
+        "policy": {
+            "enabled": ENABLE_POLICY,
+            "enforce": POLICY_ENFORCE,
+            "path": POLICY_PATH,
+            "loaded": _policy.loaded,
+            "error": _policy.load_error,
+            "overrides_active": ov_active,
+            "overrides": ov_vals,
+        },
+
+        "last_decisions": recent,
     }), 200
 
 @BUS.route("/policy/reload", methods=["POST"])
