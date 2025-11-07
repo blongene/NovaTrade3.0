@@ -1,14 +1,24 @@
-# policy_engine.py — Phase 7A (context-aware reserves, notional caps, symbol normalization)
+# policy_engine.py — Phase 8B-ready (context-aware reserves, notional caps, ledger logging, symbol normalization)
 from __future__ import annotations
-import os, json
+import os, json, hmac, hashlib
 from typing import Any, Dict, Optional, Tuple
 
-# Optional structured policy logger (degraded if unavailable)
+# --------------------------- OPTIONAL LOGGERS (degrade safely) ---------------------------
+# Existing structured policy logger (if present)
 try:
     from policy_logger import log_decision as _policy_log
 except Exception:  # pragma: no cover
     def _policy_log(*args, **kwargs):
         return
+
+# Council Ledger (Phase 8B). Best-effort; never breaks flow if missing.
+def _ledger(event: str, ok: bool, reason: str = "", token: str = "", action: str = "",
+            amt_usd: Any = "", venue: str = "", quote: str = "", patched_json: str = "", ref: str = ""):
+    try:
+        from council_ledger import log_reckoning
+        log_reckoning(event, ok, reason, token, action, amt_usd, venue, quote, patched_json, ref)
+    except Exception:
+        pass
 
 # --------------------------- Helpers ---------------------------
 
@@ -20,10 +30,14 @@ def _get(d, path, default=None):
     return cur
 
 def _venue_min_notional(cfg, venue: str) -> float:
-    return float(_get(cfg, f"venue_min_notional_usd", {}).get(venue, 0))
+    """Optional per-venue min notional USD gate (e.g., {'BINANCEUS': 10, 'KRAKEN': 5})"""
+    try:
+        return float((_get(cfg, "venue_min_notional_usd") or {}).get(venue.upper(), 0))
+    except Exception:
+        return 0.0
 
-def _notional_usd(intent: dict) -> float | None:
-    # prefer explicit notional, else price*amount if both present
+def _notional_usd(intent: dict) -> Optional[float]:
+    """Prefer explicit notional_usd; else price_usd * amount if both present."""
     n = intent.get("notional_usd")
     if isinstance(n, (int, float)): return float(n)
     p, a = intent.get("price_usd"), intent.get("amount")
@@ -32,8 +46,7 @@ def _notional_usd(intent: dict) -> float | None:
     return None
 
 def _abs_path(p: str) -> str:
-    if not p:
-        return ""
+    if not p: return ""
     return p if os.path.isabs(p) else os.path.abspath(p)
 
 def _merge(dst: dict, src: dict) -> dict:
@@ -45,14 +58,14 @@ def _merge(dst: dict, src: dict) -> dict:
 
 def _env_override_map() -> dict:
     """
-    ENV overrides applied LAST (after YAML).
-    Supported:
+    ENV overrides applied LAST (after YAML). All keys optional.
       POLICY_MAX_PER_COIN_USD
       POLICY_MIN_QUOTE_RESERVE_USD
       POLICY_KEEPBACK_USD
       POLICY_CANARY_MAX_USD
       POLICY_ALLOW_PRICE_UNKNOWN   (true/false)
-      POLICY_PREFER_QUOTES_JSON    (e.g. {"BINANCEUS":"USDT","COINBASE":"USDC","KRAKEN":"USDT"})
+      POLICY_PREFER_QUOTES_JSON    (json: {"BINANCEUS":"USDT","COINBASE":"USDC"})
+      POLICY_VENUE_MIN_NOTIONAL_JSON (json: {"BINANCEUS":10,"KRAKEN":5})
     """
     m = {}
     def _f(name, key, cast=float):
@@ -61,7 +74,7 @@ def _env_override_map() -> dict:
             try:
                 m[key] = cast(val)
             except Exception:
-                m[key] = val  # last resort
+                m[key] = val
     _f("POLICY_MAX_PER_COIN_USD", "max_per_coin_usd")
     _f("POLICY_MIN_QUOTE_RESERVE_USD", "min_quote_reserve_usd")
     _f("POLICY_KEEPBACK_USD", "keepback_usd")
@@ -70,13 +83,19 @@ def _env_override_map() -> dict:
        cast=lambda x: str(x).lower() in ("1","true","yes","on"))
     qmap = os.getenv("POLICY_PREFER_QUOTES_JSON")
     if qmap:
-        try:
-            m["prefer_quotes"] = json.loads(qmap)
-        except Exception:
-            pass
+        try: m["prefer_quotes"] = json.loads(qmap)
+        except Exception: pass
+    vmin = os.getenv("POLICY_VENUE_MIN_NOTIONAL_JSON")
+    if vmin:
+        try: m["venue_min_notional_usd"] = json.loads(vmin)
+        except Exception: pass
     return m
 
 def _get_min_qty_floor(cfg: dict, venue: str, symbol: str) -> Optional[float]:
+    """
+    Enforce exchange min-qty floors (e.g., {'KRAKEN:BTC-USDT': 0.0001} or {'KRAKEN:BTCUSDT': 0.0001})
+    Format key as VENUE:SYMBOL (joined form).
+    """
     floors = cfg.get("min_qty_floors") or {}
     key = f"{venue.upper()}:{symbol.upper()}"
     v = floors.get(key)
@@ -103,11 +122,15 @@ _DEFAULT = {
         # Price/telemetry expectations
         "allow_price_unknown": False,     # deny if no price and sizing needed
 
-        # Cooldowns (stub; computed elsewhere)
+        # Cooldowns (stub; computed elsewhere / Policy_Log assisted)
         "cool_off_minutes_after_trade": 30,
 
         # Router preference order (if used upstream)
-        "venue_order": ["BINANCEUS","COINBASE","KRAKEN"]
+        "venue_order": ["BINANCEUS","COINBASE","KRAKEN"],
+
+        # Optional advanced knobs
+        # "venue_min_notional_usd": {"BINANCEUS":10, "KRAKEN":5}
+        # "min_qty_floors": {"KRAKEN:BTC-USDT": 0.0001}
     }
 }
 
@@ -143,6 +166,7 @@ def _load_yaml(path: str) -> Dict[str, Any]:
                         "keepback_usd", "canary_max_usd", "on_short_quote",
                         "allow_price_unknown", "cool_off_minutes_after_trade",
                         "venue_order", "min_liquidity_usd",
+                        "venue_min_notional_usd",
                         "min_qty_floors",
                     ):
                         if k in node:
@@ -201,6 +225,16 @@ def _float(x: Any, default: Optional[float]=None) -> Optional[float]:
         return default
 
 def _get_quote_reserve_usd(context: Optional[dict], venue: str, quote: str) -> Optional[float]:
+    """
+    Pull quote balance from context.telemetry.
+    Expected shapes:
+      context = {
+        "telemetry": {
+          "by_venue": {"KRAKEN":{"USDT": 123.4, ...}},
+          "flat": {"USDT": 321.0, ...}
+        }
+      }
+    """
     if not context:
         return None
     tel = context.get("telemetry") or {}
@@ -234,13 +268,19 @@ class Engine:
         side   = (intent.get("side") or "").lower()
         amount = _float(intent.get("amount"), 0.0) or 0.0
 
-        # Normalize & blocklist
+        # Normalize symbol, extract base/quote
         base, quote = _split_symbol(symbol, venue)
+
+        # Blocklist guard
         if base in [s.upper() for s in (cfg.get("blocked_symbols") or [])]:
             decision = {"ok": False, "reason": f"blocked symbol {base}",
                         "patched_intent": {}, "flags": ["blocked"]}
             _policy_log(decision=decision, intent=intent, when=None)
+            _ledger("policy_check", False, f"blocked symbol {base}", base, side, intent.get("notional_usd",""),
+                    venue, quote, "", "")
             return decision
+
+        # Normalize final symbol form for venue
         symbol = _join_symbol(base, quote, venue)
 
         # Prefer quote per venue
@@ -252,7 +292,7 @@ class Engine:
             patched["symbol"] = _join_symbol(base, quote, venue)
             flags.append("prefer_quote")
 
-        # Price / notional
+        # Price / notional derivation
         price = _float(intent.get("price_usd"))
         notional = _float(intent.get("notional_usd"))
         if notional is None and price is not None:
@@ -260,17 +300,19 @@ class Engine:
         elif notional is None and price is None:
             flags.append("notional_unknown")
 
-        venue = (intent.get("venue") or "").upper()
+        # Venue min-notional guard
         min_notional = _venue_min_notional(cfg, venue)
         n = _notional_usd(intent)
-        
         if min_notional and n is not None and n < min_notional:
-            return {
+            decision = {
                 "ok": False,
-                "reason": f"min notional {min_notional:.0f} USD not met (got {n:.2f})",
+                "reason": f"min notional {min_notional:.2f} USD not met (got {n:.2f})",
                 "patched_intent": {},
                 "flags": ["below_min_notional"]
             }
+            _policy_log(decision=decision, intent=intent, when=None)
+            _ledger("policy_check", False, decision["reason"], base, side, n, venue, quote, "", "")
+            return decision
 
         # Notional cap (max_per_coin_usd)
         notional, clamp_flags = _cap_notional(cfg, notional)
@@ -278,7 +320,7 @@ class Engine:
         if "clamped" in clamp_flags and price:
             patched["amount"] = round(notional / price, 8)
 
-        # Quote-reserve logic (context-aware)
+        # Quote-reserve logic (uses context telemetry if available)
         min_reserve = _float(cfg.get("min_quote_reserve_usd"))
         keepback = _float(cfg.get("keepback_usd"), 0.0) or 0.0
         on_short = (cfg.get("on_short_quote") or "resize").lower()
@@ -294,6 +336,8 @@ class Engine:
                 decision = {"ok": False, "reason": "price unknown; sizing requires price",
                             "patched_intent": patched, "flags": flags + ["price_unknown"]}
                 _policy_log(decision=decision, intent=intent, when=None)
+                _ledger("policy_check", False, decision["reason"], base, side, intent.get("notional_usd",""),
+                        venue, quote, json.dumps(patched) if patched else "", "")
                 return decision
 
             if isinstance(quote_reserve, (int, float)):
@@ -303,6 +347,8 @@ class Engine:
                                 "reason": f"quote below min reserve (${quote_reserve:.2f} < ${min_reserve:.2f})",
                                 "patched_intent": patched, "flags": flags + ["below_min_reserve"]}
                     _policy_log(decision=decision, intent=intent, when=None)
+                    _ledger("policy_check", False, decision["reason"], base, side, intent.get("notional_usd",""),
+                            venue, quote, json.dumps(patched) if patched else "", "")
                     return decision
 
                 usable = max(0.0, float(quote_reserve) - (keepback or 0.0))
@@ -321,11 +367,13 @@ class Engine:
                                         "reason": f"insufficient quote: have ${quote_reserve:.2f}, usable ${usable:.2f}",
                                         "patched_intent": patched, "flags": flags + ["insufficient_quote"]}
                             _policy_log(decision=decision, intent=intent, when=None)
+                            _ledger("policy_check", False, decision["reason"], base, side, intent.get("notional_usd",""),
+                                    venue, quote, json.dumps(patched) if patched else "", "")
                             return decision
                 else:
                     flags.append("price_unknown")
 
-        # Enforce exchange min-qty floors (e.g., KRAKEN:BTCUSDT->0.0001)
+        # Exchange min-qty floors (enforced on BUY to avoid venue rejects)
         min_floor = _get_min_qty_floor(cfg, venue, _join_symbol(base, quote, venue))
         if min_floor and side == "buy":
             amt = _float(patched.get("amount", amount), amount)
@@ -335,6 +383,9 @@ class Engine:
 
         decision = {"ok": True, "reason": "ok", "patched_intent": patched, "flags": flags}
         _policy_log(decision=decision, intent=intent, when=None)
+        _ledger("policy_check", True, "ok", base, side,
+                decision["patched_intent"].get("notional_usd", intent.get("notional_usd","")),
+                venue, quote, json.dumps(patched) if patched else "", "")
         return decision
 
 # --------------------------- Public API ---------------------------
@@ -348,6 +399,20 @@ def load_policy(path: str):
 _engine_singleton: Optional[Engine] = None
 
 def evaluate_intent(intent: Dict[str, Any], context: Optional[dict]=None) -> Dict[str, Any]:
+    """
+    Stable entry used by Bus:
+      intent = {
+        "venue": "KRAKEN",
+        "symbol": "MIND/USDT" | "MINDUSDT" | "MIND-USDT",
+        "side": "buy" | "sell",
+        "amount": 12.34,         # base units
+        "price_usd": 0.0123,     # optional; required for sizing checks
+        "notional_usd": 100.0,   # optional; overrides price*amount if present
+        "quote_reserve_usd": 250 # optional; else pulled from context.telemetry
+      }
+      context = {"telemetry": {"by_venue": {"KRAKEN":{"USDT": 120.0}}}}
+    Returns dict: {"ok": bool, "reason": str, "patched_intent": {...}, "flags": [...]}
+    """
     global _engine_singleton
     if _engine_singleton is None:
         cfg = (_load_yaml(os.getenv("POLICY_PATH") or "policy.yaml") or {}).get("policy") or _DEFAULT["policy"]
@@ -355,4 +420,5 @@ def evaluate_intent(intent: Dict[str, Any], context: Optional[dict]=None) -> Dic
     return _engine_singleton.evaluate_intent(intent, context=context)
 
 def evaluate(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Compatibility wrapper (no context)."""
     return evaluate_intent(intent, context=None)
