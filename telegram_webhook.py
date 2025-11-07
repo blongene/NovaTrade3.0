@@ -14,7 +14,7 @@ ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM","0").lower() in ("1","true","yes")
 DEDUP_TTL_MIN   = int(os.getenv("TG_DEDUP_TTL_MIN","1"))
 SUMMARIES_ENABLED = os.getenv("TELEGRAM_SUMMARIES_ENABLED","0").lower() in ("1","true","yes")
 SUMMARIES_TTL_MIN = int(os.getenv("TELEGRAM_SUMMARIES_TTL_MIN","720"))
-
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 # --- Blueprint ---------------------------------------------------------------
 tg_blueprint = Blueprint("tg", __name__)
 
