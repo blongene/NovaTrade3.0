@@ -601,6 +601,13 @@ def policy_evaluate():
 
 flask_app.register_blueprint(BUS)
 
+# wsgi.py — start Nova loops once when the web app loads
+try:
+    from main import boot as _nova_boot
+    _ = _nova_boot()  # returns True on success
+except Exception as e:
+    log.warning("Nova boot degraded: %s", e)
+
 # ========== Errors ==========
 @flask_app.errorhandler(404)
 def _nf(_e): return jsonify(error="not_found"), 404
