@@ -1,31 +1,98 @@
-# policy.yaml — NovaTrade 3.0 Policy (Phase 7A Context-Aware)
-policy:
+# policy.yaml — Phase 8B-ready
+# This file is read by policy_engine.load_policy() and may be overridden by ENV.
+# Keep keys under the top-level "policy:" node. Unknown keys are ignored safely.
 
-  # ── sizing & risk ────────────────────────────────────────────────
-  max_per_coin_usd:       100        # per-intent cap (unchanged)
-  min_quote_reserve_usd:   10        # upgraded from 10 → 25 for safety
-  keepback_usd:             5        # always leave this untouched
-  canary_max_usd:          11        # cap for first fills
-  min_liquidity_usd:    50000        # same as before
-  on_short_quote:      resize        # resize|deny if reserve too small
-  allow_price_unknown:  false        # block if no price available
-  cool_off_minutes_after_trade: 30   # cooldown between rotations
-  min_qty_floors:
-    "KRAKEN:BTCUSDT": 0.0001
-  venue_min_notional_usd:
-    BINANCEUS: 10
-    COINBASE:  5     # treat as 5 USD/USDC; adjust if you want 10
-    KRAKEN:    25
-  venue_fees_bp:
-    BINANCEUS: 10
-    COINBASE:  20
-    KRAKEN:    26
-  # ── strategic preferences ────────────────────────────────────────
+policy:
+  # ---------- Routing & venues ----------
+  # Preferred quote per venue (used to auto-patch symbols when possible)
   prefer_quotes:
     BINANCEUS: USDT
     COINBASE:  USDC
     KRAKEN:    USDT
+
+  # Execution priority if an upstream module is choosing a venue
   venue_order: [BINANCEUS, COINBASE, KRAKEN]
 
-  # ── controls ────────────────────────────────────────────────────
+  # Optional per-venue minimum *notional* in USD (prevents tiny orders the venue rejects)
+  # If unset, no extra check beyond your own sizing/caps.
+  venue_min_notional_usd:
+    BINANCEUS: 10
+    KRAKEN: 5
+    # COINBASE: 1   # uncomment if you want a floor
+
+  # Optional exchange min-qty floors (base units) by exact joined symbol per venue.
+  # Key format: "VENUE:BASE-QUOTE" for dash venues (Coinbase) or "VENUE:BASEQUOTE" for compact.
+  # These help avoid "min qty" rejects on BUY.
+  min_qty_floors:
+    KRAKEN:BTC-USDT: 0.0001
+    KRAKEN:ETH-USDT: 0.001
+    BINANCEUS:BTCUSDT: 0.0001
+
+  # ---------- Risk & sizing ----------
+  # Hard per-intent clamp (Rebuy Driver uses this for amount_usd target)
+  max_per_coin_usd: 25
+
+  # Quote reserve requirements (prevents draining quote wallet)
+  min_quote_reserve_usd: 25  # below this, BUY is denied (or resized per on_short_quote)
+  keepback_usd: 5            # always keep at least this amount untouched
+
+  # Canary cap: a soft absolute cap applied to "usable" quote per trade (extra safety)
+  canary_max_usd: 11
+
+  # What to do if requested amount exceeds usable quote (after keepback + canary)
+  # Options: "resize" (auto reduce amount) or "deny"
+  on_short_quote: resize
+
+  # Allow proceeding when price_usd is unknown? If false, sizing checks will deny.
+  allow_price_unknown: false
+
+  # Optional liquidity floor (if provided in Vault_Intelligence)
+  # Assets with liquidity_usd < this are denied.
+  min_liquidity_usd: 50000
+
+  # ---------- Cooldowns ----------
+  # Policy engine enforces cooldown via Policy_Log scan in your Bus.
+  cool_off_minutes_after_trade: 30
+
+  # ---------- Governance ----------
+  # Deny these outright
   blocked_symbols: [BARK, BONK]
+
+  # ---------- Optional: class-based caps (if you tag tokens in Sheets/Memory) ----------
+  # Example usage by upstream modules: pick the lower of class cap and max_per_coin_usd.
+  class_caps_usd:
+    L1: 100
+    L2: 50
+    MEME: 15
+    AI: 40
+
+  # ---------- Optional: per-asset overrides ----------
+  # Use this to special-case symbols (case-insensitive token code only; quotes are inferred).
+  per_asset_overrides:
+    BTC:
+      max_per_coin_usd: 75
+      min_quote_reserve_usd: 50
+      # min_qty_floor_usd: 10  # alternate approach if you prefer USD floor for qty calc
+    MIND:
+      canary_max_usd: 9
+      keepback_usd: 8
+
+  # ---------- Optional: venue overrides ----------
+  # Any keys here (e.g., min_quote_reserve_usd) override the global value for that venue.
+  per_venue_overrides:
+    KRAKEN:
+      min_quote_reserve_usd: 30
+    COINBASE:
+      canary_max_usd: 15
+
+  # ---------- Notes ----------
+  # ENV overrides (take precedence over YAML):
+  #   POLICY_MAX_PER_COIN_USD
+  #   POLICY_MIN_QUOTE_RESERVE_USD
+  #   POLICY_KEEPBACK_USD
+  #   POLICY_CANARY_MAX_USD
+  #   POLICY_ALLOW_PRICE_UNKNOWN   (true/false)
+  #   POLICY_PREFER_QUOTES_JSON    (e.g. {"BINANCEUS":"USDT","COINBASE":"USDC"})
+  #   POLICY_VENUE_MIN_NOTIONAL_JSON (e.g. {"BINANCEUS":10,"KRAKEN":5})
+  #
+  # The engine also tolerates additional sections; unknown keys are ignored safely.
