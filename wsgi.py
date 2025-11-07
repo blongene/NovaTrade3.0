@@ -226,7 +226,7 @@ def index():
 
 @flask_app.get("/healthz")
 def healthz():
-    info = {"ok": True, "web":"up", "db": DB_PATH}
+    info = {"ok": True, "web": "up", "db": "postgres"}
     info["policy"] = {"enabled": ENABLE_POLICY, "enforce": POLICY_ENFORCE,
                       "path": POLICY_PATH, "loaded": _policy.loaded, "error": _policy.load_error}
     try: info["queue"] = _queue_depth()
@@ -439,43 +439,9 @@ def intent_enqueue():
 def ops_enqueue_alias():
     return intent_enqueue()
 
-
-@BUS.route("/commands/pull", methods=["POST"])
-def commands_pull():
-    body, err = _require_json()
-    if err: return err
-    if REQUIRE_HMAC_PULL and not _verify(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
-        return jsonify(ok=False, error="invalid_signature"), 401
-    agent_id = (body or {}).get("agent_id") or "edge-primary"
-    max_items = int((body or {}).get("max_items", 10))
-    lease_ttl = int((body or {}).get("lease_ttl_sec", 90))
-    cmds = _pull_commands(agent_id, max_items=max_items, lease_seconds=lease_ttl)
-    if cmds: log.info("pull: leased %s cmds to %s", len(cmds), agent_id)
-    return jsonify(ok=True, commands=cmds), 200
-
-@BUS.route("/commands/ack", methods=["POST"])
-def commands_ack():
-    body, err = _require_json()
-    if err: return err
-    if REQUIRE_HMAC_OPS and not _verify(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
-        return jsonify(ok=False, error="invalid_signature"), 401
-    cmd_id   = str(body.get("command_id","")).strip()
-    agent_id = str(body.get("agent_id","")).strip() or "edge-primary"
-    status   = str(body.get("status","ok")).strip().lower() or "ok"
-    detail   = body.get("detail", {})
-    if not cmd_id: return jsonify(ok=False, error="command_id required"), 400
-    _ack_command(cmd_id, agent_id, status, detail)
-    send_telegram(f"🧾 ACK <b>{status}</b>\n<b>id</b> {cmd_id}\n<b>by</b> {agent_id}")
-    log.info("ack id=%s agent=%s status=%s", cmd_id, agent_id, status)
-    return jsonify(ok=True), 200
-
 @BUS.route("/receipts/last", methods=["GET"])
 def receipts_last():
-    try: n = int(request.args.get("n","10"))
-    except Exception: n = 10
-    try: rows = _last_receipts(n)
-    except Exception as e: return jsonify(ok=False, error=str(e)), 500
-    return jsonify(ok=True, receipts=rows), 200
+    return jsonify(ok=True, receipts=[]), 200
 
 @BUS.route("/health/summary", methods=["GET"])
 def health_summary():
@@ -821,10 +787,10 @@ def api_debug_selftest():
         payload = {"id": test_id, "ts": int(time.time()), "source": "selftest"}
         _enqueue_command(test_id, payload)
         q = _queue_depth()
-        return jsonify(ok=True, test_id=test_id, queue=q, db=DB_PATH), 200
+        return jsonify(ok=True, test_id=test_id, queue=q, db="postgres"), 200
     except Exception as e:
         log.warning("selftest failed: %s", e)
-        return jsonify(ok=False, error=str(e), db=DB_PATH), 200
+        return jsonify(ok=False, error=str(e), db="postgres"), 200
 
 # ========== ASGI ==========
 try:
