@@ -603,15 +603,6 @@ def policy_evaluate():
 
 flask_app.register_blueprint(BUS)
 
-# enqueue intent (already HMAC-verified upstream)
-@app.post("/ops/enqueue")
-def ops_enqueue():
-    j = request.get_json(force=True) or {}
-    payload = j.get("payload") or {}
-    agent_id = payload.get("agent_id","cloud")
-    res = store.enqueue(agent_id, payload)
-    return jsonify(res)
-
 # Enqueue (cloud-side) — assumes your existing HMAC verify wrapper outside
 @flask_app.post("/ops/enqueue")
 def ops_enqueue():
@@ -642,6 +633,10 @@ def cmd_ack():
     if ok and cmd_id:
         store.done(int(cmd_id))
     return jsonify({"ok": True})
+
+@flask_app.get("/api/debug/outbox")
+def dbg_outbox():
+    return jsonify(store.stats())
 
 # --- Receipts API (Edge → Cloud) ---------------------------------------------
 from flask import Blueprint, request, jsonify
