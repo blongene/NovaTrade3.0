@@ -436,8 +436,8 @@ def intent_enqueue():
             intent.setdefault("flags", []).extend(route_res.get("flags") or [])
             try:
                 _last_intent_at[(intent["venue"], intent["symbol"], intent["side"])] = time.time()
-            except Exception:
-                pass
+      except Exception:
+          pass
         else:
             LAST_DECISIONS.append({"intent": intent, "decision": route_res, "ts": int(time.time())})
             return jsonify(ok=False, policy="blocked", reason=route_res.get("reason","routing_failed"), decision=route_res), 403
