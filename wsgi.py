@@ -550,8 +550,8 @@ def policy_evaluate():
 
 flask_app.register_blueprint(BUS)
 
-# --- Edge HMAC (uniform) -----------------------------------------------------
-import hmac, hashlib
+# --- Uniform Edge HMAC for pull/ack ------------------------------------------
+import os, hmac, hashlib
 from functools import wraps
 from flask import request, jsonify
 
@@ -590,7 +590,6 @@ def cmd_pull():
     out = store.lease(agent, n)
     return jsonify({"ok": True, "commands": out, "lease_seconds": OUTBOX_LEASE_SECONDS})
 
-# Edge acks execution
 @flask_app.post("/api/commands/ack")
 @require_edge_hmac
 def cmd_ack():
