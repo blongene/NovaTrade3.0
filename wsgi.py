@@ -4,6 +4,8 @@ import os, json, hmac, hashlib, logging, threading, time, uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, request, jsonify, Blueprint
+from bus_store_pg import get_store
+store = get_store()
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
@@ -600,6 +602,41 @@ def policy_evaluate():
     return jsonify(ok=True, decision=decision), 200
 
 flask_app.register_blueprint(BUS)
+
+# enqueue intent (already HMAC-verified upstream)
+@app.post("/ops/enqueue")
+def ops_enqueue():
+    j = request.get_json(force=True) or {}
+    payload = j.get("payload") or {}
+    agent_id = payload.get("agent_id","cloud")
+    res = store.enqueue(agent_id, payload)
+    return jsonify(res)
+
+# edge pulls leased commands
+@app.post("/api/commands/pull")
+def cmd_pull():
+    j = request.get_json(force=True) or {}
+    agent = (j.get("agent_id") or "edge").strip()
+    n = int(j.get("limit") or 5)
+    out = store.lease(agent, n)
+    return jsonify({"ok": True, "commands": out, "lease_seconds": OUTBOX_LEASE_SECONDS})
+
+# edge ACK after execution (save receipt + mark done)
+@app.post("/api/commands/ack")
+def cmd_ack():
+    j = request.get_json(force=True) or {}
+    agent = (j.get("agent_id") or "edge").strip()
+    cmd_id = j.get("cmd_id")
+    receipt = j.get("receipt") or {}
+    ok = bool(j.get("ok", True))
+    store.save_receipt(agent, cmd_id, receipt, ok)
+    if ok and cmd_id:
+        store.done(int(cmd_id))
+    return jsonify({"ok": True})
+
+@app.get("/api/debug/outbox")
+def dbg_outbox():
+    return jsonify(store.stats())
 
 # --- Receipts API (Edge → Cloud) ---------------------------------------------
 from flask import Blueprint, request, jsonify
