@@ -369,16 +369,20 @@ def _uniq_extend(dst, add):
 @BUS.route("/intent/enqueue", methods=["POST"])
 def intent_enqueue():
     body, err = _require_json()
-    if err: return err
+    if err:
+        return err
+
     if NOVA_KILL or CLOUD_HOLD:
         return jsonify(ok=False, error="bus_killed"), 503
+
     if REQUIRE_HMAC_OPS and not _verify(OUTBOX_SECRET, body, request.headers.get("X-NT-Sig","")):
         return jsonify(ok=False, error="invalid_signature"), 401
 
-    # venue is OPTIONAL now; router may choose
+    # minimal schema
     req = ["agent_target","symbol","side","amount"]
     missing = [k for k in req if not str(body.get(k,"")).strip()]
-    if missing: return jsonify(ok=False, error=f"missing: {', '.join(missing)}"), 400
+    if missing:
+        return jsonify(ok=False, error=f"missing: {', '.join(missing)}"), 400
 
     side = str(body["side"]).lower()
     if side not in ("buy","sell"):
@@ -386,7 +390,8 @@ def intent_enqueue():
 
     try:
         amount = float(body["amount"])
-        if amount <= 0: return jsonify(ok=False, error="amount must be > 0"), 400
+        if amount <= 0:
+            return jsonify(ok=False, error="amount must be > 0"), 400
     except Exception:
         return jsonify(ok=False, error="amount must be numeric"), 400
 
@@ -394,77 +399,90 @@ def intent_enqueue():
         "id": body.get("id") or str(uuid.uuid4()),
         "ts": body.get("ts", int(time.time())),
         "source": body.get("source","operator"),
-        "agent_target": str(body["agent_target"]),
-        "venue": str(body.get("venue","")).upper(),  # optional
+        "agent_target": body["agent_target"],
+        "venue": str(body.get("venue","") or "").upper(),   # optional; router may override
         "symbol": str(body["symbol"]).upper(),
         "side": side,
         "amount": amount,
-        "flags": body.get("flags", []),
+        "flags": list(body.get("flags", [])),
+        # optional hints:
         "price_usd": body.get("price_usd"),
         "notional_usd": body.get("notional_usd"),
         "quote_reserve_usd": body.get("quote_reserve_usd"),
     }
 
-    # Cooldown gate (anti-thrash) — uses merged policy cfg
+    # --- cooldown gate (anti-thrash) -----------------------------------------
     try:
         effective_cfg = dict(getattr(_policy.engine, "cfg", {}) or {})
         now = time.time()
-        cd_min = int(os.getenv("POLICY_COOLDOWN_MINUTES", str(effective_cfg.get("cool_off_minutes_after_trade", COOLDOWN_MINUTES))))
-        key = (intent["venue"], intent["symbol"], intent["side"])
-        last = _last_intent_at.get(key, 0)
-        if cd_min and (now - last) < cd_min * 60:
-            remain = int(cd_min*60 - (now - last))
-            decision = {"ok": False, "reason": f"cooldown active ({remain}s left)", "flags": ["cooldown"], "patched_intent": {}}
-            LAST_DECISIONS.append({"intent": intent, "decision": decision, "ts": int(now)})
-            return jsonify(ok=False, policy="blocked", reason=decision["reason"], decision=decision), 403
-        # pre-mark (we’ll update the timestamp only if we succeed routing)
-    except Exception:
-        pass
+        cd_min = int(os.getenv(
+            "POLICY_COOLDOWN_MINUTES",
+            str(effective_cfg.get("cool_off_minutes_after_trade", 30))
+        ))
+        if cd_min:
+            key = (intent.get("venue"), intent["symbol"], intent["side"])
+            last = _last_intent_at.get(key, 0)
+            if (now - last) < cd_min * 60:
+                remain = int(cd_min*60 - (now - last))
+                decision = {"ok": False, "reason": f"cooldown active ({remain}s left)", "flags": ["cooldown"], "patched_intent": {}}
+                LAST_DECISIONS.append({"intent": intent, "decision": decision, "ts": int(now)})
+                return jsonify(ok=False, policy="blocked", reason=decision["reason"], decision=decision), 403
+    except Exception as e:
+        log.info("cooldown check degraded: %s", e)
 
-    # active policy cfg for router/policy
-    try:
-        policy_cfg = dict(getattr(_policy.engine, "cfg", {}) or {})
-    except Exception:
-        policy_cfg = {}
-
-    # --- Router (prefer-quote aware) — PERMISSIVE ---
+    # --- router: choose best venue using telemetry + policy -------------------
     try:
         import router
-        route_res = router.choose_venue(intent, _last_tel, policy_cfg if isinstance(policy_cfg, dict) else {})
+        # take a copy of live policy cfg (with any active overrides surfaced by /api/policy/config)
+        try:
+            policy_cfg = dict(getattr(_policy.engine, "cfg", {}) or {})
+        except Exception:
+            policy_cfg = {}
+        route_res = router.choose_venue(intent, _last_tel or {}, policy_cfg if isinstance(policy_cfg, dict) else {})
         if route_res.get("ok"):
             intent.update(route_res.get("patched_intent") or {})
             intent.setdefault("flags", []).extend(route_res.get("flags") or [])
             try:
-                _last_intent_at[(intent["venue"], intent["symbol"], intent["side"])] = time.time()
-      except Exception:
-          pass
+                _last_intent_at[(intent.get("venue"), intent["symbol"], intent["side"])] = time.time()
+            except Exception:
+                pass
         else:
             LAST_DECISIONS.append({"intent": intent, "decision": route_res, "ts": int(time.time())})
             return jsonify(ok=False, policy="blocked", reason=route_res.get("reason","routing_failed"), decision=route_res), 403
-    
-    # --- Policy (telemetry-aware)
-    context = {"telemetry": _last_tel}
-    decision = _policy.evaluate_intent(intent, context=context)
+    except Exception as e:
+        # router failure should not crash; fall back to whatever was provided
+        log.info("router degraded: %s", e)
+
+    # --- policy evaluation with telemetry context ----------------------------
+    try:
+        context = {"telemetry": _last_tel}
+        decision = _policy.evaluate_intent(intent, context=context)
+    except Exception as e:
+        msg = f"policy exception: {e}"
+        log.warning(msg)
+        decision = {"ok": (not POLICY_ENFORCE), "reason": msg, "patched_intent": {}, "flags": ["policy_exception"]}
+
+    _policy_log(intent, decision)
     try:
         LAST_DECISIONS.append({"intent": intent, "decision": decision, "ts": int(time.time())})
     except Exception:
         pass
-    
-    _policy_log(intent, decision)
 
+    # enforce policy if not ok
     if not decision.get("ok", True) and POLICY_ENFORCE:
         reason = decision.get("reason","policy_denied")
         send_telegram(f"❌ Policy blocked\n<code>{json.dumps(intent,indent=2)}</code>\n<i>{reason}</i>")
         return jsonify(ok=False, policy="blocked", reason=reason, decision=decision), 403
 
-    # apply policy patches
+    # apply patches, if any
     patched = decision.get("patched_intent") or decision.get("patched") or {}
     if patched:
         intent.update(patched)
 
+    # enqueue
     _enqueue_command(intent["id"], intent)
     log.info("enqueue id=%s venue=%s symbol=%s side=%s amount=%s",
-             intent["id"], intent.get("venue"), intent.get("symbol"), intent["side"], intent["amount"])
+             intent["id"], intent.get("venue"), intent["symbol"], intent["side"], intent["amount"])
     send_telegram(f"✅ Intent enqueued\n<code>{json.dumps(intent,indent=2)}</code>")
     return jsonify(ok=True, id=intent["id"], decision=decision), 200
 
