@@ -573,6 +573,30 @@ def cmd_ack():
 def dbg_outbox():
     return jsonify(store.stats())
 
+@flask_app.get("/api/debug/outbox_list")
+def outbox_list():
+    import psycopg2, os
+    cx = psycopg2.connect(os.environ["DB_URL"]); cur = cx.cursor()
+    cur.execute("select id, status, leased_by, lease_expires_at from commands order by id desc limit 100;")
+    rows = [{"id":r[0], "status":r[1], "leased_by":r[2], "lease_expires_at":r[3].isoformat() if r[3] else None} for r in cur.fetchall()]
+    cx.close()
+    return jsonify({"rows": rows})
+
+@flask_app.post("/api/debug/unlease_all")
+def unlease_all():
+    import psycopg2, os
+    cx = psycopg2.connect(os.environ["DB_URL"]); cur = cx.cursor()
+    cur.execute("""
+      update commands
+         set status='queued',
+             leased_by=null,
+             lease_at=null,
+             lease_expires_at=null
+       where status='leased';
+    """)
+    cx.commit(); cx.close()
+    return jsonify({"ok": True})
+
 @flask_app.post("/api/debug/hmac_check")
 def hmac_check():
     import os, hmac, hashlib
