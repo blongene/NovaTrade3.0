@@ -1,4 +1,7 @@
-# telegram_summaries.py — NT3.0 safe daily summary (quiet by default)
+
+# telegram_summaries.py — NT3.0 Daily Summary (Upgraded for Phase 9B)
+# Backward compatible: keeps `run_telegram_summaries(force=False)` entrypoint
+# Adds Weighted_Score + Vault 7D + Heartbeat while remaining quiet/safe if data is missing.
 import os
 from datetime import datetime, timezone
 
@@ -12,20 +15,49 @@ from utils import (
 )
 
 # Env toggles
-ENABLED = (os.getenv("TELEGRAM_SUMMARIES_ENABLED", "1") in ("1", "true", "True"))
+ENABLED = (os.getenv("TELEGRAM_SUMMARIES_ENABLED", "1").lower() in ("1", "true", "yes"))
 DEDUP_TTL_MIN = int(os.getenv("TELEGRAM_SUMMARIES_TTL_MIN", "1440"))  # 24h
 SUMMARY_KEY_BASE = os.getenv("TELEGRAM_SUMMARY_KEY_BASE", "telegram_summary_daily")
 
 # Optional sheet/tab names (best-effort; code never crashes if missing)
-ROTATION_LOG_TAB   = os.getenv("ROTATION_LOG_TAB", "Rotation_Log")
-ROTATION_STATS_TAB = os.getenv("ROTATION_STATS_TAB", "Rotation_Stats")
+ROTATION_LOG_TAB     = os.getenv("ROTATION_LOG_TAB", "Rotation_Log")
+ROTATION_STATS_TAB   = os.getenv("ROTATION_STATS_TAB", "Rotation_Stats")
+ROTATION_MEMORY_TAB  = os.getenv("ROTATION_MEMORY_WS", "Rotation_Memory")
+VAULT_INTEL_TAB      = os.getenv("VAULT_INTELLIGENCE_WS", "Vault_Intelligence")
+PERF_DASH_TAB        = os.getenv("PERF_DASHBOARD_WS", "Performance_Dashboard")
+HEARTBEAT_TAB        = os.getenv("HEARTBEAT_WS", "NovaHeartbeat")
+SUMMARY_LOG_TAB      = os.getenv("SUMMARY_LOG_WS", "Summary_Log")  # optional audit
 
 def _utc_date():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+def _safe_float(x):
+    try:
+        s = str(x).replace("%","").replace(",","").strip()
+        if s == "" or s.upper() == "N/A":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def _fmt_pct(v, places=1):
+    return "—" if v is None else f"{v:.{places}f}%"
+
+def _mean(xs):
+    vals = [v for v in xs if v is not None]
+    return (sum(vals) / len(vals)) if vals else None
+
+def _try_get(ws_name, ttl_s=120):
+    try:
+        return get_all_records_cached(ws_name, ttl_s=ttl_s)
+    except Exception as e:
+        warn(f"telegram_summaries: {ws_name} read failed: {e}")
+        return []
+
 def _best_effort_counts():
-    """Try to compute a couple of simple metrics; always safe, never raises."""
     counts = {}
+
+    # Rotation_Log size
     try:
         rows = get_all_records_cached(ROTATION_LOG_TAB, ttl_s=60)
         counts["rotation_rows"] = len(rows)
@@ -41,10 +73,60 @@ def _best_effort_counts():
         warn(f"telegram_summaries: stalled detector failed: {e}")
         counts["stalled"] = "—"
 
-    # Optional heartbeat cell if you keep one (won't crash if absent)
+    # Portfolio summary (prefer Performance_Dashboard, fallback to Rotation_Stats averages)
+    dash = _try_get(PERF_DASH_TAB, ttl_s=180)
+    rstats = _try_get(ROTATION_STATS_TAB, ttl_s=120)
+
+    p1 = p7 = p30 = None
+    if dash:
+        first = dash[0]
+        p1  = _safe_float(first.get("Portfolio_1d") or first.get("Portfolio_1D"))
+        p7  = _safe_float(first.get("Portfolio_7d") or first.get("Portfolio_7D"))
+        p30 = _safe_float(first.get("Portfolio_30d") or first.get("Portfolio_30D"))
+
+    if p1 is None:
+        p1 = _mean([_safe_float(r.get("Follow-up ROI")) for r in rstats])
+    if p7 is None:
+        p7 = _mean([_safe_float(r.get("ROI_7d") or r.get("ROI 7d") or r.get("ROI7d")) for r in rstats])
+    if p30 is None:
+        p30 = _mean([_safe_float(r.get("ROI_30d") or r.get("ROI 30d") or r.get("ROI30d")) for r in rstats])
+
+    counts["p1"] = p1; counts["p7"] = p7; counts["p30"] = p30
+
+    # Top Rotations by Weighted_Score
+    mem = _try_get(ROTATION_MEMORY_TAB, ttl_s=180)
     try:
-        hb = str_or_empty(get_value_cached("NovaHeartbeat", "A2", ttl_s=60))
-        counts["heartbeat"] = hb or "—"
+        pairs = []
+        for r in mem:
+            t = str(r.get("Token","")).strip().upper()
+            s = _safe_float(r.get("Weighted_Score"))
+            if t and s is not None:
+                pairs.append((t, s))
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        counts["top_rot"] = pairs[:3]
+    except Exception as e:
+        warn(f"telegram_summaries: Rotation_Memory parse failed: {e}")
+        counts["top_rot"] = []
+
+    # Top Vaults by 7D ROI (fallback: Follow-up ROI)
+    vint = _try_get(VAULT_INTEL_TAB, ttl_s=180)
+    try:
+        vpairs = []
+        for r in vint:
+            t = str(r.get("Token") or r.get("Asset") or "").strip().upper()
+            s = _safe_float(r.get("roi_7d") or r.get("ROI_7d") or r.get("ROI 7d") or r.get("Follow-up ROI"))
+            if t and s is not None:
+                vpairs.append((t, s))
+        vpairs.sort(key=lambda x: x[1], reverse=True)
+        counts["top_vaults"] = vpairs[:3]
+    except Exception as e:
+        warn(f"telegram_summaries: Vault_Intelligence parse failed: {e}")
+        counts["top_vaults"] = []
+
+    # Optional heartbeat cell/row
+    try:
+        hb_val = str_or_empty(get_value_cached(HEARTBEAT_TAB, "A2", ttl_s=60)) or "—"
+        counts["heartbeat"] = hb_val
     except Exception:
         counts["heartbeat"] = "—"
 
@@ -52,9 +134,23 @@ def _best_effort_counts():
 
 def _format_message(counts):
     today = _utc_date()
+
+    p1  = counts.get("p1")
+    p7  = counts.get("p7")
+    p30 = counts.get("p30")
+
+    rot = counts.get("top_rot") or []
+    vts = counts.get("top_vaults") or []
+
+    rot_str = " | ".join([f"{t} {s:.1f}" for (t, s) in rot]) if rot else "—"
+    vt_str  = " | ".join([f"{t} {_fmt_pct(r)}" for (t, r) in vts]) if vts else "—"
+
     lines = [
-        f"📊 *NovaTrade Daily Summary* — {today} (UTC)",
+        f"🧭 *NovaScore Daily* — {today} (UTC)",
+        f"• Portfolio: {_fmt_pct(p1)} (7D {_fmt_pct(p7)}, 30D {_fmt_pct(p30)})",
         f"• Rotation_Log rows: {counts.get('rotation_rows', '—')}",
+        f"• Top Rotations (Weighted): {rot_str}",
+        f"• Top Vaults (7D): {vt_str}",
         f"• Stalled tokens (≥ threshold): {counts.get('stalled', '—')}",
     ]
     hb = counts.get("heartbeat", "—")
@@ -63,6 +159,25 @@ def _format_message(counts):
     lines.append("—")
     lines.append("This is an automated status ping. Set TELEGRAM_SUMMARIES_ENABLED=0 to disable.")
     return "\n".join(lines)
+
+def _write_summary_log(kind: str, text: str):
+    # best-effort audit log
+    try:
+        from utils import get_gspread_client
+        SHEET_URL = os.getenv("SHEET_URL", "")
+        if not SHEET_URL:
+            return
+        gc = get_gspread_client()
+        sh = gc.open_by_url(SHEET_URL)
+        try:
+            ws = sh.worksheet(SUMMARY_LOG_TAB)
+        except Exception:
+            ws = sh.add_worksheet(title=SUMMARY_LOG_TAB, rows=1000, cols=8)
+            ws.append_row(["Timestamp","Kind","Message"], value_input_option="USER_ENTERED")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row([ts, kind, text], value_input_option="USER_ENTERED")
+    except Exception as e:
+        warn(f"telegram_summaries: could not write Summary_Log: {e}")
 
 def run_telegram_summaries(force: bool = False):
     """
@@ -83,6 +198,7 @@ def run_telegram_summaries(force: bool = False):
         msg = _format_message(counts)
         # Use a fixed dedup key so accidental double-calls won't spam
         send_telegram_message_dedup(msg, key="telegram_summary_daily", ttl_min=DEDUP_TTL_MIN)
+        _write_summary_log("daily", msg)
         info("telegram_summaries: summary sent.")
     except Exception as e:
         # Never crash boot due to summary issues
