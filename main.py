@@ -5,6 +5,7 @@ from typing import Optional, Callable
 import gspread_guard  # patches Worksheet methods (cache+gates+backoff)
 import hmac, hashlib, json
 from flask import Blueprint, request, jsonify
+from policy_bias_engine import run_policy_bias_builder
 
 # --- Utils (required) --------------------------------------------------------
 try:
@@ -192,6 +193,7 @@ def _boot_serialize_first_minute():
     _safe_call("Planner→Log sync",             "rotation_executor",          "sync_confirmed_to_rotation_log"); _sleep_jitter()
     _safe_call("Rotation Memory (Weighted)",   "rotation_feedback_enhancer", "run_rotation_feedback_enhancer"); _sleep_jitter()
     _safe_call("Milestone Alerts (Days Held)", "rotation_signal_engine",     "run_milestone_alerts");           _sleep_jitter()
+    _safe_call("Policy Bias Builder",          "policy_bias_engine",         "run_policy_bias_builder");        _sleep_jitter()
 
 def _set_schedules():
     # Frequent cadence
@@ -220,6 +222,7 @@ def _set_schedules():
     _schedule("Planner→Log Sync",              "rotation_executor",          "sync_confirmed_to_rotation_log", every=30, unit="minutes")
     _schedule("Rotation Memory Weighted",      "rotation_feedback_enhancer", "run_rotation_feedback_enhancer", every=6,  unit="hours")
     _schedule("Milestone Alerts",              "rotation_signal_engine",     "run_milestone_alerts",           every=1,  unit="hours")
+    _schedule("Policy Bias Builder",           "policy_bias_engine",         "run_policy_bias_builder",     when="01:20")
 
 def _kick_once_and_threads():
     # Background scheduler loop
