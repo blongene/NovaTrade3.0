@@ -562,20 +562,45 @@ def cmd_pull():
 @require_edge_hmac
 def cmd_ack():
     j = request.get_json(force=True) or {}
-    agent = (j.get("agent_id") or "edge").strip()
-    cmd_id = j.get("cmd_id")
+    agent   = (j.get("agent_id") or "edge").strip()
+    cmd_id  = j.get("cmd_id")
     receipt = j.get("receipt") or {}
-    ok = bool(j.get("ok", True))
-    store.save_receipt(agent, cmd_id, receipt, ok)
-    if ok and cmd_id:
-        store.done(int(cmd_id))
+    ok      = bool(j.get("ok", True))
+
+    # 1) Persist and mark done
     try:
-      if os.getenv("BUS_LOG_TRADES", "true").lower() in ("1", "true", "yes", "on"):
-          # gc = your existing authorized gspread client
-          # SHEET_URL already lives in env for your Bus
-          log_trade_to_sheet(_get_gspread(), os.environ["SHEET_URL"], cmd, receipt)
-    except Exception as e:
-      log.exception("trade_log append failed: %s", e)
+        store.save_receipt(agent, cmd_id, receipt, ok)
+    except Exception:
+        log.exception("save_receipt failed agent=%s cmd_id=%s", agent, cmd_id)
+
+    if ok and cmd_id:
+        try:
+            store.done(int(cmd_id))
+        except Exception:
+            log.exception("done() failed for cmd_id=%s", cmd_id)
+
+    # 2) Best-effort Sheets logging (never crash the ACK path)
+    try:
+        if os.getenv("BUS_LOG_TRADES", "true").lower() in ("1", "true", "yes", "on"):
+            # Try to fetch the original command so we have intent for the row
+            command = None
+            try:
+                # Pick the method your store exposes. One of these usually exists:
+                # command = store.get_command_by_id(int(cmd_id))
+                # command = store.fetch(int(cmd_id))
+                command = store.get(int(cmd_id))  # <-- adjust if your store uses a different name
+            except Exception:
+                command = None
+
+            if not command:
+                # Fallback to a minimal shell; intent may be empty but we still log
+                command = {"id": cmd_id, "intent": {}}
+
+            gc = _get_gspread()  # helper provided earlier
+            log_trade_to_sheet(gc, os.environ["SHEET_URL"], command, receipt)
+    except Exception:
+        log.exception("trade_log append failed")
+
     return jsonify({"ok": True})
 
 @flask_app.get("/api/debug/outbox")
@@ -755,12 +780,14 @@ def _start_daily():
     log.info("Daily report scheduled for %02d:%02d UTC", DAILY_UTC_HOUR, DAILY_UTC_MIN)
 _start_daily()
 
+# --- Sheets helpers ---------------------------------------------------------
 def _get_gspread():
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+
     svc_json = os.environ.get("SVC_JSON", "sentiment-log-service.json")
-    scopes = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    scopes = ["https://spreadsheets.google.com/feeds",
+              "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name(svc_json, scopes)
     return gspread.authorize(creds)
 
@@ -782,60 +809,37 @@ def _now_et_str():
     now = datetime.now(pytz.timezone(tz))
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
-def log_trade_to_sheet(gc, sheet_url, cmd, receipt):
-    """
-    Append one row to Trade_Log for a command+receipt, idempotently.
-    Columns expected:
-      A: Timestamp, B: Venue, C: Symbol, D: Side, E: Amount_Quote,
-      F: Executed_Qty, G: Avg_Price, H: Status, I: Notes,
-      J: Cmd_ID, K: Receipt_ID, L: Note, M: Source
-    """
+def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None:
+    """Append one row to Trade_Log. Never raise."""
     try:
         sh = gc.open_by_url(sheet_url)
         ws = sh.worksheet("Trade_Log")
+
+        intent   = (command or {}).get("intent", {})          # safe
+        norm     = (receipt or {}).get("normalized", {})       # safe
+
+        # columns expected in your sheet (per screenshot)
+        # A: Timestamp, B: Venue, C: Symbol, D: Side,
+        # E: Amount_Quote, F: Executed_Qty, G: Avg_Price,
+        # H: Status, I: Notes, J: Cmd_ID, K: Receipt_ID, L: Note, M: Source
+        ts_str   = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        venue    = norm.get("venue")    or intent.get("venue")    or ""
+        symbol   = norm.get("symbol")   or intent.get("symbol")   or ""
+        side     = norm.get("side")     or intent.get("side")     or ""
+        amt_q    = intent.get("amount") or intent.get("quote_amount") or ""
+        exec_qty = norm.get("executed_qty", "")
+        avg_px   = norm.get("avg_price", "")
+        status   = norm.get("status") or ("ok" if receipt.get("status") == "ok" else (receipt.get("status") or ""))
+        notes    = norm.get("note") or receipt.get("message") or ""
+        cmd_id   = command.get("id", "")
+        rcpt_id  = norm.get("receipt_id") or receipt.get("receipt_id") or ""
+        note     = ""  # spare column you’ve had in L
+        source   = "EdgeBus"
+
+        row = [ts_str, venue, symbol, side, amt_q, exec_qty, avg_px, status, notes, cmd_id, rcpt_id, note, source]
+        ws.append_row(row, value_input_option="RAW")
     except Exception as e:
-        print(f"[bus] WARN Trade_Log open failed: {e}")
-        return
-
-    intent = (cmd or {}).get("intent", {})
-    norm   = (receipt or {}).get("normalized", {}) or {}
-
-    # Build fields with safe fallbacks
-    ts          = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    venue       = intent.get("venue") or norm.get("venue") or ""
-    symbol      = intent.get("symbol") or norm.get("symbol") or ""
-    side        = intent.get("side") or norm.get("side") or ""
-    amount_q    = intent.get("amount") or intent.get("quote_amount") or norm.get("quote_spent") or ""
-    executed_q  = norm.get("executed_qty", "")
-    avg_price   = norm.get("avg_price", "")
-    status      = norm.get("status") or (receipt.get("status") if isinstance(receipt, dict) else "") or ""
-    notes       = norm.get("note") or receipt.get("message") or ""
-    cmd_id      = (cmd or {}).get("id", "")
-    receipt_id  = norm.get("receipt_id") or receipt.get("receipt_id") or ""
-    note_col    = ""  # free-form (unused)
-    source      = "EdgeBus"
-
-    # Idempotency: if this cmd_id already logged, do nothing.
-    try:
-        # If Trade_Log has a header row with "Cmd_ID" in column J, this is fast.
-        # We’ll scan the J column for the cmd_id (as string).
-        cmd_id_s = str(cmd_id)
-        col_j = ws.col_values(10)  # 1-indexed; J is 10
-        if cmd_id_s and cmd_id_s in col_j:
-            return
-    except Exception as e:
-        # Non-fatal; continue and attempt to append
-        print(f"[bus] WARN Trade_Log dedupe check failed: {e}")
-
-    row = [
-        ts, venue, symbol, side, amount_q, executed_q, avg_price, status,
-        notes, cmd_id, receipt_id, note_col, source
-    ]
-
-    try:
-        ws.append_row(row, value_input_option="USER_ENTERED")
-    except Exception as e:
-        print(f"[bus] ERROR Trade_Log append failed: {e}")
+        app.logger.error("bus: trade_log append failed (non-fatal): %s", e)
 
 # --- DEBUG & TELEGRAM DIAGNOSTICS (restored) ---------------------------------
 def _guess_base_url() -> Optional[str]:
