@@ -3,7 +3,6 @@
 import os, time, random, threading, schedule
 from typing import Optional, Callable
 import gspread_guard  # patches Worksheet methods (cache+gates+backoff)
-# add with the other imports
 import hmac, hashlib, json
 from flask import Blueprint, request, jsonify
 
@@ -151,6 +150,8 @@ from rotation_memory import run_rotation_memory  # wrapper; safe to keep
 from rotation_signal_engine import run_milestone_alerts  # Days Held milestones
 from rotation_executor import sync_confirmed_to_rotation_log  # header-safe Planner→Log
 from council_ledger import ensure_ledger_tabs
+from telemetry_digest import run_telemetry_digest
+_schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="12:10")
 
 # --- Boot orchestration ------------------------------------------------------
 def _boot_serialize_first_minute():
