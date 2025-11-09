@@ -69,8 +69,8 @@ def send_telegram(text: str):
     if not (ENABLE_TELEGRAM and _TELEGRAM_TOKEN and _TELEGRAM_CHAT):
         return
     try:
-        import requests
-        r = requests.post(
+        import s
+        r = s.post(
             f"https://api.telegram.org/bot{_TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": _TELEGRAM_CHAT, "text": text[:4000], "parse_mode": "HTML"},
             timeout=8
@@ -540,6 +540,10 @@ def require_edge_hmac(fn):
     return _wrap
 
 # Enqueue (cloud-side) — assumes your existing HMAC verify wrapper outside
+@flask_app.before_request
+def ping_prevent_cold_start():
+    request.start_time = time.time()
+
 @flask_app.post("/ops/enqueue")
 def ops_enqueue():
     j = request.get_json(force=True) or {}
@@ -548,6 +552,12 @@ def ops_enqueue():
     res = store.enqueue(agent_id, payload)
     return jsonify(res)
 
+@app.after_request
+def add_server_timing_header(response):
+    delta = (time.time() - getattr(request, "start_time", time.time())) * 1000
+    response.headers["Server-Timing"] = f"app;dur={delta:.2f}"
+    return response
+           
 # Edge pulls leased commands
 @flask_app.post("/api/commands/pull")
 @require_edge_hmac
