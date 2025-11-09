@@ -746,6 +746,62 @@ def _start_daily():
     log.info("Daily report scheduled for %02d:%02d UTC", DAILY_UTC_HOUR, DAILY_UTC_MIN)
 _start_daily()
 
+# --- add near your other imports ---
+import pytz
+from datetime import datetime
+
+# --- helpers: get worksheet & append row (reuse your existing sheets utils if you have them) ---
+def _open_ws(gc, sheet_url: str, tab: str):
+    sh = gc.open_by_url(sheet_url)
+    try:
+        return sh.worksheet(tab)
+    except Exception:
+        # optional: create if missing
+        return sh.add_worksheet(title=tab, rows=2000, cols=20)
+
+def _now_et_str():
+    tz = os.getenv("SUMMARY_TZ", "America/New_York")
+    now = datetime.now(pytz.timezone(tz))
+    return now.strftime("%Y-%m-%d %H:%M:%S")
+
+def log_trade_to_sheet(gc, sheet_url: str, cmd: dict, receipt: dict):
+    """Append one row to Trade_Log with the exact headers in your screenshot."""
+    ws = _open_ws(gc, sheet_url, "Trade_Log")
+
+    intent   = (cmd or {}).get("intent", {})
+    norm     = (receipt or {}).get("normalized", {}) or {}
+    # Defaults & fallbacks
+    venue    = norm.get("venue") or intent.get("venue") or ""
+    symbol   = norm.get("symbol") or intent.get("symbol") or ""
+    side     = norm.get("side")   or intent.get("side")   or ""
+    quote_spent = norm.get("quote_spent")
+    amount_q = quote_spent if quote_spent is not None else intent.get("amount", "")
+    executed = norm.get("executed_qty", "")
+    avg_px   = norm.get("avg_price", "")
+    status   = str(norm.get("status") or receipt.get("status") or "").upper() or "UNKNOWN"
+    notes    = receipt.get("message") or receipt.get("error") or ""
+    cmd_id   = cmd.get("id", "")
+    r_id     = norm.get("receipt_id") or receipt.get("id") or ""
+    note     = ""   # spare field you keep in column L
+    source   = "EdgeBus"
+
+    row = [
+        _now_et_str(),  # Timestamp
+        venue,          # Venue
+        symbol,         # Symbol
+        side,           # Side
+        amount_q,       # Amount_Quote
+        executed,       # Executed_Qty
+        avg_px,         # Avg_Price
+        status,         # Status
+        notes,          # Notes
+        cmd_id,         # Cmd_ID
+        r_id,           # Receipt_ID
+        note,           # Note
+        source,         # Source
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
 # --- DEBUG & TELEGRAM DIAGNOSTICS (restored) ---------------------------------
 def _guess_base_url() -> Optional[str]:
     base = os.getenv("TELEGRAM_WEBHOOK_BASE") or os.getenv("OPS_BASE_URL")
