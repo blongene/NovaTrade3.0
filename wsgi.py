@@ -552,7 +552,7 @@ def ops_enqueue():
     res = store.enqueue(agent_id, payload)
     return jsonify(res)
 
-@app.after_request
+@flask_app.after_request
 def add_server_timing_header(response):
     delta = (time.time() - getattr(request, "start_time", time.time())) * 1000
     response.headers["Server-Timing"] = f"app;dur={delta:.2f}"
@@ -849,7 +849,7 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
         row = [ts_str, venue, symbol, side, amt_q, exec_qty, avg_px, status, notes, cmd_id, rcpt_id, note, source]
         ws.append_row(row, value_input_option="RAW")
     except Exception as e:
-        app.logger.error("bus: trade_log append failed (non-fatal): %s", e)
+        log.error("bus: trade_log append failed (non-fatal): %s", e)
 
 # --- DEBUG & TELEGRAM DIAGNOSTICS (restored) ---------------------------------
 def _guess_base_url() -> Optional[str]:
