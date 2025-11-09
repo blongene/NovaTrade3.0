@@ -1,4 +1,5 @@
-# main.py — NovaTrade 3.0 (bullet-proof boot, lazy imports, quota-safe)
+
+# main.py — NovaTrade 3.0 (bullet-proof boot, lazy imports, quota-safe) — PHASE 9 PATCHED
 import os, time, random, threading, schedule
 from typing import Optional, Callable
 import gspread_guard  # patches Worksheet methods (cache+gates+backoff)
@@ -83,7 +84,7 @@ def _sleep_jitter(min_s=0.35, max_s=1.10):
 # Start Flask + webhook (soft) — now gated, defaults OFF (Render uses gunicorn wsgi:app)
 if RUN_WEBHOOK_IN_MAIN:
     _thread(_try_start_flask)
-    
+
 # --- Safe import + call helpers ----------------------------------------------
 def _safe_import(module_path: str):
     """Import a module by string. Returns module or None."""
@@ -126,8 +127,6 @@ def _schedule(label: str, module_path: str, func_name: str,
     else:
         _thread(job)
 
-
-
 # --- Optional background loop: staking yield (soft) --------------------------
 def _staking_yield_loop():
     try:
@@ -145,6 +144,13 @@ def _staking_yield_loop():
             time.sleep(6 * 3600)  # every 6h
     except Exception as e:
         warn(f"staking_yield loop not started: {e}")
+
+# --- Phase 9 Imports (NovaTrade 3.0) -----------------------------------------
+from rotation_feedback_enhancer import run_rotation_feedback_enhancer
+from rotation_memory import run_rotation_memory  # wrapper; safe to keep
+from rotation_signal_engine import run_milestone_alerts  # Days Held milestones
+from rotation_executor import sync_confirmed_to_rotation_log  # header-safe Planner→Log
+from council_ledger import ensure_ledger_tabs
 
 # --- Boot orchestration ------------------------------------------------------
 def _boot_serialize_first_minute():
@@ -168,7 +174,8 @@ def _boot_serialize_first_minute():
     _sleep_jitter()
 
     _safe_call("ROI tracker (boot)",          "roi_tracker",                "scan_roi_tracking");            _sleep_jitter()
-    _safe_call("Milestone alerts (boot)",     "milestone_alerts",           "run_milestone_alerts");         _sleep_jitter()
+    # OLD milestone module removed (relied on 'Xd since vote' text)
+    # _safe_call("Milestone alerts (boot)",   "milestone_alerts",           "run_milestone_alerts");         _sleep_jitter()
     _safe_call("Vault sync",                   "token_vault_sync",           "sync_token_vault");             _sleep_jitter()
     _safe_call("Top token summary",            "top_token_summary",          "run_top_token_summary");        _sleep_jitter()
     _safe_call("Vault intelligence",           "vault_intelligence",         "run_vault_intelligence");       _sleep_jitter()
@@ -180,10 +187,16 @@ def _boot_serialize_first_minute():
     _safe_call("Nova trigger watcher",         "nova_trigger_watcher",       "check_nova_trigger");           _sleep_jitter()
     _safe_call("Nova ping",                    "nova_trigger",               "trigger_nova_ping", "NOVA UPDATE"); _sleep_jitter()
 
+    # --- Phase 9 additions (Planner→Log, Weighted Memory, Milestones) ---
+    _safe_call("Planner→Log sync",             "rotation_executor",          "sync_confirmed_to_rotation_log"); _sleep_jitter()
+    _safe_call("Rotation Memory (Weighted)",   "rotation_feedback_enhancer", "run_rotation_feedback_enhancer"); _sleep_jitter()
+    _safe_call("Milestone Alerts (Days Held)", "rotation_signal_engine",     "run_milestone_alerts");           _sleep_jitter()
+
 def _set_schedules():
     # Frequent cadence
     _schedule("Rotation Log Updater",          "rotation_log_updater",       "run_rotation_log_updater", every=60, unit="minutes")
     _schedule("Rebalance Scanner",             "rebalance_scanner",          "run_rebalance_scanner",   every=60, unit="minutes")
+    # Keep legacy wrapper scheduled if other modules rely on it; the enhancer now does the heavy lifting
     _schedule("Rotation Memory",               "rotation_memory",            "run_rotation_memory",     every=60, unit="minutes")
     _schedule("Sentiment Radar",               "sentiment_radar",            "run_sentiment_radar",     every=6,  unit="hours")
     _schedule("Memory-Aware Rebuy Scan",       "rebuy_memory_engine",        "run_memory_rebuy_scan",   every=3,  unit="hours")
@@ -201,6 +214,11 @@ def _set_schedules():
     _schedule("Wallet Monitor",                "wallet_monitor",             "run_wallet_monitor",          when="09:45")
     _schedule("Rebuy ROI Tracker",             "rebuy_roi_tracker",          "run_rebuy_roi_tracker",       when="12:45")
     _schedule("Sentiment Alerts",              "sentiment_alerts",           "run_sentiment_alerts",        when="13:00")
+
+    # --- Phase 9 added schedules ---
+    _schedule("Planner→Log Sync",              "rotation_executor",          "sync_confirmed_to_rotation_log", every=30, unit="minutes")
+    _schedule("Rotation Memory Weighted",      "rotation_feedback_enhancer", "run_rotation_feedback_enhancer", every=6,  unit="hours")
+    _schedule("Milestone Alerts",              "rotation_signal_engine",     "run_milestone_alerts",           every=1,  unit="hours")
 
 def _kick_once_and_threads():
     # Background scheduler loop
@@ -295,10 +313,11 @@ def boot():
     """Start all jobs/threads; expose Flask via wsgi.py/gunicorn (no app.run here)."""
     send_boot_notice_once("🟢 NovaTrade system booted and live.")
 
-    # ⬇⬇⬇ Only set the Telegram webhook if this process is designated to do so
-    #if os.getenv("SET_WEBHOOK_IN_THIS_PROCESS", "1").strip().lower() in {"1","true","yes"}:
-     #   _configure_webhook_only()
-    # ⬆⬆⬆
+    # Ensure governance tabs before anything can log to them
+    try:
+        ensure_ledger_tabs()
+    except Exception as e:
+        warn(f"Ledger ensure skipped: {e}")
 
     time.sleep(0.4)
     _thread(_safe_call, "Orion Voice Loop", "orion_voice_loop", "run_orion_voice_loop")
