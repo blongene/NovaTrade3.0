@@ -567,6 +567,13 @@ def cmd_ack():
     store.save_receipt(agent, cmd_id, receipt, ok)
     if ok and cmd_id:
         store.done(int(cmd_id))
+    try:
+      if os.getenv("BUS_LOG_TRADES", "true").lower() in ("1", "true", "yes", "on"):
+          # gc = your existing authorized gspread client
+          # SHEET_URL already lives in env for your Bus
+          log_trade_to_sheet(gc, os.environ["SHEET_URL"], cmd, receipt)
+    except Exception as e:
+      log.exception("trade_log append failed: %s", e)
     return jsonify({"ok": True})
 
 @flask_app.get("/api/debug/outbox")
