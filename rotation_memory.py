@@ -1,3 +1,5 @@
+
+# rotation_memory.py — patched to accept 'Follow-up ROI' as ROI source
 import os
 from utils import with_sheet_backoff, get_gspread_client, ping_webhook_debug
 
@@ -15,20 +17,24 @@ def _update_range(ws, rng, rows):
     ws.update(rng, rows, value_input_option="USER_ENTERED")
 
 def _header_index_map(headers):
-    return {h.strip(): i for i, h in enumerate(headers)}
+    idx = {}
+    for i, h in enumerate(headers):
+        idx[str(h).strip()] = i
+    return idx
+
+def _normalize(s): return str(s or "").strip().upper()
 
 def _safe_float(x):
     try:
-        return float(str(x).replace("%", "").strip())
+        s = str(x).replace("%","").replace(",","").strip()
+        if s == "" or s.upper() == "N/A":
+            return None
+        return float(s)
     except Exception:
         return None
 
-def _normalize(s):
-    return (s or "").strip().upper()
-
 def run_rotation_memory():
     try:
-        print("🧠 Running Rotation Memory Sync...")
         sh = _open_sheet()
         log_ws = sh.worksheet("Rotation_Log")
         stats_ws = sh.worksheet("Rotation_Stats")
@@ -43,9 +49,16 @@ def run_rotation_memory():
         sh_idx = _header_index_map(stats_vals[0])
 
         tok_c = lh.get("Token")
-        roi_c = lh.get("ROI %") or lh.get("ROI")
+
+        # 🔧 Accept Follow-up ROI as primary, then fallback to 'ROI %' or 'ROI'
+        roi_c = None
+        for candidate in ("Follow-up ROI", "ROI %", "ROI"):
+            if candidate in lh:
+                roi_c = lh.get(candidate)
+                break
+
         if tok_c is None or roi_c is None:
-            print("⛔️ Rotation_Log must include 'Token' and 'ROI %' (or 'ROI').")
+            print("⛔️ Rotation_Log must include 'Token' and 'Follow-up ROI' (or 'ROI %' / 'ROI').")
             return
 
         agg = {}
