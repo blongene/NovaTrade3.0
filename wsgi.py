@@ -381,15 +381,11 @@ def intent_enqueue():
     except Exception as e:
         log.info("cooldown check degraded: %s", e)
 
-    # --- router: choose best venue using telemetry + policy -------------------
+        # --- router: choose best venue using telemetry + policy -------------------
     try:
         import router
-        # take a copy of live policy cfg (with any active overrides surfaced by /api/policy/config)
-        try:
-            policy_cfg = dict(getattr(_policy.engine, "cfg", {}) or {})
-        except Exception:
-            policy_cfg = {}
-        route_res = router.choose_venue(intent, _last_tel or {}, policy_cfg if isinstance(policy_cfg, dict) else {})
+        policy_cfg = dict(getattr(_policy.engine, "cfg", {}) or {})
+        route_res = router.choose_venue(intent, _last_tel or {}, policy_cfg)
         if route_res.get("ok"):
             intent.update(route_res.get("patched_intent") or {})
             intent.setdefault("flags", []).extend(route_res.get("flags") or [])
@@ -399,12 +395,24 @@ def intent_enqueue():
                 pass
         else:
             LAST_DECISIONS.append({"intent": intent, "decision": route_res, "ts": int(time.time())})
-            return jsonify(ok=False, policy="blocked", reason=route_res.get("reason","routing_failed"), decision=route_res), 403
+            return jsonify(ok=False, policy="blocked",
+                           reason=route_res.get("reason", "routing_failed"),
+                           decision=route_res), 403
     except Exception as e:
-        # router failure should not crash; fall back to whatever was provided
         log.info("router degraded: %s", e)
 
-    # --- policy evaluation with telemetry context ----------------------------
+    # ✅ === Phase 10 Predictive Policy Bias ===
+    try:
+        from predictive_policy_driver import apply_predictive_bias
+        patch = apply_predictive_bias(intent)
+        if patch and patch.get("patched_intent"):
+            intent.update(patch.get("patched_intent", {}))
+            intent.setdefault("flags", []).extend(patch.get("flags", []))
+            log.info(f"Applied predictive bias {patch.get('factor'):.3f} conf={patch.get('confidence'):.2f}")
+    except Exception as e:
+        log.info(f"predictive bias degraded: {e}")
+
+    # --- policy evaluation with telemetry context -----------------------------
     try:
         context = {"telemetry": _last_tel}
         decision = _policy.evaluate_intent(intent, context=context)
