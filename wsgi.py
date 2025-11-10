@@ -59,7 +59,7 @@ def _env_true(k: str) -> bool:
 def _canonical(d: dict) -> bytes:
     return json.dumps(d, separators=(",",":"), sort_keys=True).encode("utf-8")
 
-# ========== Telegram (quiet/optional) ==========
+# ========== gram (quiet/optional) ==========
 ENABLE_TELEGRAM = _env_true("ENABLE_TELEGRAM")
 def _bot_token() -> Optional[str]:
     return os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -277,7 +277,6 @@ def telemetry_push():
     log.info("📡 Telemetry from %s | venues=%s | flat_tokens=%d", agent_id, venues_line, len(flat))
     return jsonify(ok=True, received=(len(by_venue) or len(flat))), 200
 
-@flask_app.register_blueprint(telemetry_api.bp)
 @flask_app.post("/api/telemetry/push_balances")
 @flask_app.post("/api/edge/balances")
 @flask_app.post("/bus/push_balances")
