@@ -47,42 +47,112 @@ def _send_tg(text, key):
         except Exception:
             pass
 
-def _ensure_ws(sh, name, headers):
+# --- drop-in patch: heartbeat sheet hygiene + top-insert writing ---
+
+def _ensure_ws(sh, name: str, headers: list[str]):
+    """Return a worksheet with a correct header row.
+    - Creates the sheet if missing
+    - Fixes header row if empty or wrong
+    """
     try:
         ws = sh.worksheet(name)
-        vals = ws.get_all_values()
-        if not vals:
-            ws.append_row(headers, value_input_option="USER_ENTERED")
-        return ws
     except Exception:
-        ws = sh.add_worksheet(title=name, rows=2000, cols=max(8, len(headers)+2))
-        ws.append_row(headers, value_input_option="USER_ENTERED")
-        return ws
+        ws = sh.add_worksheet(title=name, rows=2000, cols=max(8, len(headers) + 2))
+
+    # Ensure header row is present & correct
+    try:
+        first = ws.row_values(1)
+        if [h.strip() for h in first] != headers:
+            # Overwrite row 1 safely
+            ws.update('1:1', [headers], value_input_option="USER_ENTERED")
+    except Exception:
+        # Fallback if read failed for any reason
+        ws.update('1:1', [headers], value_input_option="USER_ENTERED")
+    return ws
+
+
+def _trim_tail(ws, key_col: int = 1):
+    """One-time housekeeping: remove trailing empty rows after the last non-empty
+    in `key_col` (default column A).
+    Controlled by env HEARTBEAT_TRIM_TAIL_ON_BOOT in run_telemetry_digest().
+    """
+    try:
+        col = ws.col_values(key_col)  # list already trimmed by Sheets API
+        last = len(col)
+        # walk back to last non-empty
+        while last > 1 and (col[last - 1] or "").strip() == "":
+            last -= 1
+
+        total = ws.row_count
+        if total > last:
+            start = last + 1
+            # delete in chunks so we don't exceed batch limits
+            while start <= total:
+                end = min(start + 499, total)
+                ws.delete_rows(start, end)
+                total -= (end - start + 1)
+    except Exception:
+        # non-fatal; leave as-is if trimming fails
+        pass
+
+
+def _insert_or_append(ws, row: list, mode: str = "top"):
+    """
+    mode:
+      - 'top'    : insert at row 2 (newest-first under headers)
+      - 'append' : standard append at bottom (can hit ghost tails)
+    """
+    mode = (mode or "top").lower()
+    if mode == "append":
+        ws.append_row(row, value_input_option="USER_ENTERED")
+    else:
+        ws.insert_rows([row], row=2, value_input_option="USER_ENTERED")
+
 
 def run_telemetry_digest():
     if not SHEET_URL:
         warn("SHEET_URL missing; abort.")
         return
 
-    # 1) Pull telemetry from local Bus (best-effort)
+    # 1) Pull telemetry snapshot from local Bus
     port = os.getenv("PORT", "10000")
     url = f"http://127.0.0.1:{port}/api/telemetry/last"
     j = _http_get(url) or {}
-    age_sec = j.get("age_sec")
-    agent = j.get("agent_id") or (j.get("agent") if isinstance(j.get("agent"), str) else None) or (j.get("agent") or "")
-    flat = j.get("flat") or (j.get("telemetry", {}).get("flat") if isinstance(j.get("telemetry"), dict) else {}) or {}
-    by_venue = j.get("by_venue") or (j.get("telemetry", {}).get("by_venue") if isinstance(j.get("telemetry"), dict) else {}) or {}
 
-    # 2) Append to NovaHeartbeat
+    age_sec = j.get("age_sec")
+    # accept either {agent_id:"..."} or {agent:"..."}
+    agent = j.get("agent_id") or (j.get("agent") if isinstance(j.get("agent"), str) else None) or ""
+    # support both flat/by_venue at top-level or nested under "telemetry"
+    t = j.get("telemetry") if isinstance(j.get("telemetry"), dict) else {}
+    flat = j.get("flat") or t.get("flat") or {}
+    by_venue = j.get("by_venue") or t.get("by_venue") or {}
+
+    # 2) Write to NovaHeartbeat (top-insert by default)
     try:
         gc = get_gspread_client()
         sh = gc.open_by_url(SHEET_URL)
-        ws = _ensure_ws(sh, HEARTBEAT_WS, ["Timestamp","Agent","Age_sec","Flat_Tokens","Venues","Note"])
+        headers = ["Timestamp", "Agent", "Age_sec", "Flat_Tokens", "Venues", "Note"]
+        ws = _ensure_ws(sh, HEARTBEAT_WS, headers)
+
+        # Optional one-time tail cleanup
+        if os.getenv("HEARTBEAT_TRIM_TAIL_ON_BOOT", "0").lower() in ("1", "true", "yes"):
+            _trim_tail(ws)
+
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        ws.append_row([ts, agent or "", "" if age_sec is None else int(age_sec), len(flat), len(by_venue), ""], value_input_option="USER_ENTERED")
-        info("Heartbeat row appended.")
+        row = [
+            ts,
+            agent,
+            "" if age_sec is None else int(age_sec),
+            len(flat),
+            len(by_venue),
+            ""
+        ]
+
+        mode = os.getenv("HEARTBEAT_APPEND_MODE", "top")  # 'top' | 'append'
+        _insert_or_append(ws, row, mode)
+        info(f"Heartbeat row written (mode={mode}).")
     except Exception as e:
-        warn(f"heartbeat append failed: {e}")
+        warn(f"heartbeat write failed: {e}")
 
     # 3) Alert if stale
     try:
