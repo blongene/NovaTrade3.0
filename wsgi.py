@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify, Blueprint
 from bus_store_pg import get_store, OUTBOX_LEASE_SECONDS
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import telemetry_api
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
@@ -276,6 +277,7 @@ def telemetry_push():
     log.info("📡 Telemetry from %s | venues=%s | flat_tokens=%d", agent_id, venues_line, len(flat))
     return jsonify(ok=True, received=(len(by_venue) or len(flat))), 200
 
+@flask_app.register_blueprint(telemetry_api.bp)
 @flask_app.post("/api/telemetry/push_balances")
 @flask_app.post("/api/edge/balances")
 @flask_app.post("/bus/push_balances")
