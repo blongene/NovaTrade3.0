@@ -1,3 +1,5 @@
+# Note: For higher quota resilience, consider swapping _open_sheet() to use utils.get_gspread_client
+# which includes token-bucket and backoff. Current implementation already falls back to local JSONL.
 # policy_logger.py — robust policy logging (Sheets or local JSONL)
 from __future__ import annotations
 import os, time, json
