@@ -1,3 +1,4 @@
+from utils import ws_batch_update, get_ws_cached
 
 # rotation_memory.py — patched to accept 'Follow-up ROI' as ROI source
 import os
