@@ -95,6 +95,7 @@ except Exception as e:
 # ========== HMAC ==========
 OUTBOX_SECRET          = os.getenv("OUTBOX_SECRET", "")
 TELEMETRY_SECRET       = os.getenv("TELEMETRY_SECRET", OUTBOX_SECRET)
+EDGE_SECRET            = os.getenv("EDGE_SECRET", "")
 REQUIRE_HMAC_OPS       = _env_true("REQUIRE_HMAC_OPS")        # enqueue + ack
 REQUIRE_HMAC_PULL      = _env_true("REQUIRE_HMAC_PULL")       # pull
 REQUIRE_HMAC_TELEMETRY = _env_true("REQUIRE_HMAC_TELEMETRY")  # telemetry push
