@@ -89,6 +89,11 @@ def _env_override_map() -> dict:
     if vmin:
         try: m["venue_min_notional_usd"] = json.loads(vmin)
         except Exception: pass
+
+    order = os.getenv("POLICY_VENUE_ORDER_JSON")
+    if order:
+        try: m["venue_order"] = json.loads(order)
+        except Exception: pass
     return m
 
 def _get_min_qty_floor(cfg: dict, venue: str, symbol: str) -> Optional[float]:
@@ -109,7 +114,7 @@ def _get_min_qty_floor(cfg: dict, venue: str, symbol: str) -> Optional[float]:
 _DEFAULT = {
     "policy": {
         # Pair/venue rules
-        "prefer_quotes": {"BINANCEUS":"USDT","COINBASE":"USDC","KRAKEN":"USDT"},
+        "prefer_quotes": {"BINANCEUS":"USDT","COINBASE":"USD","KRAKEN":"USDT"},
         "blocked_symbols": ["BARK","BONK"],
 
         # Risk & sizing
@@ -126,7 +131,7 @@ _DEFAULT = {
         "cool_off_minutes_after_trade": 30,
 
         # Router preference order (if used upstream)
-        "venue_order": ["BINANCEUS","COINBASE","KRAKEN"],
+        "venue_order": ["COINBASE","BINANCEUS","KRAKEN"],
 
         # Optional advanced knobs
         # "venue_min_notional_usd": {"BINANCEUS":10, "KRAKEN":5}
