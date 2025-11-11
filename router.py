@@ -1,4 +1,17 @@
 
+# --- Optional venue alias normalization ---
+_KRAKEN_BASE_ALIASES = {"BTC": "XBT"}
+_COINBASE_QUOTE_ALIASES = {"USDT": "USD"}  # enable only if your Coinbase executor requires USD
+
+def _venue_symbol_remap(base: str, quote: str, venue: str):
+    v = (venue or "").upper()
+    if v == "KRAKEN":
+        base = _KRAKEN_BASE_ALIASES.get(base, base)
+    if v == "COINBASE":
+        quote = _COINBASE_QUOTE_ALIASES.get(quote, quote)
+    return base, quote
+
+
 # router.py — Phase 7C + Phase 10 Predictive Bias (fixed symbol parsing)
 from __future__ import annotations
 import os, re, time
