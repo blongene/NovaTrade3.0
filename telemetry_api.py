@@ -22,6 +22,17 @@ REQUIRE_HMAC_TELEM = os.getenv("REQUIRE_HMAC_TELEMETRY", "1").lower() in {"1", "
 # --------------------------
 # HMAC verification (lenient)
 # --------------------------
+import logging, re
+
+def _sanitize_secret(raw):
+    cleaned = ''.join(ch for ch in raw if ch.lower() in '0123456789abcdef').lower()[:64]
+    if len(cleaned) != 64:
+        logging.warning(f"[HMAC] Secret length mismatch: {len(cleaned)} (expected 64)")
+    return cleaned.encode()
+
+TELEMETRY_SECRET = _sanitize_secret(
+    os.getenv("TELEMETRY_SECRET", "") or os.getenv("OUTBOX_SECRET", "") or ""
+)
 
 def _get_sig_from_headers() -> str:
     """
