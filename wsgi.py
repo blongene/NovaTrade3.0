@@ -7,7 +7,6 @@ from flask import Flask, request, jsonify, Blueprint
 from bus_store_pg import get_store, OUTBOX_LEASE_SECONDS
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import telemetry_api
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
@@ -745,6 +744,8 @@ def receipts_ack():
 
 # Register the blueprint on the production Flask app
 flask_app.register_blueprint(_receipts_bp)
+import telemetry_api
+flask_app.register_blueprint(telemetry_api.bp)
 
 # --- Start Nova loops when the web app loads (once) -------------------------
 try:
