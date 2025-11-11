@@ -1,3 +1,4 @@
+import time
 
 # main.py — NovaTrade 3.0 (bullet-proof boot, lazy imports, quota-safe) — PHASE 9 PATCHED
 import os, time, random, threading, schedule
@@ -129,6 +130,9 @@ def _schedule(label: str, module_path: str, func_name: str,
 
 # --- Optional background loop: staking yield (soft) --------------------------
 def _staking_yield_loop():
+    if os.getenv('ENABLE_STAKING_YIELD','0').lower() not in {'1','true','yes','on'}:
+        info('staking_yield_tracker disabled by env.')
+        return
     try:
         mod = _safe_import("staking_yield_tracker")
         fn = getattr(mod, "run_staking_yield_tracker", None) if mod else None
@@ -227,8 +231,15 @@ def _set_schedules():
 def _kick_once_and_threads():
     # Background scheduler loop
     def _scheduler_loop():
+    # patched: guard scheduler loop
         while True:
+            try:
             schedule.run_pending()
+        except Exception as e:
+            warn(f"scheduler.run_pending error: {e}")
+            time.sleep(1.5)
+        else:
+            pass
             time.sleep(1)
     _thread(_scheduler_loop)
 
