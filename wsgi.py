@@ -1,3 +1,12 @@
+
+# HMAC header helper: accept both X-NT-Sig and X-Nova-Signature
+def _hdr_sig(request, *names: str) -> str:
+    for n in names:
+        v = request.headers.get(n)
+        if v:
+            return v
+    return ""
+
 # wsgi.py — NovaTrade Bus (Phase 7A: policy wired with telemetry context)
 from __future__ import annotations
 import os, json, hmac, hashlib, logging, threading, time, uuid
