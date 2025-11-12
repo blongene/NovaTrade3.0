@@ -1,13 +1,13 @@
+# telegram_summaries.py — NT3.0 Daily Summary (Phase 9B, hardened)
+# Backward compatible: keeps run_telegram_summaries(force=False), env toggles, and tab names.
+# Adds param-compat wrappers for utils.tg_should_send / send_telegram_message_dedup.
 
-# telegram_summaries.py — NT3.0 Daily Summary (Upgraded for Phase 9B)
-# Backward compatible: keeps `run_telegram_summaries(force=False)` entrypoint
-# Adds Weighted_Score + Vault 7D + Heartbeat while remaining quiet/safe if data is missing.
 import os
 from datetime import datetime, timezone
 
 from utils import (
-    send_telegram_message_dedup,
-    tg_should_send,
+    send_telegram_message_dedup as _send_dedup_raw,
+    tg_should_send as _tg_should_send_raw,
     get_all_records_cached,
     get_value_cached,
     detect_stalled_tokens,
@@ -28,6 +28,22 @@ PERF_DASH_TAB        = os.getenv("PERF_DASHBOARD_WS", "Performance_Dashboard")
 HEARTBEAT_TAB        = os.getenv("HEARTBEAT_WS", "NovaHeartbeat")
 SUMMARY_LOG_TAB      = os.getenv("SUMMARY_LOG_WS", "Summary_Log")  # optional audit
 
+# ---- Param-compat wrappers (ttl_min vs ttl_minutes) ----
+def _tg_should_send(kind: str, key: str, ttl_min: int, consume: bool = True) -> bool:
+    try:
+        return _tg_should_send_raw(kind, key=key, ttl_min=ttl_min, consume=consume)
+    except TypeError:
+        # older utils version
+        return _tg_should_send_raw(kind, key=key, ttl_minutes=ttl_min, consume=consume)
+
+def _send_dedup(msg: str, key: str, ttl_min: int):
+    try:
+        return _send_dedup_raw(msg, key=key, ttl_min=ttl_min)
+    except TypeError:
+        # older utils version
+        return _send_dedup_raw(msg, key=key, ttl_minutes=ttl_min)
+
+# ---- Helpers ----
 def _utc_date():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -54,6 +70,13 @@ def _try_get(ws_name, ttl_s=120):
         warn(f"telegram_summaries: {ws_name} read failed: {e}")
         return []
 
+def _latest_nonempty(rows):
+    # choose last record that has at least one non-empty value
+    for r in reversed(rows or []):
+        if any(str(v).strip() for v in r.values()):
+            return r
+    return rows[-1] if rows else {}
+
 def _best_effort_counts():
     counts = {}
 
@@ -79,16 +102,16 @@ def _best_effort_counts():
 
     p1 = p7 = p30 = None
     if dash:
-        first = dash[0]
-        p1  = _safe_float(first.get("Portfolio_1d") or first.get("Portfolio_1D"))
-        p7  = _safe_float(first.get("Portfolio_7d") or first.get("Portfolio_7D"))
-        p30 = _safe_float(first.get("Portfolio_30d") or first.get("Portfolio_30D"))
+        latest = _latest_nonempty(dash)
+        p1  = _safe_float(latest.get("Portfolio_1d") or latest.get("Portfolio_1D") or latest.get("1D"))
+        p7  = _safe_float(latest.get("Portfolio_7d") or latest.get("Portfolio_7D") or latest.get("7D"))
+        p30 = _safe_float(latest.get("Portfolio_30d") or latest.get("Portfolio_30D") or latest.get("30D"))
 
-    if p1 is None:
+    if p1 is None and rstats:
         p1 = _mean([_safe_float(r.get("Follow-up ROI")) for r in rstats])
-    if p7 is None:
+    if p7 is None and rstats:
         p7 = _mean([_safe_float(r.get("ROI_7d") or r.get("ROI 7d") or r.get("ROI7d")) for r in rstats])
-    if p30 is None:
+    if p30 is None and rstats:
         p30 = _mean([_safe_float(r.get("ROI_30d") or r.get("ROI 30d") or r.get("ROI30d")) for r in rstats])
 
     counts["p1"] = p1; counts["p7"] = p7; counts["p30"] = p30
@@ -123,7 +146,7 @@ def _best_effort_counts():
         warn(f"telegram_summaries: Vault_Intelligence parse failed: {e}")
         counts["top_vaults"] = []
 
-    # Optional heartbeat cell/row
+    # Optional heartbeat cell (e.g., A2 = "Edge 2m" or timestamp)
     try:
         hb_val = str_or_empty(get_value_cached(HEARTBEAT_TAB, "A2", ttl_s=60)) or "—"
         counts["heartbeat"] = hb_val
@@ -189,7 +212,7 @@ def run_telegram_summaries(force: bool = False):
         return
 
     key = f"{SUMMARY_KEY_BASE}:{_utc_date()}"
-    if not force and not tg_should_send("daily_summary", key=key, ttl_min=DEDUP_TTL_MIN, consume=True):
+    if not force and not _tg_should_send("daily_summary", key=key, ttl_min=DEDUP_TTL_MIN, consume=True):
         # Already sent today; stay quiet
         return
 
@@ -197,7 +220,7 @@ def run_telegram_summaries(force: bool = False):
         counts = _best_effort_counts()
         msg = _format_message(counts)
         # Use a fixed dedup key so accidental double-calls won't spam
-        send_telegram_message_dedup(msg, key="telegram_summary_daily", ttl_min=DEDUP_TTL_MIN)
+        _send_dedup(msg, key="telegram_summary_daily", ttl_min=DEDUP_TTL_MIN)
         _write_summary_log("daily", msg)
         info("telegram_summaries: summary sent.")
     except Exception as e:
