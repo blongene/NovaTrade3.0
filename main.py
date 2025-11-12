@@ -7,6 +7,7 @@ import gspread_guard  # patches Worksheet methods (cache+gates+backoff)
 import hmac, hashlib, json
 from flask import Blueprint, request, jsonify
 from policy_bias_engine import run_policy_bias_builder
+from telegram_summaries import run_telegram_summaries
 
 # --- Utils (required) --------------------------------------------------------
 try:
@@ -272,7 +273,7 @@ def _kick_once_and_threads():
     info("Running Telegram Summary Layer…")
     _safe_call("Telegram summaries", "telegram_summaries", "run_telegram_summaries")
     _sleep_jitter()
-
+   
     # Memory & rebuy engines (one-shot)
     info("Running Rotation Memory Sync…")
     _safe_call("Rotation memory", "rotation_memory", "run_rotation_memory");                _sleep_jitter()
@@ -341,7 +342,7 @@ def boot():
     send_system_online_once()
     _set_schedules()
     _kick_once_and_threads()
-
+    _safe_call("telegram_summaries_boot", lambda: run_telegram_summaries(force=True))
     send_telegram_message_dedup("✅ NovaTrade boot sequence complete.", key="boot_done")
     info("NovaTrade main loop running.")
     return True
