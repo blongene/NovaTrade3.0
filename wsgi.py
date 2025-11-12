@@ -126,13 +126,12 @@ def require_edge_hmac(fn):
         return fn(*args, **kwargs)
     return _wrap
     
-def _verify(secret: str, body: dict, sig: str) -> bool:
-    if not secret: return True
-    try:
-        exp = hmac.new(secret.encode("utf-8"), _canonical(body), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(exp, sig or "")
-    except Exception:
+def _verify(secret: str, raw: bytes, given_sig: str) -> bool:
+    import hmac, hashlib
+    if not secret or not given_sig:
         return False
+    calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(calc, given_sig)
 
 def _require_json():
     if not request.is_json: return None, (jsonify(ok=False, error="invalid_or_missing_json"), 400)
@@ -295,7 +294,8 @@ def telemetry_push():
     body, err = _require_json()
     if err: return err
     sig = _hdr_sig(request, "X-NT-Sig", "X-Nova-Signature")
-    if REQUIRE_HMAC_TELEMETRY and not _verify(TELEMETRY_SECRET, request.get_data(), sig):
+    raw = request.get_data()  # exact bytes
+    if REQUIRE_HMAC_TELEMETRY and not _verify(TELEMETRY_SECRET, raw, sig):
         return jsonify(ok=False, error="invalid_signature"), 401
     agent_id = (body or {}).get("agent_id") or "edge"
     flat, by_venue = _normalize_balances((body or {}).get("balances") or {})
@@ -303,6 +303,25 @@ def telemetry_push():
     venues_line = ", ".join(f"{v}:{len(t)}" for v,t in by_venue.items()) or "—"
     log.info("📡 Telemetry from %s | venues=%s | flat_tokens=%d", agent_id, venues_line, len(flat))
     return jsonify(ok=True, received=(len(by_venue) or len(flat))), 200
+
+@flask_app.post("/api/telemetry/push_balances")
+def telemetry_push_balances():
+    """Edge → Bus: periodic balance snapshots (same HMAC as /api/telemetry/push)."""
+    sig = _hdr_sig(request, "X-NT-Sig", "X-Nova-Signature")
+    raw = request.get_data()  # exact bytes
+
+    if REQUIRE_HMAC_TELEMETRY and not _verify(TELEMETRY_SECRET, raw, sig):
+        return jsonify(ok=False, error="invalid_signature"), 401
+
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("agent") or data.get("agent_id") or "edge"
+    by_venue = data.get("by_venue", {})
+    flat     = data.get("flat", {})
+    ts       = data.get("ts")
+
+    log.info(f"📊 Telemetry snapshot from {agent_id} — venues={list(by_venue)} tokens={list(flat)} ts={ts}")
+    # Save or broadcast telemetry if you wish
+    return jsonify(ok=True, received=len(flat), venues=len(by_venue)), 200
 
 @flask_app.post("/api/telemetry/push_balances")
 @flask_app.post("/api/edge/balances")
