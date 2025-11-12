@@ -1,15 +1,7 @@
-
-# HMAC header helper: accept both X-NT-Sig and X-Nova-Signature
-def _hdr_sig(request, *names: str) -> str:
-    for n in names:
-        v = request.headers.get(n)
-        if v:
-            return v
-    return ""
-
 # wsgi.py — NovaTrade Bus (Phase 7A: policy wired with telemetry context)
 from __future__ import annotations
 import os, json, hmac, hashlib, logging, threading, time, uuid
+from functools import wraps
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, request, jsonify, Blueprint
@@ -109,6 +101,31 @@ REQUIRE_HMAC_OPS       = _env_true("REQUIRE_HMAC_OPS")        # enqueue + ack
 REQUIRE_HMAC_PULL      = _env_true("REQUIRE_HMAC_PULL")       # pull
 REQUIRE_HMAC_TELEMETRY = _env_true("REQUIRE_HMAC_TELEMETRY")  # telemetry push
 
+_HMAC_HEADER_DOC = 'Accepts X-NT-Sig and X-Nova-Signature'
+
+def _hdr_sig(req, *names: str) -> str:
+    for n in names:
+        v = req.headers.get(n)
+        if v:
+            return v
+    return ""
+
+def _edge_hmac_ok(sig: str, raw: bytes) -> bool:
+    secret = os.getenv("EDGE_SECRET", "") or ""
+    if not secret or not sig:
+        return False
+    calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(calc, sig)
+
+def require_edge_hmac(fn):
+    @wraps(fn)
+    def _wrap(*args, **kwargs):
+        sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
+        if not _edge_hmac_ok(sig, request.get_data()):
+            return jsonify({"ok": False, "error": "invalid_signature"}), 401
+        return fn(*args, **kwargs)
+    return _wrap
+    
 def _verify(secret: str, body: dict, sig: str) -> bool:
     if not secret: return True
     try:
@@ -277,7 +294,8 @@ def _normalize_balances(raw) -> Tuple[dict, dict]:
 def telemetry_push():
     body, err = _require_json()
     if err: return err
-    if REQUIRE_HMAC_TELEMETRY and not _verify(TELEMETRY_SECRET, body, request.headers.get("X-NT-Sig","")):
+    sig = _hdr_sig(request, "X-NT-Sig", "X-Nova-Signature")
+    if REQUIRE_HMAC_TELEMETRY and not _verify(TELEMETRY_SECRET, request.get_data(), sig):
         return jsonify(ok=False, error="invalid_signature"), 401
     agent_id = (body or {}).get("agent_id") or "edge"
     flat, by_venue = _normalize_balances((body or {}).get("balances") or {})
