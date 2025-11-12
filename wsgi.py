@@ -359,12 +359,20 @@ def telemetry_push_balances():
 def edge_balances():
     """Edge-authenticated balance push (HMAC: EDGE_SECRET)."""
     sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
-    raw = request.get_data()
+    raw = request.get_data()  # exact bytes
+
     if not _verify(os.getenv("EDGE_SECRET",""), raw, sig):
         return jsonify(ok=False, error="invalid_signature"), 401
 
+    # --- TEMP DEBUG (remove after you see one good POST) ---
+    try:
+        log.info("EDGE DEBUG raw_len=%d raw_head=%s", len(raw), raw[:160])
+    except Exception:
+        pass
+
     data = request.get_json(silent=True) or {}
-    root = dict(data); bal = root.get("balances") or {}
+    root = dict(data)
+    bal  = root.get("balances") or {}
 
     agent_id = root.get("agent") or root.get("agent_id") or bal.get("agent") or "edge"
     by_venue = root.get("by_venue") or bal.get("by_venue") or {}
@@ -372,8 +380,13 @@ def edge_balances():
     ts       = (root.get("ts") or root.get("timestamp") or root.get("time") or
                 bal.get("ts")  or bal.get("timestamp")  or bal.get("time"))
 
+    # normalize
     if not isinstance(by_venue, dict): by_venue = {}
     if not isinstance(flat, dict):     flat = {}
+
+    # OPTIONAL: filter to allowed venues if you want to ignore stray sources
+    allowed = set((os.getenv("ROUTER_ALLOWED","BINANCEUS,COINBASE").upper()).split(","))
+    by_venue = {k:v for k,v in by_venue.items() if k.upper() in allowed}
 
     venues_line = ",".join(by_venue.keys())
     log.info("🤝 EDGE balances from %s — venues=[%s] tokens=%d ts=%s",
