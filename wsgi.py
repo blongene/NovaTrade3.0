@@ -357,18 +357,29 @@ def telemetry_push_balances():
 
 @flask_app.post("/api/edge/balances")
 def edge_balances():
-    """Edge-authenticated balance push (HMAC with EDGE_SECRET)."""
-    data = request.get_json(silent=True) or {}
-    agent_id = data.get("agent") or data.get("agent_id") or "edge"
-    by_venue = data.get("by_venue", {})
-    flat     = data.get("flat", {})
-    ts       = data.get("ts")
+    """Edge-authenticated balance push (HMAC: EDGE_SECRET)."""
+    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
+    raw = request.get_data()
+    if not _verify(os.getenv("EDGE_SECRET",""), raw, sig):
+        return jsonify(ok=False, error="invalid_signature"), 401
 
-    log.info(
-        "🤝 EDGE balances from %s | venues=%s | flat_tokens=%d | ts=%s",
-        agent_id, ",".join(by_venue.keys()) if isinstance(by_venue, dict) else by_venue, len(flat), ts
-    )
-    return jsonify(ok=True, received=len(flat), venues=len(by_venue) if isinstance(by_venue, dict) else 0), 200
+    data = request.get_json(silent=True) or {}
+    root = dict(data); bal = root.get("balances") or {}
+
+    agent_id = root.get("agent") or root.get("agent_id") or bal.get("agent") or "edge"
+    by_venue = root.get("by_venue") or bal.get("by_venue") or {}
+    flat     = root.get("flat")     or bal.get("flat")     or {}
+    ts       = (root.get("ts") or root.get("timestamp") or root.get("time") or
+                bal.get("ts")  or bal.get("timestamp")  or bal.get("time"))
+
+    if not isinstance(by_venue, dict): by_venue = {}
+    if not isinstance(flat, dict):     flat = {}
+
+    venues_line = ",".join(by_venue.keys())
+    log.info("🤝 EDGE balances from %s — venues=[%s] tokens=%d ts=%s",
+             agent_id, venues_line, len(flat), ts)
+
+    return jsonify(ok=True, received=len(flat), venues=len(by_venue)), 200
 
 @flask_app.post("/bus/push_balances")
 def telemetry_push_aliases():
