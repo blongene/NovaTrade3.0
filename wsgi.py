@@ -323,8 +323,21 @@ def telemetry_push_balances():
     # Save or broadcast telemetry if you wish
     return jsonify(ok=True, received=len(flat), venues=len(by_venue)), 200
 
-@flask_app.post("/api/telemetry/push_balances")
 @flask_app.post("/api/edge/balances")
+def edge_balances():
+    """Edge-authenticated balance push (HMAC with EDGE_SECRET)."""
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("agent") or data.get("agent_id") or "edge"
+    by_venue = data.get("by_venue", {})
+    flat     = data.get("flat", {})
+    ts       = data.get("ts")
+
+    log.info(
+        "🤝 EDGE balances from %s | venues=%s | flat_tokens=%d | ts=%s",
+        agent_id, ",".join(by_venue.keys()) if isinstance(by_venue, dict) else by_venue, len(flat), ts
+    )
+    return jsonify(ok=True, received=len(flat), venues=len(by_venue) if isinstance(by_venue, dict) else 0), 200
+
 @flask_app.post("/bus/push_balances")
 def telemetry_push_aliases():
     return telemetry_push()
