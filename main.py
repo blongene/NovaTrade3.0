@@ -342,7 +342,6 @@ def boot():
     send_system_online_once()
     _set_schedules()
     _kick_once_and_threads()
-    _safe_call("telegram_summaries_boot", lambda: run_telegram_summaries(force=True))
     send_telegram_message_dedup("✅ NovaTrade boot sequence complete.", key="boot_done")
     info("NovaTrade main loop running.")
     return True
