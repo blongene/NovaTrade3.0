@@ -306,7 +306,7 @@ def telemetry_push():
 
 @flask_app.post("/api/telemetry/push_balances")
 def telemetry_push_balances():
-    """Edge → Bus: periodic balance snapshots (same HMAC as /api/telemetry/push)."""
+    """Edge → Bus: periodic balance snapshots (HMAC with TELEMETRY_SECRET)."""
     sig = _hdr_sig(request, "X-NT-Sig", "X-Nova-Signature")
     raw = request.get_data()  # exact bytes
 
@@ -314,14 +314,46 @@ def telemetry_push_balances():
         return jsonify(ok=False, error="invalid_signature"), 401
 
     data = request.get_json(silent=True) or {}
-    agent_id = data.get("agent") or data.get("agent_id") or "edge"
-    by_venue = data.get("by_venue", {})
-    flat     = data.get("flat", {})
-    ts       = data.get("ts")
 
-    log.info(f"📊 Telemetry snapshot from {agent_id} — venues={list(by_venue)} tokens={list(flat)} ts={ts}")
-    # Save or broadcast telemetry if you wish
-    return jsonify(ok=True, received=len(flat), venues=len(by_venue)), 200
+    # --- normalize multiple payload shapes ---
+    # Supported:
+    #  A) {agent, by_venue, flat, ts}
+    #  B) {agent, balances:{by_venue, flat, ts}}
+    #  C) {agent_id, ...} (alias for agent)
+    root = dict(data)  # shallow copy
+    bal = root.get("balances") or {}
+
+    agent_id = root.get("agent") or root.get("agent_id") or bal.get("agent") or "edge"
+
+    by_venue = (
+        root.get("by_venue") or
+        bal.get("by_venue")  or
+        {}
+    )
+    flat = (
+        root.get("flat") or
+        bal.get("flat")  or
+        {}
+    )
+
+    ts = (
+        root.get("ts") or root.get("timestamp") or root.get("time") or
+        bal.get("ts")  or bal.get("timestamp")  or bal.get("time")
+    )
+
+    # Ensure dicts
+    if not isinstance(by_venue, dict): by_venue = {}
+    if not isinstance(flat, dict):     flat = {}
+
+    venues_line = ",".join(by_venue.keys())
+    flat_count  = len(flat)
+    venue_count = len(by_venue)
+
+    log.info("📊 Telemetry snapshot from %s — venues=[%s] tokens=%d ts=%s",
+             agent_id, venues_line, flat_count, ts)
+
+    # TODO: persist by_venue/flat if desired
+    return jsonify(ok=True, received=flat_count, venues=venue_count), 200
 
 @flask_app.post("/api/edge/balances")
 def edge_balances():
