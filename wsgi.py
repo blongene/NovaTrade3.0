@@ -765,6 +765,12 @@ def hmac_check():
         "raw": raw.decode("utf-8","replace")  # for inspection (safe)
     })
 
+@flask_app.post("/api/debug/hmac_check_edge")
+def hmac_check_edge():
+    raw = request.get_data()
+    calc = hmac.new(os.getenv("EDGE_SECRET","").encode(), raw, hashlib.sha256).hexdigest()
+    return jsonify(calc=calc, len=len(raw))
+
 # --- Receipts API (Edge → Cloud) ---------------------------------------------
 from flask import Blueprint, request, jsonify
 import os, hmac, hashlib
