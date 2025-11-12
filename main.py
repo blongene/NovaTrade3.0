@@ -235,10 +235,10 @@ def _kick_once_and_threads():
     # patched: guard scheduler loop
         while True:
             try:
-                schedule.run_pending()
+                _safe_call("telegram_summaries_boot", lambda: run_telegram_summaries(force=True))
             except Exception as e:
-                warn(f"scheduler.run_pending error: {e}")
-                time.sleep(1.5)
+                warn(f"boot summary failed: {e}")
+
         else:
             pass
             time.sleep(1)
