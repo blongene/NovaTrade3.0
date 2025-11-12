@@ -293,7 +293,7 @@ def _normalize_balances(raw) -> Tuple[dict, dict]:
 def telemetry_push():
     body, err = _require_json()
     if err: return err
-    sig = _hdr_sig(request, "X-NT-Sig", "X-Nova-Signature")
+    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
     raw = request.get_data()  # exact bytes
     if REQUIRE_HMAC_TELEMETRY and not _verify(TELEMETRY_SECRET, raw, sig):
         return jsonify(ok=False, error="invalid_signature"), 401
@@ -307,7 +307,7 @@ def telemetry_push():
 @flask_app.post("/api/telemetry/push_balances")
 def telemetry_push_balances():
     """Edge → Bus: periodic balance snapshots (HMAC with TELEMETRY_SECRET)."""
-    sig = _hdr_sig(request, "X-NT-Sig", "X-Nova-Signature")
+    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
     raw = request.get_data()  # exact bytes
 
     if REQUIRE_HMAC_TELEMETRY and not _verify(TELEMETRY_SECRET, raw, sig):
