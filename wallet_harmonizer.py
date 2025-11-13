@@ -29,6 +29,10 @@ def _post(url, json_payload):
     import requests
     return requests.post(url, json=json_payload, timeout=10)
 
+if not OUTBOX_SECRET:
+    print("⚠️ wallet_harmonizer: OUTBOX_SECRET is empty; will only run in dryrun mode.")
+    HARMONIZER_MODE = "dryrun"
+
 def run_wallet_harmonizer():
     print("🧮 Wallet Harmonizer scanning …")
     sh = _open()
