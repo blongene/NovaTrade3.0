@@ -403,29 +403,37 @@ def load_policy(path: str):
 
 _engine_singleton: Optional[Engine] = None
 
+def _default_context() -> Optional[dict]:
+    """
+    Build a default policy context using Bus telemetry if available.
+    Expected Bus global: wsgi._last_tel = {"by_venue":{...}, "flat":{...}, "ts": ...}
+    """
+    try:
+        import wsgi as bus  # lazy import to avoid hard circulars
+        tel = getattr(bus, "_last_tel", None) or {}
+        if not isinstance(tel, dict) or (not tel.get("by_venue") and not tel.get("flat")):
+            return None
+        return {"telemetry": tel}
+    except Exception:
+        return None
+
 def evaluate_intent(intent: Dict[str, Any], context: Optional[dict]=None) -> Dict[str, Any]:
-    """
-    Stable entry used by Bus:
-      intent = {
-        "venue": "KRAKEN",
-        "symbol": "MIND/USDT" | "MINDUSDT" | "MIND-USDT",
-        "side": "buy" | "sell",
-        "amount": 12.34,         # base units
-        "price_usd": 0.0123,     # optional; required for sizing checks
-        "notional_usd": 100.0,   # optional; overrides price*amount if present
-        "quote_reserve_usd": 250 # optional; else pulled from context.telemetry
-      }
-      context = {"telemetry": {"by_venue": {"KRAKEN":{"USDT": 120.0}}}}
-    Returns dict: {"ok": bool, "reason": str, "patched_intent": {...}, "flags": [...]}
-    """
     global _engine_singleton
     if _engine_singleton is None:
-        cfg = (_load_yaml(os.getenv("POLICY_PATH") or "policy.yaml") or {}).get("policy") or _DEFAULT["policy"]
+        loaded = _load_yaml(os.getenv("POLICY_PATH"))
+        cfg = loaded.get("policy") if loaded else _DEFAULT["policy"]
         _engine_singleton = Engine(cfg)
+
+    # If caller didn’t pass a context, use Bus telemetry by default
+    if context is None:
+        context = _default_context()
+
     return _engine_singleton.evaluate_intent(intent, context=context)
 
 def evaluate(intent: Dict[str, Any]) -> Dict[str, Any]:
-    """Compatibility wrapper (no context)."""
+    """
+    Backwards-compat wrapper: evaluates with default context (Bus telemetry if present).
+    """
     return evaluate_intent(intent, context=None)
 
 # ---------- Backward-compat wrapper for older imports ----------
