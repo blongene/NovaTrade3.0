@@ -4,7 +4,7 @@
 
 import os
 from datetime import datetime, timezone
-
+import time
 from utils import (
     send_telegram_message_dedup as _send_dedup_raw,
     tg_should_send as _tg_should_send_raw,
@@ -62,6 +62,36 @@ def _fmt_pct(v, places=1):
 def _mean(xs):
     vals = [v for v in xs if v is not None]
     return (sum(vals) / len(vals)) if vals else None
+    
+def _get_telemetry_snapshot():
+    """
+    Best-effort read of the latest Edge telemetry snapshot from the Bus.
+
+    Returns dict with:
+      - flat: {symbol -> qty}
+      - by_venue: {VENUE -> {asset -> qty}}
+      - age_sec: seconds since snapshot (or None)
+    Never raises; falls back to empty structures.
+    """
+    try:
+        # Import lazily to avoid circulars at import time; wsgi is the Bus module.
+        import wsgi as bus_wsgi  # type: ignore
+        snap = getattr(bus_wsgi, "_last_tel", {}) or {}
+    except Exception:
+        snap = {}
+
+    flat = snap.get("flat") or {}
+    by_venue = snap.get("by_venue") or {}
+    ts = snap.get("ts") or 0
+
+    age = None
+    try:
+        if ts:
+            age = int(time.time()) - int(ts)
+    except Exception:
+        age = None
+
+    return {"flat": flat, "by_venue": by_venue, "age_sec": age}
 
 def _try_get(ws_name, ttl_s=120):
     try:
@@ -79,6 +109,18 @@ def _latest_nonempty(rows):
 
 def _best_effort_counts():
     counts = {}
+
+    # Telemetry snapshot (Edge balances → Bus)
+    try:
+        tel = _get_telemetry_snapshot()
+        counts["tel_by_venue"] = tel.get("by_venue") or {}
+        counts["tel_flat"] = tel.get("flat") or {}
+        counts["tel_age_sec"] = tel.get("age_sec")
+    except Exception as e:
+        warn(f"telegram_summaries: telemetry snapshot read failed: {e}")
+        counts["tel_by_venue"] = {}
+        counts["tel_flat"] = {}
+        counts["tel_age_sec"] = None
 
     # Rotation_Log size
     try:
@@ -176,9 +218,52 @@ def _format_message(counts):
         f"• Top Vaults (7D): {vt_str}",
         f"• Stalled tokens (≥ threshold): {counts.get('stalled', '—')}",
     ]
+
+    # Telemetry section (per-venue balances)
+    tel_by = counts.get("tel_by_venue") or {}
+    tel_age = counts.get("tel_age_sec")
+    if tel_by or tel_age is not None:
+        # Age string
+        if tel_age is None:
+            age_str = "age: unknown"
+        elif tel_age < 300:
+            age_str = f"age: {int(tel_age)}s"
+        else:
+            age_str = f"age: {int(tel_age // 60)}m"
+
+        # Prefer to show stable balances per venue
+        venue_lines = []
+        preferred = ["COINBASE", "BINANCEUS", "KRAKEN"]
+        def _venue_key(v):
+            v_up = v.upper()
+            return (preferred.index(v_up) if v_up in preferred else len(preferred), v_up)
+
+        for venue, assets in sorted(tel_by.items(), key=lambda kv: _venue_key(kv[0])):
+            assets = assets or {}
+            pieces = []
+            for asset in ("USD", "USDC", "USDT"):
+                try:
+                    val = float(assets.get(asset, 0) or 0)
+                except Exception:
+                    val = 0.0
+                if val > 0:
+                    pieces.append(f"{asset} {val:,.0f}")
+            if not pieces and assets:
+                pieces.append(f"{len(assets)} assets")
+            if pieces:
+                venue_lines.append(f"{venue}: " + ", ".join(pieces))
+
+        if venue_lines:
+            lines.append(f"• Telemetry balances ({age_str}):")
+            # Join on one line to keep message compact
+            lines.append("    " + " | ".join(venue_lines))
+        else:
+            lines.append(f"• Telemetry balances ({age_str}): none")
+
     hb = counts.get("heartbeat", "—")
     if hb != "—":
         lines.append(f"• Heartbeat: {hb}")
+
     lines.append("—")
     lines.append("This is an automated status ping. Set TELEGRAM_SUMMARIES_ENABLED=0 to disable.")
     return "\n".join(lines)
