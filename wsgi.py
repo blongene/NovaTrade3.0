@@ -358,17 +358,21 @@ def telemetry_push_balances():
 @flask_app.post("/api/edge/balances")
 def edge_balances():
     """Edge-authenticated balance push (HMAC: EDGE_SECRET)."""
-    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
+    import hmac, hashlib
+
     raw = request.get_data()  # exact bytes
+    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
+    sec = os.getenv("EDGE_SECRET", "")
 
-    if not _verify(os.getenv("EDGE_SECRET",""), raw, sig):
+    calc = hmac.new(sec.encode(), raw, hashlib.sha256).hexdigest()
+    equal = bool(sec) and bool(sig) and (sig == calc)
+
+    # DEBUG: keep this until you see one good call, then feel free to remove
+    log.info("EDGE HMAC DEBUG: has_sec=%s sig_len=%s equal=%s sig=%s calc=%s raw_len=%d",
+             bool(sec), len(sig or ""), equal, sig, calc, len(raw))
+
+    if not equal:
         return jsonify(ok=False, error="invalid_signature"), 401
-
-    # --- TEMP DEBUG (remove after you see one good POST) ---
-    try:
-        log.info("EDGE DEBUG raw_len=%d raw_head=%s", len(raw), raw[:160])
-    except Exception:
-        pass
 
     data = request.get_json(silent=True) or {}
     root = dict(data)
@@ -380,13 +384,8 @@ def edge_balances():
     ts       = (root.get("ts") or root.get("timestamp") or root.get("time") or
                 bal.get("ts")  or bal.get("timestamp")  or bal.get("time"))
 
-    # normalize
     if not isinstance(by_venue, dict): by_venue = {}
     if not isinstance(flat, dict):     flat = {}
-
-    # OPTIONAL: filter to allowed venues if you want to ignore stray sources
-    allowed = set((os.getenv("ROUTER_ALLOWED","BINANCEUS,COINBASE").upper()).split(","))
-    by_venue = {k:v for k,v in by_venue.items() if k.upper() in allowed}
 
     venues_line = ",".join(by_venue.keys())
     log.info("🤝 EDGE balances from %s — venues=[%s] tokens=%d ts=%s",
