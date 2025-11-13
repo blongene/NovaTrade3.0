@@ -232,17 +232,20 @@ def _set_schedules():
 def _kick_once_and_threads():
     # Background scheduler loop
     def _scheduler_loop():
-    # patched: guard scheduler loop
         while True:
             try:
-                _safe_call("telegram_summaries_boot", lambda: run_telegram_summaries(force=True))
+                schedule.run_pending()
             except Exception as e:
-                warn(f"boot summary failed: {e}")
-
-        else:
-            pass
+                warn(f"scheduler loop failed: {e}")
             time.sleep(1)
+
     _thread(_scheduler_loop)
+
+    # Optional: one-time Telegram summary on boot (outside the loop)
+    try:
+        _safe_call("telegram_summaries_boot", lambda: run_telegram_summaries(force=True))
+    except Exception as e:
+        warn(f"boot summary failed: {e}")
 
     # Stalled asset & claims (boot pass)
     _safe_call("Stalled asset detector (boot)", "stalled_asset_detector", "run_stalled_asset_detector"); _sleep_jitter()
