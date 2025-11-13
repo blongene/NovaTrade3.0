@@ -243,7 +243,7 @@ def _kick_once_and_threads():
 
     # Optional: one-time Telegram summary on boot (outside the loop)
     try:
-        _safe_call("telegram_summaries_boot", lambda: run_telegram_summaries(force=True))
+        _safe_call("Telegram summaries (boot)", "telegram_summaries", "run_telegram_summaries")
     except Exception as e:
         warn(f"boot summary failed: {e}")
 
