@@ -104,11 +104,21 @@ REQUIRE_HMAC_TELEMETRY = _env_true("REQUIRE_HMAC_TELEMETRY")  # telemetry push
 _HMAC_HEADER_DOC = 'Accepts X-NT-Sig and X-Nova-Signature'
 
 def _hdr_sig(req, *names: str) -> str:
+    """
+    Return the first non-empty HMAC header.
+
+    Preferred names (new clients): X-Nova-Signature, X-NT-Sig
+    Backwards-compat: X-Signature
+    """
+    # Prefer explicit names passed in
     for n in names:
         v = req.headers.get(n)
         if v:
             return v
-    return ""
+
+    # Backwards-compat for older clients that still use X-Signature
+    fallback = req.headers.get("X-Signature")
+    return fallback or ""
 
 def _edge_hmac_ok(sig: str, raw: bytes) -> bool:
     secret = os.getenv("EDGE_SECRET", "") or ""
@@ -120,7 +130,7 @@ def _edge_hmac_ok(sig: str, raw: bytes) -> bool:
 def require_edge_hmac(fn):
     @wraps(fn)
     def _wrap(*args, **kwargs):
-        sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
+        sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig", "X-Signature")
         if not _edge_hmac_ok(sig, request.get_data()):
             return jsonify({"ok": False, "error": "invalid_signature"}), 401
         return fn(*args, **kwargs)
@@ -293,7 +303,7 @@ def _normalize_balances(raw) -> Tuple[dict, dict]:
 def telemetry_push():
     body, err = _require_json()
     if err: return err
-    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
+    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig", "X-Signature")
     raw = request.get_data()  # exact bytes
     if REQUIRE_HMAC_TELEMETRY and not _verify(TELEMETRY_SECRET, raw, sig):
         return jsonify(ok=False, error="invalid_signature"), 401
@@ -307,7 +317,7 @@ def telemetry_push():
 @flask_app.post("/api/telemetry/push_balances")
 def telemetry_push_balances():
     """Edge → Bus: periodic balance snapshots (HMAC with TELEMETRY_SECRET)."""
-    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
+    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig", "X-Signature")
     raw = request.get_data()  # exact bytes
 
     if REQUIRE_HMAC_TELEMETRY and not _verify(TELEMETRY_SECRET, raw, sig):
@@ -361,7 +371,7 @@ def edge_balances():
     import hmac, hashlib
 
     raw = request.get_data()  # exact bytes
-    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig")
+    sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig", "X-Signature")
     sec = os.getenv("EDGE_SECRET", "")
 
     calc = hmac.new(sec.encode(), raw, hashlib.sha256).hexdigest()
