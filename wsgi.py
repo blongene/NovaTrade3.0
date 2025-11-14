@@ -423,11 +423,6 @@ def edge_balances():
 def telemetry_push_aliases():
     return telemetry_push()
 
-@flask_app.get("/api/telemetry/last")
-def telemetry_last():
-    age = (time.time() - _last_tel["ts"]) if _last_tel["ts"] else None
-    return jsonify(ok=True, **_last_tel, age_sec=age), 200
-
 # ========== Dash ==========
 @flask_app.get("/dash")
 def dash():
