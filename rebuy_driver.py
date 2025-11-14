@@ -62,14 +62,21 @@ def run_rebuy_driver():
         venue = venue_order[0] if venue_order else "BINANCEUS"
         quote = pe.cfg.get("prefer_quotes",{}).get(venue, "USDT")
 
+        # Stable identity + metadata for Policy Spine
+        now = int(time.time())
+        intent_id = f"rebuy:{token}:{now}"
+
         intent = {
+            "id": intent_id,
             "token": token,
             "action": "BUY",
             "amount_usd": amt_usd,
             "venue": venue,
             "quote": quote,
             "rebuy_driver": True,
-            "ts": int(time.time())
+            "agent_target": os.getenv("DEFAULT_AGENT_TARGET", "edge-primary,edge-nl1"),
+            "source": "rebuy_driver",
+            "policy_id": os.getenv("POLICY_ID", "main"),
         }
 
         ok, reason, patched = pe.validate(intent, r)
