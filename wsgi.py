@@ -326,10 +326,6 @@ def telemetry_push_balances():
     data = request.get_json(silent=True) or {}
 
     # --- normalize multiple payload shapes ---
-    # Supported:
-    #  A) {agent, by_venue, flat, ts}
-    #  B) {agent, balances:{by_venue, flat, ts}}
-    #  C) {agent_id, ...} (alias for agent)
     root = dict(data)  # shallow copy
     bal = root.get("balances") or {}
 
@@ -362,8 +358,28 @@ def telemetry_push_balances():
     log.info("📊 Telemetry snapshot from %s — venues=[%s] tokens=%d ts=%s",
              agent_id, venues_line, flat_count, ts)
 
+    # NEW: update global last snapshot for mirror jobs
+    global _last_tel
+    _last_tel = {
+        "agent_id": agent_id,
+        "by_venue": by_venue,
+        "flat": flat,
+        "ts": int(time.time()),
+    }
+
     # TODO: persist by_venue/flat if desired
     return jsonify(ok=True, received=flat_count, venues=venue_count), 200
+
+@flask_app.get("/api/telemetry/last")
+def telemetry_last():
+    """
+    Simple JSON view of the last telemetry snapshot (_last_tel).
+    Used by offline jobs like telemetry_mirror.py via HTTP.
+    """
+    global _last_tel
+    # Return a copy so callers can't mutate our global
+    data = dict(_last_tel or {})
+    return jsonify(ok=True, data=data), 200
 
 @flask_app.post("/api/edge/balances")
 def edge_balances():
