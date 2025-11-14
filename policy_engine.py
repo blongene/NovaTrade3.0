@@ -474,6 +474,10 @@ class PolicyEngine:
             "symbol": symbol,
             "side": side,  # 'buy' or 'sell'
         }
+        # propagate metadata for logging (Intent_ID, Source, etc.)
+        for k in ("id", "agent_target", "source", "policy_id"):
+            if k in intent:
+                new_intent[k] = intent.get(k)
 
         # sizing: prefer explicit notional_usd, else amount & price
         if "notional_usd" in intent:
