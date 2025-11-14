@@ -1,372 +1,536 @@
-# stalled_asset_detector.py — NT3.0 Telemetry-driven stalled asset detector
-#
-# Responsibilities:
-# - Read latest telemetry snapshot from wsgi._last_tel (by_venue / flat / ts).
-# - Compare balances vs Rotation_Log to find:
-#     • assets with balances but no Rotation_Log history (orphans),
-#     • assets whose last Rotation_Log touch is older than N days (stalled),
-#     • tiny residual balances with old history (dust).
-# - Return a structured list via detect_stalled_tokens().
-# - Expose run_stalled_asset_detector() for the scheduler: logs + Telegram + Policy_Log.
-#
-# Design goals:
-# - Best-effort: never raise; degrade to no-op on errors or stale telemetry.
-# - Uses your existing utils helpers: caching, logging, Telegram de-dupe.
+#!/usr/bin/env python3
+"""
+stalled_asset_detector.py — NovaTrade 3.0
 
+Purpose:
+    Scan Wallet_Monitor + Trade_Log to find:
+      - orphan assets (balance but no trade history),
+      - stalled assets (no trade in N days),
+      - stablecoins stuck in hubs.
+
+    Results are appended to Policy_Log with a structured row per anomaly,
+    and (optionally) summarized via Telegram using send_telegram_message_dedup.
+
+Depends on:
+    - Google Sheets (SHEET_URL, service account JSON via GOOGLE_APPLICATION_CREDENTIALS)
+    - Existing tabs:
+        * Wallet_Monitor
+        * Trade_Log
+        * Policy_Log
+
+Safe to run ad-hoc or from a scheduler/cron. If nothing looks weird, it will
+only print a short summary and exit.
+"""
+
+from __future__ import annotations
 import os
-import time
+import json
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Dict, Tuple, List, Any
 
-from utils import (
-    get_all_records_cached,
-    send_telegram_message_dedup,
-    warn,
-    info,
-    str_or_empty,
-)
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# Optional import: Bus global telemetry (_last_tel)
+# Optional utilities (Telegram + logging). We degrade gracefully if missing.
 try:
-    import wsgi as bus_wsgi  # type: ignore
+    from utils import send_telegram_message_dedup  # type: ignore
 except Exception:  # pragma: no cover
-    bus_wsgi = None  # type: ignore
+    def send_telegram_message_dedup(*a, **k) -> bool:
+        return False
+
+try:
+    from utils import warn  # type: ignore
+except Exception:  # pragma: no cover
+    def warn(msg: str) -> None:
+        print(f"[stalled_asset_detector] WARN: {msg}")
+
+# ==== Config ====
+
+SHEET_URL = os.getenv("SHEET_URL")
+
+WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
+TRADE_LOG_WS      = os.getenv("TRADE_LOG_WS", "Trade_Log")
+POLICY_LOG_WS     = os.getenv("POLICY_LOG_WS", "Policy_Log")
+
+STALL_DETECT_DAYS       = int(os.getenv("STALL_DETECT_DAYS", "7"))
+STALL_ORPHAN_DAYS       = int(os.getenv("STALL_ORPHAN_DAYS", "30"))
+STALL_MIN_BALANCE       = float(os.getenv("STALL_MIN_BALANCE", "0.000001"))
+STALL_MIN_STABLE_BAL    = float(os.getenv("STALL_MIN_STABLE_BALANCE", "5.0"))
+STALL_STABLE_DAYS       = int(os.getenv("STALL_STABLE_DAYS", "3"))
+
+STABLE_SYMBOLS = {"USDC", "USDT", "USD", "USDP", "DAI"}
 
 
-# ----- Env toggles & thresholds ------------------------------------------------
+# ==== Helpers ====
 
-ENABLED = os.getenv("STALLED_DETECTOR_ENABLED", "1").lower() in ("1", "true", "yes")
-
-ROTATION_LOG_TAB = os.getenv("ROTATION_LOG_TAB", "Rotation_Log")
-
-# How old a Rotation_Log touch (in days) before we call an asset "stalled".
-STALLED_MIN_AGE_DAYS = float(os.getenv("STALLED_MIN_AGE_DAYS", "3.0"))
-
-# Minimum balance to consider for "stalled" (ignore microscopic amounts).
-STALLED_MIN_QTY = float(os.getenv("STALLED_MIN_QTY", "0.0"))
-
-# Max balance to treat as "dust" (tiny residuals).
-STALLED_DUST_MAX_QTY = float(os.getenv("STALLED_DUST_MAX_QTY", "0.0001"))
-
-# Maximum acceptable age of telemetry snapshot, in seconds.
-STALLED_TELEMETRY_MAX_AGE_SEC = int(os.getenv("STALLED_TELEMETRY_MAX_AGE_SEC", "900"))  # 15m
-
-# Telegram de-dupe for the job-level alert (minutes).
-STALLED_DETECTOR_TTL_MIN = int(os.getenv("STALLED_DETECTOR_TTL_MIN", "60"))
-
-# Semantic groups (can be extended / overridden later)
-MAJORS = {"BTC", "ETH"}
-STABLES = {"USD", "USDC", "USDT"}
+def _utcnow() -> datetime:
+    return datetime.now(tz=timezone.utc)
 
 
-# ----- Internal helpers --------------------------------------------------------
+def _open_sheet():
+    if not SHEET_URL:
+        raise RuntimeError("SHEET_URL env var is not set")
+
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    # Same default path pattern as other modules
+    svc_path = os.getenv(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "/etc/secrets/sentiment-log-service.json",
+    )
+
+    creds = ServiceAccountCredentials.from_json_keyfile_name(svc_path, scope)
+    client = gspread.authorize(creds)
+    return client.open_by_url(SHEET_URL)
 
 
-def _parse_ts_fuzzy(raw: Any) -> Optional[datetime]:
-    """Best-effort parse for timestamps coming from Rotation_Log."""
-    if not raw:
-        return None
-    s = str(raw).strip()
+def _get_ws(sh, title: str):
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        # For Policy_Log we want to auto-create, others we can treat as empty
+        if title == POLICY_LOG_WS:
+            return sh.add_worksheet(title=title, rows=2000, cols=20)
+        raise
+
+
+def _safe_float(x: Any) -> float:
+    try:
+        if x is None:
+            return 0.0
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if not s:
+            return 0.0
+        return float(s.replace(",", ""))
+    except Exception:
+        return 0.0
+
+
+def _parse_ts(s: str) -> datetime | None:
+    """
+    Accepts strings like:
+        '2025-10-19 16:01:39'
+        '2025-10-19T16:01:39Z'
+    Returns timezone-aware UTC datetime where possible.
+    """
     if not s:
         return None
-
-    # Try strict ISO first
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        pass
-
-    # Very common Nova format: "YYYY-MM-DD HH:MM:SS"
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d"):
+    s = s.strip()
+    # Replace space with 'T' and add Z if it looks ISO-like
+    try_formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ]
+    for fmt in try_formats:
         try:
             dt = datetime.strptime(s, fmt)
-            # Treat as UTC by default
             return dt.replace(tzinfo=timezone.utc)
         except Exception:
             continue
-
     return None
 
 
-def _get_telemetry_snapshot() -> Dict[str, Any]:
-    """Read latest telemetry snapshot from wsgi._last_tel.
-
-    Expected shape (as per mysupersdiscussion33 telemetry patches):
-
-        {
-          "agent": "edge-primary",
-          "by_venue": { "COINBASE": {"USD": 5000, "USDC": 2500}, ... },
-          "flat": { "BTC": 1.2, "ETH": 4.0, ... },
-          "ts": 1730...
-        }
+def _extract_base_from_symbol(symbol: str) -> str:
     """
-    if bus_wsgi is None:
-        warn("stalled_asset_detector: bus_wsgi not importable; telemetry unavailable.")
-        return {"by_venue": {}, "flat": {}, "ts": None, "age_sec": None}
-
-    tel = getattr(bus_wsgi, "_last_tel", None) or {}
-    by_venue = tel.get("by_venue") or {}
-    flat = tel.get("flat") or {}
-    ts = tel.get("ts")
-
-    age_sec: Optional[float] = None
-    if ts is not None:
-        try:
-            now = time.time()
-            age_sec = max(0.0, now - float(ts))
-        except Exception:
-            age_sec = None
-
-    return {
-        "by_venue": by_venue,
-        "flat": flat,
-        "ts": ts,
-        "age_sec": age_sec,
-    }
-
-
-def _load_last_rotation_activity() -> Dict[str, datetime]:
-    """Return last-known Rotation_Log touch per token.
-
-    Key: TOKEN (uppercased)
-    Value: datetime (UTC) of last Rotation_Log row for that token.
+    Turn 'BTCUSDT' or 'ETH/USDC' into 'BTC' / 'ETH'.
+    Falls back to the raw symbol if we can't guess.
     """
-    last: Dict[str, datetime] = {}
+    if not symbol:
+        return ""
+    s = symbol.strip().upper()
+    if "/" in s:
+        return s.split("/", 1)[0]
+
+    for suffix in ("USDT", "USDC", "USD", "USDP", "DAI"):
+        if s.endswith(suffix):
+            return s[: -len(suffix)]
+    return s
+
+
+# ==== Data loaders ====
+
+def load_wallet_balances(sh) -> List[Dict[str, Any]]:
+    """
+    From Wallet_Monitor:
+        Timestamp | Venue | Asset | Free | Locked | Quote
+    """
     try:
-        rows = get_all_records_cached(ROTATION_LOG_TAB, ttl_s=600)
-    except Exception as e:
-        warn(f"stalled_asset_detector: could not read {ROTATION_LOG_TAB}: {e}")
-        return last
+        ws = _get_ws(sh, WALLET_MONITOR_WS)
+    except gspread.WorksheetNotFound:
+        warn(f"Worksheet {WALLET_MONITOR_WS} not found; no balances to scan")
+        return []
 
-    for row in rows:
-        token_raw = row.get("Token") or row.get("TOKEN") or row.get("Ticker") or row.get("Asset")
-        token = str_or_empty(token_raw).upper()
-        if not token:
+    rows = ws.get_all_values()
+    if not rows:
+        return []
+
+    header = rows[0]
+    hix = {h.strip(): i for i, h in enumerate(header) if h}
+
+    needed = ["Timestamp", "Venue", "Asset", "Free", "Locked"]
+    for col in needed:
+        if col not in hix:
+            warn(f"{WALLET_MONITOR_WS}: missing column '{col}', skipping")
+            return []
+
+    out = []
+    for row in rows[1:]:
+        def g(col: str) -> str:
+            idx = hix.get(col)
+            if idx is None or idx >= len(row):
+                return ""
+            return str(row[idx]).strip()
+
+        ts = g("Timestamp")
+        venue = g("Venue")
+        asset = g("Asset")
+        free = _safe_float(g("Free"))
+        locked = _safe_float(g("Locked"))
+
+        if not asset or not venue:
             continue
 
-        ts_raw = (
-            row.get("Timestamp")
-            or row.get("TS")
-            or row.get("Opened At")
-            or row.get("Opened_At")
-            or row.get("Time")
+        total = free + locked
+        if total <= 0:
+            continue
+
+        out.append(
+            {
+                "timestamp": ts,
+                "venue": venue.upper(),
+                "asset": asset.upper(),
+                "free": free,
+                "locked": locked,
+                "total": total,
+            }
         )
-        dt = _parse_ts_fuzzy(ts_raw)
-        if not dt:
+    return out
+
+
+def load_last_trades(sh) -> Dict[Tuple[str, str], datetime]:
+    """
+    From Trade_Log:
+        Timestamp | Venue | Symbol | Side | ...
+    Returns:
+        {(VENUE, BASE_ASSET): last_trade_ts}
+    """
+    try:
+        ws = _get_ws(sh, TRADE_LOG_WS)
+    except gspread.WorksheetNotFound:
+        warn(f"Worksheet {TRADE_LOG_WS} not found; treating as no trade history")
+        return {}
+
+    rows = ws.get_all_values()
+    if not rows:
+        return {}
+
+    header = rows[0]
+    hix = {h.strip(): i for i, h in enumerate(header) if h}
+
+    needed = ["Timestamp", "Venue", "Symbol"]
+    for col in needed:
+        if col not in hix:
+            warn(f"{TRADE_LOG_WS}: missing column '{col}', skipping trade history")
+            return {}
+
+    last: Dict[Tuple[str, str], datetime] = {}
+    for row in rows[1:]:
+        def g(col: str) -> str:
+            idx = hix.get(col)
+            if idx is None or idx >= len(row):
+                return ""
+            return str(row[idx]).strip()
+
+        ts_str = g("Timestamp")
+        venue = g("Venue").upper()
+        symbol = g("Symbol")
+
+        if not venue or not symbol:
             continue
 
-        prev = last.get(token)
-        if prev is None or dt > prev:
-            last[token] = dt
+        ts = _parse_ts(ts_str)
+        if ts is None:
+            continue
+
+        base = _extract_base_from_symbol(symbol)
+        if not base:
+            continue
+
+        key = (venue, base)
+        prev = last.get(key)
+        if prev is None or ts > prev:
+            last[key] = ts
 
     return last
 
 
-# ----- Core: detection logic ---------------------------------------------------
+# ==== Policy_Log integration ====
+
+def _ensure_policy_header(ws) -> List[str]:
+    rows = ws.get_all_values()
+    if not rows:
+        header = [
+            "Timestamp",
+            "Token",
+            "Action",
+            "Amount_USD",
+            "OK",
+            "Reason",
+            "Patched",
+            "Venue",
+            "Quote",
+            "Liquidity",
+            "Cooldown_Min",
+            "Notes",
+            "Intent_ID",
+            "Symbol",
+            "Decision",
+            "Source",
+        ]
+        ws.update("A1", [header])
+        return header
+
+    header = rows[0]
+    # Normalize + ensure required columns exist
+    existing = [h.strip() for h in header]
+    wanted = [
+        "Timestamp",
+        "Token",
+        "Action",
+        "Amount_USD",
+        "OK",
+        "Reason",
+        "Patched",
+        "Venue",
+        "Quote",
+        "Liquidity",
+        "Cooldown_Min",
+        "Notes",
+        "Intent_ID",
+        "Symbol",
+        "Decision",
+        "Source",
+    ]
+    changed = False
+    for w in wanted:
+        if w not in existing:
+            existing.append(w)
+            changed = True
+
+    if changed:
+        ws.update("A1", [existing])
+    return existing
 
 
-def detect_stalled_tokens() -> List[Dict[str, Any]]:
-    """Return a list of stalled/orphan/dust asset descriptors.
+def append_policy_rows(sh, rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
 
-    Shape of each entry:
-        {
-          "kind": "stalled" | "stalled_major" | "orphan" | "dust",
-          "symbol": "ABC",
-          "qty": 123.45,
-          "days_since_rotation": 4.2 or None,
-          "venues": ["COINBASE", "BINANCEUS"],
-        }
+    ws = _get_ws(sh, POLICY_LOG_WS)
+    header = _ensure_policy_header(ws)
+    col_index = {name: i for i, name in enumerate(header)}
 
-    This is designed to be imported via utils.detect_stalled_tokens()
-    and used by telegram_summaries for counts.
-    """
-    if not ENABLED:
-        info("stalled_asset_detector: disabled via STALLED_DETECTOR_ENABLED=0 (no-op).")
-        return []
+    out_rows: List[List[Any]] = []
+    for r in rows:
+        row = [""] * len(header)
+        for k, v in r.items():
+            if k not in col_index:
+                continue
+            idx = col_index[k]
+            row[idx] = v
+        out_rows.append(row)
 
-    tel = _get_telemetry_snapshot()
-    flat = tel.get("flat") or {}
-    by_venue = tel.get("by_venue") or {}
-    age_sec = tel.get("age_sec")
+    if out_rows:
+        ws.append_rows(out_rows, value_input_option="RAW")
+    return len(out_rows)
 
-    # If telemetry is missing or stale, bail out quietly.
-    if age_sec is None:
-        info("stalled_asset_detector: telemetry has no ts/age; skipping detection.")
-        return []
-    if age_sec > STALLED_TELEMETRY_MAX_AGE_SEC:
-        info(
-            f"stalled_asset_detector: telemetry age {int(age_sec)}s "
-            f"> STALLED_TELEMETRY_MAX_AGE_SEC={STALLED_TELEMETRY_MAX_AGE_SEC}; skipping."
-        )
-        return []
 
-    last_rot = _load_last_rotation_activity()
-    now = datetime.now(timezone.utc)
+# ==== Core detection ====
 
+def classify_balances(
+    balances: List[Dict[str, Any]],
+    last_trades: Dict[Tuple[str, str], datetime],
+) -> List[Dict[str, Any]]:
+    now = _utcnow()
     anomalies: List[Dict[str, Any]] = []
 
-    for sym_raw, raw_qty in flat.items():
-        symbol = str_or_empty(sym_raw).upper()
-        if not symbol:
-            continue
-        try:
-            qty = float(raw_qty or 0)
-        except Exception:
-            continue
-        if qty <= 0:
-            continue
+    for b in balances:
+        asset = b["asset"]
+        venue = b["venue"]
+        total = float(b.get("total", 0.0))
 
-        # Find venues where this symbol is present with >0 balance.
-        venues: List[str] = []
-        for venue, assets in (by_venue or {}).items():
-            try:
-                a_val = float((assets or {}).get(symbol, 0) or 0)
-            except Exception:
-                a_val = 0.0
-            if a_val > 0:
-                venues.append(str(venue).upper())
+        if asset in STABLE_SYMBOLS:
+            min_bal = STALL_MIN_STABLE_BAL
+        else:
+            min_bal = STALL_MIN_BALANCE
 
-        last_dt = last_rot.get(symbol)
-        days: Optional[float] = None
-        if last_dt:
-            days = (now - last_dt).total_seconds() / 86400.0
-
-        # Case 1: asset appears in telemetry but never in Rotation_Log ⇒ orphan
-        if last_dt is None:
-            anomalies.append(
-                {
-                    "kind": "orphan",
-                    "symbol": symbol,
-                    "qty": qty,
-                    "days_since_rotation": None,
-                    "venues": venues,
-                }
-            )
+        if total < min_bal:
+            # Treat as dust, skip; we can add dust classification later if desired.
             continue
 
-        # Case 2: stalled assets — last Rotation_Log touch older than threshold
-        if days is not None and days >= STALLED_MIN_AGE_DAYS and qty > STALLED_MIN_QTY:
-            kind = "stalled_major" if symbol in MAJORS else "stalled"
-            anomalies.append(
-                {
-                    "kind": kind,
-                    "symbol": symbol,
-                    "qty": qty,
-                    "days_since_rotation": round(days, 2),
-                    "venues": venues,
-                }
-            )
+        key = (venue, asset)
+        last_ts = last_trades.get(key)
+        classification = None
+        age_days = None
+
+        if last_ts is None:
+            classification = "orphan"
+        else:
+            delta = now - last_ts
+            age_days = delta.total_seconds() / 86400.0
+
+            if asset in STABLE_SYMBOLS:
+                if age_days is not None and age_days >= STALL_STABLE_DAYS:
+                    classification = "stable_stuck"
+            else:
+                if age_days is not None and age_days >= STALL_DETECT_DAYS:
+                    classification = "stalled"
+
+        if classification is None:
             continue
 
-        # Case 3: dust — tiny residual balances with "old enough" history
-        if (
-            symbol not in STABLES
-            and qty <= STALLED_DUST_MAX_QTY
-            and days is not None
-            and days >= 1.0
-        ):
-            anomalies.append(
-                {
-                    "kind": "dust",
-                    "symbol": symbol,
-                    "qty": qty,
-                    "days_since_rotation": round(days, 2),
-                    "venues": venues,
-                }
-            )
+        anomalies.append(
+            {
+                "asset": asset,
+                "venue": venue,
+                "total": total,
+                "last_ts": last_ts.isoformat() if last_ts else "",
+                "age_days": age_days,
+                "classification": classification,
+            }
+        )
 
     return anomalies
 
 
-# ----- Job entrypoint ---------------------------------------------------------
+def build_policy_rows(anomalies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    now_iso = _utcnow().isoformat(timespec="seconds")
 
-
-def run_stalled_asset_detector() -> None:
-    """Scheduled job entrypoint (called via main._safe_call).
-
-    - Runs detection
-    - Logs a compact Telegram summary (de-duped)
-    - Best-effort writes to Policy_Log via policy_logger, if present
-    """
-    if not ENABLED:
-        info("run_stalled_asset_detector: disabled (STALLED_DETECTOR_ENABLED=0).")
-        return
-
-    anomalies = detect_stalled_tokens()
-    if not anomalies:
-        info("run_stalled_asset_detector: no stalled/orphan/dust assets detected.")
-        return
-
-    # Summarize counts by kind
-    counts: Dict[str, int] = {}
+    rows: List[Dict[str, Any]] = []
     for a in anomalies:
-        k = a.get("kind", "unknown")
-        counts[k] = counts.get(k, 0) + 1
+        asset = a["asset"]
+        venue = a["venue"]
+        total = a["total"]
+        last_ts = a.get("last_ts") or ""
+        age_days = a.get("age_days")
+        classification = a["classification"]
 
-    tel = _get_telemetry_snapshot()
-    age_sec = tel.get("age_sec")
-    if age_sec is None:
-        age_str = "unknown"
-    elif age_sec < 300:
-        age_str = f"{int(age_sec)}s"
-    else:
-        age_str = f"{int(age_sec // 60)}m"
+        if age_days is None:
+            age_str = "no trade history"
+        else:
+            age_str = f"{age_days:.1f}d since last trade"
 
-    # Top examples sorted by days_since_rotation (desc), then qty (desc)
-    def _sort_key(a: Dict[str, Any]):
-        d = a.get("days_since_rotation") or 0.0
-        q = a.get("qty") or 0.0
-        return (float(d), float(q))
+        reason = (
+            f"{classification} asset detected: {asset} on {venue}, "
+            f"balance={total}, {age_str} (last_ts='{last_ts}')"
+        )
 
-    examples: List[str] = []
-    for a in sorted(anomalies, key=_sort_key, reverse=True)[:5]:
-        sym = a.get("symbol", "?")
-        qty = a.get("qty", 0)
-        ds = a.get("days_since_rotation")
-        ds_str = "?" if ds is None else f"{ds:.1f}d"
-        venues = a.get("venues") or []
-        v_str = ",".join(venues) if venues else "—"
-        kind = a.get("kind", "stalled")
-        examples.append(f"{sym} {qty} ({kind}, {ds_str}, {v_str})")
+        notes = {
+            "classification": classification,
+            "asset": asset,
+            "venue": venue,
+            "balance_total": total,
+            "last_trade_ts": last_ts,
+            "age_days": age_days,
+            "thresholds": {
+                "STALL_DETECT_DAYS": STALL_DETECT_DAYS,
+                "STALL_ORPHAN_DAYS": STALL_ORPHAN_DAYS,
+                "STALL_MIN_BALANCE": STALL_MIN_BALANCE,
+                "STALL_MIN_STABLE_BALANCE": STALL_MIN_STABLE_BAL,
+                "STALL_STABLE_DAYS": STALL_STABLE_DAYS,
+            },
+        }
 
-    count_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-    lines = [
-        "🧊 *Stalled Asset Detector*",
-        f"Telemetry age: {age_str}",
-        f"Counts: {count_str}",
-    ]
-    if examples:
-        lines.append("Examples:")
-        for line in examples:
-            lines.append(f"• {line}")
+        row = {
+            "Timestamp": now_iso,
+            "Token": asset,
+            "Action": "STALL_DETECTOR",
+            "Amount_USD": "",  # we don't compute USD here yet
+            "OK": "NO",
+            "Reason": reason,
+            "Patched": "",
+            "Venue": venue,
+            "Quote": "",
+            "Liquidity": "",
+            "Cooldown_Min": "",
+            "Notes": json.dumps(notes, separators=(",", ":")),
+            "Intent_ID": "stalled_asset_detector",
+            "Symbol": "",
+            "Decision": classification,
+            "Source": "bus/stalled_asset_detector",
+        }
+        rows.append(row)
 
-    text = "\n".join(lines)
+    return rows
 
-    # De-duped Telegram alert
-    send_telegram_message_dedup(
-        key="stalled_assets",
-        text=text,
-        ttl_min=STALLED_DETECTOR_TTL_MIN,
-    )
 
-    # Best-effort Policy_Log entry per anomaly (if policy_logger is available)
+def send_telegram_summary(anomalies: List[Dict[str, Any]]) -> None:
+    if not anomalies:
+        return
+
+    counts = {}
+    for a in anomalies:
+        c = a["classification"]
+        counts[c] = counts.get(c, 0) + 1
+
+    lines = ["[NovaTrade] Stalled Asset Detector"]
+    for c, n in sorted(counts.items(), key=lambda kv: kv[0]):
+        lines.append(f"- {c}: {n}")
+
+    # Include up to 5 most severe examples
+    top = anomalies[:5]
+    lines.append("")
+    lines.append("Top examples:")
+    for a in top:
+        asset = a["asset"]
+        venue = a["venue"]
+        total = a["total"]
+        cls = a["classification"]
+        age_days = a.get("age_days")
+        if age_days is None:
+            age_str = "no trade history"
+        else:
+            age_str = f"{age_days:.1f}d"
+        lines.append(f"  • {cls}: {asset} on {venue}, bal={total}, age={age_str}")
+
+    msg = "\n".join(lines)
     try:
-        from policy_logger import log_policy_event  # type: ignore
-    except Exception:
-        log_policy_event = None  # type: ignore
+        send_telegram_message_dedup(msg, key="stalled_asset_detector")
+    except Exception as e:
+        warn(f"Telegram summary failed: {e}")
 
-    if log_policy_event:
-        for a in anomalies:
-            try:
-                msg = (
-                    f"{a.get('kind')} {a.get('symbol')} "
-                    f"qty={a.get('qty')} venues={','.join(a.get('venues') or [])}"
-                )
-                log_policy_event(
-                    source="stalled_asset_detector",
-                    level="WARN",
-                    message=msg,
-                    context=a,
-                )
-            except Exception as e:
-                warn(f"stalled_asset_detector: policy_log failed: {e}")
+
+def main() -> None:
+    now = _utcnow().isoformat(timespec="seconds")
+    print(f"[stalled_asset_detector] Starting scan at {now}")
+
+    sh = _open_sheet()
+    balances = load_wallet_balances(sh)
+    print(f"[stalled_asset_detector] Loaded {len(balances)} wallet rows")
+
+    last_trades = load_last_trades(sh)
+    print(f"[stalled_asset_detector] Loaded {len(last_trades)} last-trade entries")
+
+    anomalies = classify_balances(balances, last_trades)
+    print(f"[stalled_asset_detector] Found {len(anomalies)} anomalies")
+
+    if not anomalies:
+        print("[stalled_asset_detector] No anomalies detected; exiting")
+        return
+
+    rows = build_policy_rows(anomalies)
+    written = append_policy_rows(sh, rows)
+    print(f"[stalled_asset_detector] Appended {written} rows to {POLICY_LOG_WS}")
+
+    send_telegram_summary(anomalies)
+
+
+if __name__ == "__main__":
+    main()
