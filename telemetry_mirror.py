@@ -31,17 +31,19 @@ Safe to run ad-hoc or on a schedule.
 """
 
 from __future__ import annotations
-import os
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
+import os
+import time
+import requests
+
 from utils import sheets_append_rows, warn, info  # type: ignore
 
-try:
-    import wsgi as bus_wsgi  # type: ignore
-except Exception:
-    bus_wsgi = None  # type: ignore
+# Base URL to talk to our own Bus. PORT is present in Render.
+_PORT = os.getenv("PORT", "10000")
+_BASE = os.getenv("TELEMETRY_LAST_URL_BASE", f"http://localhost:{_PORT}")
+LAST_URL = os.getenv("TELEMETRY_LAST_URL", f"{_BASE}/api/telemetry/last")
 
 SHEET_URL = os.getenv("SHEET_URL", "")
 
@@ -65,15 +67,36 @@ def _utcnow() -> datetime:
 
 
 def _get_telemetry() -> Dict[str, Any]:
-    if bus_wsgi is None:
-        warn("telemetry_mirror: wsgi module not importable; no telemetry.")
-        return {}
-    tel = getattr(bus_wsgi, "_last_tel", None) or {}
-    if not isinstance(tel, dict):
-        warn("telemetry_mirror: _last_tel not a dict; ignoring.")
-        return {}
-    return tel
+    """
+    Fetch the latest telemetry snapshot from the running Bus via HTTP.
 
+    Expects the /api/telemetry/last endpoint added in wsgi.py to return:
+        {"ok": true, "data": {"agent_id": ..., "by_venue": {...}, "flat": {...}, "ts": ...}}
+    """
+    try:
+        resp = requests.get(LAST_URL, timeout=5)
+    except Exception as e:
+        warn(f"telemetry_mirror: error calling {LAST_URL}: {e}")
+        return {}
+
+    if resp.status_code != 200:
+        warn(f"telemetry_mirror: {LAST_URL} -> HTTP {resp.status_code}")
+        return {}
+
+    try:
+        body = resp.json()
+    except Exception as e:
+        warn(f"telemetry_mirror: invalid JSON from {LAST_URL}: {e}")
+        return {}
+
+    if not body.get("ok"):
+        warn(f"telemetry_mirror: endpoint returned ok=false: {body}")
+        return {}
+
+    data = body.get("data") or {}
+    if not isinstance(data, dict):
+        return {}
+    return data
 
 def mirror_telemetry_once() -> None:
     if not TELEMETRY_MIRROR_ENABLED:
