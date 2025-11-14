@@ -531,6 +531,12 @@ def main() -> None:
 
     send_telegram_summary(anomalies)
 
+def run_stalled_asset_detector() -> None:
+    """
+    Adapter used by the boot scheduler (_safe_call).
+    Simply delegates to main(), which runs a full scan.
+    """
+    main()
 
 if __name__ == "__main__":
     main()
