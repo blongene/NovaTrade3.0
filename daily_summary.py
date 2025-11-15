@@ -259,7 +259,9 @@ def daily_phase5_summary():
 
     sh = _retry(_open_sheet)
 
+    # ------------------------------------------------------------------ #
     # Vault Intelligence (ready / total)
+    # ------------------------------------------------------------------ #
     try:
         vi_ws = _retry(sh.worksheet, VAULT_WS_NAME)
         vi = _retry(vi_ws.get_all_records)
@@ -276,7 +278,9 @@ def daily_phase5_summary():
             ready += 1
     total = len(vi)
 
-    # Policy approvals/denials in last 24h
+    # ------------------------------------------------------------------ #
+    # Policy approvals/denials in last 24h (UTC, offset-aware)
+    # ------------------------------------------------------------------ #
     appr = 0
     den = 0
     reasons = {}
@@ -287,11 +291,9 @@ def daily_phase5_summary():
     except Exception:
         pl = []
 
-    # Define 24h window in UTC, offset-aware
     now_utc = datetime.now(timezone.utc)
     since = now_utc - timedelta(hours=24)
 
-    # ---- scan recent Policy_Log rows ----
     for r in pl:
         ts = r.get("Timestamp") or r.get("timestamp") or ""
         t = _safe_iso(ts)
@@ -324,14 +326,94 @@ def daily_phase5_summary():
     top_denials = sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:3]
     reason_str = ", ".join([f"{k} ({v})" for k, v in top_denials]) if top_denials else "—"
 
+    # ------------------------------------------------------------------ #
+    # Wallet snapshot from Wallet_Monitor (latest timestamp only)
+    # ------------------------------------------------------------------ #
+    WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
+    STABLE_TOKENS = {"USD", "USDT", "USDC", "ZUSD"}
+
+    wallet_line = ""
+
+    try:
+        wm_ws = _retry(sh.worksheet, WALLET_MONITOR_WS)
+        wm_rows = _retry(wm_ws.get_all_records)
+    except Exception:
+        wm_rows = []
+
+    if wm_rows:
+        best_ts = None
+        best_rows = []
+
+        # Find the most recent timestamp
+        for r in wm_rows:
+            ts_raw = r.get("Timestamp") or r.get("timestamp") or ""
+            t = _safe_iso(ts_raw)
+            if not t:
+                continue
+
+            # Normalize to aware UTC
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            else:
+                t = t.astimezone(timezone.utc)
+
+            if best_ts is None or t > best_ts:
+                best_ts = t
+                best_rows = [r]
+            elif t == best_ts:
+                best_rows.append(r)
+
+        if best_ts and best_rows:
+            by_venue = {}
+
+            def _safe_float_or_zero(val):
+                try:
+                    if val is None or val == "":
+                        return 0.0
+                    return float(val)
+                except Exception:
+                    return 0.0
+
+            for r in best_rows:
+                venue = (r.get("Venue") or r.get("venue") or "").strip() or "?"
+                asset = (r.get("Asset") or r.get("asset") or "").strip().upper()
+                free = _safe_float_or_zero(r.get("Free") or r.get("free"))
+
+                info = by_venue.setdefault(venue, {"tokens": 0, "stable": 0.0})
+                info["tokens"] += 1
+                if asset in STABLE_TOKENS:
+                    info["stable"] += free
+
+            parts = []
+            for venue in sorted(by_venue.keys()):
+                info = by_venue[venue]
+                tokens = info["tokens"]
+                stable = info["stable"]
+                if stable > 0:
+                    parts.append(f"{venue}: {tokens} tokens, ~{stable:.2f} stable")
+                else:
+                    parts.append(f"{venue}: {tokens} tokens")
+
+            if parts:
+                ts_str = best_ts.strftime("%Y-%m-%d %H:%M")
+                desc = "; ".join(parts)
+                wallet_line = f"Wallets (snapshot {ts_str} UTC): {desc}\n"
+
+    # ------------------------------------------------------------------ #
     # Optional Bus outbox snapshot
+    # ------------------------------------------------------------------ #
     outbox_line = ""
     ob = _bus_outbox_snapshot()
     if ob:
         d, l, q = ob
-        outbox_line = f"\nBus Outbox: done <code>{d}</code>, leased <code>{l}</code>, queued <code>{q}</code>"
+        outbox_line = (
+            f"\nBus Outbox: done <code>{d}</code>, "
+            f"leased <code>{l}</code>, queued <code>{q}</code>"
+        )
 
+    # ------------------------------------------------------------------ #
     # Compose message
+    # ------------------------------------------------------------------ #
     et_now = datetime.now(ZoneInfo("America/New_York"))
     mode = os.getenv("REBUY_MODE", os.getenv("MODE", "dryrun"))
     msg = (
@@ -339,6 +421,7 @@ def daily_phase5_summary():
         f"Date (ET): <code>{et_now:%Y-%m-%d}</code> around {DAILY_HOUR_ET:02d}:00\n"
         f"Vault Intelligence: <b>{ready}</b>/<b>{total}</b> rebuy-ready\n"
         f"Policy (24h): <b>{appr}</b> approved / <b>{den}</b> denied\n"
+        f"{wallet_line}"
         f"Top denials: {reason_str}\n"
         f"Mode: <code>{mode}</code>{outbox_line}"
     )
