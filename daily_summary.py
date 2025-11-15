@@ -24,7 +24,8 @@ SVC_JSON          = os.getenv("SVC_JSON", "sentiment-log-service.json")
 
 VAULT_WS_NAME     = os.getenv("VAULT_INTELLIGENCE_WS", "Vault Intelligence")
 POLICY_LOG_WS     = os.getenv("POLICY_LOG_WS", "Policy_Log")
-
+WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
+STABLE_TOKENS = {"USD", "USDT", "USDC", "ZUSD"}
 # Optional: include a tiny Bus health line if this is set
 BASE_URL          = os.getenv("BASE_URL", "").rstrip("/")
 
@@ -164,6 +165,87 @@ def _load_recent_policy_log(ws, hours: int = 24) -> list[dict]:
         })
 
     return out
+def _safe_float_or_zero(val):
+    """Best-effort float conversion; returns 0.0 on any failure."""
+    try:
+        if val is None or val == "":
+            return 0.0
+        return float(val)
+    except Exception:
+        return 0.0
+
+
+def _latest_wallet_snapshot(sheet):
+    """
+    Read Wallet_Monitor and return (snapshot_ts_utc_str, summary_line) or None.
+
+    summary_line example:
+      'COINBASE: 2 tokens, ~19.30 stable; BINANCEUS: 1 tokens, ~17.47 stable'
+    """
+    try:
+        ws = _retry(sheet.worksheet, WALLET_MONITOR_WS)
+        rows = _retry(ws.get_all_records)
+    except Exception:
+        return None
+
+    if not rows:
+        return None
+
+    # Find the most recent timestamp
+    best_ts = None
+    best_rows = []
+
+    for r in rows:
+        ts_raw = r.get("Timestamp") or r.get("timestamp") or ""
+        t = _safe_iso(ts_raw)
+        if not t:
+            continue
+
+        # Normalize to aware UTC
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        else:
+            t = t.astimezone(timezone.utc)
+
+        if best_ts is None or t > best_ts:
+            best_ts = t
+            best_rows = [r]
+        elif t == best_ts:
+            best_rows.append(r)
+
+    if not best_ts or not best_rows:
+        return None
+
+    # Group by venue and compute counts + stable totals
+    by_venue = {}
+
+    for r in best_rows:
+        venue = (r.get("Venue") or r.get("venue") or "").strip() or "?"
+        asset = (r.get("Asset") or r.get("asset") or "").strip().upper()
+        free  = _safe_float_or_zero(r.get("Free") or r.get("free"))
+
+        info = by_venue.setdefault(venue, {"tokens": 0, "stable": 0.0})
+        info["tokens"] += 1
+        if asset in STABLE_TOKENS:
+            info["stable"] += free
+
+    # Format summary parts
+    parts = []
+    for venue in sorted(by_venue.keys()):
+        info = by_venue[venue]
+        tokens = info["tokens"]
+        stable = info["stable"]
+        if stable > 0:
+            parts.append(f"{venue}: {tokens} tokens, ~{stable:.2f} stable")
+        else:
+            parts.append(f"{venue}: {tokens} tokens")
+
+    if not parts:
+        return None
+
+    ts_str = best_ts.strftime("%Y-%m-%d %H:%M")
+    summary_line = "; ".join(parts)
+    return ts_str, summary_line
 
 # ---- Core logic -------------------------------------------------------------
 
