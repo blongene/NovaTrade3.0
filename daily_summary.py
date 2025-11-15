@@ -126,6 +126,47 @@ def _bus_outbox_snapshot():
     except Exception:
         return None
 
+def _load_recent_policy_log(ws, hours: int = 24) -> list[dict]:
+    """
+    Load recent decisions from Policy_Log for the last `hours`.
+    Column assumptions:
+      A: timestamp (ISO)
+      B: asset
+      C: source (e.g. STALL_DETECTOR, MANUAL_REBUY, etc.)
+      D: ?
+      E: approved? (YES/NO)
+      F: reason/notes
+      G: venue (optional)
+    """
+    since_utc = datetime.now(timezone.utc) - timedelta(hours=hours)
+    rows = ws.get_all_values()
+    header, data = rows[0], rows[1:]
+    out: list[dict] = []
+
+    for row in data:
+        if not row or not row[0]:
+            continue
+        t = _safe_iso(row[0])
+        # If we couldn't parse the timestamp, or it's too old, skip
+        if not t or t < since_utc:
+            continue
+
+        asset = row[1]
+        source = row[2]
+        approved_flag = (row[4] or "").strip().upper() == "YES"
+        reason = (row[5] or "").strip()
+        venue = (row[6] or "").strip()
+
+        out.append({
+            "ts": t,
+            "asset": asset,
+            "source": source,
+            "approved": approved_flag,
+            "reason": reason,
+            "venue": venue,
+        })
+
+    return out
 
 # ---- Core logic -------------------------------------------------------------
 
