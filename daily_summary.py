@@ -47,10 +47,17 @@ def _to_bool(v) -> bool:
     return s in ("true", "yes", "y", "1")
 
 def _safe_iso(ts: str):
-    # Accepts ISO-like strings with/without Z and fractional seconds
+    """Parse ISO timestamp into a UTC-aware datetime, or None."""
+    if not ts:
+        return None
     try:
-        ts = (ts or "").strip().replace("Z", "")
-        return datetime.fromisoformat(ts)
+        dt = datetime.fromisoformat(ts)
+        # If the sheet gives us a naive timestamp, assume it is UTC.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
     except Exception:
         return None
 
