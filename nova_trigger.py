@@ -1,5 +1,7 @@
 # nova_trigger.py — parse + route manual commands, Telegram ping / Policy Spine
 
+from __future__ import annotations
+
 import os
 import json
 import time
@@ -29,7 +31,7 @@ DEFAULT_AGENT_TARGET = os.getenv("DEFAULT_AGENT_TARGET", "edge-primary,edge-nl1"
 POLICY_ID = os.getenv("POLICY_ID", "main")
 
 # ---------------------------------------------------------------------------
-# Telegram helper (reuses your existing infra)
+# Telegram helper
 # ---------------------------------------------------------------------------
 
 
@@ -45,7 +47,7 @@ def send_telegram(text: str) -> None:
             timeout=10,
         )
     except Exception:
-        # We deliberately swallow errors here; this is best-effort only.
+        # best-effort only; ignore failures
         pass
 
 
@@ -54,15 +56,8 @@ def send_telegram(text: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _hmac(sig_payload: Dict[str, Any]) -> str:
-    """
-    Legacy helper: compute HMAC over a JSON payload.
-    Kept for backwards-compat, although _enqueue does not currently use it.
-    """
-    raw = json.dumps(
-        sig_payload, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")
-    return hmac.new(OUTBOX_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+def _hmac_payload(body: bytes) -> str:
+    return hmac.new(OUTBOX_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
 
 def _enqueue(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -72,15 +67,11 @@ def _enqueue(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     url = os.getenv("OPS_ENQUEUE_URL") or (BASE_URL + "/api/ops/enqueue")
 
-    raw = json.dumps(
-        payload, separators=(",", ":"), sort_keys=False
-    ).encode("utf-8")
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
 
     if OUTBOX_SECRET:
-        mac = hmac.new(
-            OUTBOX_SECRET.encode("utf-8"), raw, hashlib.sha256
-        ).hexdigest()
+        mac = _hmac_payload(raw)
         headers["X-Outbox-Signature"] = f"sha256={mac}"
 
     try:
@@ -91,12 +82,12 @@ def _enqueue(payload: Dict[str, Any]) -> Dict[str, Any]:
             "text": r.text[:200],
             "url": url,
         }
-    except Exception as e:
+    except Exception as e:  # pragma: no cover - defensive
         return {"ok": False, "status": 0, "text": str(e), "url": url}
 
 
 # ---------------------------------------------------------------------------
-# Manual rebuy parsing + routing
+# Manual rebuy parsing
 # ---------------------------------------------------------------------------
 
 
@@ -140,13 +131,18 @@ def parse_manual(msg: str) -> Optional[Dict[str, Any]]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Routing through Policy Spine
+# ---------------------------------------------------------------------------
+
+
 def route_manual(msg: str) -> Dict[str, Any]:
     """
     Entry-point used by NovaTrigger.
 
     - Parses MANUAL_REBUY commands
     - Builds a Policy Spine–aware intent
-    - Evaluates via PolicyEngine
+    - Evaluates via PolicyEngine (tuple: ok, reason, patched_intent)
     - Optionally enqueues a trade into the Outbox (when REBUY_MODE=live)
     - Sends a brief Telegram notification
     """
@@ -154,11 +150,13 @@ def route_manual(msg: str) -> Dict[str, Any]:
     if not parsed:
         return {"ok": False, "reason": "unrecognized manual format"}
 
-    # Build a stable Intent_ID + metadata for the Policy Spine
     now = int(parsed.get("ts") or time.time())
     token = parsed["token"]
+
+    # Stable identity for Policy Spine
     intent_id = f"manual_rebuy:{token}:{now}"
 
+    # Legacy / external intent with spine metadata
     intent: Dict[str, Any] = {
         **parsed,
         "id": intent_id,
@@ -168,19 +166,36 @@ def route_manual(msg: str) -> Dict[str, Any]:
     }
 
     pe = PolicyEngine()
-    # If you have on-sheet metrics, pass them as asset_state; for these manual
-    # majors we're fine leaving this empty for now.
     asset_state: Dict[str, Any] = {}
-    decision = pe.validate(intent, asset_state)
 
-    # Enqueue only if policy says OK AND we're in live mode
+    # PolicyEngine.validate returns (ok: bool, reason: str, patched_intent: dict)
+    ok, reason, patched = pe.validate(intent, asset_state)
+
+    # Build a friendly decision dict for our own use
+    decision: Dict[str, Any] = dict(patched or {})
+    decision.setdefault("ok", ok)
+    decision.setdefault("reason", reason)
+    decision.setdefault("token", parsed["token"])
+    decision.setdefault("venue", parsed["venue"])
+    decision.setdefault("ts", now)
+    decision.setdefault("amount_usd", parsed["amount_usd"])
+    if "quote" not in decision and parsed.get("quote"):
+        decision["quote"] = parsed["quote"]
+
+    # If symbol missing, construct from token + quote as a fallback
+    if "symbol" not in decision:
+        q = decision.get("quote") or parsed.get("quote") or "USDT"
+        decision["symbol"] = f"{decision['token']}{q}"
+
     enq: Dict[str, Any] = {"ok": False}
+
+    # Only enqueue if policy says OK AND we're in live mode
     if decision.get("ok") and REBUY_MODE == "live":
         symbol = decision["symbol"]
-        quote_amt = float(decision["amount_usd"])
+        quote_amt = float(decision.get("amount_usd", parsed["amount_usd"]))
 
         payload: Dict[str, Any] = {
-            "venue": decision["venue"],
+            "venue": decision.get("venue", parsed["venue"]),
             "symbol": symbol,
             "side": "BUY",
             # ops_enqueue expects amount in the quote currency (USD/USDT/USDC)
@@ -198,10 +213,9 @@ def route_manual(msg: str) -> Dict[str, Any]:
 
     # Telegram notice (brief)
     policy_word = "OK" if decision.get("ok") else "DENY"
-    reason = decision.get("reason")
     send_telegram(
         f"🔔 Orion voice triggered: {msg}\n"
-        f"Policy: {policy_word} ({reason})\n"
+        f"Policy: {policy_word} ({decision.get('reason')})\n"
         f"Enqueued: {enq.get('ok')} mode={REBUY_MODE}"
     )
 
