@@ -1,50 +1,40 @@
-# NovaTrade policy.yaml — tuned for COINBASE + BINANCEUS primary; KRAKEN later
-# To use USDC on Coinbase, either change below to COINBASE: USDC or set env:
-#   POLICY_PREFER_QUOTES_JSON={"COINBASE":"USDC","BINANCEUS":"USDT"}
-# To enable Kraken later, update venue_order and add credentials, and (optionally)
-# set a Kraken min notional: venue_min_notional_usd: {KRAKEN: 20}
-
+# policy.yaml — Phase 8B / Manual Rebuy–aware
 policy:
+  # --- Pair / venue routing ---
   prefer_quotes:
     BINANCEUS: USDT
     COINBASE: USD
-    KRAKEN: USDT
-  venue_order:
-  - COINBASE
-  - BINANCEUS
-  venue_min_notional_usd:
-    BINANCEUS: 10
-    KRAKEN: 5
-    COINBASE: 10
-  min_qty_floors:
-    KRAKEN:BTC-USDT: 0.0001
-    KRAKEN:ETH-USDT: 0.001
-    BINANCEUS:BTCUSDT: 0.0001
-  max_per_coin_usd: 25
-  min_quote_reserve_usd: 25
-  keepback_usd: 5
-  canary_max_usd: 11
-  on_short_quote: resize
-  allow_price_unknown: false
-  min_liquidity_usd: 50000
-  cool_off_minutes_after_trade: 30
+    KRAKEN:  USDT
+
   blocked_symbols:
-  - BARK
-  - BONK
-  class_caps_usd:
-    L1: 100
-    L2: 50
-    MEME: 15
-    AI: 40
-  per_asset_overrides:
-    BTC:
-      max_per_coin_usd: 75
-      min_quote_reserve_usd: 50
-    MIND:
-      canary_max_usd: 9
-      keepback_usd: 8
-  per_venue_overrides:
-    KRAKEN:
-      min_quote_reserve_usd: 30
-    COINBASE:
-      canary_max_usd: 15
+    - BARK
+    - BONK
+
+  # --- Risk & sizing (per intent) ---
+  max_per_coin_usd: 25          # hard cap per single rebuy
+  min_quote_reserve_usd: 25     # below this, deny (for that quote/venue)
+  keepback_usd: 5               # keep at least this much unspent
+  canary_max_usd: 11            # first safety cap while system is young
+  on_short_quote: resize        # resize | deny
+
+  # --- Price expectations ---
+  allow_price_unknown: false    # require price for all buys that need sizing
+
+  # --- Cooldowns (still mostly advisory) ---
+  cool_off_minutes_after_trade: 30
+
+  # --- Router preference (if multiple venues viable) ---
+  venue_order:
+    - COINBASE
+    - BINANCEUS
+    - KRAKEN
+
+  # --- Optional advanced knobs ---
+  venue_min_notional_usd:
+    BINANCEUS: 10              # don’t bother with tiny dust rebuys
+    KRAKEN: 5
+
+  # Example per-pair min-qty floors (tweak as needed)
+  min_qty_floors:
+    "BINANCEUS:BTCUSDT": 0.0001
+    "KRAKEN:BTCUSDT":    0.0001
