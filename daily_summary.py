@@ -47,17 +47,14 @@ def _to_bool(v) -> bool:
     return s in ("true", "yes", "y", "1")
 
 def _safe_iso(ts: str):
-    """Parse ISO timestamp into a UTC-aware datetime, or None."""
+    """Parse ISO timestamp into a UTC-aware datetime object."""
     if not ts:
         return None
     try:
         dt = datetime.fromisoformat(ts)
-        # If the sheet gives us a naive timestamp, assume it is UTC.
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            dt = dt.astimezone(timezone.utc)
-        return dt
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -206,12 +203,26 @@ def daily_phase5_summary():
     except Exception:
         pl = []
 
+    now_utc = datetime.now(timezone.utc)
+    since = now_utc - timedelta(hours=24)
+    
     for r in pl:
-        ts = r.get("Timestamp") or r.get("timestamp") or ""
-        t = _safe_iso(ts)
-        if not t or t < since:
-            continue
+    ts = r.get("Timestamp") or r.get("timestamp") or ""
+    t = _safe_iso(ts)
 
+    # Skip if we can’t parse
+    if not t:
+        continue
+
+    # Normalize to UTC + make sure it's aware
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    else:
+        t = t.astimezone(timezone.utc)
+
+    if t < since:
+        continue
+        
         ok = r.get("OK")
         ok_b = _to_bool(ok)
         reason = (r.get("Reason") or r.get("reason") or "ok").strip() or "ok"
