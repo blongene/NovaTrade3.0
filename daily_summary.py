@@ -167,6 +167,9 @@ def _load_recent_policy_log(ws, hours: int = 24) -> list[dict]:
 
 # ---- Core logic -------------------------------------------------------------
 
+from datetime import datetime, timedelta, timezone  # make sure this is at the top
+# from zoneinfo import ZoneInfo  # already present above
+
 def daily_phase5_summary():
     if not SHEET_URL:
         print("SHEET_URL missing; abort.")
@@ -192,7 +195,6 @@ def daily_phase5_summary():
     total = len(vi)
 
     # Policy approvals/denials in last 24h
-    since = datetime.utcnow() - timedelta(hours=24)
     appr = 0
     den = 0
     reasons = {}
@@ -203,26 +205,29 @@ def daily_phase5_summary():
     except Exception:
         pl = []
 
+    # Define 24h window in UTC, offset-aware
     now_utc = datetime.now(timezone.utc)
     since = now_utc - timedelta(hours=24)
-    
+
+    # ---- scan recent Policy_Log rows ----
     for r in pl:
-    ts = r.get("Timestamp") or r.get("timestamp") or ""
-    t = _safe_iso(ts)
+        ts = r.get("Timestamp") or r.get("timestamp") or ""
+        t = _safe_iso(ts)
 
-    # Skip if we can’t parse
-    if not t:
-        continue
+        # Skip if we can’t parse
+        if not t:
+            continue
 
-    # Normalize to UTC + make sure it's aware
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=timezone.utc)
-    else:
-        t = t.astimezone(timezone.utc)
+        # Normalize to UTC + make sure it's aware
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        else:
+            t = t.astimezone(timezone.utc)
 
-    if t < since:
-        continue
-        
+        # Only keep events in the last 24h
+        if t < since:
+            continue
+
         ok = r.get("OK")
         ok_b = _to_bool(ok)
         reason = (r.get("Reason") or r.get("reason") or "ok").strip() or "ok"
@@ -257,7 +262,6 @@ def daily_phase5_summary():
     )
 
     _send_once_per_day(msg)
-
 
 # ---- CLI entry --------------------------------------------------------------
 
