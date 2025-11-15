@@ -494,7 +494,10 @@ class PolicyEngine:
             if "amount" in intent: new_intent["amount"] = intent.get("amount")
             if "price_usd" in intent: new_intent["price_usd"] = intent.get("price_usd")
 
-        decision = self._eng.evaluate_intent(new_intent, context=None)
+        # 🔁 NEW: use default telemetry context (wallet balances from Bus)
+        ctx = _default_context()
+
+        decision = self._eng.evaluate_intent(new_intent, context=ctx)
         ok = bool(decision.get("ok"))
         reason = decision.get("reason", "ok")
         patched = dict(intent)
@@ -515,3 +518,4 @@ class PolicyEngine:
                 pass
 
         return ok, reason, patched
+
