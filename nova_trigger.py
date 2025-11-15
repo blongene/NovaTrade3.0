@@ -1,42 +1,36 @@
-# nova_trigger.py — parse + route manual commands, Telegram ping / Policy Spine
-
+# nova_trigger.py — parse + route manual commands, Telegram ping
 from __future__ import annotations
 
-import os
-import json
-import time
-import hmac
-import hashlib
-import re
-from typing import Optional, Dict, Any
+import os, json, time, re
+from typing import Dict, Any
 
 import requests
-from policy_engine import PolicyEngine
+
+from policy_engine import PolicyEngine  # still imported for backwards compat
+from manual_rebuy_policy import evaluate_manual_rebuy
+from ops_sign_and_enqueue import attempt as _ops_attempt  # reuse the canonical signer
 
 # ---------------------------------------------------------------------------
-# Config / env
+# Config
 # ---------------------------------------------------------------------------
 
 BASE_URL = (
-    os.getenv("OPS_BASE_URL")          # optional override just for enqueue calls
-    or os.getenv("CLOUD_BASE_URL")
-    or "https://novatrade3-0.onrender.com"   # fallback to your service URL
+    os.getenv("OPS_BASE_URL") or          # optional new var just for enqueue calls
+    os.getenv("CLOUD_BASE_URL") or
+    "https://novatrade3-0.onrender.com"   # your service URL
 ).rstrip("/")
 
-REBUY_MODE = os.getenv("REBUY_MODE", "dryrun").lower()
-OUTBOX_SECRET = os.getenv("OUTBOX_SECRET", "")
-
-# Policy Spine metadata
-DEFAULT_AGENT_TARGET = os.getenv("DEFAULT_AGENT_TARGET", "edge-primary,edge-nl1")
-POLICY_ID = os.getenv("POLICY_ID", "main")
+REBUY_MODE        = os.getenv("REBUY_MODE", "dryrun").lower()
+OUTBOX_SECRET_RAW = os.getenv("OUTBOX_SECRET", "")
+OUTBOX_SECRET     = OUTBOX_SECRET_RAW.encode() if OUTBOX_SECRET_RAW else b""
+MANUAL_AGENT_ID   = os.getenv("MANUAL_AGENT_ID", os.getenv("EDGE_AGENT_ID", "edge-primary"))
 
 # ---------------------------------------------------------------------------
-# Telegram helper
+# Telegram helper (minimal; reuses existing BOT_TOKEN / TELEGRAM_CHAT_ID)
 # ---------------------------------------------------------------------------
-
 
 def send_telegram(text: str) -> None:
-    bot = os.getenv("BOT_TOKEN")
+    bot  = os.getenv("BOT_TOKEN")
     chat = os.getenv("TELEGRAM_CHAT_ID")
     if not (bot and chat):
         return
@@ -47,77 +41,74 @@ def send_telegram(text: str) -> None:
             timeout=10,
         )
     except Exception:
-        # best-effort only; ignore failures
-        pass
-
+        # soft-fail; Nova heartbeat will still be alive
+        return
 
 # ---------------------------------------------------------------------------
-# Outbox enqueue helper
+# Low-level enqueue helper — wraps ops_sign_and_enqueue.attempt
 # ---------------------------------------------------------------------------
-
-
-def _hmac_payload(body: bytes) -> str:
-    return hmac.new(OUTBOX_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
-
 
 def _enqueue(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Sends raw JSON body to OPS_ENQUEUE_URL (or BASE_URL + /api/ops/enqueue)
-    with X-Outbox-Signature: sha256=<hex(hmac(body))> when OUTBOX_SECRET is set.
+    Wraps the /ops/enqueue signing logic used by the CLI helper.
+
+    payload example:
+      {
+        "venue": "BINANCEUS",
+        "symbol": "BTC/USDT",
+        "side": "BUY",
+        "amount": "25",          # quote or base per executor config
+        "time_in_force": "IOC",
+        ...
+      }
     """
-    url = os.getenv("OPS_ENQUEUE_URL") or (BASE_URL + "/api/ops/enqueue")
+    if not OUTBOX_SECRET:
+        return {"ok": False, "error": "OUTBOX_SECRET missing", "url": f"{BASE_URL}/ops/enqueue"}
 
-    raw = json.dumps(payload, separators=(",", ":"), sort_keys=False).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    body = {
+        "agent_id": MANUAL_AGENT_ID,
+        "type": "order.place",
+        "payload": payload,
+    }
 
-    if OUTBOX_SECRET:
-        mac = _hmac_payload(raw)
-        headers["X-Outbox-Signature"] = f"sha256={mac}"
+    ok, label, resp = _ops_attempt(BASE_URL, OUTBOX_SECRET, body)
+    j = resp or {}
 
-    try:
-        r = requests.post(url, data=raw, headers=headers, timeout=20)
-        return {
-            "ok": r.ok,
-            "status": r.status_code,
-            "text": r.text[:200],
-            "url": url,
-        }
-    except Exception as e:  # pragma: no cover - defensive
-        return {"ok": False, "status": 0, "text": str(e), "url": url}
-
+    return {
+        "ok": bool(ok and j.get("ok", False)),
+        "label": label,
+        "json": j,
+        "status": j.get("status"),
+        "url": f"{BASE_URL}/ops/enqueue",
+        "text": json.dumps(j)[:200] if j else "",
+    }
 
 # ---------------------------------------------------------------------------
-# Manual rebuy parsing
+# Manual rebuy parsing + routing
 # ---------------------------------------------------------------------------
 
-
-def parse_manual(msg: str) -> Optional[Dict[str, Any]]:
+def parse_manual(msg: str) -> Dict[str, Any] | None:
     """
-    Parse a MANUAL_REBUY command from NovaTrigger.
+    EXAMPLES (from NovaTrigger sheet / Orion Voice):
 
-    Examples:
+      MANUAL_REBUY BTC 5
       MANUAL_REBUY BTC 5 VENUE=BINANCEUS
       MANUAL_REBUY ETH 10 VENUE=COINBASE QUOTE=USD
     """
-    m = re.match(
-        r"^\s*MANUAL_REBUY\s+([A-Za-z0-9]+)\s+(\d+(?:\.\d+)?)\s*(.*)$", msg or ""
-    )
+    m = re.match(r"^\s*MANUAL_REBUY\s+([A-Za-z0-9]+)\s+(\d+(?:\.\d+)?)\s*(.*)$", msg or "")
     if not m:
         return None
 
     token = m.group(1).upper()
-    amt = float(m.group(2))
-    rest = m.group(3) or ""
+    amt   = float(m.group(2))
+    rest  = m.group(3) or ""
 
-    # Parse key=value pairs (VENUE=..., QUOTE=..., etc.)
+    # parse simple KEY=VALUE pairs (VENUE=..., QUOTE=...)
     kv = {
         k.upper(): v.upper()
-        for k, v in re.findall(
-            r"([A-Za-z_]+)\s*=\s*([A-Za-z0-9\-]+)", rest
-        )
+        for k, v in re.findall(r"([A-Za-z_]+)\s*=\s*([A-Za-z0-9\-]+)", rest)
     }
-
-    venue = kv.get("VENUE", "BINANCEUS")
+    venue = kv.get("VENUE", "BINANCEUS").upper()
     quote = kv.get("QUOTE", "")
 
     return {
@@ -130,111 +121,86 @@ def parse_manual(msg: str) -> Optional[Dict[str, Any]]:
         "ts": int(time.time()),
     }
 
-
-# ---------------------------------------------------------------------------
-# Routing through Policy Spine
-# ---------------------------------------------------------------------------
-
-
 def route_manual(msg: str) -> Dict[str, Any]:
     """
-    Entry-point used by NovaTrigger.
-
-    - Parses MANUAL_REBUY commands
-    - Builds a Policy Spine–aware intent
-    - Evaluates via PolicyEngine (tuple: ok, reason, patched_intent)
-    - Optionally enqueues a trade into the Outbox (when REBUY_MODE=live)
-    - Sends a brief Telegram notification
+    Entry point used by nova_trigger_watcher.check_nova_trigger
+    when it sees a MANUAL_REBUY command in NovaTrigger!A1.
     """
-    parsed = parse_manual(msg)
-    if not parsed:
-        return {"ok": False, "reason": "unrecognized manual format"}
+    intent = parse_manual(msg)
+    if not intent:
+        return {
+            "ok": False,
+            "reason": "unrecognized manual format",
+            "decision": {},
+            "enqueue": {"ok": False},
+        }
 
-    now = int(parsed.get("ts") or time.time())
-    token = parsed["token"]
+    # Run through unified policy engine via our manual wrapper
+    decision = evaluate_manual_rebuy(intent)
+    patched  = decision.get("patched") or {}
 
-    # Stable identity for Policy Spine
-    intent_id = f"manual_rebuy:{token}:{now}"
-
-    # Legacy / external intent with spine metadata
-    intent: Dict[str, Any] = {
-        **parsed,
-        "id": intent_id,
-        "agent_target": DEFAULT_AGENT_TARGET,
-        "source": "nova_trigger.manual_rebuy",
-        "policy_id": POLICY_ID,
-    }
-
-    pe = PolicyEngine()
-    asset_state: Dict[str, Any] = {}
-
-    # PolicyEngine.validate returns (ok: bool, reason: str, patched_intent: dict)
-    ok, reason, patched = pe.validate(intent, asset_state)
-
-    # Build a friendly decision dict for our own use
-    decision: Dict[str, Any] = dict(patched or {})
-    decision.setdefault("ok", ok)
-    decision.setdefault("reason", reason)
-    decision.setdefault("token", parsed["token"])
-    decision.setdefault("venue", parsed["venue"])
-    decision.setdefault("ts", now)
-    decision.setdefault("amount_usd", parsed["amount_usd"])
-    if "quote" not in decision and parsed.get("quote"):
-        decision["quote"] = parsed["quote"]
-
-    # If symbol missing, construct from token + quote as a fallback
-    if "symbol" not in decision:
-        q = decision.get("quote") or parsed.get("quote") or "USDT"
-        decision["symbol"] = f"{decision['token']}{q}"
-
+    # enqueue only if OK + live
     enq: Dict[str, Any] = {"ok": False}
-
-    # Only enqueue if policy says OK AND we're in live mode
     if decision.get("ok") and REBUY_MODE == "live":
-        symbol = decision["symbol"]
-        quote_amt = float(decision.get("amount_usd", parsed["amount_usd"]))
+        symbol = patched.get("symbol") or f"{intent['token']}/{patched.get('quote') or intent.get('quote') or 'USDT'}"
+        venue  = patched.get("venue")  or intent.get("venue") or "BINANCEUS"
+        amt_usd = patched.get("amount_usd") or intent.get("amount_usd")
 
-        payload: Dict[str, Any] = {
-            "venue": decision.get("venue", parsed["venue"]),
+        # For now our manual path uses quote-notional = amt_usd; executors on edge side
+        # know whether that is base or quote per venue.
+        quote_amt = str(amt_usd)
+
+        payload = {
+            "venue":  venue,
             "symbol": symbol,
-            "side": "BUY",
-            # ops_enqueue expects amount in the quote currency (USD/USDT/USDC)
-            "amount_quote": quote_amt,
-            "client_id": f"manual-{decision['token']}-{int(decision['ts'])}",
+            "side":   "BUY",
+            "amount": quote_amt,
+            "time_in_force": "IOC",
+            "client_id": f"manual-{intent['token']}-{int(intent['ts'])}",
             "policy_reason": decision.get("reason", "ok"),
-            "intent_id": intent_id,
+            "source": "manual_rebuy",
         }
         enq = _enqueue(payload)
-        print(
-            f"[manual_enq] url={enq.get('url')} "
-            f"status={enq.get('status')} ok={enq.get('ok')} "
-            f"text={enq.get('text')}"
-        )
 
-    # Telegram notice (brief)
-    policy_word = "OK" if decision.get("ok") else "DENY"
+    # Telegram notice (brief, but shows policy outcome)
+    status = decision.get("status", "UNKNOWN")
+    reason = decision.get("reason", "")
+    orig   = decision.get("original_amount_usd")
+    patched_amt = (decision.get("patched") or {}).get("amount_usd", orig)
+
+    sizing_line = "n/a"
+    try:
+        if orig is not None and patched_amt is not None:
+            o = float(orig)
+            p = float(patched_amt)
+            if abs(p - o) > 0.01:
+                sizing_line = f"{o:.2f} → {p:.2f} USD"
+            else:
+                sizing_line = f"{o:.2f} USD"
+    except Exception:
+        pass
+
     send_telegram(
         f"🔔 Orion voice triggered: {msg}\n"
-        f"Policy: {policy_word} ({decision.get('reason')})\n"
+        f"Policy: {status} ({reason or 'ok'})\n"
+        f"Sizing: {sizing_line}\n"
         f"Enqueued: {enq.get('ok')} mode={REBUY_MODE}"
     )
 
-    return {"ok": True, "intent": intent, "decision": decision, "enqueue": enq}
-
+    return {"ok": bool(decision.get("ok")), "intent": intent, "decision": decision, "enqueue": enq}
 
 # ---------------------------------------------------------------------------
-# Shim: trigger_nova_ping, expected by Nova ping infrastructure
+# shim: trigger_nova_ping, expected by Nova ping job
 # ---------------------------------------------------------------------------
-
 
 def trigger_nova_ping(trigger_type: str = "NOVA UPDATE") -> Dict[str, Any]:
     presets = {
-        "SOS": "🚨 *NovaTrade SOS*\nTesting alert path.",
-        "PRESALE ALERT": "🚀 *Presale Alert*\nNew high-score presale detected.",
-        "ROTATION COMPLETE": "🔁 *Rotation Complete*\nVault rotation executed.",
-        "SYNC NEEDED": "🧩 *Sync Needed*\nPlease review latest responses.",
-        "FYI ONLY": "📘 *FYI*\nNon-urgent update.",
-        "NOVA UPDATE": "🧠 *Nova Update*\nSystem improvement deployed.",
+        "SOS": "🚨 *NovaTrade SOS*\\nTesting alert path.",
+        "PRESALE ALERT": "🚀 *Presale Alert*\\nNew high-score presale detected.",
+        "ROTATION COMPLETE": "🔁 *Rotation Complete*\\nVault rotation executed.",
+        "SYNC NEEDED": "🧩 *Sync Needed*\\nPlease review latest responses.",
+        "FYI ONLY": "📘 *FYI*\\nNon-urgent update.",
+        "NOVA UPDATE": "🧠 *Nova Update*\\nSystem improvement deployed.",
     }
     text = presets.get(trigger_type.upper(), f"🔔 *{trigger_type}*")
     send_telegram(text)
