@@ -253,7 +253,7 @@ def daily_phase5_summary():
     et_now = datetime.now(ZoneInfo("America/New_York"))
     mode = os.getenv("REBUY_MODE", os.getenv("MODE", "dryrun"))
     msg = (
-        "🧠 <b>Phase-5 Daily</b>\n"
+        "🧠 <b>NovaTrade Daily Summary</b>\n"
         f"Date (ET): <code>{et_now:%Y-%m-%d}</code> around {DAILY_HOUR_ET:02d}:00\n"
         f"Vault Intelligence: <b>{ready}</b>/<b>{total}</b> rebuy-ready\n"
         f"Policy (24h): <b>{appr}</b> approved / <b>{den}</b> denied\n"
