@@ -202,8 +202,9 @@ def _boot_serialize_first_minute():
 
 def _set_schedules():
     # Frequent cadence
+    _schedule("Nova Trigger Watcher",          "nova_trigger_watcher",       "check_nova_trigger",       every=2, unit="minutes")
     _schedule("Rotation Log Updater",          "rotation_log_updater",       "run_rotation_log_updater", every=60, unit="minutes")
-    _schedule("Rebalance Scanner",             "rebalance_scanner",          "run_rebalance_scanner",   every=60, unit="minutes")
+    _schedule("Rebalance Scanner",             "rebalance_scanner",          "run_rebalance_scanner",    every=60, unit="minutes")
     # Keep legacy wrapper scheduled if other modules rely on it; the enhancer now does the heavy lifting
     _schedule("Rotation Memory",               "rotation_memory",            "run_rotation_memory",     every=60, unit="minutes")
     _schedule("Sentiment Radar",               "sentiment_radar",            "run_sentiment_radar",     every=6,  unit="hours")
