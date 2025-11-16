@@ -241,7 +241,7 @@ def route_manual(msg: str) -> Dict[str, Any]:
     Entry point used by nova_trigger_watcher.check_nova_trigger
     when it sees a MANUAL_REBUY command in NovaTrigger!A1.
     """
-        intent = {
+    intent = {
         "source": "manual_rebuy",
         "token": token,
         "action": "BUY",
@@ -250,27 +250,26 @@ def route_manual(msg: str) -> Dict[str, Any]:
         "quote": quote,
         "ts": time.time(),
         "raw_msg": msg,
-        }
+    }
     
-        # -----------------------------------------------------------------------
-        # B-2: auto price fetch from Unified_Snapshot
-        # -----------------------------------------------------------------------
-        price_usd = None
-        price_reason = ""
+    # -----------------------------------------------------------------------
+    # B-2: auto price fetch from Unified_Snapshot
+    # -----------------------------------------------------------------------
+    price_usd = None
+    price_reason = ""
     
-        try:
-            price_usd, price_reason = _get_price_usd_from_unified_snapshot(token)
-        except Exception as e:
-            price_reason = f"error:{type(e).__name__}"
+    try:
+       price_usd, price_reason = _get_price_usd_from_unified_snapshot(token)
+    except Exception as e:
+        price_reason = f"error:{type(e).__name__}"
     
-        if price_usd and price_usd > 0:
-            intent["price_usd"] = float(price_usd)
-        # else: leave unset; manual_rebuy_policy / PolicyEngine will still
-        #       enforce allow_price_unknown etc.
-    
-        # Run through manual policy (which delegates to PolicyEngine)
-        decision = evaluate_manual_rebuy(intent)
-        patched  = decision.get("patched") or {}
+    if price_usd and price_usd > 0:
+        intent["price_usd"] = float(price_usd)
+    # else: leave unset; manual_rebuy_policy / PolicyEngine will still
+    #       enforce allow_price_unknown etc.
+    # Run through manual policy (which delegates to PolicyEngine)
+    decision = evaluate_manual_rebuy(intent)
+    patched  = decision.get("patched") or {}
 
     # enqueue only if OK + live
     enq: Dict[str, Any] = {"ok": False}
