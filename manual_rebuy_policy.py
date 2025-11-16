@@ -1,91 +1,145 @@
-# manual_rebuy_policy.py — Safe manual rebuy wrapper around PolicyEngine
+"""
+manual_rebuy_policy.py
+
+Wrapper around PolicyEngine for MANUAL_REBUY intents.
+
+Responsibilities:
+  - Normalize the incoming intent (token/venue/amount_usd/price_usd).
+  - Call PolicyEngine.validate(...) for sizing & risk checks.
+  - Append a lightweight row into Policy_Log.
+  - Send a short Telegram summary.
+  - Return (ok, reason, patched) for upstream callers.
+
+Compatible with the B-3 policy_engine.py wrapper.
+"""
+
 from __future__ import annotations
-import math
-from typing import Dict, Any
+
+import os
+import time
+from datetime import datetime, timezone
+from typing import Dict, Any, Tuple
 
 from policy_engine import PolicyEngine
+from utils import sheets_append_rows, send_telegram_message_dedup, warn  # type: ignore
 
-_EPS = 1e-9
+SHEET_URL = os.getenv("SHEET_URL", "")
+POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
 
 
-def _to_float(x, default: float = 0.0) -> float:
+def _append_policy_log_row(intent: Dict[str, Any], ok: bool, reason: str, patched: Dict[str, Any]) -> None:
+    """Best-effort append into Policy_Log; never raises."""
+    if not SHEET_URL:
+        return
+
     try:
-        return float(x)
-    except Exception:
-        return default
+        ts = datetime.now(timezone.utc).isoformat()
+        src = str(intent.get("source") or "manual_rebuy")
+        token = str(intent.get("token") or "").upper()
+        venue = str(intent.get("venue") or "").upper()
+        quote = str(intent.get("quote") or "").upper()
+        amt_usd = intent.get("amount_usd")
+        price_usd = intent.get("price_usd")
+        patched_amt_usd = patched.get("amount_usd", amt_usd)
+
+        row = [
+            ts,
+            src,
+            token,
+            venue,
+            quote,
+            amt_usd,
+            price_usd,
+            patched_amt_usd,
+            "OK" if ok else "DENIED",
+            reason,
+        ]
+        sheets_append_rows(SHEET_URL, POLICY_LOG_WS, [row])
+    except Exception as e:  # pragma: no cover
+        warn(f"manual_rebuy_policy: failed to append Policy_Log row: {e}")
 
 
-def evaluate_manual_rebuy(intent: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    High-level policy wrapper for MANUAL_REBUY intents.
+def _format_telegram_summary(intent: Dict[str, Any], ok: bool, reason: str, patched: Dict[str, Any]) -> str:
+    token = str(intent.get("token") or "").upper()
+    venue = str(intent.get("venue") or "").upper()
+    quote = str(intent.get("quote") or "").upper()
 
-    Input `intent` is expected to look like:
-      {
-        "source": "manual_rebuy",
-        "token": "BTC",
-        "action": "BUY",
-        "amount_usd": 25.0,
-        "venue": "BINANCEUS",
-        "quote": "USDT" | "USD" | "USDC" | "",
-        "ts": 1700000000,
-        ... (any other fields are passed through)
-      }
+    orig_amt_usd = intent.get("amount_usd")
+    patched_amt_usd = patched.get("amount_usd", orig_amt_usd)
+    price_usd = intent.get("price_usd")
 
-    Returns a decision dict:
+    lines = []
+    lines.append("🧭 Manual Rebuy Policy Check")
+    lines.append(f"Asset: {token} on {venue} {f'/{quote}' if quote else ''}".rstrip())
 
-      {
-        "ok": bool,
-        "status": "APPROVED" | "CLIPPED" | "DENIED",
-        "reason": str,
-        "original_amount_usd": float,
-        "patched": dict,          # patched intent from PolicyEngine
-      }
-
-    Notes:
-      * We intentionally delegate all sizing / venue caps / notional limits
-        to PolicyEngine, so this stays as a thin, well-typed facade.
-      * Classification into APPROVED vs CLIPPED vs DENIED is based purely on:
-          - ok flag from PolicyEngine
-          - comparison of requested vs patched notional_usd / amount_usd
-    """
-    pe = PolicyEngine()
-
-    # normalize inputs
-    orig_amt_usd = _to_float(
-        intent.get("amount_usd") or intent.get("notional_usd") or 0.0,
-        0.0,
-    )
-
-    # Let the engine do the heavy lifting.
-    # For now we don't pass any extra asset_state context; venue budgets / telemetry
-    # can plug in here later without changing nova_trigger.
-    ok, reason, patched = pe.validate(dict(intent), asset_state={})  # type: ignore[arg-type]
-
-    patched_amt = _to_float(
-        (patched or {}).get("amount_usd")
-        or (patched or {}).get("notional_usd")
-        or orig_amt_usd,
-        orig_amt_usd,
-    )
-
-    # Decide on status label
-    if not ok:
-        status = "DENIED"
-    else:
-        # treat small float jitter as 'same'
-        if orig_amt_usd <= 0:
-            status = "APPROVED"
+    if orig_amt_usd is not None:
+        if patched_amt_usd is not None and patched_amt_usd != orig_amt_usd:
+            lines.append(f"Requested: ${orig_amt_usd:,.2f} → Allowed: ${patched_amt_usd:,.2f}")
         else:
-            rel_diff = abs(patched_amt - orig_amt_usd) / max(orig_amt_usd, _EPS)
-            if rel_diff > 0.01 and patched_amt < orig_amt_usd:  # >1% reduction => clipped
-                status = "CLIPPED"
-            else:
-                status = "APPROVED"
+            lines.append(f"Requested: ${orig_amt_usd:,.2f}")
+    if price_usd:
+        try:
+            lines.append(f"Price: ${float(price_usd):,.4f} (from Unified_Snapshot)")
+        except Exception:
+            pass
 
-    return {
-        "ok": bool(ok),
-        "status": status,
-        "reason": reason or "",
-        "original_amount_usd": orig_amt_usd,
-        "patched": patched or {},
-    }
+    lines.append(f"Decision: {'✅ APPROVED' if ok else '⛔ DENIED'}")
+    if reason:
+        lines.append(f"Reason: {reason}")
+
+    return "\n".join(lines)
+
+
+def evaluate_manual_rebuy(intent: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Main entrypoint used by nova_trigger.
+
+    intent (expected minimal fields):
+      token: str
+      venue: str
+      amount_usd: float
+      price_usd: float (set by B-2 where possible)
+      quote: str (optional)
+      source: 'manual_rebuy' (optional)
+    """
+    # Normalize a couple of fields for PolicyEngine wrapper
+    token = (intent.get("token") or "").upper()
+    venue = (intent.get("venue") or "").upper()
+    quote = (intent.get("quote") or "").upper()
+    amount_usd = intent.get("amount_usd")
+    price_usd = intent.get("price_usd")
+
+    if not token:
+        return False, "missing token", intent
+    if amount_usd is None:
+        return False, "missing amount_usd", intent
+    try:
+        amount_usd_f = float(amount_usd)
+    except Exception:
+        return False, "invalid amount_usd", intent
+
+    patched_intent = dict(intent)
+    patched_intent["token"] = token
+    patched_intent["venue"] = venue
+    if quote:
+        patched_intent["quote"] = quote
+    patched_intent["amount_usd"] = amount_usd_f
+    if price_usd is not None:
+        try:
+            patched_intent["price_usd"] = float(price_usd)
+        except Exception:
+            pass
+
+    # Use the B-3 PolicyEngine wrapper (legacy API)
+    pe = PolicyEngine()
+    ok, reason, patched = pe.validate(patched_intent, asset_state=None)
+
+    # Logging + Telegram side effects
+    _append_policy_log_row(patched_intent, ok, reason, patched)
+    try:
+        msg = _format_telegram_summary(patched_intent, ok, reason, patched)
+        send_telegram_message_dedup(msg, dedup_ttl_sec=60)
+    except Exception as e:  # pragma: no cover
+        warn(f"manual_rebuy_policy: failed to send Telegram summary: {e}")
+
+    return ok, reason, patched
