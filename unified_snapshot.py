@@ -1,5 +1,5 @@
 """
-unified_snapshot.py — C-Series C-1
+unified_snapshot.py — C-1 + B-2
 
 Builds a normalized balance view in the Unified_Snapshot sheet:
 
@@ -10,14 +10,11 @@ Source:
       columns: Timestamp, Venue, Asset, Free, Locked, Quote
 
 Rules:
-  • Total = Free + Locked
-  • IsQuote = TRUE if Asset in {USDT, USDC, USD}, else FALSE
-  • For quote assets, Equity_USD = Total (1 quote ≈ 1 USD).
-  • For non-quote assets, Equity_USD left blank (used later once price feed wired).
-
-This replaces the older version that depended on a local JSON keyfile.
-It uses utils.get_gspread_client so we share the same quota/backoff behavior
-as the rest of the Bus.
+  • Total       = Free + Locked
+  • IsQuote     = TRUE if Asset in {USDT, USDC, USD}, else FALSE
+  • Equity_USD:
+      - If IsQuote: Equity_USD = Total (1 quote ≈ 1 USD)
+      - Else      : Equity_USD = Total * price_feed.get_price_usd(Asset, Quote or "USDT", Venue)
 """
 
 from __future__ import annotations
@@ -29,6 +26,7 @@ from typing import List, Tuple
 import gspread  # type: ignore
 
 from utils import get_gspread_client, warn  # type: ignore
+from price_feed import get_price_usd  # B-2 oracle
 
 SHEET_URL = os.getenv("SHEET_URL", "").strip()
 SNAP_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
@@ -82,7 +80,7 @@ def run_unified_snapshot() -> None:
     """
     Main entrypoint: build Unified_Snapshot from Wallet_Monitor.
 
-    This is safe to schedule periodically (e.g., every 10–15 minutes).
+    Safe to schedule periodically (e.g., every 10–15 minutes).
     """
     if not SHEET_URL:
         print("⚠️ unified_snapshot: SHEET_URL not set; aborting.")
@@ -100,30 +98,39 @@ def run_unified_snapshot() -> None:
     if not wallet_rows:
         print("ℹ️ unified_snapshot: no Wallet_Monitor rows found; Unified_Snapshot will be empty (ok).")
 
-    # Prepare output rows
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     out_rows: List[list] = []
 
     for venue, asset, free, locked, quote in wallet_rows:
         total = free + locked
-        is_quote = "TRUE" if asset in QUOTE_ASSETS else "FALSE"
+        is_quote = asset in QUOTE_ASSETS
+        is_quote_str = "TRUE" if is_quote else "FALSE"
+
         equity_usd = ""
 
-        if is_quote:
-            # For quote assets, treat Total as USD value.
-            equity_usd = total
+        if total > 0:
+            if is_quote:
+                # For quote assets, treat Total as USD value.
+                equity_usd = total
+            else:
+                # B-2: lookup price via price_feed.
+                # Prefer row's Quote if present; otherwise default to USDT.
+                q = quote or "USDT"
+                price = get_price_usd(asset, q, venue)
+                if price is not None and price > 0:
+                    equity_usd = total * price
 
         out_rows.append(
             [
-                now,        # Timestamp
-                venue,      # Venue
-                asset,      # Asset
-                free,       # Free
-                locked,     # Locked
-                total,      # Total
-                is_quote,   # IsQuote
-                quote or "",  # QuoteSymbol
-                equity_usd,   # Equity_USD
+                now,           # Timestamp
+                venue,         # Venue
+                asset,         # Asset
+                free,          # Free
+                locked,        # Locked
+                total,         # Total
+                is_quote_str,  # IsQuote
+                quote or "",   # QuoteSymbol
+                equity_usd,    # Equity_USD
             ]
         )
 
