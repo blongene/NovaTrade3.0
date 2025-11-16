@@ -1,4 +1,4 @@
-# rebuy_driver.py — C-Series wired via trade_guard
+# rebuy_driver.py — C-Series + B-2 price feed via trade_guard
 
 import os, json, hmac, hashlib, time
 from datetime import datetime
@@ -8,7 +8,8 @@ import gspread  # type: ignore
 
 from utils import get_gspread_client, warn  # type: ignore
 from policy_engine import PolicyEngine
-from trade_guard import guard_trade_intent  # central safety gate
+from trade_guard import guard_trade_intent
+from price_feed import get_price_usd  # NEW
 
 SHEET_URL = os.getenv("SHEET_URL")
 VAULT_WS_NAME = os.getenv("VAULT_INTELLIGENCE_WS", "Vault Intelligence")
@@ -28,28 +29,6 @@ def _open_sheet() -> gspread.Spreadsheet:
         raise RuntimeError("SHEET_URL not set.")
     gc = get_gspread_client()
     return gc.open_by_url(SHEET_URL)
-
-
-def _build_guard_intent(
-    token: str,
-    venue: str,
-    quote: str,
-    amount_usd: float,
-    intent_id: str,
-) -> Dict[str, Any]:
-    """Compose the generic intent dict for trade_guard."""
-    return {
-        "token": token,
-        "venue": venue,
-        "quote": quote,
-        "amount_usd": amount_usd,
-        "price_usd": None,  # B-2 price feed can be added later
-        "action": "BUY",
-        "intent_id": intent_id,
-        "agent_target": os.getenv("DEFAULT_AGENT_TARGET", "edge-primary,edge-nl1"),
-        "source": "rebuy_driver",
-        "policy_id": os.getenv("POLICY_ID", "main"),
-    }
 
 
 def run_rebuy_driver():
@@ -78,7 +57,6 @@ def run_rebuy_driver():
         print(f"⚠️ No '{VAULT_WS_NAME}' sheet or unable to read it: {e}")
         return
 
-    # PolicyEngine only used here to read config knobs (max_per_coin, venue_order, prefer_quotes)
     pe = PolicyEngine()
     max_per_coin = float(pe.cfg.get("max_per_coin_usd", 25) or 25)
     venue_order = pe.cfg.get("venue_order", ["BINANCEUS", "COINBASE", "KRAKEN"]) or ["BINANCEUS"]
@@ -91,12 +69,10 @@ def run_rebuy_driver():
         if not token:
             continue
 
-        # Vault Intelligence flag (rebuy_ready can be TRUE / True / 1 / yes)
         ready_raw = str(r.get("rebuy_ready", "")).strip().upper()
         if ready_raw not in ("TRUE", "YES", "1", "Y"):
             continue
 
-        # For now, use max_per_coin_usd as target spend per candidate
         amt_usd = max_per_coin
 
         venue = str(venue_order[0]).upper() if venue_order else "BINANCEUS"
@@ -105,9 +81,22 @@ def run_rebuy_driver():
         now = int(time.time())
         intent_id = f"rebuy:{token}:{now}"
 
-        guard_intent = _build_guard_intent(token, venue, quote, amt_usd, intent_id)
+        # B-2: get price for this venue/token/quote
+        price_usd = get_price_usd(token, quote, venue)
 
-        # C-Series + PolicyEngine via central gate
+        guard_intent: Dict[str, Any] = {
+            "token": token,
+            "venue": venue,
+            "quote": quote,
+            "amount_usd": amt_usd,
+            "price_usd": price_usd,
+            "action": "BUY",
+            "intent_id": intent_id,
+            "agent_target": os.getenv("DEFAULT_AGENT_TARGET", "edge-primary,edge-nl1"),
+            "source": "rebuy_driver",
+            "policy_id": os.getenv("POLICY_ID", "main"),
+        }
+
         decision = guard_trade_intent(guard_intent)
         ok = bool(decision.get("ok"))
         if not ok:
@@ -124,7 +113,6 @@ def run_rebuy_driver():
         final_venue = str(patched.get("venue") or venue).upper()
         final_quote = str(patched.get("quote") or quote).upper()
 
-        # DRYRUN path: log to Policy_Log and move on
         if REBUY_MODE == "dryrun":
             try:
                 log_ws = sh.worksheet("Policy_Log")
@@ -151,7 +139,6 @@ def run_rebuy_driver():
             enqueued += 1
             continue
 
-        # LIVE path: HMAC-sign and POST /ops/enqueue
         if not OUTBOX_SECRET or not OPS_ENQUEUE_URL:
             print("⚠️ OUTBOX_SECRET or OPS_ENQUEUE_URL missing; skipping LIVE enqueue.")
             continue
