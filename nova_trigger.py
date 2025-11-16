@@ -55,7 +55,6 @@ def _send_summary(raw, parsed, status, ok, reason, orig_amt, patched_amt, enq_ok
     token = parsed.get("token") or "?"
     venue = parsed.get("venue") or "?"
     quote = parsed.get("quote") or ""
-
     venue_str = f"{venue}/{quote}" if quote else venue
 
     lines = [
@@ -63,6 +62,7 @@ def _send_summary(raw, parsed, status, ok, reason, orig_amt, patched_amt, enq_ok
         f"Command: `{raw}`",
         f"Asset: {token} @ {venue_str}",
     ]
+
     if orig_amt is not None:
         if patched_amt is not None and abs(patched_amt - orig_amt) > 1e-9:
             lines.append(f"Sizing: {orig_amt} → {patched_amt} USD")
@@ -78,9 +78,14 @@ def _send_summary(raw, parsed, status, ok, reason, orig_amt, patched_amt, enq_ok
     else:
         lines.append(f"Enqueued: False (mode={mode})")
 
+    text = "\n".join(lines)
+
+    # ✔️ Correct key format for dedup
+    dedup_key = f"nova_trigger:{token}:{venue}:{raw}"
+
     try:
-        # utils version takes positional args only
-        send_telegram_message_dedup("\n".join(lines))
+        # ✔️ Call signature must be (message, key)
+        send_telegram_message_dedup(text, dedup_key)
     except Exception as e:
         warn(f"nova_trigger: failed summary send: {e}")
 
