@@ -3,7 +3,7 @@ from __future__ import annotations
 import os, json, time, re
 from typing import Dict, Any
 import requests
-from gateway.sheets_gateway import open_sheet as _open_sheet, get_ws
+
 from utils import _retry
 from policy_engine import PolicyEngine  # still imported for backwards compat
 from manual_rebuy_policy import evaluate_manual_rebuy
