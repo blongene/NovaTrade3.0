@@ -1,18 +1,3 @@
-"""
-price_feed.py
-
-B-2 price feed for NovaTrade.
-
-Reads Unified_Snapshot and exposes:
-
-    get_price_usd(token: str, quote: str = "USDT", venue: str | None = None) -> float | None
-
-Strategy:
-  • Prefer rows matching (venue, token, quote) if venue is provided.
-  • Otherwise, fall back to the freshest row for (token, quote) across all venues.
-  • If no explicit price column exists, attempt to derive from Equity_USD / Total.
-"""
-
 from __future__ import annotations
 
 import os
@@ -50,7 +35,7 @@ def _load_snapshot_rows(force: bool = False) -> List[dict]:
     try:
         gc = get_gspread_client()
         sh = gc.open_by_url(SHEET_URL)
-        ws = sh.worksheet(unified_snapshot_ws := UNIFIED_SNAPSHOT_WS)
+        ws = sh.worksheet(UNIFIED_SNAPSHOT_WS)
         rows = ws.get_all_records()
     except Exception as e:
         warn(f"price_feed: failed to load {UNIFIED_SNAPSHOT_WS}: {e}")
@@ -62,7 +47,8 @@ def _load_snapshot_rows(force: bool = False) -> List[dict]:
 
 
 def _extract_price_from_row(row: dict) -> Optional[float]:
-    """Try several common column names to derive a USD price."""
+    """Try to derive a USD price from a Unified_Snapshot row."""
+    # 1) Try explicit price-like columns, if they ever appear.
     for key in ("Price_USD", "PriceUsd", "Price", "LastPrice"):
         val = row.get(key)
         if isinstance(val, (int, float)):
@@ -76,7 +62,7 @@ def _extract_price_from_row(row: dict) -> Optional[float]:
             except Exception:
                 continue
 
-    # Fallback: Equity_USD / Total
+    # 2) Fallback (current NovaTrade design): Equity_USD / Total
     eq = row.get("Equity_USD")
     total = row.get("Total") or row.get("Balance") or row.get("Free")
     try:
@@ -90,49 +76,43 @@ def _extract_price_from_row(row: dict) -> Optional[float]:
     return None
 
 
-def _row_matches(row: dict, token: str, quote: str) -> bool:
-    asset = str(row.get("Asset") or row.get("Token") or "").upper()
-    quote_sym = str(row.get("QuoteSymbol") or row.get("Quote") or "").upper()
-    if not asset:
-        return False
-    if asset != token:
-        return False
-    if quote and quote_sym and quote_sym != quote:
-        return False
-    return True
-
-
 def _parse_ts(row: dict) -> float:
-    """Parse Timestamp column into a float; fall back to 0 if not parseable."""
+    """Parse Timestamp/TS into epoch seconds, best-effort."""
     ts_val = row.get("Timestamp") or row.get("TS") or ""
     if isinstance(ts_val, (int, float)):
         return float(ts_val)
     if isinstance(ts_val, str) and ts_val.strip():
-        try:
-            # Try ISO8601
-            from datetime import datetime
-
-            return datetime.fromisoformat(ts_val.replace("Z", "+00:00")).timestamp()
-        except Exception:
-            # Try epoch-like
+        from datetime import datetime
+        s = ts_val.replace("Z", "").strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
             try:
-                return float(ts_val)
+                return datetime.strptime(s, fmt).timestamp()
             except Exception:
-                return 0.0
+                continue
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
     return 0.0
 
 
 def get_price_usd(token: str, quote: str = "USDT", venue: Optional[str] = None) -> Optional[float]:
     """
-    Return a USD price for (token, quote, venue).
+    Return a USD price for `token`.
 
-    Preference:
-      1) rows in Unified_Snapshot matching (venue, token, quote) with the freshest timestamp.
-      2) otherwise, freshest row for (token, quote) across all venues.
-      3) if no quote is provided, match token only and use any quote's price.
+    Strategy (robust to current Unified_Snapshot layout):
+
+      1. Find rows where Asset == token (case-insensitive).
+         We do NOT require QuoteSymbol to match; Unified_Snapshot is one row per
+         asset with Equity_USD / Total rather than per trading pair.
+
+      2. If a venue is provided, prefer the freshest row for that venue.
+
+      3. Otherwise, fall back to the freshest candidate overall.
+
+      4. If no suitable row or no usable price can be derived, return None.
     """
     token = (token or "").upper()
-    quote = (quote or "").upper()
     venue = (venue or "").upper() or None
 
     if not token:
@@ -142,18 +122,19 @@ def get_price_usd(token: str, quote: str = "USDT", venue: Optional[str] = None) 
     candidates: List[Dict[str, Any]] = []
 
     for r in rows:
-        if not _row_matches(r, token, quote):
+        asset = str(r.get("Asset") or "").upper()
+        if asset != token:
             continue
 
-        v = str(r.get("Venue") or "").upper()
         price = _extract_price_from_row(r)
         if price is None or price <= 0:
             continue
 
+        cand_venue = str(r.get("Venue") or "").upper()
         candidates.append(
             {
-                "venue": v,
-                "price": price,
+                "venue": cand_venue,
+                "price": float(price),
                 "ts": _parse_ts(r),
             }
         )
@@ -161,13 +142,13 @@ def get_price_usd(token: str, quote: str = "USDT", venue: Optional[str] = None) 
     if not candidates:
         return None
 
-    # If venue specified, prefer freshest candidate for that venue
+    # Prefer freshest price for the requested venue, if present.
     if venue:
         v_matches = [c for c in candidates if c["venue"] == venue]
         if v_matches:
             best = max(v_matches, key=lambda c: c["ts"])
             return float(best["price"])
 
-    # Fallback: freshest candidate overall
+    # Fallback: freshest candidate overall.
     best = max(candidates, key=lambda c: c["ts"])
     return float(best["price"])
