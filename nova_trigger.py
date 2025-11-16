@@ -1,11 +1,10 @@
 # nova_trigger.py — parse + route manual commands, Telegram ping
 from __future__ import annotations
-
 import os, json, time, re
 from typing import Dict, Any
-
 import requests
-from utils import _open_sheet, _retry, get_ws
+from gateway.sheets_gateway import open_sheet as _open_sheet, get_ws
+from utils import _retry
 from policy_engine import PolicyEngine  # still imported for backwards compat
 from manual_rebuy_policy import evaluate_manual_rebuy
 from ops_sign_and_enqueue import attempt as _ops_attempt  # reuse the canonical signer
