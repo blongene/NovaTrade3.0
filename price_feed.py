@@ -1,154 +1,195 @@
+"""
+price_feed.py — B-2 price oracle for NovaTrade
+
+Main entrypoint:
+
+    get_price_usd(token: str, quote: str = "USDT", venue: str | None = None) -> float | None
+
+Behavior:
+    • Try venue-specific public APIs first (no auth):
+        - BINANCEUS  -> https://api.binance.us/api/v3/ticker/price
+        - COINBASE   -> https://api.exchange.coinbase.com/products/{BASE}-{QUOTE}/ticker
+        - KRAKEN     -> https://api.kraken.com/0/public/Ticker
+    • If venue is None or unsupported, try BinanceUS BTC/USDT-style symbol.
+    • Cache responses for PRICE_FEED_TTL_SEC (default 30s) to avoid hammering APIs.
+    • Return None on failure; callers (trade_guard/PolicyEngine) will deny or fall back.
+"""
+
 from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Dict, Tuple, Optional
 
-from utils import get_gspread_client, warn  # type: ignore
+import requests  # type: ignore
+from utils import warn  # type: ignore
 
-SHEET_URL = os.getenv("SHEET_URL", "").strip()
-UNIFIED_SNAPSHOT_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
-PRICE_CACHE_TTL_SEC = int(os.getenv("PRICE_CACHE_TTL_SEC", "60"))
+PRICE_FEED_TTL_SEC = int(os.getenv("PRICE_FEED_TTL_SEC", "30"))
 
-_snapshot_cache: Dict[str, Any] = {
-    "ts": 0.0,
-    "rows": [],
-}
+# (venue, token, quote) -> (price, ts)
+_price_cache: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
 
 
-def _load_snapshot_rows(force: bool = False) -> List[dict]:
-    """Load Unified_Snapshot rows with a small TTL cache."""
-    now = time.time()
-    if (
-        not force
-        and _snapshot_cache.get("rows")
-        and now - float(_snapshot_cache.get("ts", 0.0)) < PRICE_CACHE_TTL_SEC
-    ):
-        return _snapshot_cache["rows"]
+def _cache_get(venue: str, token: str, quote: str) -> Optional[float]:
+    key = (venue.upper(), token.upper(), quote.upper())
+    val = _price_cache.get(key)
+    if not val:
+        return None
+    price, ts = val
+    if time.time() - ts > PRICE_FEED_TTL_SEC:
+        return None
+    return price
 
-    if not SHEET_URL:
-        warn("price_feed: SHEET_URL missing.")
-        _snapshot_cache["rows"] = []
-        _snapshot_cache["ts"] = now
-        return []
 
+def _cache_set(venue: str, token: str, quote: str, price: float) -> None:
+    key = (venue.upper(), token.upper(), quote.upper())
+    _price_cache[key] = (float(price), time.time())
+
+
+def _fetch_binanceus(base: str, quote: str) -> Optional[float]:
+    """
+    Binance.US public ticker:
+        GET /api/v3/ticker/price?symbol=BTCUSDT
+    """
+    symbol = f"{base}{quote}".upper()
+    url = "https://api.binance.us/api/v3/ticker/price"
     try:
-        gc = get_gspread_client()
-        sh = gc.open_by_url(SHEET_URL)
-        ws = sh.worksheet(UNIFIED_SNAPSHOT_WS)
-        rows = ws.get_all_records()
+        r = requests.get(url, params={"symbol": symbol}, timeout=5)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        price = float(data["price"])
+        return price if price > 0 else None
     except Exception as e:
-        warn(f"price_feed: failed to load {UNIFIED_SNAPSHOT_WS}: {e}")
-        rows = []
-
-    _snapshot_cache["rows"] = rows or []
-    _snapshot_cache["ts"] = now
-    return _snapshot_cache["rows"]
+        warn(f"price_feed: binanceus error for {symbol}: {e}")
+        return None
 
 
-def _extract_price_from_row(row: dict) -> Optional[float]:
-    """Try to derive a USD price from a Unified_Snapshot row."""
-    # 1) Try explicit price-like columns, if they ever appear.
-    for key in ("Price_USD", "PriceUsd", "Price", "LastPrice"):
-        val = row.get(key)
-        if isinstance(val, (int, float)):
-            if val > 0:
-                return float(val)
-        elif isinstance(val, str) and val.strip():
-            try:
-                f = float(val)
-                if f > 0:
-                    return f
-            except Exception:
-                continue
-
-    # 2) Fallback (current NovaTrade design): Equity_USD / Total
-    eq = row.get("Equity_USD")
-    total = row.get("Total") or row.get("Balance") or row.get("Free")
+def _fetch_coinbase(base: str, quote: str) -> Optional[float]:
+    """
+    Coinbase public ticker:
+        GET /products/BTC-USD/ticker
+    """
+    product = f"{base}-{quote}".upper()
+    url = f"https://api.exchange.coinbase.com/products/{product}/ticker"
     try:
-        eq_f = float(eq)
-        tot_f = float(total)
-        if eq_f > 0 and tot_f > 0:
-            return eq_f / tot_f
-    except Exception:
-        pass
+        r = requests.get(url, timeout=5)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        price = float(data.get("price") or data.get("last"))
+        return price if price > 0 else None
+    except Exception as e:
+        warn(f"price_feed: coinbase error for {product}: {e}")
+        return None
 
-    return None
+
+def _kraken_pair(base: str, quote: str) -> str:
+    """
+    Very small helper to map BTC/ETH to Kraken's XBT/ETH pairs.
+    We keep this simple for now and extend as needed.
+    """
+    b = base.upper()
+    q = quote.upper()
+    if b == "BTC":
+        b = "XBT"
+    if q == "BTC":
+        q = "XBT"
+    return f"{b}{q}"
 
 
-def _parse_ts(row: dict) -> float:
-    """Parse Timestamp/TS into epoch seconds, best-effort."""
-    ts_val = row.get("Timestamp") or row.get("TS") or ""
-    if isinstance(ts_val, (int, float)):
-        return float(ts_val)
-    if isinstance(ts_val, str) and ts_val.strip():
-        from datetime import datetime
-        s = ts_val.replace("Z", "").strip()
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
-            try:
-                return datetime.strptime(s, fmt).timestamp()
-            except Exception:
-                continue
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
-    return 0.0
+def _fetch_kraken(base: str, quote: str) -> Optional[float]:
+    """
+    Kraken public ticker:
+        GET /0/public/Ticker?pair=XBTUSD
+    """
+    pair = _kraken_pair(base, quote)
+    url = "https://api.kraken.com/0/public/Ticker"
+    try:
+        r = requests.get(url, params={"pair": pair}, timeout=5)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if data.get("error"):
+            return None
+        result = data.get("result") or {}
+        if not result:
+            return None
+        # Get first entry
+        ticker = next(iter(result.values()))
+        # 'c' is last trade [price, volume]
+        price = float(ticker["c"][0])
+        return price if price > 0 else None
+    except Exception as e:
+        warn(f"price_feed: kraken error for {pair}: {e}")
+        return None
+
+
+def _fetch_generic(base: str, quote: str) -> Optional[float]:
+    """
+    Simple generic fallback: try BinanceUS as a global feed even if venue is unknown.
+    """
+    return _fetch_binanceus(base, quote)
 
 
 def get_price_usd(token: str, quote: str = "USDT", venue: Optional[str] = None) -> Optional[float]:
     """
-    Return a USD price for `token`.
+    Main B-2 price oracle entrypoint.
 
-    Strategy (robust to current Unified_Snapshot layout):
+    Args:
+        token: base asset symbol, e.g. "BTC"
+        quote: quote asset symbol, e.g. "USDT" or "USD"
+        venue: preferred venue ("BINANCEUS", "COINBASE", "KRAKEN") or None
 
-      1. Find rows where Asset == token (case-insensitive).
-         We do NOT require QuoteSymbol to match; Unified_Snapshot is one row per
-         asset with Equity_USD / Total rather than per trading pair.
-
-      2. If a venue is provided, prefer the freshest row for that venue.
-
-      3. Otherwise, fall back to the freshest candidate overall.
-
-      4. If no suitable row or no usable price can be derived, return None.
+    Returns:
+        float price in quote units (usually USD/USDT) or None if unavailable.
     """
     token = (token or "").upper()
-    venue = (venue or "").upper() or None
+    quote = (quote or "USDT").upper()
+    venue = (venue or "").upper()
 
     if not token:
         return None
 
-    rows = _load_snapshot_rows(force=False)
-    candidates: List[Dict[str, Any]] = []
+    # Identity: if token itself is a USD stable, price≈1.
+    if token in ("USDT", "USDC", "USD") and quote in ("USDT", "USDC", "USD"):
+        return 1.0
 
-    for r in rows:
-        asset = str(r.get("Asset") or "").upper()
-        if asset != token:
-            continue
+    # Cache
+    cached = _cache_get(venue or "ANY", token, quote)
+    if cached is not None:
+        return cached
 
-        price = _extract_price_from_row(r)
-        if price is None or price <= 0:
-            continue
+    price: Optional[float] = None
 
-        cand_venue = str(r.get("Venue") or "").upper()
-        candidates.append(
-            {
-                "venue": cand_venue,
-                "price": float(price),
-                "ts": _parse_ts(r),
-            }
-        )
+    # Venue-specific first
+    if venue == "BINANCEUS":
+        price = _fetch_binanceus(token, quote)
+    elif venue == "COINBASE":
+        price = _fetch_coinbase(token, quote)
+    elif venue == "KRAKEN":
+        price = _fetch_kraken(token, quote)
 
-    if not candidates:
-        return None
+    # Fallback if venue unsupported or failed
+    if price is None:
+        price = _fetch_generic(token, quote)
 
-    # Prefer freshest price for the requested venue, if present.
-    if venue:
-        v_matches = [c for c in candidates if c["venue"] == venue]
-        if v_matches:
-            best = max(v_matches, key=lambda c: c["ts"])
-            return float(best["price"])
+    if price is not None:
+        _cache_set(venue or "ANY", token, quote, price)
 
-    # Fallback: freshest candidate overall.
-    best = max(candidates, key=lambda c: c["ts"])
-    return float(best["price"])
+    return price
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python price_feed.py BTC [USDT] [VENUE]")
+        raise SystemExit(1)
+
+    t = sys.argv[1]
+    q = sys.argv[2] if len(sys.argv) > 2 else "USDT"
+    v = sys.argv[3] if len(sys.argv) > 3 else None
+
+    p = get_price_usd(t, q, v)
+    print(f"Price {t}/{q} @ {v or 'ANY'} = {p}")
