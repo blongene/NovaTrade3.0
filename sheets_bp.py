@@ -21,8 +21,8 @@ def start_background_flusher():
         while not _bg_stop.is_set():
             try:
                 _gateway.flush()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[SheetsFlusher] error during flush: {e}", flush=True)
             _bg_stop.wait(iv)
     _bg_thread = threading.Thread(target=_run, name="SheetsFlusher", daemon=True)
     _bg_thread.start()
