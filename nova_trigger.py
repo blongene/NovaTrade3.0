@@ -5,9 +5,10 @@ Manual command router for NovaTrade (Bus side).
 
 Current scope:
   - Parse MANUAL_REBUY commands (via Telegram / NovaTrigger sheet).
-  - Build a policy intent with metadata (intent_id, agent_target, source, policy_id).
-  - Run it through manual_rebuy_policy.evaluate_manual_rebuy(...) which in turn
-    uses PolicyEngine + C-Series venue budgets.
+  - Normalize into a generic trade intent.
+  - Run it through trade_guard.guard_trade_intent(...) which applies:
+        • C-Series venue budgets (Unified_Snapshot-based)
+        • PolicyEngine (caps, keepback, canary, min-notional, etc.)
   - Optionally enqueue to the Outbox when REBUY_MODE=live (best-effort, fail-safe).
   - Emit a concise Telegram summary for human visibility.
 
@@ -21,14 +22,14 @@ from __future__ import annotations
 import os
 import re
 import time
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Optional
 
 from utils import (
     send_telegram_message_dedup,
     warn,
     info,
 )
-from manual_rebuy_policy import evaluate_manual_rebuy  # must exist in repo
+from trade_guard import guard_trade_intent  # central policy gate
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +87,7 @@ def parse_manual(msg: str) -> Dict[str, Any]:
       MANUAL_REBUY <TOKEN> <AMOUNT_USD> [VENUE=...] [QUOTE=...]
 
     Returns a dict with at minimum:
-      { "type": "MANUAL_REBUY" | "UNKNOWN", "raw": msg, ... }
+      { "type": "MANUAL_REBUY" | "UNKNOWN" | "ERROR", "raw": msg, ... }
     """
     msg = (msg or "").strip()
 
@@ -117,13 +118,12 @@ def parse_manual(msg: str) -> Dict[str, Any]:
 
     parsed: Dict[str, Any] = {
         "type": "MANUAL_REBUY",
-        "source": "manual_rebuy",
+        "raw": msg,
         "token": (token_raw or "").upper(),
         "amount_usd": amount_usd,
         "venue": venue.upper() if isinstance(venue, str) else None,
         "quote": quote.upper() if isinstance(quote, str) else None,
         "params": params,
-        "raw": msg,
     }
     return parsed
 
@@ -168,132 +168,90 @@ def _send_orion_summary(
 
     lines.append(f"Policy: {status} ({reason or 'no reason provided'})")
 
-    if REBUY_MODE == "live":
+    if enq_mode == "live":
         lines.append(f"Enqueued: {'True' if enq_ok else 'False'} mode=live")
         if enq_reason:
             lines.append(f"Enqueue note: {enq_reason}")
     else:
-        lines.append(f"Enqueued: False mode={REBUY_MODE or 'dryrun'}")
+        lines.append(f"Enqueued: False mode={enq_mode or 'dryrun'}")
 
     text = "\n".join(lines)
     try:
-        # Use existing de-duplicated Telegram helper
         send_telegram_message_dedup(text, dedup_ttl_sec=TELEGRAM_DEDUP_TTL)
     except Exception as e:  # pragma: no cover
         warn(f"nova_trigger: failed to send Orion summary: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Manual rebuy handling
+# Manual rebuy handling (via trade_guard)
 # ---------------------------------------------------------------------------
-
-def _normalize_mrp_result(
-    mrp_result: Any,
-    intent: Dict[str, Any],
-) -> Tuple[bool, str, Dict[str, Any]]:
-    """
-    manual_rebuy_policy.evaluate_manual_rebuy may return either:
-      - (ok: bool, reason: str, patched: dict)
-      - or a dict with keys {"ok", "reason", "patched"} (older style)
-
-    This normalizes to a (ok, reason, patched) tuple.
-    """
-    # New-style (tuple)
-    if isinstance(mrp_result, tuple) and len(mrp_result) == 3:
-        ok, reason, patched = mrp_result
-        patched = patched or {}
-        if not isinstance(patched, dict):
-            patched = {}
-        return bool(ok), str(reason or ""), patched
-
-    # Older style: dict
-    if isinstance(mrp_result, dict):
-        ok = bool(mrp_result.get("ok"))
-        reason = str(mrp_result.get("reason") or "")
-        patched = mrp_result.get("patched") or {}
-        if not isinstance(patched, dict):
-            patched = {}
-        # If patched is empty, fall back to original intent
-        if not patched:
-            patched = dict(intent)
-        return ok, reason, patched
-
-    # Unexpected
-    warn(f"manual_rebuy_policy returned unexpected type: {type(mrp_result)}")
-    return False, "unexpected manual_rebuy_policy return type", dict(intent)
-
 
 def _handle_manual_rebuy(parsed: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build intent + metadata, run through manual_rebuy_policy, and
-    (optionally) enqueue.
+    Build a generic trade intent, pass through trade_guard, and optionally enqueue.
     """
     token = (parsed.get("token") or "").upper()
-    if not token:
-        return {
-            "ok": False,
-            "error": "missing token",
-            "parsed": parsed,
-        }
-
+    venue = (parsed.get("venue") or "")
+    quote = (parsed.get("quote") or "")
     amount_usd = parsed.get("amount_usd")
+
     try:
         amount_usd_f = float(amount_usd)
     except Exception:
         return {
             "ok": False,
-            "error": f"invalid amount_usd: {amount_usd!r}",
+            "status": "DENIED",
+            "reason": f"invalid amount_usd: {amount_usd!r}",
             "parsed": parsed,
         }
 
-    venue = parsed.get("venue")
-    quote = parsed.get("quote")
+    if not token:
+        return {"ok": False, "status": "DENIED", "reason": "missing token", "parsed": parsed}
+    if not venue:
+        return {"ok": False, "status": "DENIED", "reason": "missing venue", "parsed": parsed}
 
     now = int(time.time())
     intent_id = f"manual_rebuy:{token}:{now}"
 
-    # Base policy intent
-    intent: Dict[str, Any] = {
+    # Base intent we give to the guard
+    base_intent: Dict[str, Any] = {
         "token": token,
-        "action": "BUY",
+        "venue": venue.upper(),
+        "quote": quote.upper() if quote else None,
         "amount_usd": amount_usd_f,
-        "venue": venue,
-        "quote": quote,
-        # Policy spine metadata:
+        "action": "BUY",
+        # metadata for downstream logging/policy
         "intent_id": intent_id,
         "agent_target": DEFAULT_AGENT_TARGET or MANUAL_AGENT_ID,
         "source": "nova_trigger.manual_rebuy",
         "policy_id": POLICY_ID,
     }
 
-    # Run through manual_rebuy_policy (which calls PolicyEngine + C-Series)
-    mrp_result = evaluate_manual_rebuy(intent)
-    ok, reason, patched = _normalize_mrp_result(mrp_result, intent)
+    # trade_guard applies C-Series + PolicyEngine
+    decision = guard_trade_intent(base_intent)
+
+    ok = bool(decision.get("ok"))
+    status = decision.get("status") or ("APPROVED" if ok else "DENIED")
+    reason = decision.get("reason") or ""
+    patched = decision.get("patched") or {}
+    if not isinstance(patched, dict):
+        patched = {}
 
     orig_amt = amount_usd_f
     patched_amt = None
     if isinstance(patched.get("amount_usd"), (int, float)):
         patched_amt = float(patched["amount_usd"])
 
-    # Determine status label
-    if not ok:
-        status = "DENIED"
-    elif patched_amt is not None and patched_amt + 1e-9 < orig_amt:
-        status = "CLIPPED"
-    else:
-        status = "APPROVED"
-
     # -----------------------------------------------------------------------
-    # Optional enqueue (best-effort, fail-safe)
+    # Optional enqueue (best-effort, fail-safe) when REBUY_MODE=live
     # -----------------------------------------------------------------------
     enq_ok = False
     enq_reason: Optional[str] = None
     enqueue_result: Dict[str, Any] = {"ok": False}
+    enq_mode = REBUY_MODE
 
     if ok and REBUY_MODE == "live":
         try:
-            # We attempt to re-use the same helper ops_sign_and_enqueue.attempt()
-            # but guard it so any mismatch or error does NOT crash policy path.
             from ops_sign_and_enqueue import attempt as outbox_attempt  # type: ignore
 
             payload: Dict[str, Any] = {
@@ -301,8 +259,8 @@ def _handle_manual_rebuy(parsed: Dict[str, Any]) -> Dict[str, Any]:
                 "intent": {
                     "type": "manual_rebuy",
                     "token": token,
-                    "venue": patched.get("venue") or venue,
-                    "quote": patched.get("quote") or quote,
+                    "venue": patched.get("venue") or base_intent["venue"],
+                    "quote": patched.get("quote") or base_intent.get("quote"),
                     "amount_usd": patched_amt if patched_amt is not None else orig_amt,
                     "intent_id": intent_id,
                 },
@@ -328,7 +286,7 @@ def _handle_manual_rebuy(parsed: Dict[str, Any]) -> Dict[str, Any]:
         orig_amt=orig_amt,
         patched_amt=patched_amt,
         enq_ok=enq_ok,
-        enq_mode=REBUY_MODE,
+        enq_mode=enq_mode,
         enq_reason=enq_reason,
     )
 
@@ -336,10 +294,10 @@ def _handle_manual_rebuy(parsed: Dict[str, Any]) -> Dict[str, Any]:
         "ok": ok,
         "status": status,
         "reason": reason,
-        "intent": intent,
+        "intent": base_intent,
         "patched_intent": patched,
         "enqueue": {
-            "mode": REBUY_MODE,
+            "mode": enq_mode,
             "ok": enq_ok,
             "result": enqueue_result,
             "reason": enq_reason,
@@ -362,7 +320,6 @@ def route_manual(msg: str) -> Dict[str, Any]:
     parsed = parse_manual(msg)
 
     if parsed.get("type") == "ERROR":
-        # Parsing error
         _send_orion_summary(
             raw=parsed.get("raw") or msg,
             parsed=parsed,
@@ -378,14 +335,12 @@ def route_manual(msg: str) -> Dict[str, Any]:
         return {"ok": False, "error": parsed.get("error"), "parsed": parsed}
 
     if parsed.get("type") == "UNKNOWN":
-        # Not a recognized manual command; we silently ignore or gently warn.
         warn(f"nova_trigger: unknown manual command: {msg!r}")
         return {"ok": False, "error": "unknown_command", "parsed": parsed}
 
     if parsed.get("type") == "MANUAL_REBUY":
         return _handle_manual_rebuy(parsed)
 
-    # Future: other command types
     warn(f"nova_trigger: unsupported parsed type: {parsed.get('type')}")
     return {"ok": False, "error": "unsupported_type", "parsed": parsed}
 
@@ -403,7 +358,7 @@ if __name__ == "__main__":
 
     if not msg:
         print("Usage: python nova_trigger.py 'MANUAL_REBUY BTC 25 VENUE=BINANCEUS'")
-        sys.exit(1)
+        raise SystemExit(1)
 
     info(f"nova_trigger CLI invoked with: {msg!r}")
     res = route_manual(msg)
