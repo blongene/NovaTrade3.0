@@ -328,6 +328,9 @@ def _kick_once_and_threads():
     info("Unlock horizon alerts…")
     _safe_call("Unlock horizon alerts", "unlock_horizon_alerts", "run_unlock_horizon_alerts"); _sleep_jitter()
 
+from sheets_bp import start_background_flusher
+start_background_flusher()
+
 # --- Production-safe boot (no dev server) ------------------------------------
 def boot():
     """Start all jobs/threads; expose Flask via wsgi.py/gunicorn (no app.run here)."""
