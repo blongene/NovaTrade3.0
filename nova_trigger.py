@@ -320,6 +320,28 @@ def route_manual(msg: str) -> Dict[str, Any]:
 
     return {"ok": bool(decision.get("ok")), "intent": intent, "decision": decision, "enqueue": enq}
 
+def _log_trigger_event(event_row):
+    sheet_url = os.getenv("SHEET_URL", "")
+    ws_name = os.getenv("NOVA_TRIGGER_LOG_WS", "NovaTrigger_Log")
+
+    if not sheet_url:
+        warn("nova_trigger: SHEET_URL missing; cannot log trigger.")
+        return
+
+    try:
+        sheets_append_rows(sheet_url, ws_name, [event_row])
+    except Exception as e:
+        warn(f"nova_trigger: failed to log trigger: {e}")
+
+_log_trigger_event([
+    time.time(),
+    "MANUAL_REBUY",
+    token,
+    amount_usd,
+    venue,
+    raw_msg,
+])
+
 # ---------------------------------------------------------------------------
 # shim: trigger_nova_ping, expected by Nova ping job
 # ---------------------------------------------------------------------------
