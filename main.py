@@ -165,6 +165,7 @@ from rotation_signal_engine import run_milestone_alerts  # Days Held milestones
 from rotation_executor import sync_confirmed_to_rotation_log  # header-safe Planner→Log
 from council_ledger import ensure_ledger_tabs
 from telemetry_digest import run_telemetry_digest
+from unified_snapshot import run_unified_snapshot
 _schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="12:10")
 
 # --- Boot orchestration ------------------------------------------------------
@@ -237,7 +238,7 @@ def _set_schedules():
     _schedule("Rotation Memory Weighted",      "rotation_feedback_enhancer", "run_rotation_feedback_enhancer", every=6,  unit="hours")
     _schedule("Milestone Alerts",              "rotation_signal_engine",     "run_milestone_alerts",           every=1,  unit="hours")
     _schedule("Policy Bias Builder",           "policy_bias_engine",         "run_policy_bias_builder",     when="01:20")
-
+    _schedule("Unified Snapshot",              "run_unified_snapshot",       
 def _kick_once_and_threads():
     # Background scheduler loop
     def _scheduler_loop():
