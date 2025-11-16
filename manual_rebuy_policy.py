@@ -5,22 +5,21 @@ Wrapper around PolicyEngine for MANUAL_REBUY intents.
 
 Responsibilities:
   - Normalize the incoming intent (token/venue/amount_usd/price_usd).
+  - Apply C-Series venue budget clamp (Unified_Snapshot-based) BEFORE policy.
   - Call PolicyEngine.validate(...) for sizing & risk checks.
   - Append a lightweight row into Policy_Log.
   - Send a short Telegram summary.
   - Return (ok, reason, patched) for upstream callers.
-
-Compatible with the B-3 policy_engine.py wrapper.
 """
 
 from __future__ import annotations
 
 import os
-import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple
 
 from policy_engine import PolicyEngine
+from venue_budget import get_budget_for_intent
 from utils import sheets_append_rows, send_telegram_message_dedup, warn  # type: ignore
 
 SHEET_URL = os.getenv("SHEET_URL", "")
@@ -70,13 +69,23 @@ def _format_telegram_summary(intent: Dict[str, Any], ok: bool, reason: str, patc
 
     lines = []
     lines.append("🧭 Manual Rebuy Policy Check")
-    lines.append(f"Asset: {token} on {venue} {f'/{quote}' if quote else ''}".rstrip())
+    lines.append(f"Asset: {token} on {venue}{f' / {quote}' if quote else ''}")
 
     if orig_amt_usd is not None:
-        if patched_amt_usd is not None and patched_amt_usd != orig_amt_usd:
-            lines.append(f"Requested: ${orig_amt_usd:,.2f} → Allowed: ${patched_amt_usd:,.2f}")
-        else:
-            lines.append(f"Requested: ${orig_amt_usd:,.2f}")
+        try:
+            orig_f = float(orig_amt_usd)
+        except Exception:
+            orig_f = None
+        try:
+            patched_f = float(patched_amt_usd) if patched_amt_usd is not None else None
+        except Exception:
+            patched_f = None
+
+        if orig_f is not None and patched_f is not None and patched_f != orig_f:
+            lines.append(f"Requested: ${orig_f:,.2f} → Allowed: ${patched_f:,.2f}")
+        elif orig_f is not None:
+            lines.append(f"Requested: ${orig_f:,.2f}")
+
     if price_usd:
         try:
             lines.append(f"Price: ${float(price_usd):,.4f} (from Unified_Snapshot)")
@@ -102,7 +111,7 @@ def evaluate_manual_rebuy(intent: Dict[str, Any]) -> Tuple[bool, str, Dict[str, 
       quote: str (optional)
       source: 'manual_rebuy' (optional)
     """
-    # Normalize a couple of fields for PolicyEngine wrapper
+    # Normalize fields
     token = (intent.get("token") or "").upper()
     venue = (intent.get("venue") or "").upper()
     quote = (intent.get("quote") or "").upper()
@@ -111,14 +120,17 @@ def evaluate_manual_rebuy(intent: Dict[str, Any]) -> Tuple[bool, str, Dict[str, 
 
     if not token:
         return False, "missing token", intent
+    if not venue:
+        return False, "missing venue", intent
     if amount_usd is None:
         return False, "missing amount_usd", intent
+
     try:
         amount_usd_f = float(amount_usd)
     except Exception:
         return False, "invalid amount_usd", intent
 
-    patched_intent = dict(intent)
+    patched_intent: Dict[str, Any] = dict(intent)
     patched_intent["token"] = token
     patched_intent["venue"] = venue
     if quote:
@@ -130,7 +142,36 @@ def evaluate_manual_rebuy(intent: Dict[str, Any]) -> Tuple[bool, str, Dict[str, 
         except Exception:
             pass
 
-    # Use the B-3 PolicyEngine wrapper (legacy API)
+    # -----------------------------------------------------------------------
+    # C-Series: venue budget clamp (Unified_Snapshot-based)
+    # -----------------------------------------------------------------------
+    try:
+        budget_usd, budget_reason = get_budget_for_intent(patched_intent)
+    except Exception as e:  # hard failure should not abort policy
+        budget_usd, budget_reason = None, f"budget_error:{type(e).__name__}"
+
+    if budget_usd is not None:
+        if budget_usd <= 0:
+            # No usable quote after reserve/keepback → DENY
+            reason = f"venue_budget_zero ({budget_reason})"
+            ok = False
+            patched = dict(patched_intent)
+            patched["amount_usd"] = 0.0
+            _append_policy_log_row(patched_intent, ok, reason, patched)
+            try:
+                msg = _format_telegram_summary(patched_intent, ok, reason, patched)
+                send_telegram_message_dedup(msg, dedup_ttl_sec=60)
+            except Exception as e:  # pragma: no cover
+                warn(f"manual_rebuy_policy: failed to send Telegram summary (budget_zero): {e}")
+            return ok, reason, patched
+
+        # If user requested more than venue budget, clamp down before PolicyEngine
+        if amount_usd_f > budget_usd:
+            patched_intent["amount_usd"] = budget_usd
+
+    # -----------------------------------------------------------------------
+    # B-3: use PolicyEngine wrapper for final sizing & risk checks
+    # -----------------------------------------------------------------------
     pe = PolicyEngine()
     ok, reason, patched = pe.validate(patched_intent, asset_state=None)
 
