@@ -5,7 +5,7 @@ import os, json, time, re
 from typing import Dict, Any
 
 import requests
-
+from utils import _open_sheet, _retry, get_ws
 from policy_engine import PolicyEngine  # still imported for backwards compat
 from manual_rebuy_policy import evaluate_manual_rebuy
 from ops_sign_and_enqueue import attempt as _ops_attempt  # reuse the canonical signer
@@ -24,7 +24,16 @@ REBUY_MODE        = os.getenv("REBUY_MODE", "dryrun").lower()
 OUTBOX_SECRET_RAW = os.getenv("OUTBOX_SECRET", "")
 OUTBOX_SECRET     = OUTBOX_SECRET_RAW.encode() if OUTBOX_SECRET_RAW else b""
 MANUAL_AGENT_ID   = os.getenv("MANUAL_AGENT_ID", os.getenv("EDGE_AGENT_ID", "edge-primary"))
+# ---------------------------------------------------------------------------
+# B-2: Unified_Snapshot price feed for manual rebuys
+# ---------------------------------------------------------------------------
+UNIFIED_SNAPSHOT_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
+PRICE_CACHE_TTL_SEC = int(os.getenv("PRICE_CACHE_TTL_SEC", "180"))   # 3 minutes
 
+_price_cache = {
+    "ts": 0.0,
+    "rows": [],
+}
 # ---------------------------------------------------------------------------
 # Telegram helper (minimal; reuses existing BOT_TOKEN / TELEGRAM_CHAT_ID)
 # ---------------------------------------------------------------------------
@@ -121,23 +130,147 @@ def parse_manual(msg: str) -> Dict[str, Any] | None:
         "ts": int(time.time()),
     }
 
+# ---------------------------------------------------------------------------
+# B-2: Unified_Snapshot-based price lookup
+# Sheet schema (headers):
+#   Timestamp, Venue, Asset, Free, Locked, Total, IsQuote, QuoteSymbol, Equity_USD
+# ---------------------------------------------------------------------------
+
+def _load_unified_snapshot(force: bool = False):
+    """Load & cache the Unified_Snapshot sheet for a short TTL."""
+    global _price_cache
+
+    now = time.time()
+    if (
+        not force
+        and _price_cache.get("rows")
+        and now - float(_price_cache.get("ts", 0.0)) < PRICE_CACHE_TTL_SEC
+    ):
+        return _price_cache["rows"]
+
+    sh = _retry(_open_sheet)
+    if not sh:
+        return []
+
+    try:
+        ws = _retry(get_ws, sh, UNIFIED_SNAPSHOT_WS)
+        rows = _retry(ws.get_all_records)
+    except Exception:
+        return []
+
+    _price_cache["ts"] = now
+    _price_cache["rows"] = rows or []
+    return _price_cache["rows"]
+
+
+def _derive_price_from_snapshot_row(row: dict) -> float | None:
+    """
+    Given one Unified_Snapshot row, derive a USD price:
+        price_usd ≈ Equity_USD / Total
+    Falls back to Free+Locked if Total is missing/zero.
+    """
+    if not row:
+        return None
+
+    try:
+        equity_usd = float(row.get("Equity_USD") or 0)
+    except Exception:
+        equity_usd = 0.0
+
+    if equity_usd <= 0:
+        return None
+
+    # Prefer explicit Total if present
+    total = row.get("Total")
+    try:
+        total_val = float(total) if total not in (None, "") else 0.0
+    except Exception:
+        total_val = 0.0
+
+    # Fallback: Free + Locked
+    if total_val <= 0:
+        try:
+            free_val = float(row.get("Free") or 0)
+        except Exception:
+            free_val = 0.0
+        try:
+            locked_val = float(row.get("Locked") or 0)
+        except Exception:
+            locked_val = 0.0
+        total_val = free_val + locked_val
+
+    if total_val <= 0:
+        return None
+
+    price = equity_usd / total_val
+    return price if price > 0 else None
+
+
+def _get_price_usd_from_unified_snapshot(token: str) -> tuple[float | None, str]:
+    """
+    Look up a USD price for `token` from Unified_Snapshot.
+
+    Strategy:
+    - Load cached rows (refreshed every PRICE_CACHE_TTL_SEC).
+    - Filter rows where Asset == token (case-insensitive).
+    - Iterate from newest to oldest (sheet is top→bottom oldest→newest).
+    - Use the first row where we can derive a positive price.
+    """
+    token_up = (token or "").upper()
+    if not token_up:
+        return None, "no_token"
+
+    rows = _load_unified_snapshot()
+    if not rows:
+        return None, "no_snapshot_rows"
+
+    # assume sheet is chronological; newest at bottom
+    for r in reversed(rows):
+        asset = str(r.get("Asset") or "").upper()
+        if asset != token_up:
+            continue
+
+        price = _derive_price_from_snapshot_row(r)
+        if price and price > 0:
+            return float(price), "ok"
+
+    return None, "no_price_for_token"
+
 def route_manual(msg: str) -> Dict[str, Any]:
     """
     Entry point used by nova_trigger_watcher.check_nova_trigger
     when it sees a MANUAL_REBUY command in NovaTrigger!A1.
     """
-    intent = parse_manual(msg)
-    if not intent:
-        return {
-            "ok": False,
-            "reason": "unrecognized manual format",
-            "decision": {},
-            "enqueue": {"ok": False},
+        intent = {
+        "source": "manual_rebuy",
+        "token": token,
+        "action": "BUY",
+        "amount_usd": amt_usd,
+        "venue": venue,
+        "quote": quote,
+        "ts": time.time(),
+        "raw_msg": msg,
         }
-
-    # Run through unified policy engine via our manual wrapper
-    decision = evaluate_manual_rebuy(intent)
-    patched  = decision.get("patched") or {}
+    
+        # -----------------------------------------------------------------------
+        # B-2: auto price fetch from Unified_Snapshot
+        # -----------------------------------------------------------------------
+        price_usd = None
+        price_reason = ""
+    
+        try:
+            price_usd, price_reason = _get_price_usd_from_unified_snapshot(token)
+        except Exception as e:
+            price_reason = f"error:{type(e).__name__}"
+    
+        if price_usd and price_usd > 0:
+            intent["price_usd"] = float(price_usd)
+        # else: leave unset; manual_rebuy_policy / PolicyEngine will still
+        #       enforce allow_price_unknown etc.
+    
+        # Run through manual policy (which delegates to PolicyEngine)
+        decision = evaluate_manual_rebuy(intent)
+        patched  = decision.get("patched") or {}
 
     # enqueue only if OK + live
     enq: Dict[str, Any] = {"ok": False}
