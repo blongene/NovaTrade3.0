@@ -1,12 +1,10 @@
-# --- BEGIN nova_trigger.py (patched for dedup + watcher compatibility) -----
-
 from __future__ import annotations
 import os, re, time
 from typing import Any, Dict, Optional
 
 from utils import send_telegram_message_dedup, warn, info
 from trade_guard import guard_trade_intent
-
+from price_feed import get_price_usd  # NEW
 
 REBUY_MODE = os.getenv("REBUY_MODE", "dryrun").strip().lower()
 DEFAULT_AGENT_TARGET = os.getenv("DEFAULT_AGENT_TARGET", "")
@@ -15,7 +13,6 @@ POLICY_ID = os.getenv("POLICY_ID", "main")
 
 if not MANUAL_AGENT_ID:
     MANUAL_AGENT_ID = (DEFAULT_AGENT_TARGET or os.getenv("AGENT_ID", "edge-primary")).split(",")[0]
-
 
 _MANUAL_REBUY_RE = re.compile(
     r"^\s*MANUAL_REBUY\s+([A-Za-z0-9_\-]+)\s+([0-9]*\.?[0-9]+)\s*(.*)$",
@@ -37,7 +34,7 @@ def parse_manual(msg: str) -> Dict[str, Any]:
 
     try:
         amt = float(amt_raw)
-    except:
+    except Exception:
         return {"type": "ERROR", "raw": msg, "error": f"invalid amount_usd: {amt_raw}"}
 
     params = _parse_kv(rest)
@@ -54,16 +51,12 @@ def parse_manual(msg: str) -> Dict[str, Any]:
         "params": params,
     }
 
-
 def _send_summary(raw, parsed, status, ok, reason, orig_amt, patched_amt, enq_ok, mode, enq_reason):
     token = parsed.get("token") or "?"
     venue = parsed.get("venue") or "?"
     quote = parsed.get("quote") or ""
 
-    if quote:
-        venue_str = f"{venue}/{quote}"
-    else:
-        venue_str = venue
+    venue_str = f"{venue}/{quote}" if quote else venue
 
     lines = [
         "🔔 Orion voice triggered:",
@@ -80,32 +73,35 @@ def _send_summary(raw, parsed, status, ok, reason, orig_amt, patched_amt, enq_ok
 
     if mode == "live":
         lines.append(f"Enqueued: {enq_ok}")
-        if enq_reason: lines.append(f"Note: {enq_reason}")
+        if enq_reason:
+            lines.append(f"Note: {enq_reason}")
     else:
         lines.append(f"Enqueued: False (mode={mode})")
 
     try:
-        # Call WITHOUT keyword arg (utils version does NOT accept dedup_ttl_sec)
+        # utils version takes positional args only
         send_telegram_message_dedup("\n".join(lines))
     except Exception as e:
         warn(f"nova_trigger: failed summary send: {e}")
-
 
 def _handle_manual_rebuy(parsed):
     token = parsed["token"]
     venue = parsed["venue"]
     amount = parsed["amount_usd"]
-    quote = parsed.get("quote")
+    quote = parsed.get("quote") or "USDT"
 
     now = int(time.time())
     intent_id = f"manual_rebuy:{token}:{now}"
+
+    # B-2: get price from Unified_Snapshot (venue-specific with fallback)
+    price_usd = get_price_usd(token, quote, venue)
 
     guard_intent = {
         "token": token,
         "venue": venue,
         "quote": quote,
         "amount_usd": float(amount),
-        "price_usd": None,
+        "price_usd": price_usd,  # NEW
         "action": "BUY",
         "intent_id": intent_id,
         "agent_target": DEFAULT_AGENT_TARGET or MANUAL_AGENT_ID,
@@ -123,7 +119,7 @@ def _handle_manual_rebuy(parsed):
     orig_amt = float(amount)
     patched_amt = patched.get("amount_usd", orig_amt)
 
-    # Enqueue logic (same as before, best-effort)
+    # Enqueue logic (best-effort)
     enq_ok = False
     enq_reason = None
 
@@ -165,7 +161,7 @@ def _handle_manual_rebuy(parsed):
         "ok": ok,
         "status": status,
         "reason": reason,
-        "decision": {       # <-- Added so watcher stops crashing
+        "decision": {       # watcher compatibility
             "status": status,
             "reason": reason,
             "ok": ok,
@@ -178,7 +174,6 @@ def _handle_manual_rebuy(parsed):
             "reason": enq_reason,
         },
     }
-
 
 def route_manual(msg: str) -> Dict[str, Any]:
     parsed = parse_manual(msg)
@@ -196,4 +191,17 @@ def route_manual(msg: str) -> Dict[str, Any]:
     warn(f"nova_trigger: unsupported type: {parsed['type']}")
     return {"ok": False, "error": "unsupported_type", "decision": {"ok": False}}
 
-# --- END nova_trigger.py -----
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        msg = " ".join(sys.argv[1:])
+    else:
+        msg = os.getenv("NOVA_TRIGGER_MSG", "").strip()
+
+    if not msg:
+        print("Usage: python nova_trigger.py 'MANUAL_REBUY BTC 25 VENUE=BINANCEUS'")
+        raise SystemExit(1)
+
+    info(f"nova_trigger CLI invoked with: {msg!r}")
+    res = route_manual(msg)
+    print(res)
