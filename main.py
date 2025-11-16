@@ -9,6 +9,14 @@ from flask import Blueprint, request, jsonify
 from policy_bias_engine import run_policy_bias_builder
 from telegram_summaries import run_telegram_summaries
 
+# Enable asynchronous Sheets gateway flusher
+try:
+    from sheets_bp import start_background_flusher
+    start_background_flusher()
+    print("[SheetsGateway] background flusher started", flush=True)
+except Exception as e:
+    print(f"[SheetsGateway] flusher not started: {e}", flush=True)
+
 # --- Utils (required) --------------------------------------------------------
 try:
     from utils import (
@@ -327,9 +335,6 @@ def _kick_once_and_threads():
 
     info("Unlock horizon alerts…")
     _safe_call("Unlock horizon alerts", "unlock_horizon_alerts", "run_unlock_horizon_alerts"); _sleep_jitter()
-
-from sheets_bp import start_background_flusher
-start_background_flusher()
 
 # --- Production-safe boot (no dev server) ------------------------------------
 def boot():
