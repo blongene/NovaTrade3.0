@@ -37,7 +37,6 @@ POLICY_MIN_QUOTE_RESERVE_USD = float(os.getenv("POLICY_MIN_QUOTE_RESERVE_USD", "
 
 VENUE_BUDGET_CACHE_TTL_SEC = int(os.getenv("VENUE_BUDGET_CACHE_TTL_SEC", "60"))
 
-
 _budget_cache: Dict[str, Any] = {
     "ts": 0.0,
     "rows": [],
@@ -168,12 +167,26 @@ def get_budget_for_intent(intent: Dict[str, Any]) -> Tuple[Optional[float], str]
 
     Returns (budget_usd, reason):
       budget_usd: None => budget unknown (do nothing)
-                  0.0  => venue has no usable quote after keepback
+                  0.0  => venue has no usable quote after reserves
                   >0   => max allowed spend in USD for this venue+quote
 
     Reason is for logging / debugging.
     """
     venue = str(intent.get("venue") or "").upper()
     quote = str(intent.get("quote") or "").upper()
+
     if not venue:
-        return None
+        return None, "missing_venue"
+    if not quote:
+        return None, "missing_quote"
+
+    total_equity = _get_total_equity_usd(venue, quote)
+    if total_equity is None:
+        return None, "no_snapshot_data"
+
+    # Apply min reserve + keepback; never let it go below zero
+    usable = float(total_equity) - POLICY_MIN_QUOTE_RESERVE_USD - POLICY_KEEPBACK_USD
+    if usable <= 0:
+        return 0.0, "no_usable_after_reserve"
+
+    return usable, "ok"
