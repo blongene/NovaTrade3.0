@@ -1,5 +1,5 @@
 """
-unified_snapshot.py — C-1 + B-2
+unified_snapshot.py — C-1 + B-2 (latest-per-asset)
 
 Builds a normalized balance view in the Unified_Snapshot sheet:
 
@@ -15,13 +15,14 @@ Rules:
   • Equity_USD:
       - If IsQuote: Equity_USD = Total (1 quote ≈ 1 USD)
       - Else      : Equity_USD = Total * price_feed.get_price_usd(Asset, Quote or "USDT", Venue)
+  • Only the **latest** Wallet_Monitor row per (Venue, Asset) is used.
 """
 
 from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Dict, Any, Tuple
 
 import gspread  # type: ignore
 
@@ -49,11 +50,40 @@ def _safe_num(x) -> float:
         return 0.0
 
 
-def _load_wallet_rows(sh: gspread.Spreadsheet) -> List[Tuple[str, str, float, float, str]]:
+def _parse_ts(val) -> float:
+    """Best-effort parse of Wallet_Monitor Timestamp to epoch seconds."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str) and val.strip():
+        s = val.replace("Z", "").strip()
+        # Try a few common formats
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(s, fmt).timestamp()
+            except Exception:
+                continue
+        # Last resort: maybe it's already a numeric string
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _load_wallet_rows(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
     """
-    Returns list of (venue, asset, free, locked, quote)
+    Load Wallet_Monitor and return normalized rows:
+
+        {
+          "venue": str,
+          "asset": str,
+          "free": float,
+          "locked": float,
+          "quote": str,
+          "ts": float (epoch seconds),
+        }
     """
-    rows: List[Tuple[str, str, float, float, str]] = []
+    rows: List[Dict[str, Any]] = []
     try:
         ws = sh.worksheet(WALLET_MONITOR_WS)
         data = ws.get_all_records()
@@ -70,8 +100,19 @@ def _load_wallet_rows(sh: gspread.Spreadsheet) -> List[Tuple[str, str, float, fl
         free = _safe_num(r.get("Free", 0))
         locked = _safe_num(r.get("Locked", 0))
         quote = str(r.get("Quote", "")).strip().upper()
+        ts_raw = r.get("Timestamp", "")
+        ts = _parse_ts(ts_raw)
 
-        rows.append((venue, asset, free, locked, quote))
+        rows.append(
+            {
+                "venue": venue,
+                "asset": asset,
+                "free": free,
+                "locked": locked,
+                "quote": quote,
+                "ts": ts,
+            }
+        )
 
     return rows
 
@@ -98,15 +139,27 @@ def run_unified_snapshot() -> None:
     if not wallet_rows:
         print("ℹ️ unified_snapshot: no Wallet_Monitor rows found; Unified_Snapshot will be empty (ok).")
 
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    out_rows: List[list] = []
+    # Collapse Wallet_Monitor into latest row per (venue, asset)
+    latest_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-    for venue, asset, free, locked, quote in wallet_rows:
+    for r in wallet_rows:
+        key = (r["venue"], r["asset"])
+        prev = latest_by_key.get(key)
+        if prev is None or r["ts"] >= prev["ts"]:
+            latest_by_key[key] = r
+
+    snapshot_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    out_rows: List[List[Any]] = []
+
+    for (venue, asset), r in latest_by_key.items():
+        free = r["free"]
+        locked = r["locked"]
+        quote = r["quote"]
         total = free + locked
         is_quote = asset in QUOTE_ASSETS
         is_quote_str = "TRUE" if is_quote else "FALSE"
 
-        equity_usd = ""
+        equity_usd: Any = ""
 
         if total > 0:
             if is_quote:
@@ -122,7 +175,7 @@ def run_unified_snapshot() -> None:
 
         out_rows.append(
             [
-                now,           # Timestamp
+                snapshot_ts,   # snapshot build time
                 venue,         # Venue
                 asset,         # Asset
                 free,          # Free
