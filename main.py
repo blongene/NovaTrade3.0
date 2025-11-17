@@ -301,6 +301,9 @@ def _kick_once_and_threads():
     info("Calculating Rebuy Weights…")
     _safe_call("Rebuy weight calculator", "rebuy_weight_calculator", "run_rebuy_weight_calculator"); _sleep_jitter()
 
+    info("Running Unified Snapshot…")
+    _safe_call("Unified Snapshot", "unified_snapshot", "run_unified_snapshot"); _sleep_jitter()
+               
     # Sentiment-triggered scan (soft)
     info("Sentiment-Triggered Rebuy Scan…")
     _safe_call("Sentiment trigger engine", "sentiment_trigger_engine", "run_sentiment_trigger_engine"); _sleep_jitter()
