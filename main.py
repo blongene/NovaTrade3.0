@@ -233,11 +233,12 @@ def _set_schedules():
     _schedule("Rebuy ROI Tracker",             "rebuy_roi_tracker",          "run_rebuy_roi_tracker",       when="12:45")
     _schedule("Sentiment Alerts",              "sentiment_alerts",           "run_sentiment_alerts",        when="13:00")
 
-    # --- Phase 9 added schedules ---
+        # --- Phase 9 added schedules ---
     _schedule("Planner→Log Sync",              "rotation_executor",          "sync_confirmed_to_rotation_log", every=30, unit="minutes")
     _schedule("Rotation Memory Weighted",      "rotation_feedback_enhancer", "run_rotation_feedback_enhancer", every=6,  unit="hours")
     _schedule("Milestone Alerts",              "rotation_signal_engine",     "run_milestone_alerts",           every=1,  unit="hours")
     _schedule("Wallet Monitor",                "wallet_monitor",             "run_wallet_monitor",             every=15, unit="minutes")
+    _schedule("Telemetry Mirror",              "telemetry_mirror",           "mirror_telemetry_once",          every=15, unit="minutes")
     _schedule("Unified Snapshot",              "unified_snapshot",           "run_unified_snapshot",           every=15, unit="minutes")
     
 def _kick_once_and_threads():
