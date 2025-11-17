@@ -219,35 +219,42 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
 
     source = intent.get("source") or ""
 
-    row_dict: Dict[str, Any] = {
-        "Timestamp": ts,
-        "Token": token,
-        "Action": action,
-        "Amount_USD": amt_usd,
-        "OK": "TRUE" if ok else "FALSE",
-        "Reason": reason,
-        "Patched": _to_json(patched),
-        "Venue": venue,
-        "Quote": quote,
-        "Liquidity": liquidity,
-        "Cooldown_Min": cooldown_min,
-        "Notes": notes,
-        "Intent_ID": intent_id,
-        "Symbol": symbol,
-        "Decision": _to_json(decision),
-        "Source": source,
-    }
+        # Append to Sheets if possible; otherwise fall back to local JSONL
+    headers = [
+        "Timestamp",
+        "Token",
+        "Action",
+        "Amount_USD",
+        "OK",
+        "Reason",
+        "Patched",
+        "Venue",
+        "Quote",
+        "Liquidity",
+        "Cooldown_Min",
+        "Notes",
+        "Intent_ID",
+        "Symbol",
+        "Decision",
+        "Source",
+    ]
 
-    # Sheets append + local fallback
+    # Always attempt local append as a safety net
     try:
-        if not SHEET_URL:
-            # No remote sheet configured; keep a local JSONL trail only
-            _append_local(row_dict)
-        else:
-            _append_sheet_row(row_dict)
-    except Exception as e:
-        try:
-            _log_warn(f"Policy_Log append failed: {e}")
-        except Exception:
-            pass
         _append_local(row_dict)
+    except Exception:
+        # Local logging must never break the flow
+        pass
+
+    if not SHEET_URL:
+        # No sheet configured; local log is all we can do.
+        return
+
+    try:
+        ws = _open_sheet()
+        row = [row_dict.get(h, "") for h in headers]
+        # Use USER_ENTERED so numbers/JSON are interpreted sensibly
+        ws.append_row(row, value_input_option="USER_ENTERED")
+    except Exception:
+        # If Sheets fails (quota, auth, etc.), we’ve already written to local file.
+        return
