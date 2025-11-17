@@ -13,6 +13,21 @@ LOCAL_FALLBACK_PATH = os.getenv("POLICY_LOG_LOCAL", "./policy_log.jsonl")
 MAX_RETRIES = 2
 RETRY_BASE = 0.75  # seconds
 
+try:
+    # Prefer Bus-wide Sheets + backoff helpers if available
+    from utils import get_gspread_client, with_sheet_backoff, warn as _log_warn
+except Exception:  # pragma: no cover - degrade gracefully when utils not present
+    get_gspread_client = None
+
+    def with_sheet_backoff(fn):
+        return fn
+
+    def _log_warn(msg: str) -> None:
+        try:
+            print(f"[policy_logger] {msg}")
+        except Exception:
+            pass
+
 
 def _ts(dt: Optional[datetime] = None) -> str:
     return (dt or datetime.utcnow()).strftime("%Y-%m-%d %H:%M:%S")
@@ -87,6 +102,73 @@ def _open_sheet():
     return ws
 
 
+@with_sheet_backoff
+def _append_sheet_row(row: Dict[str, Any]) -> None:
+    """Append a single Policy_Log row to Sheets (or raise).
+
+    Uses the Bus token-bucket + backoff via with_sheet_backoff;
+    falls back to gspread direct if utils client is unavailable.
+    """
+    # Prefer shared utils client when available
+    if SHEET_URL and get_gspread_client is not None:
+        gc = get_gspread_client()
+        sh = gc.open_by_url(SHEET_URL)
+        try:
+            ws = sh.worksheet(POLICY_LOG_WS)
+        except Exception:
+            # Create sheet and seed headers if missing
+            ws = sh.add_worksheet(title=POLICY_LOG_WS, rows=4000, cols=20)
+            ws.append_row(
+                [
+                    "Timestamp",
+                    "Token",
+                    "Action",
+                    "Amount_USD",
+                    "OK",
+                    "Reason",
+                    "Patched",
+                    "Venue",
+                    "Quote",
+                    "Liquidity",
+                    "Cooldown_Min",
+                    "Notes",
+                    "Intent_ID",
+                    "Symbol",
+                    "Decision",
+                    "Source",
+                ],
+                value_input_option="USER_ENTERED",
+            )
+    else:
+        # Fallback to local gspread auth helper
+        ws = _open_sheet()
+
+    headers = [
+        "Timestamp",
+        "Token",
+        "Action",
+        "Amount_USD",
+        "OK",
+        "Reason",
+        "Patched",
+        "Venue",
+        "Quote",
+        "Liquidity",
+        "Cooldown_Min",
+        "Notes",
+        "Intent_ID",
+        "Symbol",
+        "Decision",
+        "Source",
+    ]
+    values = [row.get(h, "") for h in headers]
+    try:
+        ws.append_row(values, value_input_option="USER_ENTERED")
+    except TypeError:
+        # Older gspread versions may not support value_input_option here
+        ws.append_row(values)
+
+
 def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = None) -> None:
     if not LOG_ENABLED:
         return
@@ -156,5 +238,16 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
         "Source": source,
     }
 
-    # ...existing Sheets append / local fallback logic using row_dict...
-
+    # Sheets append + local fallback
+    try:
+        if not SHEET_URL:
+            # No remote sheet configured; keep a local JSONL trail only
+            _append_local(row_dict)
+        else:
+            _append_sheet_row(row_dict)
+    except Exception as e:
+        try:
+            _log_warn(f"Policy_Log append failed: {e}")
+        except Exception:
+            pass
+        _append_local(row_dict)
