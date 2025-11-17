@@ -229,7 +229,7 @@ def _set_schedules():
     _schedule("Vault ROI Tracker",             "vault_roi_tracker",          "run_vault_roi_tracker",       when="02:00")
     _schedule("Vault Rotation Scanner",        "vault_rotation_scanner",     "run_vault_rotation_scanner",  when="09:15")
     _schedule("Vault Rotation Executor",       "vault_rotation_executor",    "run_vault_rotation_executor", when="09:25")
-    _schedule("Wallet Monitor",                "wallet_monitor",             "run_wallet_monitor",          when="09:45")
+    _schedule("Policy Bias Builder",           "policy_bias_engine",         "run_policy_bias_builder",     when="01:20") 
     _schedule("Rebuy ROI Tracker",             "rebuy_roi_tracker",          "run_rebuy_roi_tracker",       when="12:45")
     _schedule("Sentiment Alerts",              "sentiment_alerts",           "run_sentiment_alerts",        when="13:00")
 
@@ -237,7 +237,7 @@ def _set_schedules():
     _schedule("Planner→Log Sync",              "rotation_executor",          "sync_confirmed_to_rotation_log", every=30, unit="minutes")
     _schedule("Rotation Memory Weighted",      "rotation_feedback_enhancer", "run_rotation_feedback_enhancer", every=6,  unit="hours")
     _schedule("Milestone Alerts",              "rotation_signal_engine",     "run_milestone_alerts",           every=1,  unit="hours")
-    _schedule("Policy Bias Builder",           "policy_bias_engine",         "run_policy_bias_builder",        when="01:20")
+    _schedule("Wallet Monitor",                "wallet_monitor",             "run_wallet_monitor",             every=15, unit="minutes")
     _schedule("Unified Snapshot",              "unified_snapshot",           "run_unified_snapshot",           every=15, unit="minutes")
     
 def _kick_once_and_threads():
@@ -301,6 +301,9 @@ def _kick_once_and_threads():
     info("Calculating Rebuy Weights…")
     _safe_call("Rebuy weight calculator", "rebuy_weight_calculator", "run_rebuy_weight_calculator"); _sleep_jitter()
 
+    info("Wallet Monitor…")
+    _safe_call("Wallet Monitor", "wallet_monitor", "run_wallet_monitor"); _sleep_jitter()
+    
     info("Running Unified Snapshot…")
     _safe_call("Unified Snapshot", "unified_snapshot", "run_unified_snapshot"); _sleep_jitter()
                
