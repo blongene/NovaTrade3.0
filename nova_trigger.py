@@ -6,7 +6,7 @@ from utils import send_telegram_message_dedup, warn, info
 from trade_guard import guard_trade_intent
 from price_feed import get_price_usd  # NEW
 from nova_trigger_logger import log_nova_trigger  # NEW
-from nova_trigger_sender import 
+from nova_trigger_sender import trigger_nova_ping
 
 REBUY_MODE = os.getenv("REBUY_MODE", "dryrun").strip().lower()
 DEFAULT_AGENT_TARGET = os.getenv("DEFAULT_AGENT_TARGET", "")
@@ -20,7 +20,6 @@ _MANUAL_REBUY_RE = re.compile(
     r"^\s*MANUAL_REBUY\s+([A-Za-z0-9_\-]+)\s+([0-9]*\.?[0-9]+)\s*(.*)$",
     re.IGNORECASE,
 )
-
 
 def _parse_kv(rest: str) -> Dict[str, str]:
     return {k.upper(): v for k, v in re.findall(r"([A-Za-z_]+)=([A-Za-z0-9_\-]+)", rest or "")}
