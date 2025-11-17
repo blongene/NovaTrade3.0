@@ -6,6 +6,7 @@ from utils import send_telegram_message_dedup, warn, info
 from trade_guard import guard_trade_intent
 from price_feed import get_price_usd  # NEW
 from nova_trigger_logger import log_nova_trigger  # NEW
+from nova_trigger_sender import 
 
 REBUY_MODE = os.getenv("REBUY_MODE", "dryrun").strip().lower()
 DEFAULT_AGENT_TARGET = os.getenv("DEFAULT_AGENT_TARGET", "")
