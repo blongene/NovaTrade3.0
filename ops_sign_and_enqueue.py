@@ -15,24 +15,29 @@
 #                 "venue": "BINANCEUS",
 #                 "symbol": "BTC/USDT",
 #                 "side": "BUY",
-#                 "amount": "25",
-#                 ...
+#                 "amount": 25,
 #             },
-#             "meta": {...},      # optional
 #         }
 #
-#      attempt() reads base URL + secret from env and returns:
+#      which will be converted into the canonical Outbox payload:
 #
-#         { "ok": bool, "reason": str, "status": int | None }
+#         {
+#             "payload": {
+#                 "agent_id": "edge-primary",
+#                 "type": "order.place",
+#                 "payload": {...},
+#                 "meta": {...optional...},
+#             }
+#         }
 #
-#   2) CLI tester:
+#   2) CLI helper:
 #
 #         python ops_sign_and_enqueue.py \
-#             --base https://novatrade3-0.onrender.com/api \
-#             --secret <OUTBOX_SECRET> \
+#             --base https://novatrade3-0.onrender.com \
+#             --secret $OUTBOX_SECRET \
 #             --agent edge-primary \
-#             --venue BINANCE.US \
-#             --symbol BTC/USDT \
+#             --venue BINANCEUS \
+#             --symbol BTCUSDT \
 #             --side BUY \
 #             --amount 25
 #
@@ -52,11 +57,21 @@ from typing import Any, Dict, Optional, Tuple
 import requests
 
 
-# ---------- shared helpers ----------
+# ---------- HMAC helpers ----------
 
 
-def now_ms() -> str:
-    return str(int(time.time() * 1000))
+def _load_secret_from_env() -> bytes:
+    """
+    Load OUTBOX_SECRET from either OUTBOX_SECRET or OUTBOX_SECRET_FILE.
+    """
+    s = os.getenv("OUTBOX_SECRET") or ""
+    path = os.getenv("OUTBOX_SECRET_FILE")
+    if not s and path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            s = f.read().strip()
+    if not s:
+        raise RuntimeError("OUTBOX_SECRET or OUTBOX_SECRET_FILE must be set")
+    return s.encode("utf-8")
 
 
 def hmac_hex(secret: bytes, data: bytes) -> str:
@@ -75,7 +90,6 @@ def _trial_signatures(secret: bytes, raw_json: bytes, ts: str):
         ("ts\\nbody", hmac_hex(secret, (ts + "\n" + body_str).encode())),
     ]
     for label, sig in trials:
-        # IMPORTANT: ops_api_sqlite expects X-Outbox-Signature
         yield label, {
             "Content-Type": "application/json",
             "X-Timestamp": ts,
@@ -94,113 +108,98 @@ def _attempt_raw(
     """
     Core HTTP logic, shared by CLI and bus.
 
-    Returns (ok, label, json_response, status_code)
+    We try multiple signing formats; the Bus will accept whichever
+    matches its HMAC policy (if any). If none match, we fail.
     """
-    raw = json.dumps(body_dict, separators=(",", ":"), sort_keys=True).encode()
-    ts = now_ms()
+    raw_json = json.dumps(body_dict, separators=(",", ":"), ensure_ascii=False).encode()
+    ts = str(int(time.time()))
     last_status: Optional[int] = None
+    last_body: Optional[Dict[str, Any]] = None
 
-    for label, headers in _trial_signatures(secret, raw, ts):
+    for label, headers in _trial_signatures(secret, raw_json, ts):
         try:
-            r = requests.post(url, data=raw, headers=headers, timeout=timeout)
-            status = r.status_code
-            last_status = status
-            is_json = r.headers.get("content-type", "").startswith("application/json")
+            r = requests.post(url, data=raw_json, headers=headers, timeout=timeout)
+            last_status = r.status_code
+            try:
+                last_body = r.json()
+            except Exception:
+                last_body = {"raw": r.text}
             if verbose:
-                if not is_json:
-                    snippet = r.text[:200] if r.text else ""
-                    print(f"[{label}] HTTP {status} → {snippet}")
-            if status == 200 and is_json:
-                j = r.json()
-                if j.get("ok") is True:
-                    if verbose:
-                        print(f"[SUCCESS via {label}] id={j.get('id')}, status={status}")
-                    return True, label, j, status
-                else:
-                    if verbose:
-                        print(f"[{label}] HTTP 200 but ok!=True → {j}")
-            else:
-                if verbose and is_json:
-                    print(f"[{label}] HTTP {status} → {r.text[:200]}")
-        except Exception as err:
+                print(f"[{label}] status={r.status_code} body={last_body}")
+            # if bus replies with ok or 4xx, treat as definitive
+            if r.status_code < 500:
+                return True, label, last_body, last_status
+        except Exception as e:
             if verbose:
-                print(f"[{label}] error: {err}")
+                print(f"[{label}] request failed: {e}")
+            last_body = {"error": str(e)}
 
-    return False, None, None, last_status
+    # all attempts failed
+    return False, "all_failed", last_body, last_status
 
 
-# ---------- BUS-SIDE API (for nova_trigger) ----------
-
-
-def _load_secret_from_env() -> bytes:
-    """
-    Load OUTBOX secret from either OUTBOX_SECRET_FILE or OUTBOX_SECRET.
-    Returns bytes suitable for HMAC.
-    """
-    path = os.getenv("OUTBOX_SECRET_FILE", "").strip()
-    if path:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                val = f.read().strip()
-                if val:
-                    try:
-                        return bytes.fromhex(val)
-                    except ValueError:
-                        return val.encode("utf-8")
-        except FileNotFoundError:
-            pass  # fall through to env var
-
-    s = os.getenv("OUTBOX_SECRET", "").strip()
-    if not s:
-        raise RuntimeError("OUTBOX_SECRET / OUTBOX_SECRET_FILE is missing")
-    try:
-        return bytes.fromhex(s)
-    except ValueError:
-        return s.encode("utf-8")
+# ---------- Envelope → payload ----------
 
 
 def _derive_base_from_env() -> str:
-    """
-    Prefer OPS_ENQUEUE_BASE; fallback to OPS_ENQUEUE_URL.
+    """Resolve the Outbox base URL.
 
-    For ops_api_sqlite's /api/ops/enqueue you typically want:
-        OPS_ENQUEUE_BASE = https://novatrade3-0.onrender.com/api
+    Priority:
+      1) OPS_ENQUEUE_BASE
+      2) OPS_BASE_URL
+      3) Derive from OPS_ENQUEUE_URL (backwards-compat).
+
+    Normalized for Bus wsgi.py which exposes POST /ops/enqueue (no /api prefix).
     """
+    # Highest priority: explicit base override
     base = os.getenv("OPS_ENQUEUE_BASE", "").strip()
+    if not base:
+        # Next: general Bus base (e.g., https://novatrade3-0.onrender.com)
+        base = os.getenv("OPS_BASE_URL", "").strip()
     if base:
         return base.rstrip("/")
 
     url = os.getenv("OPS_ENQUEUE_URL", "").strip()
     if not url:
-        raise RuntimeError("OPS_ENQUEUE_BASE or OPS_ENQUEUE_URL must be set")
+        raise RuntimeError("OPS_ENQUEUE_BASE, OPS_BASE_URL or OPS_ENQUEUE_URL must be set")
 
-    if url.endswith("/ops/enqueue"):
-        url = url[: -len("/ops/enqueue")]
+    # Legacy patterns:
+    #   https://host/api/ops/enqueue  -> strip /api/ops/enqueue
+    #   https://host/ops/enqueue      -> strip /ops/enqueue
+    for suffix in ("/api/ops/enqueue", "/ops/enqueue"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+            break
+    # Also tolerate bare '/api' base
+    if url.endswith("/api"):
+        url = url[:-4]
     return url.rstrip("/")
 
 
 def _shape_body_from_envelope(envelope: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Convert a high-level `envelope` into the body expected by /ops/enqueue.
+    Convert a high-level `envelope` into the payload expected by /ops/enqueue.
 
     Accepted envelope shapes:
 
       * Native:
-            {"agent_id": ..., "type": ..., "payload": {...}}
+            {"agent_id": ..., "type": ..., "payload": {...}, "meta": {...}?}
 
-      * Intent-based (recommended for nova_trigger):
+      * Intent-based:
             {
-                "agent_id": "...",
-                "intent": {
-                    "type": "order.place",
-                    "venue": "...",
-                    "symbol": "...",
-                    "side": "BUY",
-                    "amount": "25",
-                    ...
-                },
-                "meta": {...},  # optional, passed through
+              "agent_id": "edge-primary",
+              "intent": {
+                  "type": "order.place",
+                  "venue": "BINANCEUS",
+                  "symbol": "BTC/USDT",
+                  "side": "BUY",
+                  "amount": 25,
+                  ...
+              },
+              "meta": {...optional...}
             }
+
+    Returns the canonical *payload* dict (not yet wrapped in {"payload": ...}).
     """
     if not isinstance(envelope, dict):
         raise RuntimeError("envelope must be a dict")
@@ -218,6 +217,9 @@ def _shape_body_from_envelope(envelope: Dict[str, Any]) -> Dict[str, Any]:
         return body
 
     intent: Dict[str, Any] = envelope.get("intent") or {}
+    if not isinstance(intent, dict):
+        raise RuntimeError("envelope.intent must be a dict")
+
     cmd_type = intent.get("type") or "order.place"
 
     body = {
@@ -232,11 +234,10 @@ def _shape_body_from_envelope(envelope: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def attempt(envelope: Dict[str, Any], *, timeout: float = 15.0) -> Dict[str, Any]:
-    """
-    Bus-facing API used by nova_trigger and future modules.
+    """Bus-facing API used by nova_trigger and future modules.
 
     Reads base URL and secret from env, shapes the envelope into the
-    /ops/enqueue body schema, signs it, and POSTs.
+    /ops/enqueue payload schema, signs it, and POSTs.
 
     Returns:
 
@@ -255,7 +256,8 @@ def attempt(envelope: Dict[str, Any], *, timeout: float = 15.0) -> Dict[str, Any
         return {"ok": False, "reason": str(e), "status": None}
 
     try:
-        body_dict = _shape_body_from_envelope(envelope)
+        payload = _shape_body_from_envelope(envelope)
+        body_dict = {"payload": payload}
     except RuntimeError as e:
         return {"ok": False, "reason": str(e), "status": None}
 
@@ -278,35 +280,32 @@ def attempt(envelope: Dict[str, Any], *, timeout: float = 15.0) -> Dict[str, Any
 # ---------- CLI entrypoint ----------
 
 
-def cli_attempt(base: str, secret_str: str, body_dict: Dict[str, Any]) -> None:
+def cli_attempt(base: str, secret_str: str, payload: Dict[str, Any]) -> None:
     """
-    Retains the old CLI semantics:
-      - prints detailed results
-      - exits with code 0/2 based on success
+    CLI helper used by __main__.
+
+    Wraps the high-level payload into the /ops/enqueue schema
+    and prints verbose diagnostics.
     """
     secret = secret_str.encode()
     url = base.rstrip("/") + "/ops/enqueue"
-
+    body_dict = {"payload": payload}
     ok, label, j, status = _attempt_raw(url, secret, body_dict, timeout=15.0, verbose=True)
     if not ok:
         print(
             "All signing patterns failed. Check OUTBOX_SECRET, time sync, "
-            "and that /ops/enqueue is deployed."
+            "and that /ops/enqueue is deployed.",
         )
         sys.exit(2)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", required=True, help="Base URL (e.g., https://novatrade3-0.onrender.com/api)")
-    ap.add_argument("--secret", required=True, help="OUTBOX_SECRET")
-    ap.add_argument("--agent", required=True, help="agent_id (e.g., edge-cb-1)")
-    ap.add_argument(
-        "--venue",
-        required=True,
-        choices=["COINBASE", "COINBASE_ADVANCED", "BINANCE.US", "MEXC", "KRAKEN"],
-    )
-    ap.add_argument("--symbol", required=True, help="e.g., BTC/USDT")
+    ap.add_argument("--base", required=True, help="Base URL (e.g., https://novatrade3-0.onrender.com)")
+    ap.add_argument("--secret", required=True, help="Outbox secret (string)")
+    ap.add_argument("--agent", default="edge-primary")
+    ap.add_argument("--venue", required=True)
+    ap.add_argument("--symbol", required=True)
     ap.add_argument("--side", required=True, choices=["BUY", "SELL"])
     ap.add_argument("--amount", required=True, help="numeric string (quote or base per executor config)")
     ap.add_argument("--tif", default="IOC")
