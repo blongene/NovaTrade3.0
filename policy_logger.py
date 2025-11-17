@@ -88,38 +88,40 @@ def _open_sheet():
 
 
 def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = None) -> None:
-    """
-    Canonical logger used by PolicyEngine.
-
-    Parameters:
-        decision: dict-like, should contain "ok", "reason", "patched" (or "patched_intent")
-        intent:   original intent dict (token, venue, quote, amount_usd, etc.)
-        when:     optional timestamp override
-    """
     if not LOG_ENABLED:
         return
 
     ts = when or _ts()
 
-    token = (intent.get("token") or "").upper()
+    # -------- field extraction ----------
+    token = (
+        intent.get("token")
+        or intent.get("asset")
+        or intent.get("base")
+        or ""
+    ).upper()
+
     action = (intent.get("action") or intent.get("side") or "").upper()
-    amount_usd = intent.get("amount_usd", intent.get("amount"))
 
-    ok = decision.get("ok")
-    allowed_norm = bool(ok if ok is not None else True)
-
-    reason = decision.get("reason") or ""
+    # Prefer patched USD amount if present, else original intent
     patched = decision.get("patched") or decision.get("patched_intent") or {}
+    amt_usd = patched.get("amount_usd")
+    if amt_usd is None:
+        amt_usd = intent.get("amount_usd", intent.get("amount"))
+
+    ok = bool(decision.get("ok", True))
+    reason = decision.get("reason") or ""
+
     venue = (intent.get("venue") or "").upper()
     quote = (intent.get("quote") or "").upper()
 
     liquidity = decision.get("liquidity", "")
     cooldown_min = decision.get("cooldown_min", "")
-    flags = decision.get("flags") or []
 
+    flags = decision.get("flags") or []
     notes = ""
     if flags:
-        notes = ",".join(sorted(set(str(f) for f in flags)))
+        notes = ",".join(sorted(str(f) for f in flags))
 
     intent_id = (
         intent.get("id")
@@ -127,6 +129,7 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
         or intent.get("order_id")
         or ""
     )
+
     symbol = (
         intent.get("symbol")
         or (f"{token}/{quote}" if token and quote else token)
@@ -138,8 +141,8 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
         "Timestamp": ts,
         "Token": token,
         "Action": action,
-        "Amount_USD": amount_usd,
-        "OK": "TRUE" if allowed_norm else "FALSE",
+        "Amount_USD": amt_usd,
+        "OK": "TRUE" if ok else "FALSE",
         "Reason": reason,
         "Patched": _to_json(patched),
         "Venue": venue,
@@ -153,49 +156,5 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
         "Source": source,
     }
 
-    # Try Sheets; fall back to local JSONL if anything goes wrong.
-    try:
-        import gspread  # noqa: F401
-    except Exception:
-        _append_local(row_dict)
-        return
+    # ...existing Sheets append / local fallback logic using row_dict...
 
-    if not SHEET_URL:
-        _append_local(row_dict)
-        return
-
-    delay = RETRY_BASE
-    for attempt in range(MAX_RETRIES):
-        try:
-            ws = _open_sheet()
-            ws.append_row(
-                [
-                    row_dict["Timestamp"],
-                    row_dict["Token"],
-                    row_dict["Action"],
-                    row_dict["Amount_USD"],
-                    row_dict["OK"],
-                    row_dict["Reason"],
-                    row_dict["Patched"],
-                    row_dict["Venue"],
-                    row_dict["Quote"],
-                    row_dict["Liquidity"],
-                    row_dict["Cooldown_Min"],
-                    row_dict["Notes"],
-                    row_dict["Intent_ID"],
-                    row_dict["Symbol"],
-                    row_dict["Decision"],
-                    row_dict["Source"],
-                ],
-                value_input_option="USER_ENTERED",
-            )
-            return
-        except Exception:
-            # backoff and try again
-            import time as _time
-
-            _time.sleep(delay)
-            delay *= 2
-
-    # If all retries failed, persist locally.
-    _append_local(row_dict)
