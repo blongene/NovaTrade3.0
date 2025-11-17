@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 from utils import send_telegram_message_dedup, warn, info
 from trade_guard import guard_trade_intent
 from price_feed import get_price_usd  # NEW
+from nova_trigger_logger import log_nova_trigger  # NEW
 
 REBUY_MODE = os.getenv("REBUY_MODE", "dryrun").strip().lower()
 DEFAULT_AGENT_TARGET = os.getenv("DEFAULT_AGENT_TARGET", "")
@@ -19,8 +20,10 @@ _MANUAL_REBUY_RE = re.compile(
     re.IGNORECASE,
 )
 
+
 def _parse_kv(rest: str) -> Dict[str, str]:
     return {k.upper(): v for k, v in re.findall(r"([A-Za-z_]+)=([A-Za-z0-9_\-]+)", rest or "")}
+
 
 def parse_manual(msg: str) -> Dict[str, Any]:
     msg = (msg or "").strip()
@@ -50,6 +53,7 @@ def parse_manual(msg: str) -> Dict[str, Any]:
         "quote": quote.upper() if quote else None,
         "params": params,
     }
+
 
 def _send_summary(raw, parsed, status, ok, reason, orig_amt, patched_amt, enq_ok, mode, enq_reason):
     token = parsed.get("token") or "?"
@@ -88,6 +92,7 @@ def _send_summary(raw, parsed, status, ok, reason, orig_amt, patched_amt, enq_ok
         send_telegram_message_dedup(text, dedup_key)
     except Exception as e:
         warn(f"nova_trigger: failed summary send: {e}")
+
 
 def _handle_manual_rebuy(parsed):
     token = parsed["token"]
@@ -162,6 +167,23 @@ def _handle_manual_rebuy(parsed):
         enq_reason=enq_reason,
     )
 
+    # 🔹 Log into NovaTrigger_Log (best-effort)
+    try:
+        note_parts = [
+            f"status={status}",
+            f"ok={ok}",
+            f"mode={REBUY_MODE}",
+            f"enq_ok={enq_ok}",
+        ]
+        if reason:
+            note_parts.append(f"reason={reason}")
+        if enq_reason:
+            note_parts.append(f"enq_reason={enq_reason}")
+        log_nova_trigger(parsed["raw"], "; ".join(note_parts))
+    except Exception:
+        # Never let logging break the trigger path
+        pass
+
     return {
         "ok": ok,
         "status": status,
@@ -180,6 +202,7 @@ def _handle_manual_rebuy(parsed):
         },
     }
 
+
 def route_manual(msg: str) -> Dict[str, Any]:
     parsed = parse_manual(msg)
 
@@ -195,6 +218,7 @@ def route_manual(msg: str) -> Dict[str, Any]:
 
     warn(f"nova_trigger: unsupported type: {parsed['type']}")
     return {"ok": False, "error": "unsupported_type", "decision": {"ok": False}}
+
 
 if __name__ == "__main__":
     import sys
