@@ -693,8 +693,22 @@ def ops_enqueue():
     j = request.get_json(force=True) or {}
     payload = j.get("payload") or {}
     agent_id = (payload.get("agent_id") or "cloud")
-    res = store.enqueue(agent_id, payload)
-    return jsonify(res)
+
+    try:
+        res = store.enqueue(agent_id, payload)
+        # Expect res like: {"ok": True, "id": ..., "status": "queued", "hash": "..."}
+        log.info(
+            "ops_enqueue: agent=%s ok=%s id=%s status=%s hash=%s",
+            agent_id,
+            res.get("ok"),
+            res.get("id"),
+            res.get("status"),
+            res.get("hash"),
+        )
+        return jsonify(res)
+    except Exception as e:
+        log.exception("ops_enqueue failed for agent=%s: %s", agent_id, e)
+        return jsonify(ok=False, error=str(e)), 500
 
 @flask_app.after_request
 def add_server_timing_header(response):
