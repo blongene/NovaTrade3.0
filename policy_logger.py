@@ -1,4 +1,3 @@
-# policy_logger.py — C-Series aligned Policy_Log writer
 from __future__ import annotations
 
 import os
@@ -10,13 +9,11 @@ SHEET_URL = os.getenv("SHEET_URL")
 POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
 LOG_ENABLED = os.getenv("POLICY_LOG_ENABLE", "1").lower() in ("1", "true", "yes", "on")
 LOCAL_FALLBACK_PATH = os.getenv("POLICY_LOG_LOCAL", "./policy_log.jsonl")
-MAX_RETRIES = 2
-RETRY_BASE = 0.75  # seconds
 
 try:
-    # Prefer Bus-wide Sheets + backoff helpers if available
+    # Prefer Bus-wide Sheets helpers if available
     from utils import get_gspread_client, with_sheet_backoff, warn as _log_warn
-except Exception:  # pragma: no cover - degrade gracefully when utils not present
+except Exception:
     get_gspread_client = None
 
     def with_sheet_backoff(fn):
@@ -45,19 +42,13 @@ def _append_local(row: Dict[str, Any]) -> None:
         with open(LOCAL_FALLBACK_PATH, "a", encoding="utf-8") as f:
             f.write(_to_json(row) + "\n")
     except Exception:
+        # Local logging must never break the policy flow
         pass
 
 
-def _open_sheet():
-    """
-    Open (or create) the Policy_Log sheet and ensure headers match:
-
-        Timestamp | Token | Action | Amount_USD | OK | Reason | Patched |
-        Venue | Quote | Liquidity | Cooldown_Min | Notes | Intent_ID |
-        Symbol | Decision | Source
-    """
-    import gspread  # type: ignore
-    from oauth2client.service_account import ServiceAccountCredentials  # type: ignore
+def _open_sheet_legacy():
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
 
     svc = (
         os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -104,19 +95,15 @@ def _open_sheet():
 
 @with_sheet_backoff
 def _append_sheet_row(row: Dict[str, Any]) -> None:
-    """Append a single Policy_Log row to Sheets (or raise).
+    if not SHEET_URL:
+        raise RuntimeError("SHEET_URL not configured")
 
-    Uses the Bus token-bucket + backoff via with_sheet_backoff;
-    falls back to gspread direct if utils client is unavailable.
-    """
-    # Prefer shared utils client when available
-    if SHEET_URL and get_gspread_client is not None:
+    if get_gspread_client is not None:
         gc = get_gspread_client()
         sh = gc.open_by_url(SHEET_URL)
         try:
             ws = sh.worksheet(POLICY_LOG_WS)
         except Exception:
-            # Create sheet and seed headers if missing
             ws = sh.add_worksheet(title=POLICY_LOG_WS, rows=4000, cols=20)
             ws.append_row(
                 [
@@ -140,8 +127,8 @@ def _append_sheet_row(row: Dict[str, Any]) -> None:
                 value_input_option="USER_ENTERED",
             )
     else:
-        # Fallback to local gspread auth helper
-        ws = _open_sheet()
+        # Fallback to direct gspread auth
+        ws = _open_sheet_legacy()
 
     headers = [
         "Timestamp",
@@ -165,7 +152,6 @@ def _append_sheet_row(row: Dict[str, Any]) -> None:
     try:
         ws.append_row(values, value_input_option="USER_ENTERED")
     except TypeError:
-        # Older gspread versions may not support value_input_option here
         ws.append_row(values)
 
 
@@ -175,7 +161,6 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
 
     ts = when or _ts()
 
-    # -------- field extraction ----------
     token = (
         intent.get("token")
         or intent.get("asset")
@@ -185,7 +170,6 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
 
     action = (intent.get("action") or intent.get("side") or "").upper()
 
-    # Prefer patched USD amount if present, else original intent
     patched = decision.get("patched") or decision.get("patched_intent") or {}
     amt_usd = patched.get("amount_usd")
     if amt_usd is None:
@@ -212,49 +196,40 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
         or ""
     )
 
-    symbol = (
-        intent.get("symbol")
-        or (f"{token}/{quote}" if token and quote else token)
-    )
+    symbol = intent.get("symbol") or (f"{token}/{quote}" if token and quote else token)
 
     source = intent.get("source") or ""
 
-        # Append to Sheets if possible; otherwise fall back to local JSONL
-    headers = [
-        "Timestamp",
-        "Token",
-        "Action",
-        "Amount_USD",
-        "OK",
-        "Reason",
-        "Patched",
-        "Venue",
-        "Quote",
-        "Liquidity",
-        "Cooldown_Min",
-        "Notes",
-        "Intent_ID",
-        "Symbol",
-        "Decision",
-        "Source",
-    ]
+    row_dict: Dict[str, Any] = {
+        "Timestamp": ts,
+        "Token": token,
+        "Action": action,
+        "Amount_USD": amt_usd,
+        "OK": "TRUE" if ok else "FALSE",
+        "Reason": reason,
+        "Patched": _to_json(patched),
+        "Venue": venue,
+        "Quote": quote,
+        "Liquidity": liquidity,
+        "Cooldown_Min": cooldown_min,
+        "Notes": notes,
+        "Intent_ID": intent_id,
+        "Symbol": symbol,
+        "Decision": _to_json(decision),
+        "Source": source,
+    }
 
-    # Always attempt local append as a safety net
-    try:
-        _append_local(row_dict)
-    except Exception:
-        # Local logging must never break the flow
-        pass
+    # Always log locally first
+    _append_local(row_dict)
 
+    # Then try Sheets if configured
     if not SHEET_URL:
-        # No sheet configured; local log is all we can do.
         return
 
     try:
-        ws = _open_sheet()
-        row = [row_dict.get(h, "") for h in headers]
-        # Use USER_ENTERED so numbers/JSON are interpreted sensibly
-        ws.append_row(row, value_input_option="USER_ENTERED")
-    except Exception:
-        # If Sheets fails (quota, auth, etc.), we’ve already written to local file.
-        return
+        _append_sheet_row(row_dict)
+    except Exception as e:
+        try:
+            _log_warn(f"Policy_Log append failed: {e}")
+        except Exception:
+            pass
