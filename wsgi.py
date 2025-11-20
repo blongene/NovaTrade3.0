@@ -135,13 +135,22 @@ def require_edge_hmac(fn):
             return jsonify({"ok": False, "error": "invalid_signature"}), 401
         return fn(*args, **kwargs)
     return _wrap
-    
-def _verify(secret: str, raw: bytes, given_sig: str) -> bool:
-    import hmac, hashlib
-    if not secret or not given_sig:
-        return False
-    calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(calc, given_sig)
+
+# ---------- Canonical HMAC over sorted JSON ----------
+def _verify_hmac_json(secret_env: str, header_name: str):
+    secret = os.getenv(secret_env, "") or ""
+    body = request.get_json(force=True, silent=True) or {}
+    raw_sorted = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    provided = (request.headers.get(header_name) or "").strip()
+    if not secret or not provided:
+        expected = ""
+        ok = False
+    else:
+        expected = hmac.new(secret.encode("utf-8"), raw_sorted, hashlib.sha256).hexdigest()
+        ok = hmac.compare_digest(provided, expected)
+
+    return ok, body, provided, expected
 
 def _require_json():
     if not request.is_json: return None, (jsonify(ok=False, error="invalid_or_missing_json"), 400)
@@ -717,54 +726,66 @@ def add_server_timing_header(response):
     return response
            
 # Edge pulls leased commands
-@flask_app.post("/api/commands/pull")
-@require_edge_hmac
+@app.post("/api/commands/pull")
 def cmd_pull():
-    j = request.get_json(force=True) or {}
-    agent = (j.get("agent_id") or "edge").strip()
-    n = int(j.get("limit") or 5)
+    ok, body, provided, expected = _verify_hmac_json("OUTBOX_SECRET", "X-OUTBOX-SIGN")
+    if not ok:
+        return (
+            jsonify({
+                "ok": False,
+                "error": "invalid_signature",
+                "provided": provided,
+                "expected": expected
+            }), 
+            401
+        )
+
+    agent = (body.get("agent_id") or "edge").strip()
+    n     = int(body.get("limit") or 5)
+
     out = store.lease(agent, n)
     return jsonify({"ok": True, "commands": out, "lease_seconds": OUTBOX_LEASE_SECONDS})
 
-@flask_app.post("/api/commands/ack")
-@require_edge_hmac
+@app.post("/api/commands/ack")
 def cmd_ack():
-    j = request.get_json(force=True) or {}
-    agent   = (j.get("agent_id") or "edge").strip()
-    cmd_id  = j.get("cmd_id")
-    receipt = j.get("receipt") or {}
-    ok      = bool(j.get("ok", True))
+    ok, body, provided, expected = _verify_hmac_json("OUTBOX_SECRET", "X-OUTBOX-SIGN")
+    if not ok:
+        return (
+            jsonify({
+                "ok": False,
+                "error": "invalid_signature",
+                "provided": provided,
+                "expected": expected
+            }),
+            401
+        )
 
-    # 1) Persist and mark done
+    agent   = (body.get("agent_id") or "edge").strip()
+    cmd_id  = body.get("id") or body.get("cmd_id")
+    receipt = body.get("receipt") or {}
+    ok_val  = bool(body.get("ok", True))
+
     try:
-        store.save_receipt(agent, cmd_id, receipt, ok)
+        store.save_receipt(agent, cmd_id, receipt, ok_val)
     except Exception:
         log.exception("save_receipt failed agent=%s cmd_id=%s", agent, cmd_id)
 
-    if ok and cmd_id:
+    if ok_val and cmd_id:
         try:
             store.done(int(cmd_id))
         except Exception:
             log.exception("done() failed for cmd_id=%s", cmd_id)
 
-    # 2) Best-effort Sheets logging (never crash the ACK path)
+    # Sheets logging block unchanged…
     try:
         if os.getenv("BUS_LOG_TRADES", "true").lower() in ("1", "true", "yes", "on"):
-            # Try to fetch the original command so we have intent for the row
             command = None
             try:
-                # Pick the method your store exposes. One of these usually exists:
-                # command = store.get_command_by_id(int(cmd_id))
-                # command = store.fetch(int(cmd_id))
-                command = store.get(int(cmd_id))  # <-- adjust if your store uses a different name
+                command = store.get(int(cmd_id))
             except Exception:
-                command = None
-
-            if not command:
-                # Fallback to a minimal shell; intent may be empty but we still log
                 command = {"id": cmd_id, "intent": {}}
 
-            gc = _get_gspread()  # helper provided earlier
+            gc = _get_gspread()
             log_trade_to_sheet(gc, os.environ["SHEET_URL"], command, receipt)
     except Exception:
         log.exception("trade_log append failed")
