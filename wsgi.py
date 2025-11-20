@@ -726,7 +726,7 @@ def add_server_timing_header(response):
     return response
            
 # Edge pulls leased commands
-@app.post("/api/commands/pull")
+@flask_app.post("/api/commands/pull")
 def cmd_pull():
     ok, body, provided, expected = _verify_hmac_json("OUTBOX_SECRET", "X-OUTBOX-SIGN")
     if not ok:
@@ -746,7 +746,7 @@ def cmd_pull():
     out = store.lease(agent, n)
     return jsonify({"ok": True, "commands": out, "lease_seconds": OUTBOX_LEASE_SECONDS})
 
-@app.post("/api/commands/ack")
+@flask_app.post("/api/commands/ack")
 def cmd_ack():
     ok, body, provided, expected = _verify_hmac_json("OUTBOX_SECRET", "X-OUTBOX-SIGN")
     if not ok:
