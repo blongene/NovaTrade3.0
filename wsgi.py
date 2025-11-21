@@ -770,49 +770,57 @@ def cmd_pull():
     out = store.lease(agent, n)
     return jsonify({"ok": True, "commands": out, "lease_seconds": OUTBOX_LEASE_SECONDS})
 
+# Edge ACKs execution results
 @flask_app.post("/api/commands/ack")
+@require_edge_hmac
 def cmd_ack():
-    ok, body, provided, expected = _verify_hmac_json("OUTBOX_SECRET", "X-OUTBOX-SIGN")
-    if not ok:
-        return (
-            jsonify({
-                "ok": False,
-                "error": "invalid_signature",
-                "provided": provided,
-                "expected": expected
-            }),
-            401
-        )
+    j = request.get_json(force=True) or {}
 
-    agent   = (body.get("agent_id") or "edge").strip()
-    cmd_id  = body.get("id") or body.get("cmd_id")
-    receipt = body.get("receipt") or {}
-    ok_val  = bool(body.get("ok", True))
+    agent   = (j.get("agent_id") or "edge").strip()
+    cmd_id  = j.get("id") or j.get("cmd_id")
+    receipt = j.get("receipt") or {}
 
+    # Accept either {status="ok"|"error"} or legacy {ok: bool}
+    status  = (j.get("status") or "").lower()
+    if not status:
+        status = "ok" if j.get("ok", True) else "error"
+
+    ok = status in ("ok", "success")
+
+    # ---------- 1) Persist + mark done in the outbox store ----------
     try:
-        store.save_receipt(agent, cmd_id, receipt, ok_val)
+        store.save_receipt(agent, cmd_id, receipt, ok)
     except Exception:
         log.exception("save_receipt failed agent=%s cmd_id=%s", agent, cmd_id)
 
-    if ok_val and cmd_id:
+    if ok and cmd_id:
         try:
             store.done(int(cmd_id))
         except Exception:
             log.exception("done() failed for cmd_id=%s", cmd_id)
 
-    # Sheets logging block unchanged…
+    # ---------- 2) Best-effort Trade_Log append (never crash ACK) ----------
     try:
         if os.getenv("BUS_LOG_TRADES", "true").lower() in ("1", "true", "yes", "on"):
             command = None
             try:
+                # Try to fetch the original command for richer context
                 command = store.get(int(cmd_id))
             except Exception:
-                command = {"id": cmd_id, "intent": {}}
+                command = None
+
+            # Make sure command is a dict the logger can safely consume
+            if not isinstance(command, dict):
+                command = {"id": cmd_id or None, "intent": command or {}}
+
+            # Make sure receipt is a dict as well
+            if not isinstance(receipt, dict):
+                receipt = {"status": status, "ok": ok, "raw": receipt}
 
             gc = _get_gspread()
             log_trade_to_sheet(gc, os.environ["SHEET_URL"], command, receipt)
     except Exception:
-        log.exception("trade_log append failed")
+        log.exception("trade_log append failed (non-fatal)")
 
     return jsonify({"ok": True})
 
