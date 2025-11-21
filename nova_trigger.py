@@ -1,27 +1,28 @@
-# nova_trigger.py — Manual Command Router & Price Feed
-# B-2 PATCH: Auto-injects price_usd from Unified_Snapshot to resolve "price unknown" denials.
-# COMPATIBILITY: Updated to use the new hardened utils.py.
+# nova_trigger.py — Manual command router with B-2 Price Feed (Bus side).
+# - Routes MANUAL_REBUY commands to the policy engine for validation.
+# - Auto-injects price_usd from Unified_Snapshot to resolve "price unknown" denials.
+# - Uses SAFE IMPORTS to prevent crashes if utils.py is mid-update.
 
 import os, json, time, re
 from typing import Any, Dict, Optional, Tuple, List
 
-# Import from the new hardened utils
-from utils import (
-    get_ws, 
-    get_sheet, 
-    warn, 
-    info, 
-    send_telegram_message_dedup, 
-    hmac_enqueue  # Ensure utils.py has hmac_enqueue or we use ops_sign_and_enqueue shim
-)
-# If utils.py doesn't export hmac_enqueue, we use a local shim or import it
+# 1. Safe Import Block
 try:
-    from utils import hmac_enqueue
+    from utils import (
+        get_ws, 
+        get_sheet, 
+        warn, 
+        info, 
+        send_telegram_message_dedup, 
+        hmac_enqueue
+    )
 except ImportError:
-    # Fallback if utils.py hasn't been fully updated with the enqueue helper
-    from ops_sign_and_enqueue import attempt as outbox_attempt
-    def hmac_enqueue(payload):
-        return outbox_attempt({"agent_id": "cloud", "intent": payload, "type": "order.place"})
+    # Fallback if hmac_enqueue is missing from utils
+    from utils import get_ws, get_sheet, warn, info, send_telegram_message_dedup
+    # Define shim if missing
+    def hmac_enqueue(intent):
+        warn("nova_trigger: using fallback hmac_enqueue shim")
+        return {"ok": False, "reason": "hmac_enqueue_missing_in_utils"}
 
 # We might need the policy engine
 try:
@@ -31,38 +32,34 @@ except ImportError:
     def evaluate_manual_rebuy(intent, asset_state):
         return {"ok": True, "reason": "policy_missing_allow_all", "patched_intent": intent}
 
-# === Config ===
+# === Config & Constants ===
 UNIFIED_SNAPSHOT_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
 PRICE_CACHE_TTL_SEC = int(os.getenv("PRICE_CACHE_TTL_SEC", "180"))
 TELEGRAM_DEDUP_TTL  = int(os.getenv("TELEGRAM_DEDUP_TTL_SEC", "120"))
 
-# Global Cache
+# Global Cache (In-process memory)
 _price_cache = { "ts": 0.0, "rows": [] }
 
 # ---------------------------------------------------------------------------
-# B-2: Unified_Snapshot price lookup
+# B-2: Unified_Snapshot price lookup for manual rebuys
 # ---------------------------------------------------------------------------
 def _load_price_snapshot(force: bool = False) -> List[Dict[str, Any]]:
-    """Load & cache the Unified_Snapshot sheet for a short TTL."""
     global _price_cache
     now = time.time()
-    
-    if not force and _price_cache.get("rows") and (now - float(_price_cache.get("ts", 0.0)) < PRICE_CACHE_TTL_SEC):
+    if (not force and _price_cache.get("rows") and now - float(_price_cache.get("ts", 0.0)) < PRICE_CACHE_TTL_SEC):
         return _price_cache["rows"]
 
     try:
-        # Use new utils.get_ws which handles backoff/auth
         ws = get_ws(UNIFIED_SNAPSHOT_WS)
         rows = ws.get_all_records()
         _price_cache["ts"] = now
         _price_cache["rows"] = rows or []
         return _price_cache["rows"]
     except Exception as e:
-        warn(f"nova_trigger: Failed to load {UNIFIED_SNAPSHOT_WS}: {e}")
+        warn(f"nova_trigger: Failed to load {UNIFIED_SNAPSHOT_WS} for price feed: {e}")
         return []
 
 def _get_price_usd_from_snapshot(token: str) -> Tuple[Optional[float], str]:
-    """Look up a USD price for `token`."""
     token_up = (token or "").upper()
     if not token_up: return None, "no_token"
     
@@ -74,7 +71,6 @@ def _get_price_usd_from_snapshot(token: str) -> Tuple[Optional[float], str]:
     sym_cols   = ["Token", "Symbol", "Asset"]
 
     for r in rows:
-        # Try to find the symbol
         found_sym = False
         for c in sym_cols:
             if str(r.get(c, "")).upper() == token_up:
@@ -82,7 +78,6 @@ def _get_price_usd_from_snapshot(token: str) -> Tuple[Optional[float], str]:
                 break
         
         if found_sym:
-            # Try to find the price
             for pc in price_cols:
                 val = r.get(pc)
                 if val is not None and str(val).strip() != "":
@@ -94,16 +89,9 @@ def _get_price_usd_from_snapshot(token: str) -> Tuple[Optional[float], str]:
     return None, "not_found"
 
 # -----------------------------------------------------------------------
-# Routing Logic
+# Core Router
 # -----------------------------------------------------------------------
 def route_manual(raw: str) -> dict:
-    """
-    Handles manual commands (e.g. 'MANUAL_REBUY BTC 500').
-    1. Parses command
-    2. Fetches Price (B-2)
-    3. Checks Policy
-    4. Enqueues to Bus
-    """
     parsed = parse_manual(raw)
     if not parsed["ok"]:
         return {"ok": False, "reason": parsed["reason"]}
@@ -128,9 +116,8 @@ def route_manual(raw: str) -> dict:
 
     # Policy Check
     decision = evaluate_manual_rebuy(intent, asset_state={})
-    
     policy_ok = bool(decision.get("ok"))
-    reason = decision.get("reason")
+    decision_reason = decision.get("reason")
     patched = decision.get("patched_intent", {})
     
     enq_ok = False
@@ -139,18 +126,16 @@ def route_manual(raw: str) -> dict:
     
     if policy_ok and mode == "live":
         try:
-            # Construct payload for /ops/enqueue
+            # Construct payload for enqueue
             payload = {
                 "venue": patched.get("venue") or intent["venue"],
                 "symbol": patched.get("symbol") or f"{intent['token']}/{intent['quote']}",
                 "side": patched.get("side") or "BUY",
-                "amount": patched.get("amount") or 0.0,  # Base units
-                "amount_quote": patched.get("amount_usd"), # Quote units (helper)
+                "amount": patched.get("amount") or 0.0,
+                "amount_quote": patched.get("amount_usd"),
                 "source": "manual_rebuy",
                 "ts": int(time.time())
             }
-            
-            # Pass price if we have it
             if intent.get("price_usd"):
                 payload["price_usd"] = intent["price_usd"]
 
@@ -161,7 +146,6 @@ def route_manual(raw: str) -> dict:
             warn(f"nova_trigger: Enqueue failed: {e}")
             enq_reason = str(e)
 
-    # Telegram Summary
     _send_summary(raw, intent, decision, enq_ok, enq_reason, mode)
     
     return {
@@ -171,8 +155,7 @@ def route_manual(raw: str) -> dict:
     }
 
 def parse_manual(raw: str) -> dict:
-    """Simple parser: MANUAL_REBUY [TOKEN] [USD_AMOUNT] (VENUE=...)"""
-    # Example: MANUAL_REBUY BTC 500 VENUE=BINANCEUS
+    # MANUAL_REBUY BTC 500 VENUE=BINANCEUS
     parts = raw.strip().split()
     if len(parts) < 3:
         return {"ok": False, "reason": "formatting_error"}
@@ -184,7 +167,7 @@ def parse_manual(raw: str) -> dict:
         return {"ok": False, "reason": "invalid_amount"}
     
     venue = None
-    quote = "USDT" # default
+    quote = "USDT"
     
     for p in parts[3:]:
         if p.startswith("VENUE="):
@@ -193,11 +176,7 @@ def parse_manual(raw: str) -> dict:
             quote = p.split("=")[1].upper()
             
     return {
-        "ok": True, 
-        "token": token, 
-        "amount_usd": amt, 
-        "venue": venue, 
-        "quote": quote
+        "ok": True, "token": token, "amount_usd": amt, "venue": venue, "quote": quote
     }
 
 def _send_summary(raw, intent, decision, enq_ok, enq_reason, mode):
