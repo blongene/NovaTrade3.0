@@ -157,6 +157,30 @@ def _require_json():
     try: return request.get_json(force=True, silent=False), None
     except Exception: return None, (jsonify(ok=False, error="malformed_json"), 400)
 
+# ---- HMAC helpers (canonical, sorted JSON) -----------------------------
+
+def _verify_sorted(secret: str, raw: bytes, given_sig: str) -> bool:
+    import hmac, hashlib, json
+    if not secret or not given_sig:
+        return False
+    try:
+        # Raw body from Flask
+        raw_unsorted = raw or b""
+        data = json.loads(raw_unsorted.decode("utf-8") or "{}")
+        raw_sorted = json.dumps(
+            data, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    except Exception:
+        # Fall back to raw if anything goes wrong
+        raw_sorted = raw or b""
+
+    calc = hmac.new(secret.encode("utf-8"), raw_sorted, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(calc, given_sig)
+
+# Backwards-compatible alias for older call sites (e.g. telemetry)
+def _verify(secret: str, raw: bytes, given_sig: str) -> bool:
+    return _verify_sorted(secret, raw, given_sig)
+
 # ========== Kill switches & Policy flags ==========
 CLOUD_HOLD     = _env_true("CLOUD_HOLD")
 NOVA_KILL      = _env_true("NOVA_KILL")
