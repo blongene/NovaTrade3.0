@@ -122,10 +122,7 @@ def _hdr_sig(req, *names: str) -> str:
 
 def _edge_hmac_ok(sig: str, raw: bytes) -> bool:
     secret = os.getenv("EDGE_SECRET", "") or ""
-    if not secret or not sig:
-        return False
-    calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(calc, sig)
+    return _verify_sorted(secret, raw, sig)
 
 def require_edge_hmac(fn):
     @wraps(fn)
@@ -417,20 +414,11 @@ def telemetry_last():
 @flask_app.post("/api/edge/balances")
 def edge_balances():
     """Edge-authenticated balance push (HMAC: EDGE_SECRET)."""
-    import hmac, hashlib
-
     raw = request.get_data()  # exact bytes
     sig = _hdr_sig(request, "X-Nova-Signature", "X-NT-Sig", "X-Signature")
     sec = os.getenv("EDGE_SECRET", "")
 
-    calc = hmac.new(sec.encode(), raw, hashlib.sha256).hexdigest()
-    equal = bool(sec) and bool(sig) and (sig == calc)
-
-    # DEBUG: keep this until you see one good call, then feel free to remove
-    log.info("EDGE HMAC DEBUG: has_sec=%s sig_len=%s equal=%s sig=%s calc=%s raw_len=%d",
-             bool(sec), len(sig or ""), equal, sig, calc, len(raw))
-
-    if not equal:
+    if not _verify_sorted(sec, raw, sig):
         return jsonify(ok=False, error="invalid_signature"), 401
 
     data = request.get_json(silent=True) or {}
@@ -696,25 +684,8 @@ def policy_evaluate():
 flask_app.register_blueprint(BUS)
 
 # --- Uniform Edge HMAC for pull/ack ------------------------------------------
-import os, hmac, hashlib
-from functools import wraps
-from flask import request, jsonify
-
-def _edge_hmac_ok(sig: str, raw: bytes) -> bool:
-    secret = os.getenv("EDGE_SECRET", "")
-    if not secret or not sig:
-        return False
-    calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(calc, sig)
-
-def require_edge_hmac(fn):
-    @wraps(fn)
-    def _wrap(*args, **kwargs):
-        sig = request.headers.get("X-Nova-Signature", "")
-        if not _edge_hmac_ok(sig, request.get_data()):
-            return jsonify({"ok": False, "error": "invalid_signature"}), 401
-        return fn(*args, **kwargs)
-    return _wrap
+# (duplicate definitions of _edge_hmac_ok and require_edge_hmac removed from here
+#  as they are already defined earlier in the file)
 
 # Enqueue (cloud-side) — assumes your existing HMAC verify wrapper outside
 @flask_app.before_request
@@ -882,10 +853,7 @@ _SEEN_IDS = set()  # in-proc idempotency; move to Postgres later
 
 def _verify_hmac(sig: str, body: bytes) -> bool:
     EDGE_SECRET = os.getenv("EDGE_SECRET", "")  # must match Edge
-    if not EDGE_SECRET:
-        return False
-    mac = hmac.new(EDGE_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(mac, sig or "")
+    return _verify_sorted(EDGE_SECRET, body, sig)
 
 def _append_trade_row(norm: dict):
     # Uses your utils.get_gspread_client + SHEET_URL env

@@ -77,6 +77,8 @@ def _verify_hmac_raw(body: bytes) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """
     Verify HMAC using TELEMETRY_SECRET, then OUTBOX_SECRET, then EDGE_SECRET.
     Accepts hex or base64 signatures and the three common header names.
+
+    Updated to use canonical sorted-JSON verification (like wsgi.py's _verify_sorted).
     """
     if not REQUIRE_HMAC_TELEM:
         return True, None
@@ -84,6 +86,16 @@ def _verify_hmac_raw(body: bytes) -> Tuple[bool, Optional[Dict[str, Any]]]:
     provided = _get_sig_from_headers()
     if not provided:
         return False, {"ok": False, "error": "missing_signature"}
+
+    # --- Canonicalize body for verification ---
+    try:
+        raw_unsorted = body or b""
+        data = json.loads(raw_unsorted.decode("utf-8") or "{}")
+        raw_sorted = json.dumps(
+            data, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    except Exception:
+        raw_sorted = body or b""
 
     candidates = [
         os.getenv("TELEMETRY_SECRET", ""),
@@ -93,7 +105,7 @@ def _verify_hmac_raw(body: bytes) -> Tuple[bool, Optional[Dict[str, Any]]]:
     candidates = [c for c in candidates if c]
 
     for secret in candidates:
-        expected_hex = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        expected_hex = hmac.new(secret.encode(), raw_sorted, hashlib.sha256).hexdigest()
         if _digests_match(expected_hex, provided):
             return True, None
 
