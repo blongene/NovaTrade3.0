@@ -9,14 +9,11 @@
 # NOTE: This file is a drop-in replacement for your current utils.py.
 
 from __future__ import annotations
-import os, time, json, threading, functools, hashlib, hmac, random, traceback
+import os, time, json, threading, functools, hashlib, hmac, random
 from datetime import datetime, timezone
 from contextlib import contextmanager
-from typing import Any
-
 import requests
 from requests.adapters import HTTPAdapter, Retry
-
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -674,6 +671,11 @@ def safe_len(x) -> int:
 
 # ========= HMAC (for signed Edge/Bus messages) =========
 def hmac_hex(secret: str, payload: dict) -> str:
+    """
+    Canonical signer for internal Bus usage.
+    Always uses sort_keys=True.
+    """
     key = secret.encode()
+    # STRICT CANONICAL: separators=(',', ':'), sort_keys=True
     msg = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
