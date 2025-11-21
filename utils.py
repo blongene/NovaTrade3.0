@@ -5,15 +5,17 @@
 # - Telegram de-duped notifications + prompts (quiet failure)
 # - Legacy shims preserved (names/behaviors used by prior modules)
 # - Small reliability polish: requests Session with retries for Telegram
-#
-# NOTE: This file is a drop-in replacement for your current utils.py.
+# - HMAC signing & Enqueue helpers (FIXED)
 
 from __future__ import annotations
-import os, time, json, threading, functools, hashlib, hmac, random
+import os, time, json, threading, functools, hashlib, hmac, random, traceback
 from datetime import datetime, timezone
 from contextlib import contextmanager
+from typing import Any
+
 import requests
 from requests.adapters import HTTPAdapter, Retry
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -128,14 +130,12 @@ _boot_once_key = "_boot_once_sent"
 
 def _tg_send_raw(text):
     if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        # Do not warn constantly; keep quiet if not configured.
         return
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
         _REQ.post(url, json=data, timeout=10)
     except Exception as e:
-        # quiet failure; log at WARN just once per process if needed
         warn(f"Telegram send failed: {e}")
 
 def send_telegram_message_dedup(message: str, key: str, ttl_min: int = TG_DEDUP_TTL_MIN):
@@ -270,7 +270,6 @@ def _resolve_service_account_path() -> str | None:
         if os.path.isfile(p):
             info(f"[WEB] using fallback creds at {p}")
             return p
-
     return None
 
 def _make_gspread_client():
@@ -299,13 +298,11 @@ def _make_gspread_client():
     try:
         svc_path = path or "sentiment-log-service.json"
         if os.path.isfile(svc_path):
-            creds = ServiceAccountCredentials.from_json_keyfile_name(svc_path, _SCOPE)  # FIXED: __SCOPE -> _SCOPE
+            creds = ServiceAccountCredentials.from_json_keyfile_name(svc_path, _SCOPE)
         else:
-            # Try parsing SVC_JSON as dict (if it's not valid JSON, this will raise)
             creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(os.getenv("SVC_JSON", "{}")), _SCOPE)
         return gspread.authorize(creds)
     except Exception as e:
-        # Last-ditch: default lookup (will raise if nothing is configured)
         warn(f"[WEB] oauth2client fallback failed: {e}; trying gspread default lookup.")
         return gspread.service_account()
 
@@ -329,7 +326,6 @@ def with_sheet_backoff(fn):
         while True:
             try:
                 op = k.pop("_sheet_op", None) or fn.__name__
-                # choose bucket
                 if "update" in op or "batch" in op or "append" in op or "write" in op:
                     _wait_for(_write_bucket)
                 else:
@@ -344,7 +340,6 @@ def with_sheet_backoff(fn):
                     continue
                 raise
             except Exception as e:
-                # retry on obvious transient issues
                 if any(x in str(e).lower() for x in ["timed out", "connection reset", "temporarily", "unavailable"]):
                     warn(f"Transient error ({fn.__name__}): {e}; retrying…")
                     time.sleep(delay)
@@ -360,17 +355,14 @@ _values_cache: dict[str, tuple[float, Any]] = {}
 _cache_lock = threading.Lock()
 
 def clear_sheet_caches():
-    """Global cache clear (worksheet handles, rows, values)."""
     with _cache_lock:
         _cached_ws.clear()
         _cached_rows.clear()
         _values_cache.clear()
 
 def invalidate_tab(tab: str):
-    """Invalidate caches for a particular tab/sheet name."""
     with _cache_lock:
         _cached_ws.pop(f"ws::{tab}", None)
-        # values keys: 'vals::<tab>::...'
         for k in list(_values_cache.keys()):
             if k.startswith(f"vals::{tab}::"):
                 _values_cache.pop(k, None)
@@ -419,21 +411,14 @@ def get_all_records_cached(name: str, ttl_s: int | None = None):
         _cached_rows[key] = (time.time()+ttl_s, rows)
     return rows
 
-# Backwards-compat alias some modules expect
 def get_records_cached(sheet_name: str, ttl_s: int = 120):
     return get_all_records_cached(sheet_name, ttl_s)
 
-# ========= Cached range/values reads =========
 @with_sheet_backoff
 def _ws_get(ws, range_a1: str):
     return ws.get(range_a1)
 
 def get_values_cached(sheet_name: str, range_a1: str | None = None, ttl_s: int | None = None):
-    """
-    Returns a 2D list.
-      - If range_a1 is provided: uses ws.get(range_a1)
-      - If None: uses ws.get_all_values()
-    """
     ttl_s = DEFAULT_VALUES_TTL_S if ttl_s is None else ttl_s
     key = f"vals::{sheet_name}::{range_a1 or '__ALL__'}"
     with _cache_lock:
@@ -459,7 +444,6 @@ def get_value_cached(sheet_name: str, cell_a1: str, ttl_s: int = 60):
         return row[0]
     return row or ""
 
-# ========= Writes =========
 @with_sheet_backoff
 def ws_batch_update(ws, writes):
     if not writes: return
@@ -470,7 +454,6 @@ def ws_append_row(ws, values):
     ws.append_row(values, value_input_option="RAW")
 
 def sanitize_range(a1: str) -> str:
-    """Defensive: strip duplicate sheet names like 'Tab!Tab!A1'"""
     if "!" not in a1: return a1
     tab, rng = a1.split("!", 1)
     tab = tab.split("!")[-1]
@@ -480,12 +463,7 @@ def sanitize_range(a1: str) -> str:
 def ws_update(ws, range_a1, values):
     ws.update(sanitize_range(range_a1), values)
 
-# ========= Sheet header hygiene =========
 def ensure_sheet_headers(tab: str, required_headers: list[str]) -> list[str]:
-    """
-    Ensures each name in required_headers exists as a header in row 1 of 'tab'.
-    Returns the final header list. No-ops on quota errors.
-    """
     try:
         ws = get_ws_cached(tab, ttl_s=30)
         vals = _ws_get_all_values(ws) or []
@@ -506,7 +484,6 @@ def ensure_sheet_headers(tab: str, required_headers: list[str]) -> list[str]:
         warn(f"ensure_sheet_headers({tab}) skipped: {e}")
         return []
 
-# ========= Legacy compat shims =========
 def ws_get_all_records_cached(name: str, ttl_s: int = 120):
     return get_all_records_cached(name, ttl_s)
 
@@ -529,13 +506,10 @@ def ping_webhook(message: str):
     ping_webhook_debug(message)
 
 def safe_get_all_records(sheet_name: str, ttl_s: int = 120):
-    """Compatibility shim used by legacy modules (e.g., top_token_summary)."""
     return get_all_records_cached(sheet_name, ttl_s=ttl_s)
 
-# ========= Simple retry decorator =========
 from functools import wraps
 def backoff_guard(tries=5, base=1.8, first_sleep=1.0):
-    """Retry decorator with exponential backoff."""
     def _wrap(fn):
         @wraps(fn)
         def _run(*a, **k):
@@ -552,13 +526,8 @@ def backoff_guard(tries=5, base=1.8, first_sleep=1.0):
         return _run
     return _wrap
 
-# ========= Helper used by receipts_bridge & others =========
 @backoff_guard(tries=6, base=1.6, first_sleep=1.0)
 def sheets_append_rows(sheet_url: str, worksheet_name: str, rows: list[list]):
-    """
-    Append rows to a Google Sheet worksheet.
-    Auth is resolved via the same robust logic as the rest of this module.
-    """
     gc = get_gspread_client()
     sh = gc.open_by_url(sheet_url)
     try:
@@ -567,7 +536,6 @@ def sheets_append_rows(sheet_url: str, worksheet_name: str, rows: list[list]):
         ws = sh.add_worksheet(title=worksheet_name, rows=200, cols=20)
     ws.append_rows(rows, value_input_option="USER_ENTERED")
 
-# ========= Watchdog helpers =========
 WATCHDOG_TAB = os.getenv("WATCHDOG_TAB", "Rotation_Log")
 WATCHDOG_TOKEN_COL = os.getenv("WATCHDOG_TOKEN_COL", "Token")
 WATCHDOG_TIME_HEADERS = [h.strip() for h in os.getenv(
@@ -581,8 +549,7 @@ def str_or_empty(v):
 
 def _parse_dt(val):
     s = str_or_empty(val)
-    if not s:
-        return None
+    if not s: return None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"):
         try:
             return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
@@ -606,8 +573,7 @@ def detect_stalled_tokens(
         now = datetime.now(timezone.utc)
         for idx, row in enumerate(rows, start=2):
             token = str_or_empty(row.get(token_col))
-            if not token:
-                continue
+            if not token: continue
             seen_dt = None
             last_col = None
             for h in time_headers:
@@ -615,8 +581,7 @@ def detect_stalled_tokens(
                 if dt:
                     seen_dt, last_col = dt, h
                     break
-            if not seen_dt:
-                continue
+            if not seen_dt: continue
             age_h = (now - seen_dt).total_seconds() / 3600.0
             if age_h >= threshold_hours:
                 stalled.append({
@@ -631,7 +596,6 @@ def detect_stalled_tokens(
         return []
     return stalled
 
-# ========= Number parsing helpers (legacy-safe) =========
 def to_float(v, default=None):
     s = str_or_empty(v).replace("%", "").replace(",", "")
     if s == "": return default
@@ -652,8 +616,7 @@ def safe_float(v, default=None):
 
 def safe_int(v, default=None):
     f = safe_float(v, default=None)
-    if f is None:
-        return default
+    if f is None: return default
     try:
         return int(float(f))
     except Exception:
@@ -669,13 +632,52 @@ def safe_len(x) -> int:
     except TypeError:
         return len(str(x))
 
-# ========= HMAC (for signed Edge/Bus messages) =========
+# ========= HMAC Helpers (FIXED) =========
 def hmac_hex(secret: str, payload: dict) -> str:
-    """
-    Canonical signer for internal Bus usage.
-    Always uses sort_keys=True.
-    """
+    """Canonical signer using sort_keys=True"""
     key = secret.encode()
-    # STRICT CANONICAL: separators=(',', ':'), sort_keys=True
     msg = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+def hmac_enqueue(intent: dict) -> dict:
+    """
+    Helper to enqueue an intent to the Bus via HTTP (loopback or external).
+    Wraps intent -> envelope -> payload, signs it, and posts.
+    """
+    base_url = os.getenv("CLOUD_BASE_URL") or os.getenv("OPS_BASE_URL") or "http://127.0.0.1:5000"
+    url = f"{base_url.rstrip('/')}/ops/enqueue"
+    
+    secret = os.getenv("OUTBOX_SECRET", "")
+    if not secret:
+        return {"ok": False, "reason": "no_outbox_secret"}
+        
+    # Construct Envelope
+    envelope = {
+        "agent_id": "cloud",
+        "type": "order.place",
+        "payload": intent,
+        "ts": int(time.time())
+    }
+    
+    # Wrap for API: {"payload": envelope}
+    api_body = {"payload": envelope}
+    
+    try:
+        sig = hmac_hex(secret, api_body)
+    except Exception as e:
+        return {"ok": False, "reason": f"signing_error: {e}"}
+        
+    headers = {
+        "Content-Type": "application/json",
+        "X-Nova-Signature": sig,
+        "X-NT-Sig": sig,
+        "X-Timestamp": str(int(time.time()))
+    }
+    
+    try:
+        resp = _REQ.post(url, json=api_body, headers=headers, timeout=10)
+        if resp.ok:
+            return resp.json()
+        return {"ok": False, "reason": f"http_{resp.status_code}", "body": resp.text}
+    except Exception as e:
+        return {"ok": False, "reason": f"connection_error: {e}"}
