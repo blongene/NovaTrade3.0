@@ -1012,24 +1012,17 @@ def _now_et_str():
 def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None:
     """Append one row to Trade_Log. Never raise."""
     try:
-        # ---- Normalize inputs so .get() is always safe -----------------
+        # Ensure we always have dicts so .get() is safe.
         if not isinstance(command, dict):
-            command = {
-                "id": getattr(command, "id", None),
-                "intent": command or {},
-            }
+            command = {"id": getattr(command, "id", None), "intent": command or {}}
 
         if not isinstance(receipt, dict):
-            # Best-effort projection of legacy shapes / booleans / strings
+            # Legacy / non-dict receipts get wrapped.
             status = getattr(receipt, "status", None)
             ok_val = getattr(receipt, "ok", None)
             if isinstance(ok_val, bool) and not status:
                 status = "ok" if ok_val else "error"
-            receipt = {
-                "status": status,
-                "ok": bool(ok_val) if isinstance(ok_val, bool) else None,
-                "raw": receipt,
-            }
+            receipt = {"status": status, "ok": ok_val, "raw": receipt}
 
         if not isinstance(command, dict):
             command = {}
@@ -1044,14 +1037,16 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
         if not isinstance(norm, dict):
             norm = {}
 
-        # ---- Shape row fields ------------------------------------------
+        # columns expected:
+        # A: Timestamp, B: Venue, C: Symbol, D: Side,
+        # E: Amount_Quote, F: Executed_Qty, G: Avg_Price,
+        # H: Status, I: Notes, J: Cmd_ID, K: Receipt_ID, L: Note, M: Source
         ts_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
         venue  = norm.get("venue")  or intent.get("venue")  or ""
         symbol = norm.get("symbol") or intent.get("symbol") or ""
         side   = norm.get("side")   or intent.get("side")   or ""
 
-        # Amount: prefer explicit quote amount from intent if present.
         amt_q  = intent.get("amount") or intent.get("quote_amount") or ""
 
         exec_qty = norm.get("executed_qty", "")
@@ -1061,29 +1056,27 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
         if not status:
             status = receipt.get("status") or ""
 
-        notes = norm.get("note") or receipt.get("message") or ""
-
+        notes   = norm.get("note") or receipt.get("message") or ""
         cmd_id  = command.get("id", "")
         rcpt_id = norm.get("receipt_id") or receipt.get("receipt_id") or ""
 
-        # Spare column + provenance
-        note   = ""         # your column L
+        note   = ""         # spare column L
         source = "EdgeBus"  # column M
 
         row = [
-            ts_str,  # A: Timestamp
-            venue,   # B: Venue
-            symbol,  # C: Symbol
-            side,    # D: Side
-            amt_q,   # E: Amount_Quote (requested)
-            exec_qty,# F: Executed_Qty
-            avg_px,  # G: Avg_Price
-            status,  # H: Status
-            notes,   # I: Notes
-            cmd_id,  # J: Cmd_ID
-            rcpt_id, # K: Receipt_ID
-            note,    # L: Note (spare)
-            source,  # M: Source
+            ts_str,
+            venue,
+            symbol,
+            side,
+            amt_q,
+            exec_qty,
+            avg_px,
+            status,
+            notes,
+            cmd_id,
+            rcpt_id,
+            note,
+            source,
         ]
 
         sh = gc.open_by_url(sheet_url)
@@ -1091,7 +1084,6 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
         ws.append_row(row, value_input_option="USER_ENTERED")
 
     except Exception as e:
-        # Absolutely never crash the ACK path – just log and move on.
         log.error("bus: trade_log append failed (non-fatal): %s", e)
 
 # --- DEBUG & TELEGRAM DIAGNOSTICS (restored) ---------------------------------
