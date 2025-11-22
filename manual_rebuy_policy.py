@@ -161,4 +161,35 @@ def evaluate_manual_rebuy(
     if budget_usd is not None:
         if budget_usd <= 0:
             # No usable quote after reserve/keepback → DENY
-            reason = f"venue_budget_zero ({bu
+            reason = f"venue_budget_zero ({budget_reason})"
+            ok = False
+            patched = dict(patched_intent)
+            patched["amount_usd"] = 0.0
+            _append_policy_log_row(patched_intent, ok, reason, patched)
+            try:
+                msg = _format_telegram_summary(patched_intent, ok, reason, patched)
+                send_telegram_message_dedup(msg, dedup_ttl_sec=60)
+            except Exception as e:  # pragma: no cover
+                warn(f"manual_rebuy_policy: failed to send Telegram summary (budget_zero): {e}")
+            return ok, reason, patched
+
+        # If user requested more than venue budget, clamp down before PolicyEngine
+        if amount_usd_f > budget_usd:
+            patched_intent["amount_usd"] = budget_usd
+
+    # -----------------------------------------------------------------------
+    # B-3: use PolicyEngine wrapper for final sizing & risk checks
+    # -----------------------------------------------------------------------
+    pe = PolicyEngine()
+    # Pass through asset_state from nova_trigger if provided
+    ok, reason, patched = pe.validate(patched_intent, asset_state=asset_state)
+
+    # Logging + Telegram side effects
+    _append_policy_log_row(patched_intent, ok, reason, patched)
+    try:
+        msg = _format_telegram_summary(patched_intent, ok, reason, patched)
+        send_telegram_message_dedup(msg, dedup_ttl_sec=60)
+    except Exception as e:  # pragma: no cover
+        warn(f"manual_rebuy_policy: failed to send Telegram summary: {e}")
+
+    return ok, reason, patched
