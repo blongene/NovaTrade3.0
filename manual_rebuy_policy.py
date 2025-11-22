@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 
 from policy_engine import PolicyEngine
 from venue_budget import get_budget_for_intent
@@ -99,7 +99,11 @@ def _format_telegram_summary(intent: Dict[str, Any], ok: bool, reason: str, patc
     return "\n".join(lines)
 
 
-def evaluate_manual_rebuy(intent: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+def evaluate_manual_rebuy(
+    intent: Dict[str, Any],
+    asset_state: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Main entrypoint used by nova_trigger.
 
@@ -110,6 +114,10 @@ def evaluate_manual_rebuy(intent: Dict[str, Any]) -> Tuple[bool, str, Dict[str, 
       price_usd: float (set by B-2 where possible)
       quote: str (optional)
       source: 'manual_rebuy' (optional)
+
+    asset_state (optional):
+      Optional per-asset state dict passed by nova_trigger. We pass it
+      through to PolicyEngine.validate(...) when provided.
     """
     # Normalize fields
     token = (intent.get("token") or "").upper()
@@ -153,34 +161,4 @@ def evaluate_manual_rebuy(intent: Dict[str, Any]) -> Tuple[bool, str, Dict[str, 
     if budget_usd is not None:
         if budget_usd <= 0:
             # No usable quote after reserve/keepback → DENY
-            reason = f"venue_budget_zero ({budget_reason})"
-            ok = False
-            patched = dict(patched_intent)
-            patched["amount_usd"] = 0.0
-            _append_policy_log_row(patched_intent, ok, reason, patched)
-            try:
-                msg = _format_telegram_summary(patched_intent, ok, reason, patched)
-                send_telegram_message_dedup(msg, dedup_ttl_sec=60)
-            except Exception as e:  # pragma: no cover
-                warn(f"manual_rebuy_policy: failed to send Telegram summary (budget_zero): {e}")
-            return ok, reason, patched
-
-        # If user requested more than venue budget, clamp down before PolicyEngine
-        if amount_usd_f > budget_usd:
-            patched_intent["amount_usd"] = budget_usd
-
-    # -----------------------------------------------------------------------
-    # B-3: use PolicyEngine wrapper for final sizing & risk checks
-    # -----------------------------------------------------------------------
-    pe = PolicyEngine()
-    ok, reason, patched = pe.validate(patched_intent, asset_state=None)
-
-    # Logging + Telegram side effects
-    _append_policy_log_row(patched_intent, ok, reason, patched)
-    try:
-        msg = _format_telegram_summary(patched_intent, ok, reason, patched)
-        send_telegram_message_dedup(msg, dedup_ttl_sec=60)
-    except Exception as e:  # pragma: no cover
-        warn(f"manual_rebuy_policy: failed to send Telegram summary: {e}")
-
-    return ok, reason, patched
+            reason = f"venue_budget_zero ({bu
