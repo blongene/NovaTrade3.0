@@ -772,6 +772,16 @@ def cmd_ack():
     # ---------- 3) Best-effort Trade_Log append (never crash ACK) ----------
     try:
         if os.getenv("BUS_LOG_TRADES", "true").lower() in ("1", "true", "yes", "on"):
+            # Build a gspread client on demand so we don't depend on a global GC.
+            try:
+                from utils import get_gspread_client
+                gc_client = get_gspread_client()
+            except ImportError:
+                # Fallback if your utils uses a different name
+                from utils import build_gspread_client as get_gspread_client  # type: ignore
+                gc_client = get_gspread_client()
+
+            # Fetch the command so we can log it
             command = None
             try:
                 command = store.get(int(cmd_id)) if cmd_id else None
@@ -787,13 +797,10 @@ def cmd_ack():
                     "raw": receipt,
                 }
 
-            log_trade_to_sheet(GC, SHEET_URL, command, receipt)
+            log_trade_to_sheet(gc_client, SHEET_URL, command, receipt)
 
     except Exception as e:
-        log.error("trade_log append degraded: %s", e)
-
-    # We only report whether the ACK itself was accepted.
-    return jsonify({"ok": True, "acked": True, "status": status})
+        log.error("bus: trade_log append degraded: %s", e)
 
 @flask_app.get("/api/debug/outbox")
 def dbg_outbox():
