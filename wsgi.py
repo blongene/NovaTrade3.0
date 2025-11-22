@@ -716,57 +716,84 @@ def cmd_ack():
                 "error": "invalid_signature",
                 "provided": provided,
                 "expected": expected
-            }), 
-            401
+            }),
+            401,
         )
 
     agent   = (body.get("agent_id") or "edge").strip()
     cmd_id  = body.get("id") or body.get("cmd_id")
     receipt = body.get("receipt") or {}
 
-    # Accept either {status="ok"|"error"} or legacy {ok: bool}
-    status  = (body.get("status") or "").lower()
+    # ---------- Status + ok flag ----------
+    # Prefer explicit body.status, fall back to receipt.status, then legacy ok.
+    status = (body.get("status") or "").lower()
+    if not status and isinstance(receipt, dict):
+        status = (receipt.get("status") or "").lower()
+
     if not status:
         status = "ok" if body.get("ok", True) else "error"
 
-    ok_val = status in ("ok", "success")
+    ok_val = status in ("ok", "success", "done")
 
-    # ---------- 1) Persist + mark done in the outbox store ----------
+    # Reason for fail(): best-effort from receipt.
+    reason = ""
+    if isinstance(receipt, dict):
+        reason = (
+            receipt.get("error")
+            or receipt.get("message")
+            or receipt.get("status")
+            or status
+        )
+
+    # ---------- 1) Persist receipt ----------
     try:
         store.save_receipt(agent, cmd_id, receipt, ok_val)
     except Exception:
         log.exception("save_receipt failed agent=%s cmd_id=%s", agent, cmd_id)
 
-    if ok_val and cmd_id:
+    # ---------- 2) Mark command terminal (done or error) ----------
+    if cmd_id:
         try:
-            store.done(int(cmd_id))
+            cmd_id_int = int(cmd_id)
         except Exception:
-            log.exception("done() failed for cmd_id=%s", cmd_id)
+            cmd_id_int = None
 
-    # ---------- 2) Best-effort Trade_Log append (never crash ACK) ----------
+        if cmd_id_int is not None:
+            try:
+                if ok_val:
+                    # Success path – command moves to 'done'
+                    store.done(cmd_id_int)
+                else:
+                    # Error path – command moves to 'error' and will NOT be leased again
+                    store.fail(cmd_id_int, reason or status or "error")
+            except Exception:
+                log.exception("terminal update failed for cmd_id=%s", cmd_id)
+
+    # ---------- 3) Best-effort Trade_Log append (never crash ACK) ----------
     try:
         if os.getenv("BUS_LOG_TRADES", "true").lower() in ("1", "true", "yes", "on"):
             command = None
             try:
-                # Try to fetch the original command for richer context
-                command = store.get(int(cmd_id))
+                command = store.get(int(cmd_id)) if cmd_id else None
             except Exception:
                 command = None
 
-            # Make sure command is a dict the logger can safely consume
             if not isinstance(command, dict):
                 command = {"id": cmd_id or None, "intent": command or {}}
-
-            # Make sure receipt is a dict as well
             if not isinstance(receipt, dict):
-                receipt = {"status": status, "ok": ok_val, "raw": receipt}
+                receipt = {
+                    "status": status,
+                    "ok": ok_val,
+                    "raw": receipt,
+                }
 
-            gc = _get_gspread()
-            log_trade_to_sheet(gc, os.environ["SHEET_URL"], command, receipt)
-    except Exception:
-        log.exception("trade_log append failed (non-fatal)")
+            log_trade_to_sheet(GC, SHEET_URL, command, receipt)
 
-    return jsonify({"ok": True})
+    except Exception as e:
+        log.error("trade_log append degraded: %s", e)
+
+    # We only report whether the ACK itself was accepted.
+    return jsonify({"ok": True, "acked": True, "status": status})
 
 @flask_app.get("/api/debug/outbox")
 def dbg_outbox():
