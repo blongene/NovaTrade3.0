@@ -9,18 +9,18 @@ Responsibilities:
   - Call PolicyEngine.validate(...) for sizing & risk checks.
   - Append a lightweight row into Policy_Log.
   - Send a short Telegram summary.
-  - Return (ok, reason, patched) for upstream callers.
+  - Return a dict: {"ok": bool, "reason": str, "patched_intent": dict}
 """
 
 from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Dict, Any, Tuple, Optional
+from typing import Any, Dict, Optional
 
 from policy_engine import PolicyEngine
 from venue_budget import get_budget_for_intent
-from utils import sheets_append_rows, send_telegram_message_dedup, warn  # type: ignore
+from utils import sheets_append_rows, send_telegram_message_dedup, warn
 
 SHEET_URL = os.getenv("SHEET_URL", "")
 POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
@@ -67,7 +67,7 @@ def _format_telegram_summary(intent: Dict[str, Any], ok: bool, reason: str, patc
     patched_amt_usd = patched.get("amount_usd", orig_amt_usd)
     price_usd = intent.get("price_usd")
 
-    lines = []
+    lines: list[str] = []
     lines.append("🧭 Manual Rebuy Policy Check")
     lines.append(f"Asset: {token} on {venue}{f' / {quote}' if quote else ''}")
 
@@ -86,7 +86,7 @@ def _format_telegram_summary(intent: Dict[str, Any], ok: bool, reason: str, patc
         elif orig_f is not None:
             lines.append(f"Requested: ${orig_f:,.2f}")
 
-    if price_usd:
+    if price_usd is not None:
         try:
             lines.append(f"Price: ${float(price_usd):,.4f} (from Unified_Snapshot)")
         except Exception:
@@ -103,7 +103,7 @@ def evaluate_manual_rebuy(
     intent: Dict[str, Any],
     asset_state: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
-) -> Tuple[bool, str, Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
     Main entrypoint used by nova_trigger.
 
@@ -118,6 +118,9 @@ def evaluate_manual_rebuy(
     asset_state (optional):
       Optional per-asset state dict passed by nova_trigger. We pass it
       through to PolicyEngine.validate(...) when provided.
+
+    Returns:
+      {"ok": bool, "reason": str, "patched_intent": dict}
     """
     # Normalize fields
     token = (intent.get("token") or "").upper()
@@ -127,16 +130,16 @@ def evaluate_manual_rebuy(
     price_usd = intent.get("price_usd")
 
     if not token:
-        return False, "missing token", intent
+        return {"ok": False, "reason": "missing token", "patched_intent": intent}
     if not venue:
-        return False, "missing venue", intent
+        return {"ok": False, "reason": "missing venue", "patched_intent": intent}
     if amount_usd is None:
-        return False, "missing amount_usd", intent
+        return {"ok": False, "reason": "missing amount_usd", "patched_intent": intent}
 
     try:
         amount_usd_f = float(amount_usd)
     except Exception:
-        return False, "invalid amount_usd", intent
+        return {"ok": False, "reason": "invalid amount_usd", "patched_intent": intent}
 
     patched_intent: Dict[str, Any] = dict(intent)
     patched_intent["token"] = token
@@ -168,10 +171,11 @@ def evaluate_manual_rebuy(
             _append_policy_log_row(patched_intent, ok, reason, patched)
             try:
                 msg = _format_telegram_summary(patched_intent, ok, reason, patched)
-                send_telegram_message_dedup(msg, dedup_ttl_sec=60)
+                key = f"manual_rebuy_policy:{token}:{venue}"
+                send_telegram_message_dedup(msg, key)
             except Exception as e:  # pragma: no cover
                 warn(f"manual_rebuy_policy: failed to send Telegram summary (budget_zero): {e}")
-            return ok, reason, patched
+            return {"ok": ok, "reason": reason, "patched_intent": patched}
 
         # If user requested more than venue budget, clamp down before PolicyEngine
         if amount_usd_f > budget_usd:
@@ -181,15 +185,15 @@ def evaluate_manual_rebuy(
     # B-3: use PolicyEngine wrapper for final sizing & risk checks
     # -----------------------------------------------------------------------
     pe = PolicyEngine()
-    # Pass through asset_state from nova_trigger if provided
     ok, reason, patched = pe.validate(patched_intent, asset_state=asset_state)
 
     # Logging + Telegram side effects
     _append_policy_log_row(patched_intent, ok, reason, patched)
     try:
         msg = _format_telegram_summary(patched_intent, ok, reason, patched)
-        send_telegram_message_dedup(msg, dedup_ttl_sec=60)
+        key = f"manual_rebuy_policy:{token}:{venue}"
+        send_telegram_message_dedup(msg, key)
     except Exception as e:  # pragma: no cover
         warn(f"manual_rebuy_policy: failed to send Telegram summary: {e}")
 
-    return ok, reason, patched
+    return {"ok": ok, "reason": reason, "patched_intent": patched}
