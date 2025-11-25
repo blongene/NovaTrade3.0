@@ -777,35 +777,40 @@ def cmd_ack():
 
     # ---- 4) Best-effort Trade_Log append (never crash ACK) ------------------
     try:
-        if os.getenv("BUS_LOG_TRADES", "true").lower() in ("1", "true", "yes", "on"):
-            command = None
+        sheet_url = os.getenv("SHEET_URL")
+        if not sheet_url:
+            log.warning("cmd_ack: SHEET_URL missing; skipping Trade_Log append")
+        else:
+            # Use the project’s helper so it can find creds the usual way
+            try:
+                from utils import get_gspread_client
+            except ImportError:
+                # older versions used build_gspread_client
+                from utils import build_gspread_client as get_gspread_client
+
+            gc_client = get_gspread_client()
+
+            # Try to fetch the original command for richer context.
+            # Do this *before* worrying if it exists; otherwise fall back to a stub.
             try:
                 command = store.get(int(cmd_id))
             except Exception:
-                command = None
-                log.warning("cmd_ack: could not fetch command %s for Trade_Log; using stub", cmd_id)
+                log.warning(
+                    "cmd_ack: could not fetch command %s for Trade_Log; using stub",
+                    cmd_id,
+                )
+                command = {"id": cmd_id, "intent": {}}
 
-            if not isinstance(command, dict):
-                command = {"id": cmd_id or None, "intent": command or {}}
-
+            # Normalize receipt for logging
             if not isinstance(receipt, dict):
                 receipt = {"status": status, "ok": ok_val, "raw": receipt}
 
-            # your existing log_trade_to_sheet helper:
-            try:
-                gc_client = gspread.authorize(
-                    ServiceAccountCredentials.from_json_keyfile_name(
-                        os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"],
-                        ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-                    )
-                )
-                sheet_url = os.environ.get("SHEET_URL")
-                if sheet_url:
-                    log_trade_to_sheet(gc_client, sheet_url, command, receipt)
-            except Exception:
-                log.exception("cmd_ack: Trade_Log append degraded (non-fatal)")
+            # Existing helper that writes to the Trade_Log sheet
+            log_trade_to_sheet(gc_client, sheet_url, command, receipt)
+
     except Exception:
-        log.exception("cmd_ack: Trade_Log handling degraded (non-fatal)")
+        # Sheets/logging issues must NEVER break ACK
+        log.exception("cmd_ack: Trade_Log append degraded (non-fatal)")
 
     # ---- 5) Final JSON response back to Edge --------------------------------
     return jsonify({"ok": True})
