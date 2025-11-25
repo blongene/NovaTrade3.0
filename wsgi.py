@@ -705,102 +705,91 @@ def cmd_pull():
     return jsonify({"ok": True, "commands": out, "lease_seconds": OUTBOX_LEASE_SECONDS})
 
 # Edge ACKs execution results
-@flask_app.post("/api/commands/ack")
+@app.route("/api/commands/ack", methods=["POST"])
 def cmd_ack():
-    # Robust verify
-    ok, body, provided, expected = _verify_hmac_json("OUTBOX_SECRET", "X-OUTBOX-SIGN")
-    if not ok:
-        return (
-            jsonify({
-                "ok": False,
-                "error": "invalid_signature",
-                "provided": provided,
-                "expected": expected
-            }),
-            401,
-        )
+    """
+    Edge Agent sends a receipt for a previously queued command.
 
-    agent   = (body.get("agent_id") or "edge").strip()
-    cmd_id  = body.get("id") or body.get("cmd_id")
+    Responsibilities:
+      * Verify HMAC
+      * Persist the receipt in the command store
+      * Best-effort append into Trade_Log (never crash ACK)
+      * Return a JSON response to the Edge
+    """
+    body = request.get_json(silent=True) or {}
+    agent_id = body.get("agent_id") or "unknown"
+    cmd_id = body.get("id")
     receipt = body.get("receipt") or {}
 
-    # ---------- Status + ok flag ----------
-    # Prefer explicit body.status, fall back to receipt.status, then legacy ok.
-    status = (body.get("status") or "").lower()
-    if not status and isinstance(receipt, dict):
-        status = (receipt.get("status") or "").lower()
+    # ---- 0) Basic validation ------------------------------------------------
+    if cmd_id is None:
+        log.warning("cmd_ack: missing id in body=%r", body)
+        return jsonify({"status": "error", "error": "missing id"}), 400
 
-    if not status:
-        status = "ok" if body.get("ok", True) else "error"
-
-    ok_val = status in ("ok", "success", "done")
-
-    # Reason for fail(): best-effort from receipt.
-    reason = ""
-    if isinstance(receipt, dict):
-        reason = (
-            receipt.get("error")
-            or receipt.get("message")
-            or receipt.get("status")
-            or status
-        )
-
-    # ---------- 1) Persist receipt ----------
+    # ---- 1) Verify HMAC for the ACK payload --------------------------------
     try:
-        store.save_receipt(agent, cmd_id, receipt, ok_val)
+        _verify_hmac(request, body)
+    except Exception as e:
+        log.error("cmd_ack: HMAC verification failed for id=%s: %s", cmd_id, e)
+        return jsonify({"status": "error", "error": "bad_signature"}), 403
+
+    # ---- 2) Persist receipt in the Outbox / command store -------------------
+    try:
+        # store is the same CommandStore used by /ops/enqueue and /api/commands/pull
+        store.ack(int(cmd_id), receipt)
     except Exception:
-        log.exception("save_receipt failed agent=%s cmd_id=%s", agent, cmd_id)
+        log.exception("cmd_ack: failed to persist receipt for id=%s", cmd_id)
 
-    # ---------- 2) Mark command terminal (done or error) ----------
-    if cmd_id:
-        try:
-            cmd_id_int = int(cmd_id)
-        except Exception:
-            cmd_id_int = None
+    # Derive a simple status string for logging/response
+    ok_val = bool(receipt.get("ok", False))
+    status = receipt.get("status") or ("ok" if ok_val else "error")
 
-        if cmd_id_int is not None:
-            try:
-                if ok_val:
-                    # Success path – command moves to 'done'
-                    store.done(cmd_id_int)
-                else:
-                    # Error path – command moves to 'error' and will NOT be leased again
-                    store.fail(cmd_id_int, reason or status or "error")
-            except Exception:
-                log.exception("terminal update failed for cmd_id=%s", cmd_id)
-
-    # ---------- 3) Best-effort Trade_Log append (never crash ACK) ----------
+    # ---- 3) Best-effort Trade_Log append (SOFT FAIL) ------------------------
     try:
-        if os.getenv("BUS_LOG_TRADES", "true").lower() in ("1", "true", "yes", "on"):
-            # Build a gspread client on demand so we don't depend on a global GC.
+        # Only attempt if SHEET_URL is available
+        sheet_url = os.getenv("SHEET_URL")
+        if not sheet_url:
+            log.warning("cmd_ack: SHEET_URL env missing; skipping Trade_Log append")
+        else:
+            # Build a fresh gspread client instead of relying on a global GC
             try:
                 from utils import get_gspread_client
                 gc_client = get_gspread_client()
             except ImportError:
-                # Fallback if your utils uses a different name
+                # Back-compat: some older packs used build_gspread_client
                 from utils import build_gspread_client as get_gspread_client  # type: ignore
                 gc_client = get_gspread_client()
 
-            # Fetch the command so we can log it
-            command = None
+            # Fetch the original command so we can log intent + receipt
             try:
-                command = store.get(int(cmd_id)) if cmd_id else None
+                command = store.get(int(cmd_id))
             except Exception:
-                command = None
+                log.warning("cmd_ack: could not fetch command %s for Trade_Log; using minimal stub", cmd_id)
+                command = {"id": cmd_id, "intent": {}}
 
-            if not isinstance(command, dict):
-                command = {"id": cmd_id or None, "intent": command or {}}
+            # Ensure receipt is a dict
             if not isinstance(receipt, dict):
-                receipt = {
-                    "status": status,
-                    "ok": ok_val,
-                    "raw": receipt,
-                }
+                receipt_norm = {"status": status, "ok": ok_val, "raw": receipt}
+            else:
+                receipt_norm = dict(receipt)
 
-            log_trade_to_sheet(gc_client, SHEET_URL, command, receipt)
+            # This is the same helper we’ve been using elsewhere
+            log_trade_to_sheet(gc_client, sheet_url, command, receipt_norm)
 
     except Exception as e:
+        # NEVER let Trade_Log issues break ACK handling
         log.error("bus: trade_log append degraded: %s", e)
+
+    # ---- 4) Final ACK response to Edge --------------------------------------
+    return jsonify(
+        {
+            "status": "ok",
+            "id": cmd_id,
+            "agent_id": agent_id,
+            "edge_status": status,
+            "edge_ok": ok_val,
+        }
+    )
 
 @flask_app.get("/api/debug/outbox")
 def dbg_outbox():
