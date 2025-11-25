@@ -31,6 +31,13 @@ except ImportError:
     # Fallback stub if file missing
     def evaluate_manual_rebuy(intent, asset_state):
         return {"ok": True, "reason": "policy_missing_allow_all", "patched_intent": intent}
+# B-2 price feed (direct to venues)
+try:
+    from price_feed import get_price_usd as _feed_get_price_usd
+except ImportError:
+    def _feed_get_price_usd(token: str, quote: str = "USDT", venue: str | None = None):
+        warn("nova_trigger: price_feed missing; _feed_get_price_usd returns None")
+        return None
 
 # === Config & Constants ===
 UNIFIED_SNAPSHOT_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
@@ -88,6 +95,25 @@ def _get_price_usd_from_snapshot(token: str) -> Tuple[Optional[float], str]:
                         continue
     return None, "not_found"
 
+def _get_price_usd(token: str, quote: str, venue: Optional[str]) -> Tuple[Optional[float], str]:
+    """
+    Unified price helper:
+    1) Try Unified_Snapshot (if it ever gets a Price_USD column)
+    2) If not found, fall back to direct venue price via price_feed.get_price_usd
+    """
+    # 1) Try snapshot (current behavior)
+    snap_price, snap_reason = _get_price_usd_from_snapshot(token)
+    if snap_price is not None:
+        return snap_price, "snapshot_ok"
+
+    # 2) Fall back to direct venue price feed
+    price = _feed_get_price_usd(token, quote or "USDT", venue)
+    if price is not None:
+        return price, "venue_feed_ok"
+
+    # Still nothing
+    return None, f"snapshot:{snap_reason};feed_not_found"
+
 # -----------------------------------------------------------------------
 # Core Router
 # -----------------------------------------------------------------------
@@ -107,9 +133,13 @@ def route_manual(raw: str) -> dict:
         "raw_msg": raw,
     }
     
-    # B-2: Auto Price Fetch
-    price_usd, p_reason = _get_price_usd_from_snapshot(intent["token"])
-    if price_usd:
+    # B-2: Auto Price Fetch (snapshot → venue feed)
+    price_usd, p_reason = _get_price_usd(
+        intent["token"],
+        intent.get("quote") or "USDT",
+        intent.get("venue"),
+    )
+    if price_usd is not None:
         intent["price_usd"] = price_usd
     else:
         warn(f"nova_trigger: Could not find price for {intent['token']} ({p_reason})")
