@@ -711,85 +711,80 @@ def cmd_ack():
     Edge Agent sends a receipt for a previously queued command.
 
     Responsibilities:
-      * Verify HMAC
-      * Persist the receipt in the command store
-      * Best-effort append into Trade_Log (never crash ACK)
-      * Return a JSON response to the Edge
+      * Verify HMAC (same scheme as /api/commands/pull)
+      * Persist the receipt in the outbox store
+      * Best-effort Trade_Log append (never crash ACK)
+      * Return a JSON response for the Edge
     """
-    body = request.get_json(silent=True) or {}
-    agent_id = body.get("agent_id") or "unknown"
-    cmd_id = body.get("id")
+    # ---- 1) Robust HMAC verify using canonical JSON -------------------------
+    # Use EDGE_SECRET + X-Nova-Signature to match edge_bus_client.post_signed()
+    ok, body, provided, expected = _verify_hmac_json("EDGE_SECRET", "X-Nova-Signature")
+    if not ok:
+        cmd_id = body.get("id") or body.get("cmd_id")
+        log.error(
+            "cmd_ack: invalid HMAC for id=%s provided=%s expected=%s",
+            cmd_id,
+            provided,
+            expected,
+        )
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "invalid_signature",
+                    "provided": provided,
+                    "expected": expected,
+                }
+            ),
+            401,
+        )
+
+    # ---- 2) Normalize core fields -------------------------------------------
+    agent = (body.get("agent_id") or "edge").strip()
+    cmd_id = body.get("id") or body.get("cmd_id")
     receipt = body.get("receipt") or {}
 
-    # ---- 0) Basic validation ------------------------------------------------
-    if cmd_id is None:
-        log.warning("cmd_ack: missing id in body=%r", body)
-        return jsonify({"status": "error", "error": "missing id"}), 400
+    # Accept either {status:"ok"|"error"} or legacy {ok: bool}
+    status = (body.get("status") or "").lower()
+    if not status:
+        status = "ok" if body.get("ok", True) else "error"
+    ok_val = status in ("ok", "success")
 
-    # ---- 1) Verify HMAC for the ACK payload --------------------------------
+    # ---- 3) Persist in outbox store -----------------------------------------
     try:
-        _verify_hmac(request, body)
-    except Exception as e:
-        log.error("cmd_ack: HMAC verification failed for id=%s: %s", cmd_id, e)
-        return jsonify({"status": "error", "error": "bad_signature"}), 403
-
-    # ---- 2) Persist receipt in the Outbox / command store -------------------
-    try:
-        # store is the same CommandStore used by /ops/enqueue and /api/commands/pull
-        store.ack(int(cmd_id), receipt)
+        # This is the same CommandStore used by /ops/enqueue and /api/commands/pull
+        store.save_receipt(agent, cmd_id, receipt, ok_val)
     except Exception:
-        log.exception("cmd_ack: failed to persist receipt for id=%s", cmd_id)
+        log.exception("outbox: save_receipt failed for id=%s", cmd_id)
 
-    # Derive a simple status string for logging/response
-    ok_val = bool(receipt.get("ok", False))
-    status = receipt.get("status") or ("ok" if ok_val else "error")
-
-    # ---- 3) Best-effort Trade_Log append (SOFT FAIL) ------------------------
+    # ---- 4) Best-effort Trade_Log append (SOFT FAIL) ------------------------
     try:
-        # Only attempt if SHEET_URL is available
-        sheet_url = os.getenv("SHEET_URL")
-        if not sheet_url:
-            log.warning("cmd_ack: SHEET_URL env missing; skipping Trade_Log append")
-        else:
-            # Build a fresh gspread client instead of relying on a global GC
+        if os.getenv("BUS_LOG_TRADES", "true").lower() in ("1", "true", "yes", "on"):
+            command = None
             try:
-                from utils import get_gspread_client
-                gc_client = get_gspread_client()
-            except ImportError:
-                # Back-compat: some older packs used build_gspread_client
-                from utils import build_gspread_client as get_gspread_client  # type: ignore
-                gc_client = get_gspread_client()
-
-            # Fetch the original command so we can log intent + receipt
-            try:
+                # Try to fetch the original command for richer context
                 command = store.get(int(cmd_id))
             except Exception:
-                log.warning("cmd_ack: could not fetch command %s for Trade_Log; using minimal stub", cmd_id)
-                command = {"id": cmd_id, "intent": {}}
+                command = None
 
-            # Ensure receipt is a dict
+            # Make sure command is a dict the logger can safely consume
+            if not isinstance(command, dict):
+                command = {"id": cmd_id or None, "intent": command or {}}
+
+            # Make sure receipt is a dict as well
             if not isinstance(receipt, dict):
-                receipt_norm = {"status": status, "ok": ok_val, "raw": receipt}
-            else:
-                receipt_norm = dict(receipt)
+                receipt = {"status": status, "ok": ok_val, "raw": receipt}
 
-            # This is the same helper we’ve been using elsewhere
-            log_trade_to_sheet(gc_client, sheet_url, command, receipt_norm)
+            # Existing helper you already use elsewhere
+            gc = _get_gspread()
+            log_trade_to_sheet(gc, os.environ["SHEET_URL"], command, receipt)
 
-    except Exception as e:
+    except Exception:
         # NEVER let Trade_Log issues break ACK handling
-        log.error("bus: trade_log append degraded: %s", e)
+        log.exception("trade_log append failed (non-fatal)")
 
-    # ---- 4) Final ACK response to Edge --------------------------------------
-    return jsonify(
-        {
-            "status": "ok",
-            "id": cmd_id,
-            "agent_id": agent_id,
-            "edge_status": status,
-            "edge_ok": ok_val,
-        }
-    )
+    # ---- 5) Final response back to Edge -------------------------------------
+    return jsonify({"ok": True})
 
 @flask_app.get("/api/debug/outbox")
 def dbg_outbox():
