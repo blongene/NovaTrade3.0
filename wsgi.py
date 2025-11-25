@@ -705,7 +705,7 @@ def cmd_pull():
     return jsonify({"ok": True, "commands": out, "lease_seconds": OUTBOX_LEASE_SECONDS})
 
 # Edge ACKs execution results
-@app.route("/api/commands/ack", methods=["POST"])
+@flask_app.post("/api/commands/ack")
 def cmd_ack():
     """
     Edge Agent sends a receipt for a previously queued command.
