@@ -104,42 +104,36 @@ REQUIRE_HMAC_TELEMETRY = _env_true("REQUIRE_HMAC_TELEMETRY")
 
 def _verify_hmac_json(secret_env: str, header_name: str):
     """
-    Robust HMAC Validator.
-    Checks BOTH Raw Bytes AND Canonical JSON to prevent drift.
+    Verify an HMAC-SHA256 signature over the raw request body.
+
+    Edge sends:
+      - body: canonical JSON bytes (sorted keys, no spaces)
+      - header: header_name (e.g. 'X-OUTBOX-SIGN')
+      - key:   value from env[secret_env] (e.g. 'OUTBOX_SECRET')
+
     Returns: (ok, body_dict, provided_sig, expected_sig)
     """
-    secret = os.getenv(secret_env, "") or ""
-    # Get body safely
-    body = request.get_json(force=True, silent=True) or {}
-    
-    # Get header (tolerant of casing/alternatives)
-    provided = (request.headers.get(header_name) or 
-                request.headers.get("X-Nova-Signature") or 
-                request.headers.get("X-NT-Sig") or 
-                request.headers.get("X-Outbox-Signature") or 
-                request.headers.get("X-Signature") or "").strip()
+    raw = request.get_data() or b""
+    try:
+        body = json.loads(raw.decode("utf-8") or "{}")
+    except Exception:
+        body = {}
+
+    secret = os.getenv(secret_env, "")
+    provided = request.headers.get(header_name, "") or ""
 
     if not secret or not provided:
-        return False, body, provided, "missing_secret_or_sig"
+        # signal that we couldn't even attempt verification
+        return False, body, "", "missing_secret_or_sig"
 
-    sec_bytes = secret.encode("utf-8")
-    
-    # 1. Check RAW bytes (fast path)
-    raw_bytes = request.get_data() or b""
-    calc_raw = hmac.new(sec_bytes, raw_bytes, hashlib.sha256).hexdigest()
-    if hmac.compare_digest(calc_raw, provided):
-        return True, body, provided, calc_raw
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        raw,
+        hashlib.sha256,
+    ).hexdigest()
 
-    # 2. Check CANONICAL (Sorted Keys) - The fix for serialization drift
-    try:
-        raw_sorted = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        calc_canon = hmac.new(sec_bytes, raw_sorted, hashlib.sha256).hexdigest()
-        if hmac.compare_digest(calc_canon, provided):
-            return True, body, provided, calc_canon
-    except Exception:
-        pass
-
-    return False, body, provided, "mismatch"
+    ok = hmac.compare_digest(expected, provided)
+    return ok, body, provided, expected
 
 def _require_json():
     if not request.is_json: return None, (jsonify(ok=False, error="invalid_or_missing_json"), 400)
@@ -711,16 +705,15 @@ def cmd_ack():
     Edge Agent sends a receipt for a previously queued command.
 
     Responsibilities:
-      * Verify HMAC (same scheme as bus_pull/_post_json on Edge)
+      * Verify HMAC using OUTBOX_SECRET + X-OUTBOX-SIGN
       * Persist the receipt in the outbox store
       * Best-effort Trade_Log append (never crash ACK)
       * Return a JSON response for the Edge
     """
-    # ---- 1) Robust HMAC verify using canonical JSON -------------------------
-    # Edge signs with OUTBOX_SECRET and header X-OUTBOX-SIGN
+    # ---- 1) HMAC verification (must match Edge _post_json) ------------------
     ok, body, provided, expected = _verify_hmac_json(
-        "OUTBOX_SECRET",
-        "X-OUTBOX-SIGN",
+        "OUTBOX_SECRET",      # env var name
+        "X-OUTBOX-SIGN",      # header name from Edge
     )
     if not ok:
         cmd_id = body.get("id") or body.get("cmd_id")
@@ -742,20 +735,19 @@ def cmd_ack():
             401,
         )
 
-    # ---- 2) Normalize core fields -------------------------------------------
+    # ---- 2) Normalize fields ------------------------------------------------
     agent = (body.get("agent_id") or "edge").strip()
     cmd_id = body.get("id") or body.get("cmd_id")
     receipt = body.get("receipt") or {}
 
-    # Accept either explicit status or legacy ok-bool
     status = (body.get("status") or "").lower()
     if not status:
         status = "ok" if receipt.get("ok", True) else "error"
     ok_val = status in ("ok", "done", "success")
 
-    # ---- 3) Persist in outbox store -----------------------------------------
+    # ---- 3) Persist receipt in outbox store ---------------------------------
     try:
-        # Same CommandStore used by /ops/enqueue and /api/commands/pull
+        # Same store used by /ops/enqueue and /api/commands/pull
         store.save_receipt(agent, cmd_id, receipt, ok_val)
     except Exception:
         log.exception("cmd_ack: failed to persist receipt for id=%s", cmd_id)
@@ -764,9 +756,9 @@ def cmd_ack():
     try:
         sheet_url = os.getenv("SHEET_URL")
         if not sheet_url:
-            log.warning("cmd_ack: SHEET_URL env missing; skipping Trade_Log append")
+            log.warning("cmd_ack: SHEET_URL missing; skipping Trade_Log append")
         else:
-            # Build a gspread client using our helper
+            # Build a gspread client from utils
             try:
                 from utils import get_gspread_client
                 gc_client = get_gspread_client()
@@ -774,11 +766,14 @@ def cmd_ack():
                 from utils import build_gspread_client as get_gspread_client  # back-compat
                 gc_client = get_gspread_client()
 
-            # Try to fetch the original command for richer log context
+            # Fetch original command for richer logging
             try:
                 command = store.get(int(cmd_id))
             except Exception:
-                log.warning("cmd_ack: could not fetch command %s for Trade_Log; using stub", cmd_id)
+                log.warning(
+                    "cmd_ack: could not fetch command %s for Trade_Log; using stub",
+                    cmd_id,
+                )
                 command = {"id": cmd_id, "intent": {}}
 
             if not isinstance(receipt, dict):
@@ -787,10 +782,10 @@ def cmd_ack():
             log_trade_to_sheet(gc_client, sheet_url, command, receipt)
 
     except Exception:
-        # NEVER let Trade_Log issues break ACK handling
+        # Trade log must never break ACK handling
         log.exception("bus: trade_log append degraded (non-fatal)")
 
-    # ---- 5) Final response back to Edge -------------------------------------
+    # ---- 5) Final JSON response back to Edge --------------------------------
     return jsonify({"ok": True})
 
 @flask_app.get("/api/debug/outbox")
