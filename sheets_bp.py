@@ -6,9 +6,6 @@ from sheets_gateway import build_gateway_from_env
 
 SHEETS_ROUTES = Blueprint("sheets", __name__)
 _gateway = build_gateway_from_env()
-SHEETS_ROUTES.url_prefix = "/sheets"
-app.register_blueprint(SHEETS_ROUTES, url_prefix="/sheets")
-
 _bg_thread = None
 _bg_stop = threading.Event()
 
