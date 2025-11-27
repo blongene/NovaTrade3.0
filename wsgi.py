@@ -9,6 +9,7 @@ from flask import Flask, request, jsonify, Blueprint
 from bus_store_pg import get_store, OUTBOX_LEASE_SECONDS
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from sheets_bp import SHEETS_ROUTES, start_background_flusher
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
@@ -20,6 +21,7 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING if LOG_LEVEL != "DEBUG" e
 # ========== Flask ==========
 flask_app = Flask(__name__)
 store = get_store()
+flask_app.register_blueprint(SHEETS_ROUTES, url_prefix="/sheets")
 
 # ---- Outbox shims (route-safe; delegate to Postgres store) ----
 def _enqueue_command(cmd_id: str, payload: dict) -> None:
@@ -997,7 +999,14 @@ try:
     _ = _nova_boot()  # returns True on success
 except Exception as e:
     log.warning("Nova boot degraded: %s", e)
-
+  
+# Try to start the background Sheets flusher
+try:
+    start_background_flusher()
+    print("[SheetsGateway] background flusher started", flush=True)
+except Exception as e:
+    print(f"[SheetsGateway] flusher not started: {e}", flush=True)
+  
 # ========== Errors ==========
 @flask_app.errorhandler(404)
 def _nf(_e): return jsonify(error="not_found"), 404
