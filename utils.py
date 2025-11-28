@@ -444,6 +444,49 @@ def get_value_cached(sheet_name: str, cell_a1: str, ttl_s: int = 60):
         return row[0]
     return row or ""
 
+# ---------------------------------------------------------------------------
+# Backwards-compat shim: write_rows_to_sheet
+# Older code (and some boot diagnostics) still import this from utils.
+# Newer code should prefer SheetsGateway, but this keeps everything happy.
+# ---------------------------------------------------------------------------
+
+def write_rows_to_sheet(sheet_name, rows, *args, clear=False, **kwargs):
+    """
+    Backwards-compat helper to write rows into a worksheet.
+
+    Parameters (loosely inferred from older usage):
+        sheet_name: str   – tab name in the main sheet
+        rows: list[list]  – rows of values to append or write
+        clear: bool       – if True, clear the sheet before writing
+
+    Any extra positional/keyword args are ignored so we don't break old callers
+    that may have passed additional flags.
+    """
+    from utils import get_ws, warn  # self-import is fine inside the function
+
+    if not rows:
+        return
+
+    try:
+        ws = get_ws(sheet_name)
+    except Exception as e:
+        warn(f"write_rows_to_sheet: failed to open worksheet {sheet_name!r}: {e}")
+        return
+
+    try:
+        # Normalise single row vs list of rows
+        if rows and not isinstance(rows[0], (list, tuple)):
+            rows = [rows]
+
+        if clear:
+            ws.clear()
+
+        # Basic append; this is what the old helper did in practice for logs.
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+    except Exception as e:
+        warn(f"write_rows_to_sheet: error writing to {sheet_name!r}: {e}")
+
 @with_sheet_backoff
 def ws_batch_update(ws, writes):
     if not writes: return
