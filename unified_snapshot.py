@@ -1,145 +1,217 @@
 """
-NovaTrade Unified Snapshot Builder
-----------------------------------
-Builds the Unified_Snapshot tab from the latest telemetry (_last_tel).
+unified_snapshot.py — C-1 + B-2 (latest-per-asset)
 
-This version automatically includes all venues present in the telemetry payload
-(COINBASE, BINANCEUS, KRAKEN, etc.) without hard-coding them.
+Builds a normalized balance view in the Unified_Snapshot sheet:
+
+  Timestamp | Venue | Asset | Free | Locked | Total | IsQuote | QuoteSymbol | Equity_USD
+
+Source:
+  • Wallet_Monitor (primary)
+      columns: Timestamp, Venue, Asset, Free, Locked, Quote
+
+Rules:
+  • Total       = Free + Locked
+  • IsQuote     = TRUE if Asset in {USDT, USDC, USD}, else FALSE
+  • Equity_USD:
+      - If IsQuote: Equity_USD = Total (1 quote ≈ 1 USD)
+      - Else      : Equity_USD = Total * price_feed.get_price_usd(Asset, Quote or "USDT", Venue)
+  • Only the **latest** Wallet_Monitor row per (Venue, Asset) is used.
 """
 
+from __future__ import annotations
+
 import os
-import time
-import math
-import traceback
 from datetime import datetime
-from utils import get_gspread_client, write_rows_to_sheet, backoff
-from telemetry_mirror import get_last_telemetry
-from price_feed import get_price_usd
+from typing import List, Dict, Any, Tuple
 
-# === Config ===
-SHEET_URL = os.getenv("SHEET_URL")
-TAB_NAME = "Unified_Snapshot"
-QUOTE_TOKENS = {"USDC", "USDT", "USD"}
-EQUITY_DECIMALS = 2
+import gspread  # type: ignore
 
-# === Helpers ===
+from utils import get_gspread_client, warn  # type: ignore
+from price_feed import get_price_usd  # B-2 oracle
 
-def _fmt_ts(ts=None):
-    if not ts:
-        ts = time.time()
-    return datetime.utcfromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+SHEET_URL = os.getenv("SHEET_URL", "").strip()
+SNAP_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
+WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
 
-def _normalize_asset_name(asset: str) -> str:
-    return (asset or "").upper().strip()
+QUOTE_ASSETS = {"USDT", "USDC", "USD"}
 
-def _is_quote(asset: str) -> bool:
-    return _normalize_asset_name(asset) in QUOTE_TOKENS
 
-def _safe_float(val, default=0.0):
+def _open_sheet() -> gspread.Spreadsheet:
+    if not SHEET_URL:
+        raise RuntimeError("unified_snapshot: SHEET_URL not set")
+    gc = get_gspread_client()
+    return gc.open_by_url(SHEET_URL)
+
+
+def _safe_num(x) -> float:
     try:
-        if val is None or (isinstance(val, str) and not val.strip()):
-            return default
-        return float(val)
+        return float(str(x).replace(",", "").strip())
     except Exception:
-        return default
+        return 0.0
 
 
-# === Core snapshot builder ===
+def _parse_ts(val) -> float:
+    """Best-effort parse of Wallet_Monitor Timestamp to epoch seconds."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str) and val.strip():
+        s = val.replace("Z", "").strip()
+        # Try a few common formats
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(s, fmt).timestamp()
+            except Exception:
+                continue
+        # Last resort: maybe it's already a numeric string
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+    return 0.0
 
-@backoff(max_tries=3, delay=3)
-def build_unified_snapshot():
+
+def _load_wallet_rows(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
     """
-    Pulls latest telemetry from telemetry_mirror (_last_tel)
-    and writes a clean Unified_Snapshot tab for all venues.
+    Load Wallet_Monitor and return normalized rows:
+
+        {
+          "venue": str,
+          "asset": str,
+          "free": float,
+          "locked": float,
+          "quote": str,
+          "ts": float (epoch seconds),
+        }
     """
+    rows: List[Dict[str, Any]] = []
+    try:
+        ws = sh.worksheet(WALLET_MONITOR_WS)
+        data = ws.get_all_records()
+    except Exception as e:
+        warn(f"unified_snapshot: unable to read Wallet_Monitor: {e}")
+        return rows
 
-    telemetry = get_last_telemetry()
-    if not telemetry:
-        print("[UnifiedSnapshot] No telemetry data available; skipping.")
-        return
-
-    ts = telemetry.get("ts") or time.time()
-    by_venue = telemetry.get("by_venue") or {}
-    if not by_venue:
-        print("[UnifiedSnapshot] Telemetry missing by_venue; skipping.")
-        return
-
-    rows = []
-    tstamp = _fmt_ts(ts)
-    quote_symbol = "USDT"  # default accounting quote
-    print(f"[UnifiedSnapshot] Building snapshot at {tstamp} for venues: {list(by_venue.keys())}")
-
-    for venue, asset_map in by_venue.items():
-        v_up = (venue or "").upper()
-        if not asset_map:
+    for r in data:
+        venue = str(r.get("Venue", "")).strip().upper()
+        asset = str(r.get("Asset", "")).strip().upper()
+        if not venue or not asset:
             continue
 
-        for asset, balance in asset_map.items():
-            a_up = _normalize_asset_name(asset)
-            free = _safe_float(balance)
-            locked = 0.0
-            total = free + locked
-            if math.isclose(total, 0.0, abs_tol=1e-9):
-                continue
+        free = _safe_num(r.get("Free", 0))
+        locked = _safe_num(r.get("Locked", 0))
+        quote = str(r.get("Quote", "")).strip().upper()
+        ts_raw = r.get("Timestamp", "")
+        ts = _parse_ts(ts_raw)
 
-            is_quote = _is_quote(a_up)
-            eq_usd = None
-            if is_quote:
-                eq_usd = total
-            else:
-                # Try to look up USD price if available
-                try:
-                    px = get_price_usd(a_up, quote_symbol, v_up)
-                    if px:
-                        eq_usd = round(total * px, EQUITY_DECIMALS)
-                except Exception:
-                    eq_usd = None
+        rows.append(
+            {
+                "venue": venue,
+                "asset": asset,
+                "free": free,
+                "locked": locked,
+                "quote": quote,
+                "ts": ts,
+            }
+        )
 
-            row = [
-                tstamp,
-                v_up,
-                a_up,
-                round(free, 8),
-                round(locked, 8),
-                round(total, 8),
-                "TRUE" if is_quote else "FALSE",
-                quote_symbol,
-                eq_usd,
-            ]
-            rows.append(row)
+    return rows
 
-    if not rows:
-        print("[UnifiedSnapshot] No balances to write; skipping.")
+
+def run_unified_snapshot() -> None:
+    """
+    Main entrypoint: build Unified_Snapshot from Wallet_Monitor.
+
+    Safe to schedule periodically (e.g., every 10–15 minutes).
+    """
+    if not SHEET_URL:
+        print("⚠️ unified_snapshot: SHEET_URL not set; aborting.")
         return
 
-    header = [
-        "Timestamp",
-        "Venue",
-        "Asset",
-        "Free",
-        "Locked",
-        "Total",
-        "IsQuote",
-        "QuoteSymbol",
-        "Equity_USD",
-    ]
+    print("📸 unified_snapshot: building Unified_Snapshot from Wallet_Monitor…")
 
     try:
-        gc = get_gspread_client()
-        write_rows_to_sheet(
-            gc,
-            SHEET_URL,
-            TAB_NAME,
-            [header] + rows,
-            clear_first=True,
-        )
-        print(f"[UnifiedSnapshot] Wrote {len(rows)} rows across {len(by_venue)} venues.")
+        sh = _open_sheet()
     except Exception as e:
-        print(f"[UnifiedSnapshot] Sheet write failed: {e}")
-        traceback.print_exc()
+        print(f"❌ unified_snapshot: failed to open sheet: {e}")
         return
 
+    wallet_rows = _load_wallet_rows(sh)
+    if not wallet_rows:
+        print("ℹ️ unified_snapshot: no Wallet_Monitor rows found; Unified_Snapshot will be empty (ok).")
 
-# === Entry point ===
-if __name__ == "__main__":
-    build_unified_snapshot()
+    # Collapse Wallet_Monitor into latest row per (venue, asset)
+    latest_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    for r in wallet_rows:
+        key = (r["venue"], r["asset"])
+        prev = latest_by_key.get(key)
+        if prev is None or r["ts"] >= prev["ts"]:
+            latest_by_key[key] = r
+
+    snapshot_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    out_rows: List[List[Any]] = []
+
+    for (venue, asset), r in latest_by_key.items():
+        free = r["free"]
+        locked = r["locked"]
+        quote = r["quote"]
+        total = free + locked
+        is_quote = asset in QUOTE_ASSETS
+        is_quote_str = "TRUE" if is_quote else "FALSE"
+
+        equity_usd: Any = ""
+
+        if total > 0:
+            if is_quote:
+                # For quote assets, treat Total as USD value.
+                equity_usd = total
+            else:
+                # B-2: lookup price via price_feed.
+                # Prefer row's Quote if present; otherwise default to USDT.
+                q = quote or "USDT"
+                price = get_price_usd(asset, q, venue)
+                if price is not None and price > 0:
+                    equity_usd = total * price
+
+        out_rows.append(
+            [
+                snapshot_ts,   # snapshot build time
+                venue,         # Venue
+                asset,         # Asset
+                free,          # Free
+                locked,        # Locked
+                total,         # Total
+                is_quote_str,  # IsQuote
+                quote or "",   # QuoteSymbol
+                equity_usd,    # Equity_USD
+            ]
+        )
+
+    # Write to Unified_Snapshot
+    try:
+        try:
+            ws = sh.worksheet(SNAP_WS)
+            ws.clear()
+        except Exception:
+            ws = sh.add_worksheet(title=SNAP_WS, rows=2000, cols=9)
+
+        headers = [
+            "Timestamp",
+            "Venue",
+            "Asset",
+            "Free",
+            "Locked",
+            "Total",
+            "IsQuote",
+            "QuoteSymbol",
+            "Equity_USD",
+        ]
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+
+        if out_rows:
+            ws.append_rows(out_rows, value_input_option="USER_ENTERED")
+            print(f"✅ unified_snapshot: wrote {len(out_rows)} rows to {SNAP_WS}")
+        else:
+            print("ℹ️ unified_snapshot: nothing to write; snapshot contains headers only.")
+    except Exception as e:
+        print(f"⚠️ unified_snapshot: error writing {SNAP_WS}: {e}")
