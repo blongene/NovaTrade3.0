@@ -29,14 +29,17 @@ import gspread  # type: ignore
 from utils import get_gspread_client, warn  # type: ignore
 from price_feed import get_price_usd  # B-2 oracle
 
+
 SHEET_URL = os.getenv("SHEET_URL", "").strip()
 SNAP_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
 WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
 
+# Treat these as USD-like quote assets
 QUOTE_ASSETS = {"USDT", "USDC", "USD"}
 
 
 def _open_sheet() -> gspread.Spreadsheet:
+    """Open the main spreadsheet via the shared utils client."""
     if not SHEET_URL:
         raise RuntimeError("unified_snapshot: SHEET_URL not set")
     gc = get_gspread_client()
@@ -44,6 +47,7 @@ def _open_sheet() -> gspread.Spreadsheet:
 
 
 def _safe_num(x) -> float:
+    """Best-effort conversion to float, tolerant of commas/strings."""
     try:
         return float(str(x).replace(",", "").strip())
     except Exception:
@@ -54,6 +58,7 @@ def _parse_ts(val) -> float:
     """Best-effort parse of Wallet_Monitor Timestamp to epoch seconds."""
     if isinstance(val, (int, float)):
         return float(val)
+
     if isinstance(val, str) and val.strip():
         s = val.replace("Z", "").strip()
         # Try a few common formats
@@ -62,11 +67,12 @@ def _parse_ts(val) -> float:
                 return datetime.strptime(s, fmt).timestamp()
             except Exception:
                 continue
-        # Last resort: maybe it's already a numeric string
+        # Last resort: maybe it's already numeric
         try:
             return float(s)
         except Exception:
             return 0.0
+
     return 0.0
 
 
@@ -84,6 +90,7 @@ def _load_wallet_rows(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
         }
     """
     rows: List[Dict[str, Any]] = []
+
     try:
         ws = sh.worksheet(WALLET_MONITOR_WS)
         data = ws.get_all_records()
