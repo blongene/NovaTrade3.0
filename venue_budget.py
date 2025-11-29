@@ -160,6 +160,19 @@ def _get_total_equity_usd(venue: str, quote: str) -> Optional[float]:
         m = _build_venue_quote_map(force=False)
     return m.get(key)
 
+def get_quote_equity_usd(venue: str, quote: str) -> Optional[float]:
+    """
+    Return the total Equity_USD for a given VENUE + QUOTE from Unified_Snapshot.
+
+    This is a thin public wrapper around the cached map used for budgets.
+    It does NOT apply any reserves or keepback; callers (PolicyEngine, etc.)
+    can layer their own rules on top of this raw equity figure.
+
+    Returns:
+        float  -> total equity in USD-equivalent for that quote
+        None   -> if no data exists yet for that venue/quote
+    """
+    return _get_total_equity_usd(venue, quote)
 
 def get_budget_for_intent(intent: Dict[str, Any]) -> Tuple[Optional[float], str]:
     """
