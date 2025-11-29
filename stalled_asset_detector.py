@@ -328,29 +328,64 @@ def _ensure_policy_header(ws) -> List[str]:
         ws.update("A1", [existing])
     return existing
 
+def append_policy_rows(sh, new_records: List[Dict[str, Any]]) -> int:
+    """
+    Write stalled-asset rows into Policy_Log, but avoid unbounded growth.
 
-def append_policy_rows(sh, rows: List[Dict[str, Any]]) -> int:
-    if not rows:
+    Strategy:
+      • Keep all existing Policy_Log rows where Action != "STALL_DETECTOR".
+      • Drop all old STALL_DETECTOR rows.
+      • Append this run's stalled-asset rows.
+      • Rewrite the sheet (header + compacted rows).
+
+    That way:
+      • Other policy events remain a true append-only audit log.
+      • Stalled-asset detector behaves like a "latest snapshot" view.
+    """
+    if not new_records:
         return 0
 
     ws = _get_ws(sh, POLICY_LOG_WS)
     header = _ensure_policy_header(ws)
     col_index = {name: i for i, name in enumerate(header)}
 
-    out_rows: List[List[Any]] = []
-    for r in rows:
-        row = [""] * len(header)
-        for k, v in r.items():
-            if k not in col_index:
-                continue
-            idx = col_index[k]
-            row[idx] = v
-        out_rows.append(row)
+    def dicts_to_rows(records: List[Dict[str, Any]]) -> List[List[Any]]:
+        out: List[List[Any]] = []
+        for rec in records:
+            row = [""] * len(header)
+            for k, v in rec.items():
+                if k not in col_index:
+                    continue
+                row[col_index[k]] = v
+            out.append(row)
+        return out
 
+    # 1) Load existing rows and keep only NON-STALL_DETECTOR entries
+    try:
+        existing_dicts = ws.get_all_records()  # uses header row
+    except Exception:
+        existing_dicts = []
+
+    base_dicts: List[Dict[str, Any]] = []
+    for rec in existing_dicts:
+        action = str(rec.get("Action", "")).strip().upper()
+        if action == "STALL_DETECTOR":
+            # Old stalled-asset rows are discarded; we will replace them.
+            continue
+        base_dicts.append(rec)
+
+    # 2) Convert both existing (kept) and new stalled rows to raw row lists
+    base_rows = dicts_to_rows(base_dicts)
+    new_rows = dicts_to_rows(new_records)
+
+    # 3) Rewrite the sheet: header + compacted rows
+    ws.clear()
+    ws.append_row(header, value_input_option="RAW")
+    out_rows = base_rows + new_rows
     if out_rows:
         ws.append_rows(out_rows, value_input_option="RAW")
-    return len(out_rows)
 
+    return len(new_rows)
 
 # ==== Core detection ====
 
