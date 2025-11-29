@@ -162,7 +162,12 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     base["action"] = action
 
     # --- Kraken: telemetry-only by default ---------------------------------
-    if venue == "KRAKEN" and os.getenv("AUTO_ENABLE_KRAKEN", "0").lower() not in {"1", "true", "yes", "on"}:
+    if venue == "KRAKEN" and os.getenv("AUTO_ENABLE_KRAKEN", "0").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
         patched = dict(base)
         patched["amount_usd"] = 0.0
         return {
