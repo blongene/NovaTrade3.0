@@ -3,6 +3,12 @@ from __future__ import annotations
 import os, json, hmac, hashlib
 from typing import Any, Dict, Optional, Tuple
 
+# Prefer Unified_Snapshot (via venue_budget) for quote reserves when available
+try:
+    from venue_budget import get_quote_equity_usd as _vs_get_quote_equity_usd
+except Exception:  # degrade safely if venue_budget is missing
+    _vs_get_quote_equity_usd = None
+    
 # --------------------------- OPTIONAL LOGGERS (degrade safely) ---------------------------
 # Existing structured policy logger (if present)
 try:
@@ -231,24 +237,53 @@ def _float(x: Any, default: Optional[float]=None) -> Optional[float]:
 
 def _get_quote_reserve_usd(context: Optional[dict], venue: str, quote: str) -> Optional[float]:
     """
-    Pull quote balance from context.telemetry.
-    Expected shapes:
-      context = {
-        "telemetry": {
-          "by_venue": {"KRAKEN":{"USDT": 123.4, ...}},
-          "flat": {"USDT": 321.0, ...}
+    Resolve quote reserve for policy decisions.
+
+    Phase 18 behavior:
+      1) Prefer Unified_Snapshot via venue_budget.get_quote_equity_usd()
+         (this is the same data used by venue_budget / trade_guard).
+      2) Fall back to context["telemetry"] (Bus _last_tel shape) if snapshot
+         data is missing or venue_budget is unavailable.
+
+    context shape (legacy telemetry path):
+        context = {
+            "telemetry": {
+                "by_venue": {"KRAKEN": {"USDT": 123.4, ...}, ...},
+                "flat": {"USDT": 321.0, ...}
+            }
         }
-      }
     """
+    v = (venue or "").upper()
+    q = (quote or "").upper()
+    if not v or not q:
+        return None
+
+    # --- Preferred source: Unified_Snapshot via venue_budget ---
+    try:
+        if _vs_get_quote_equity_usd:
+            eq = _vs_get_quote_equity_usd(v, q)
+            if isinstance(eq, (int, float)):
+                return float(eq)
+    except Exception:
+        # Any issues here should silently fall back to telemetry
+        pass
+
+    # --- Fallback: legacy telemetry context (wsgi._last_tel) ---
     if not context:
         return None
+
     tel = context.get("telemetry") or {}
-    balances = (tel.get("by_venue") or {}).get(venue.upper()) or {}
-    if quote in balances:
-        return _float(balances.get(quote), 0.0)
+
+    # Per-venue quote balances
+    balances = (tel.get("by_venue") or {}).get(v) or {}
+    if q in balances:
+        return _float(balances.get(q), 0.0)
+
+    # Flat (global) quote balances, if present
     flat = tel.get("flat") or {}
-    if quote in flat:
-        return _float(flat.get(quote), 0.0)
+    if q in flat:
+        return _float(flat.get(q), 0.0)
+
     return None
 
 def _cap_notional(cfg: dict, notional: Optional[float]) -> Tuple[Optional[float], list]:
