@@ -1,5 +1,5 @@
 """
-unified_snapshot.py — C-1 + B-2 (latest-per-asset)
+unified_snapshot.py — C-1 + B-2 (latest-per-asset) with venue/quote grid
 
 Builds a normalized balance view in the Unified_Snapshot sheet:
 
@@ -16,6 +16,8 @@ Rules:
       - If IsQuote: Equity_USD = Total (1 quote ≈ 1 USD)
       - Else      : Equity_USD = Total * price_feed.get_price_usd(Asset, Quote or "USDT", Venue)
   • Only the **latest** Wallet_Monitor row per (Venue, Asset) is used.
+  • Additionally, we always emit a full VENUE × QUOTE grid for
+    USD/USDC/USDT using VENUE_ORDER, even if a particular cell is zero.
 """
 
 from __future__ import annotations
@@ -37,12 +39,13 @@ WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
 # Treat these as USD-like quote assets
 QUOTE_ASSETS = {"USDT", "USDC", "USD"}
 
-# Venues/assets we want to always materialize (even if the balance is 0)
-_DEF_VENUES = os.getenv("UNIFIED_SNAPSHOT_VENUES", "COINBASE,BINANCEUS,KRAKEN")
-FORCE_VENUES = tuple(v.strip().upper() for v in _DEF_VENUES.split(",") if v.strip())
+# Venue order for the fixed grid
+VENUE_ORDER = [
+    v.strip().upper()
+    for v in os.getenv("VENUE_ORDER", "COINBASE,BINANCEUS,KRAKEN").split(",")
+    if v.strip()
+]
 
-_DEF_ASSETS = os.getenv("UNIFIED_SNAPSHOT_ASSETS", "USD,USDC,USDT")
-FORCE_ASSETS = tuple(a.strip().upper() for a in _DEF_ASSETS.split(",") if a.strip())
 
 def _open_sheet() -> gspread.Spreadsheet:
     """Open the main spreadsheet via the shared utils client."""
@@ -150,7 +153,7 @@ def run_unified_snapshot() -> None:
 
     wallet_rows = _load_wallet_rows(sh)
     if not wallet_rows:
-        print("ℹ️ unified_snapshot: no Wallet_Monitor rows found; will fall back to zeroed FORCE_VENUES x FORCE_ASSETS grid.")
+        print("ℹ️ unified_snapshot: no Wallet_Monitor rows found; Unified_Snapshot will be empty (ok).")
 
     # Collapse Wallet_Monitor into latest row per (venue, asset)
     latest_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -161,44 +164,60 @@ def run_unified_snapshot() -> None:
         if prev is None or r["ts"] >= prev["ts"]:
             latest_by_key[key] = r
 
-    # Ensure a full grid of FORCE_VENUES x FORCE_ASSETS even if some
-    # venue/asset pairs have never appeared in Wallet_Monitor yet.
-    # This is mainly for the operator-facing dashboard view where we
-    # always want to see COINBASE / BINANCEUS / KRAKEN crossed with
-    # USD, USDC and USDT (9 rows total by default).
-    for venue in FORCE_VENUES:
-        for asset in FORCE_ASSETS:
-            key = (venue, asset)
-            if key not in latest_by_key:
-                latest_by_key[key] = {
-                    "venue": venue,
-                    "asset": asset,
-                    "free": 0.0,
-                    "locked": 0.0,
-                    "quote": asset if asset in QUOTE_ASSETS else "",
-                    "ts": 0.0,
-                }
-
     snapshot_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     out_rows: List[List[Any]] = []
 
+    # --- 1) Forced VENUE × QUOTE grid (3×3) ----------------------------
+    for venue in VENUE_ORDER:
+        for asset in ("USD", "USDC", "USDT"):
+            asset_u = asset.upper()
+            key = (venue, asset_u)
+            r = latest_by_key.get(key)
+
+            if r:
+                free = r["free"]
+                locked = r["locked"]
+            else:
+                free = 0.0
+                locked = 0.0
+
+            total = free + locked
+            is_quote_str = "TRUE"
+            quote_symbol = asset_u
+            equity_usd: Any = total if total > 0 else ""
+
+            out_rows.append(
+                [
+                    snapshot_ts,
+                    venue,
+                    asset_u,
+                    free,
+                    locked,
+                    total,
+                    is_quote_str,
+                    quote_symbol,
+                    equity_usd,
+                ]
+            )
+
+    # --- 2) Additional non-quote assets (alts) -------------------------
     for (venue, asset), r in latest_by_key.items():
+        # Skip quote assets we already covered in the grid
+        if asset in QUOTE_ASSETS and venue in VENUE_ORDER:
+            continue
+
         free = r["free"]
         locked = r["locked"]
-        quote = r["quote"]
         total = free + locked
         is_quote = asset in QUOTE_ASSETS
         is_quote_str = "TRUE" if is_quote else "FALSE"
+        quote = r.get("quote") or ("USD" if is_quote else "")
 
         equity_usd: Any = ""
-
         if total > 0:
             if is_quote:
-                # For quote assets, treat Total as USD value.
                 equity_usd = total
             else:
-                # B-2: lookup price via price_feed.
-                # Prefer row's Quote if present; otherwise default to USDT.
                 q = quote or "USDT"
                 price = get_price_usd(asset, q, venue)
                 if price is not None and price > 0:
@@ -206,15 +225,15 @@ def run_unified_snapshot() -> None:
 
         out_rows.append(
             [
-                snapshot_ts,   # snapshot build time
-                venue,         # Venue
-                asset,         # Asset
-                free,          # Free
-                locked,        # Locked
-                total,         # Total
-                is_quote_str,  # IsQuote
-                quote or "",   # QuoteSymbol
-                equity_usd,    # Equity_USD
+                snapshot_ts,
+                venue,
+                asset,
+                free,
+                locked,
+                total,
+                is_quote_str,
+                quote or "",
+                equity_usd,
             ]
         )
 
