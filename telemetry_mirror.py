@@ -36,6 +36,7 @@ from typing import Any, Dict, List
 
 import os
 import time
+import json
 import requests
 
 from utils import sheets_append_rows, warn, info  # type: ignore
@@ -52,19 +53,19 @@ WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
 TELEMETRY_MIRROR_ENABLED = (
     os.getenv("TELEMETRY_MIRROR_ENABLED", "1").lower() in ("1", "true", "yes")
 )
-TELEMETRY_MIRROR_MAX_AGE_SEC = int(
-    os.getenv("TELEMETRY_MIRROR_MAX_AGE_SEC", "900")
+_MIRROR_MAX_AGE_SEC = int(
+    os.getenv("_MIRROR_MAX_AGE_SEC", "900")
 )  # 15 minutes
 TELEMETRY_MIRROR_MIN_BALANCE = float(
     os.getenv("TELEMETRY_MIRROR_MIN_BALANCE", "0.0")
 )
 
 STABLES = {"USDC", "USDT", "USD", "USDP", "DAI"}
-
+HEADLINE = tuple(list(STABLES) + ["BTC", "ETH"])
+MIRROR_DEBUG_DUMP = (os.getenv("TELEMETRY_MIRROR_DEBUG_DUMP") or "0").lower() in ("1", "true", "yes")
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
 
 def _get_telemetry() -> Dict[str, Any]:
     """
@@ -98,6 +99,32 @@ def _get_telemetry() -> Dict[str, Any]:
         return {}
     return data
 
+def _summarize_by_venue(by_venue: Dict[str, Any]) -> str:
+    """
+    Build a compact human-readable snapshot of balances for logs.
+
+    Example:
+        COINBASE:USD=50.00,USDC=12.34 | BINANCEUS:USDT=17.46 || flat not shown here.
+    """
+    parts: List[str] = []
+    try:
+        for venue, assets in sorted((by_venue or {}).items()):
+            if not isinstance(assets, dict):
+                continue
+            bits = []
+            for asset in HEADLINE:
+                if asset in assets:
+                    try:
+                        bits.append(f"{asset}={float(assets[asset]):.2f}")
+                    except Exception:
+                        pass
+            if bits:
+                parts.append(f"{str(venue).upper()}:" + ",".join(bits))
+    except Exception:
+        # Keep failures from breaking the mirror task
+        return ""
+    return " | ".join(parts)
+
 def mirror_telemetry_once() -> None:
     if not TELEMETRY_MIRROR_ENABLED:
         info("telemetry_mirror: disabled via TELEMETRY_MIRROR_ENABLED=0.")
@@ -114,6 +141,8 @@ def mirror_telemetry_once() -> None:
 
     ts = tel.get("ts")
     by_venue = tel.get("by_venue") or {}
+    flat = tel.get("flat") or {}
+    agent = tel.get("agent") or tel.get("agent_id") or "edge"
 
     age_sec = None
     if ts is not None:
@@ -132,6 +161,32 @@ def mirror_telemetry_once() -> None:
             f"> TELEMETRY_MIRROR_MAX_AGE_SEC={TELEMETRY_MIRROR_MAX_AGE_SEC}; skipping."
         )
         return
+
+    # Log a compact snapshot summary for observability.
+    try:
+        summary = _summarize_by_venue(by_venue)
+        info(
+            "telemetry_mirror: using snapshot agent=%s age=%ss venues=%d %s",
+            str(agent),
+            int(age_sec),
+            len(by_venue),
+            summary or "",
+        )
+        if MIRROR_DEBUG_DUMP:
+            try:
+                dumped = json.dumps(
+                    {"agent": agent, "ts": ts, "by_venue": by_venue, "flat": flat},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                if len(dumped) > 2000:
+                    dumped = dumped[:2000] + "...(truncated)"
+                info(f"telemetry_mirror raw={dumped}")
+            except Exception as e:
+                warn(f"telemetry_mirror: debug dump failed: {e}")
+    except Exception as e:
+        warn(f"telemetry_mirror: summary failed: {e}")
 
     now_str = _utcnow().strftime("%Y-%m-%d %H:%M:%S")
     rows: List[List[Any]] = []
