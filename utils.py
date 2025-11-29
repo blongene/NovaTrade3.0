@@ -695,8 +695,9 @@ def hmac_enqueue(intent: dict) -> dict:
         return {"ok": False, "reason": "no_outbox_secret"}
         
     # Construct Envelope
+    agent_id = (os.getenv("AGENT_ID") or "cloud").split(",")[0]
     envelope = {
-        "agent_id": "cloud",
+        "agent_id": agent_id,
         "type": "order.place",
         "payload": intent,
         "ts": int(time.time())
