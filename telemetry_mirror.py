@@ -17,17 +17,13 @@ Expected telemetry shape (as used elsewhere in NovaTrade 3.0):
             "BINANCEUS": {"USDT": 17.46, ...},
             ...
         },
-        "flat": {...},    # optional per-asset totals
-        "ts": 1731600000  # unix timestamp (float)
+        "flat": {
+            "BTC": 0.015,
+            "ETH": 0.42,
+            ...
+        },
+        "ts": 1700000000,
     }
-
-Writes rows to Wallet_Monitor with columns:
-    Timestamp | Venue | Asset | Free | Locked | Quote
-
-- Locked is set to 0.0 (we don't track per-venue lock state here).
-- Quote is set to the asset symbol if it's a stablecoin, else "".
-
-Safe to run ad-hoc or on a schedule.
 """
 
 from __future__ import annotations
@@ -53,8 +49,8 @@ WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
 TELEMETRY_MIRROR_ENABLED = (
     os.getenv("TELEMETRY_MIRROR_ENABLED", "1").lower() in ("1", "true", "yes")
 )
-_MIRROR_MAX_AGE_SEC = int(
-    os.getenv("_MIRROR_MAX_AGE_SEC", "900")
+TELEMETRY_MIRROR_MAX_AGE_SEC = int(
+    os.getenv("TELEMETRY_MIRROR_MAX_AGE_SEC", "900")
 )  # 15 minutes
 TELEMETRY_MIRROR_MIN_BALANCE = float(
     os.getenv("TELEMETRY_MIRROR_MIN_BALANCE", "0.0")
@@ -64,8 +60,10 @@ STABLES = {"USDC", "USDT", "USD", "USDP", "DAI"}
 HEADLINE = tuple(list(STABLES) + ["BTC", "ETH"])
 MIRROR_DEBUG_DUMP = (os.getenv("TELEMETRY_MIRROR_DEBUG_DUMP") or "0").lower() in ("1", "true", "yes")
 
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def _get_telemetry() -> Dict[str, Any]:
     """
@@ -99,6 +97,7 @@ def _get_telemetry() -> Dict[str, Any]:
         return {}
     return data
 
+
 def _summarize_by_venue(by_venue: Dict[str, Any]) -> str:
     """
     Build a compact human-readable snapshot of balances for logs.
@@ -124,6 +123,7 @@ def _summarize_by_venue(by_venue: Dict[str, Any]) -> str:
         # Keep failures from breaking the mirror task
         return ""
     return " | ".join(parts)
+
 
 def mirror_telemetry_once() -> None:
     if not TELEMETRY_MIRROR_ENABLED:
