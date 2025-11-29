@@ -37,6 +37,12 @@ WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
 # Treat these as USD-like quote assets
 QUOTE_ASSETS = {"USDT", "USDC", "USD"}
 
+# Venues/assets we want to always materialize (even if the balance is 0)
+_DEF_VENUES = os.getenv("UNIFIED_SNAPSHOT_VENUES", "COINBASE,BINANCEUS,KRAKEN")
+FORCE_VENUES = tuple(v.strip().upper() for v in _DEF_VENUES.split(",") if v.strip())
+
+_DEF_ASSETS = os.getenv("UNIFIED_SNAPSHOT_ASSETS", "USD,USDC,USDT")
+FORCE_ASSETS = tuple(a.strip().upper() for a in _DEF_ASSETS.split(",") if a.strip())
 
 def _open_sheet() -> gspread.Spreadsheet:
     """Open the main spreadsheet via the shared utils client."""
@@ -144,7 +150,7 @@ def run_unified_snapshot() -> None:
 
     wallet_rows = _load_wallet_rows(sh)
     if not wallet_rows:
-        print("ℹ️ unified_snapshot: no Wallet_Monitor rows found; Unified_Snapshot will be empty (ok).")
+        print("ℹ️ unified_snapshot: no Wallet_Monitor rows found; will fall back to zeroed FORCE_VENUES x FORCE_ASSETS grid.")
 
     # Collapse Wallet_Monitor into latest row per (venue, asset)
     latest_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -154,6 +160,24 @@ def run_unified_snapshot() -> None:
         prev = latest_by_key.get(key)
         if prev is None or r["ts"] >= prev["ts"]:
             latest_by_key[key] = r
+
+    # Ensure a full grid of FORCE_VENUES x FORCE_ASSETS even if some
+    # venue/asset pairs have never appeared in Wallet_Monitor yet.
+    # This is mainly for the operator-facing dashboard view where we
+    # always want to see COINBASE / BINANCEUS / KRAKEN crossed with
+    # USD, USDC and USDT (9 rows total by default).
+    for venue in FORCE_VENUES:
+        for asset in FORCE_ASSETS:
+            key = (venue, asset)
+            if key not in latest_by_key:
+                latest_by_key[key] = {
+                    "venue": venue,
+                    "asset": asset,
+                    "free": 0.0,
+                    "locked": 0.0,
+                    "quote": asset if asset in QUOTE_ASSETS else "",
+                    "ts": 0.0,
+                }
 
     snapshot_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     out_rows: List[List[Any]] = []
