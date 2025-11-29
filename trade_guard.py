@@ -110,20 +110,6 @@ def _normalize_base_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Main entrypoint.
-
-    Input: a generic trade intent dict from *any* source (nova_trigger, rotation, rebuy engine).
-           Must at least have "token", "amount_usd", "venue". "quote" and "price_usd" recommended.
-
-    Output: {
-        "ok": bool,
-        "status": "APPROVED" | "CLIPPED" | "DENIED",
-        "reason": str,
-        "intent": original_normalized_intent,
-        "patched": final_intent_after_policy,
-    }
-    """
     base = _normalize_base_intent(intent)
     token = (base.get("token") or "").upper()
     venue = (base.get("venue") or "").upper()
@@ -168,7 +154,6 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
             "patched": dict(base),
         }
 
-    # Normalize + enrich
     base["token"] = token
     base["venue"] = venue
     if quote:
@@ -176,9 +161,7 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     base["amount_usd"] = amount_usd_f
     base["action"] = action
 
-    # ----------------------------------------------------------------------
-    # Kraken safety: telemetry-only by default
-    # ----------------------------------------------------------------------
+    # --- Kraken: telemetry-only by default ---------------------------------
     if venue == "KRAKEN" and os.getenv("AUTO_ENABLE_KRAKEN", "0").lower() not in {"1", "true", "yes", "on"}:
         patched = dict(base)
         patched["amount_usd"] = 0.0
@@ -190,9 +173,7 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
             "patched": patched,
         }
 
-    # ----------------------------------------------------------------------
-    # Venue-level minimum notional guard (BinanceUS, etc.)
-    # ----------------------------------------------------------------------
+    # --- Venue min-notional guard (e.g., BinanceUS 10 USDT) ----------------
     min_notional = _get_min_notional_usd(venue, quote)
     if min_notional is not None and amount_usd_f + 1e-9 < min_notional:
         patched = dict(base)
@@ -205,9 +186,7 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
             "patched": patched,
         }
 
-    # ----------------------------------------------------------------------
-    # C-Series: venue budget clamp (Unified_Snapshot → max per venue)
-    # ----------------------------------------------------------------------
+    # --- Venue budget clamp (Unified_Snapshot) -----------------------------
     try:
         budget_usd, budget_reason = get_budget_for_intent(base)
     except Exception as e:
@@ -226,19 +205,15 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
                 "patched": patched,
             }
         if amount_usd_f > budget_usd:
-            # Truncate ask to budget, mark as potential clip later
             base["amount_usd"] = budget_usd
 
-    # ----------------------------------------------------------------------
-    # B-3: PolicyEngine.validate (all the Ash / policy.yaml logic)
-    # ----------------------------------------------------------------------
+    # --- PolicyEngine (price, reserves, etc.) ------------------------------
     pe = PolicyEngine()
     ok, reason, patched = pe.validate(base, asset_state=None)
     patched = patched or {}
     if not isinstance(patched, dict):
         patched = {}
 
-    # Ensure some core fields exist on the outgoing payload
     patched.setdefault("token", token)
     patched.setdefault("venue", venue)
     if quote:
@@ -252,17 +227,13 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
 
     patched_amount_usd = patched.get("amount_usd", base.get("amount_usd"))
 
-    # Final status classification
     if not ok:
         status = "DENIED"
     else:
         try:
             pa = float(patched_amount_usd)
             ba = float(base["amount_usd"])
-            if pa + 1e-9 < ba:
-                status = "CLIPPED"
-            else:
-                status = "APPROVED"
+            status = "CLIPPED" if pa + 1e-9 < ba else "APPROVED"
         except Exception:
             status = "APPROVED" if ok else "DENIED"
 
