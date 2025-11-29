@@ -165,13 +165,12 @@ def mirror_telemetry_once() -> None:
     # Log a compact snapshot summary for observability.
     try:
         summary = _summarize_by_venue(by_venue)
-        info(
-            "telemetry_mirror: using snapshot agent=%s age=%ss venues=%d %s",
-            str(agent),
-            int(age_sec),
-            len(by_venue),
-            summary or "",
+        msg = (
+            f"telemetry_mirror: using snapshot agent={agent} "
+            f"age={int(age_sec)}s venues={len(by_venue)} {summary or ''}"
         )
+        info(msg)
+
         if MIRROR_DEBUG_DUMP:
             try:
                 dumped = json.dumps(
