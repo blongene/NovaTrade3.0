@@ -446,9 +446,37 @@ def classify_balances(
 
 
 def build_policy_rows(anomalies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Turn classified anomalies into Policy_Log rows.
+
+    We emit TWO kinds of rows:
+
+      1) Anomaly row:
+         - Action = "STALL_DETECTOR"
+         - OK = FALSE
+         - Reason / Notes describe the classification.
+
+      2) (Optional) BUY suggestion row:
+         - Action = "BUY"
+         - OK = TRUE
+         - Notes contains "auto_resized"
+         - Decision.patched_intent contains a tiny suggested BUY
+           that downstream guard + autotrader can inspect.
+
+    BUY suggestions are only emitted for:
+      - venue in {"COINBASE", "BINANCEUS"}
+      - non-stable assets (asset not in STABLE_SYMBOLS)
+    """
     now_iso = _utcnow().isoformat(timespec="seconds")
 
+    # Default tiny order size (in USD) for suggestions; can be overridden by env.
+    try:
+        default_buy_usd = float(os.getenv("STALL_AUTOBUY_DEFAULT_USD", "11"))
+    except Exception:
+        default_buy_usd = 11.0
+
     rows: List[Dict[str, Any]] = []
+
     for a in anomalies:
         asset = a["asset"]
         venue = a["venue"]
@@ -471,40 +499,85 @@ def build_policy_rows(anomalies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "classification": classification,
             "asset": asset,
             "venue": venue,
-            "balance_total": total,
-            "last_trade_ts": last_ts,
+            "total": total,
             "age_days": age_days,
-            "thresholds": {
-                "STALL_DETECT_DAYS": STALL_DETECT_DAYS,
-                "STALL_ORPHAN_DAYS": STALL_ORPHAN_DAYS,
-                "STALL_MIN_BALANCE": STALL_MIN_BALANCE,
-                "STALL_MIN_STABLE_BALANCE": STALL_MIN_STABLE_BAL,
-                "STALL_STABLE_DAYS": STALL_STABLE_DAYS,
-            },
+            "last_ts": last_ts,
         }
 
-        row = {
+        # 1) Always emit the anomaly row (what you already have today)
+        anomaly_row = {
             "Timestamp": now_iso,
             "Token": asset,
             "Action": "STALL_DETECTOR",
-            "Amount_USD": "",  # we don't compute USD here yet
-            "OK": "NO",
+            "Amount_USD": "",
+            "OK": False,
             "Reason": reason,
-            "Patched": "",
+            "Patched": "{}",  # no sizing here
             "Venue": venue,
             "Quote": "",
             "Liquidity": "",
             "Cooldown_Min": "",
-            "Notes": json.dumps(notes, separators=(",", ":")),
-            "Intent_ID": "stalled_asset_detector",
+            "Notes": json.dumps(notes, sort_keys=True),
+            "Intent_ID": "",
             "Symbol": "",
-            "Decision": classification,
+            "Decision": "{}",  # purely informational
             "Source": "bus/stalled_asset_detector",
         }
-        rows.append(row)
+        rows.append(anomaly_row)
+
+        # 2) Optional BUY suggestion row (for the autotrader, still shadow)
+        v_up = (venue or "").upper()
+        asset_up = (asset or "").upper()
+
+        if v_up not in {"COINBASE", "BINANCEUS"}:
+            continue
+        if asset_up in STABLE_SYMBOLS:
+            # We only suggest BUYs for non-stable assets.
+            continue
+
+        # Very small USD size; guard + budgets will clamp further if needed.
+        amount_usd = default_buy_usd
+
+        # For now we don't try to be clever about pairs — we just mark quote "USDT".
+        # trade_guard only needs a non-zero price_usd for sizing; notional is in amount_usd.
+        suggested_intent = {
+            "token": asset_up,
+            "venue": v_up,
+            "quote": "USDT",
+            "amount_usd": amount_usd,
+            "price_usd": 1.0,
+            "action": "BUY",
+        }
+
+        decision = {
+            "ok": True,
+            "reason": "ok",
+            "patched_intent": suggested_intent,
+            "flags": ["auto_resized", "stalled_suggestion"],
+        }
+
+        buy_row = {
+            "Timestamp": now_iso,
+            "Token": asset_up,
+            "Action": "BUY",
+            "Amount_USD": amount_usd,
+            "OK": True,
+            "Reason": "stalled_auto_resized",
+            "Patched": json.dumps({"amount_usd": amount_usd}),
+            "Venue": v_up,
+            "Quote": "USDT",
+            "Liquidity": "",
+            "Cooldown_Min": "",
+            # <<< IMPORTANT: this is what our autotrader looks for
+            "Notes": "auto_resized",
+            "Intent_ID": "",
+            "Symbol": "",
+            "Decision": json.dumps(decision, sort_keys=True),
+            "Source": "bus/stalled_asset_detector",
+        }
+        rows.append(buy_row)
 
     return rows
-
 
 def send_telegram_summary(anomalies: List[Dict[str, Any]]) -> None:
     if not anomalies:
