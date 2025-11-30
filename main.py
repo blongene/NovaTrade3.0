@@ -8,6 +8,7 @@ import hmac, hashlib, json
 from flask import Blueprint, request, jsonify
 from policy_bias_engine import run_policy_bias_builder
 from telegram_summaries import run_telegram_summaries
+from stalled_autotrader import run_stalled_autotrader_shadow
 
 # Enable asynchronous Sheets gateway flusher
 try:
@@ -219,7 +220,8 @@ def _set_schedules():
     _schedule("Sentiment Radar",               "sentiment_radar",            "run_sentiment_radar",     every=6,  unit="hours")
     _schedule("Memory-Aware Rebuy Scan",       "rebuy_memory_engine",        "run_memory_rebuy_scan",   every=3,  unit="hours")
     _schedule("Sentiment Summary",             "sentiment_summary",          "run_sentiment_summary",   every=3,  unit="hours")
-
+    _schedule("Stalled Autotrader (Shadow)",     "stalled_autotrader",         "run_stalled_autotrader_shadow",    every=6,  unit="hours")
+              
     # Daily (spread to avoid spikes)
     _schedule("Health Summary",                "health_summary",             "run_health_summary",          when="13:00")
     _schedule("ROI Threshold Validator",       "roi_threshold_validator",    "run_roi_threshold_validator", when="01:00")
