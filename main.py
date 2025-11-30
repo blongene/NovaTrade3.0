@@ -203,7 +203,7 @@ def _boot_serialize_first_minute():
     _safe_call("Sentiment Radar (boot)",       "sentiment_radar",            "run_sentiment_radar");          _sleep_jitter()
     _safe_call("Nova trigger watcher",         "nova_trigger_watcher",       "check_nova_trigger");           _sleep_jitter()
     _safe_call("Nova ping",                    "nova_trigger_sender",        "trigger_nova_ping",);           _sleep_jitter()
-    _safe_call("Stalled Autotrader (Shadow)",  "stalled_autotrader",         "run_stalled_autotrader_shadow",); _sleep_jitter()
+
     # --- Phase 9 additions (Planner→Log, Weighted Memory, Milestones) ---
     _safe_call("Planner→Log sync",             "rotation_executor",          "sync_confirmed_to_rotation_log"); _sleep_jitter()
     _safe_call("Rotation Memory (Weighted)",   "rotation_feedback_enhancer", "run_rotation_feedback_enhancer"); _sleep_jitter()
@@ -264,7 +264,7 @@ def _kick_once_and_threads():
     # Stalled asset & claims (boot pass)
     _safe_call("Stalled asset detector (boot)", "stalled_asset_detector", "run_stalled_asset_detector"); _sleep_jitter()
     _safe_call("Claim tracker (boot)",          "claim_tracker",          "check_claims");               _sleep_jitter()
-
+    _safe_call("Stalled Autotrader (Shadow)",   "stalled_autotrader",     "run_stalled_autotrader_shadow",); _sleep_jitter()
     # Staking yield background loop (optional)
     _thread(_staking_yield_loop);                                              _sleep_jitter()
 
