@@ -55,7 +55,11 @@ def _iter_stalled_autoresized_candidates(rows: List[Dict[str, Any]]) -> Tuple[Di
         if venue not in ALLOWED_VENUES:
             continue
 
-        cooldown = str(row.get("Cooldown Notes", "")).lower()
+        cooldown = str(
+            row.get("Cooldown Notes")  # newer header
+            or row.get("Notes")        # older / current header
+            or ""
+        ).lower()
         if "auto_resized" not in cooldown:
             continue
 
