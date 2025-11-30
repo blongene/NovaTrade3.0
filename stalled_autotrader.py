@@ -2,8 +2,12 @@ import os
 import json
 from typing import Dict, Any, List, Tuple
 
-from utils import info, warn
-from sheets import get_ws, get_records
+from utils import (
+    info,
+    warn,
+    get_ws_cached,
+    with_sheet_backoff,
+)
 from trade_guard import guard_trade_intent
 
 # Only let the stalled-autotrader consider these venues for now.
@@ -19,11 +23,12 @@ def _parse_bool(val: Any) -> bool:
     return s in {"1", "true", "yes", "y"}
 
 
+@with_sheet_backoff
 def _load_policy_rows() -> List[Dict[str, Any]]:
-    """Load Policy_Log rows via Sheets adapter."""
-    ws = get_ws("Policy_Log")
-    rows = get_records(ws)
-    return rows or []
+    """Load Policy_Log rows via the same utils adapter as the rest of Nova."""
+    ws = get_ws_cached("Policy_Log")
+    rows = ws.get_all_records() or []
+    return rows
 
 
 def _iter_stalled_autoresized_candidates(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
