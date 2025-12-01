@@ -9,6 +9,7 @@ from flask import Blueprint, request, jsonify
 from policy_bias_engine import run_policy_bias_builder
 from telegram_summaries import run_telegram_summaries
 from stalled_autotrader import run_stalled_autotrader_shadow
+from telemetry_mirror import _compact_wallet_monitor_if_needed
 
 # Enable asynchronous Sheets gateway flusher
 try:
