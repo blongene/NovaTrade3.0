@@ -1,9 +1,13 @@
-
-# telemetry_digest.py — Phase 9D
-# Pulls /api/telemetry/last (local) and writes a heartbeat row to NovaHeartbeat.
-# If telemetry age > threshold, posts a Telegram alert (deduped).
-import os, time
+# telemetry_digest.py — Phase 9D/18 bridge
+#
+# Pulls /api/telemetry/last (local) and:
+#   1. Writes a heartbeat row to NovaHeartbeat.
+#   2. Sends a tiny Telegram digest of per-venue stable balances.
+#
+import os
+import time
 from datetime import datetime, timezone
+from typing import Any, Dict, Tuple
 
 HEARTBEAT_WS = os.getenv("HEARTBEAT_WS", "NovaHeartbeat")
 HEARTBEAT_ALERT_MIN = int(os.getenv("HEARTBEAT_ALERT_MIN", "90"))  # minutes
@@ -11,105 +15,138 @@ SHEET_URL = os.getenv("SHEET_URL", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Optional one-shot housekeeping
+HEARTBEAT_TRIM_TAIL_ON_BOOT = os.getenv("HEARTBEAT_TRIM_TAIL_ON_BOOT", "1") in (
+    "1",
+    "true",
+    "True",
+)
+
+STABLES = {"USD", "USDT", "USDC"}
+
 try:
-    from utils import get_gspread_client, send_telegram_message_dedup, warn, info
+    from utils import (
+        get_gspread_client,
+        send_telegram_message_dedup,
+        warn,
+        info,
+    )
 except Exception:
-    get_gspread_client = None
-    send_telegram_message_dedup = None
-    def warn(x): print("[telemetry_digest] WARN:", x)
-    def info(x): print("[telemetry_digest] INFO:", x)
+    # Very defensive fallbacks for tooling environments
+    def warn(msg: str) -> None:  # type: ignore
+        print("[WARN]", msg)
 
-def _http_get(url, timeout=6):
-    try:
-        import requests
-        r = requests.get(url, timeout=timeout)
-        if r.ok:
-            return r.json()
-    except Exception:
-        pass
-    return {}
+    def info(msg: str) -> None:  # type: ignore
+        print("[INFO]", msg)
 
-def _send_tg(text, key):
-    if send_telegram_message_dedup:
-        try:
-            send_telegram_message_dedup(text, key=key, ttl_min=120)
+    def get_gspread_client():  # type: ignore
+        raise RuntimeError("get_gspread_client unavailable")
+
+    def send_telegram_message_dedup(message: str, key: str, ttl_min: int = 15) -> None:  # type: ignore
+        if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
             return
-        except Exception:
-            pass
-    if BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            import requests
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
-                timeout=8,
-            )
-        except Exception:
-            pass
+        print("[TG]", key, message)
 
-# --- drop-in patch: heartbeat sheet hygiene + top-insert writing ---
 
-def _ensure_ws(sh, name: str, headers: list[str]):
-    """Return a worksheet with a correct header row.
-    - Creates the sheet if missing
-    - Fixes header row if empty or wrong
-    """
+def _http_get(url: str) -> Dict[str, Any]:
+    import requests
+
+    try:
+        resp = requests.get(url, timeout=5)
+    except Exception as e:
+        warn(f"telemetry_digest: GET {url} failed: {e}")
+        return {}
+
+    if resp.status_code != 200:
+        warn(f"telemetry_digest: {url} -> HTTP {resp.status_code}")
+        return {}
+
+    try:
+        return resp.json()
+    except Exception as e:
+        warn(f"telemetry_digest: invalid JSON from {url}: {e}")
+        return {}
+
+
+def _open_or_create_worksheet(sh, name: str, headers) -> Any:
+    """Return a worksheet with a correct header row."""
     try:
         ws = sh.worksheet(name)
     except Exception:
         ws = sh.add_worksheet(title=name, rows=2000, cols=max(8, len(headers) + 2))
 
-    # Ensure header row is present & correct
     try:
         first = ws.row_values(1)
         if [h.strip() for h in first] != headers:
-            # Overwrite row 1 safely
-            ws.update('1:1', [headers], value_input_option="USER_ENTERED")
+            ws.update("1:1", [headers], value_input_option="USER_ENTERED")
     except Exception:
-        # Fallback if read failed for any reason
-        ws.update('1:1', [headers], value_input_option="USER_ENTERED")
+        ws.update("1:1", [headers], value_input_option="USER_ENTERED")
     return ws
 
 
-def _trim_tail(ws, key_col: int = 1):
-    """One-time housekeeping: remove trailing empty rows after the last non-empty
-    in `key_col` (default column A).
-    Controlled by env HEARTBEAT_TRIM_TAIL_ON_BOOT in run_telemetry_digest().
+def _trim_tail(ws, key_col: int = 1) -> None:
+    """
+    Remove trailing empty rows after the last non-empty in key_col (default A).
+    Controlled by HEARTBEAT_TRIM_TAIL_ON_BOOT.
     """
     try:
-        col = ws.col_values(key_col)  # list already trimmed by Sheets API
+        col = ws.col_values(key_col)
         last = len(col)
-        # walk back to last non-empty
         while last > 1 and (col[last - 1] or "").strip() == "":
             last -= 1
 
         total = ws.row_count
         if total > last:
             start = last + 1
-            # delete in chunks so we don't exceed batch limits
             while start <= total:
                 end = min(start + 499, total)
                 ws.delete_rows(start, end)
-                total -= (end - start + 1)
-    except Exception:
-        # non-fatal; leave as-is if trimming fails
-        pass
+                start = end + 1
+            info(f"telemetry_digest: trimmed empty tail rows after {last}")
+    except Exception as e:
+        warn(f"telemetry_digest: trim tail failed: {e}")
 
 
-def _insert_or_append(ws, row: list, mode: str = "top"):
+def _compute_stable_digest(by_venue: Dict[str, Dict[str, float]]) -> Tuple[str, Dict[str, float]]:
     """
-    mode:
-      - 'top'    : insert at row 2 (newest-first under headers)
-      - 'append' : standard append at bottom (can hit ghost tails)
+    Return:
+        digest_str, per_venue_totals
+
+    per_venue_totals[VENUE] = sum of USD+USDT+USDC balances for that venue.
     """
-    mode = (mode or "top").lower()
-    if mode == "append":
-        ws.append_row(row, value_input_option="USER_ENTERED")
-    else:
-        ws.insert_rows([row], row=2, value_input_option="USER_ENTERED")
+    totals: Dict[str, float] = {}
+    for venue, assets in by_venue.items():
+        if not isinstance(assets, dict):
+            continue
+        acc = 0.0
+        for sym, qty in assets.items():
+            try:
+                qf = float(qty or 0.0)
+            except Exception:
+                continue
+            if sym.upper() not in STABLES:
+                continue
+            acc += qf
+        if acc > 0:
+            totals[str(venue).upper()] = acc
+
+    if not totals:
+        return "no stable balances reported", totals
+
+    parts = [f"{v}={amt:.2f}" for v, amt in sorted(totals.items())]
+    return ", ".join(parts) + " (USD+USDT+USDC)", totals
 
 
-def run_telemetry_digest():
+def _send_tg(msg: str, key: str) -> None:
+    if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        send_telegram_message_dedup(msg, key=key)
+    except Exception as e:
+        warn(f"telemetry_digest: telegram send failed: {e}")
+
+
+def run_telemetry_digest() -> None:
     if not SHEET_URL:
         warn("SHEET_URL missing; abort.")
         return
@@ -120,48 +157,86 @@ def run_telemetry_digest():
     j = _http_get(url) or {}
 
     age_sec = j.get("age_sec")
-    # accept either {agent_id:"..."} or {agent:"..."}
-    agent = j.get("agent_id") or (j.get("agent") if isinstance(j.get("agent"), str) else None) or ""
-    # support both flat/by_venue at top-level or nested under "telemetry"
-    t = j.get("telemetry") if isinstance(j.get("telemetry"), dict) else {}
-    flat = j.get("flat") or t.get("flat") or {}
-    by_venue = j.get("by_venue") or t.get("by_venue") or {}
+    data = j.get("data") or {}
+    if not isinstance(data, dict):
+        warn("telemetry_digest: /api/telemetry/last returned no data")
+        return
 
-    # 2) Write to NovaHeartbeat (top-insert by default)
+    agent = (
+        data.get("agent_id")
+        or data.get("agent")
+        or j.get("agent_id")
+        or j.get("agent")
+        or ""
+    )
+    by_venue = data.get("by_venue") or {}
+    if not isinstance(by_venue, dict):
+        by_venue = {}
+
+    # Compute human-readable stable digest
+    digest_str, per_venue = _compute_stable_digest(by_venue)
+
+    # 2) Append heartbeat row
     try:
         gc = get_gspread_client()
         sh = gc.open_by_url(SHEET_URL)
-        headers = ["Timestamp", "Agent", "Age_sec", "Flat_Tokens", "Venues", "Note"]
-        ws = _ensure_ws(sh, HEARTBEAT_WS, headers)
-
-        # Optional one-time tail cleanup
-        if os.getenv("HEARTBEAT_TRIM_TAIL_ON_BOOT", "0").lower() in ("1", "true", "yes"):
-            _trim_tail(ws)
-
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        row = [
-            ts,
-            agent,
-            "" if age_sec is None else int(age_sec),
-            len(flat),
-            len(by_venue),
-            ""
+        headers = [
+            "Timestamp",
+            "Agent",
+            "Age_sec",
+            "Age_min",
+            "Digest",
+            "PerVenue_JSON",
         ]
+        ws = _open_or_create_worksheet(sh, HEARTBEAT_WS, headers)
 
-        mode = os.getenv("HEARTBEAT_APPEND_MODE", "top")  # 'top' | 'append'
-        _insert_or_append(ws, row, mode)
-        info(f"Heartbeat row written (mode={mode}).")
+        if HEARTBEAT_TRIM_TAIL_ON_BOOT:
+            _trim_tail(ws, key_col=1)
+
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        age_min = None
+        if isinstance(age_sec, (int, float)):
+            age_min = age_sec / 60.0
+
+        row = [
+            ts_str,
+            str(agent or ""),
+            age_sec if age_sec is not None else "",
+            f"{age_min:.1f}" if age_min is not None else "",
+            digest_str,
+            str(per_venue),
+        ]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        info(f"telemetry_digest: wrote heartbeat row for agent={agent}")
     except Exception as e:
         warn(f"heartbeat write failed: {e}")
 
     # 3) Alert if stale
     try:
-        if age_sec is not None:
+        if isinstance(age_sec, (int, float)):
             age_min = age_sec / 60.0
             if age_min > HEARTBEAT_ALERT_MIN:
-                _send_tg(f"⚠️ Edge heartbeat stale: {int(age_min)} min (>{HEARTBEAT_ALERT_MIN} min)", key=f"hb:{int(age_min)}")
+                _send_tg(
+                    f"⚠️ Edge heartbeat stale: {int(age_min)} min "
+                    f"(>{HEARTBEAT_ALERT_MIN} min)",
+                    key=f"hb:{int(age_min)}",
+                )
     except Exception:
         pass
+
+    # 4) Send a small daily telemetry digest to Telegram
+    try:
+        if per_venue:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            _send_tg(
+                f"📊 Telemetry digest {today}: {digest_str}",
+                key=f"tel_digest:{today}",
+            )
+    except Exception as e:
+        warn(f"telemetry_digest: digest telegram failed: {e}")
+
 
 if __name__ == "__main__":
     run_telemetry_digest()
