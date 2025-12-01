@@ -9,7 +9,7 @@ from flask import Blueprint, request, jsonify
 from policy_bias_engine import run_policy_bias_builder
 from telegram_summaries import run_telegram_summaries
 from stalled_autotrader import run_stalled_autotrader_shadow
-from telemetry_mirror import _compact_wallet_monitor_if_needed
+
 
 # Enable asynchronous Sheets gateway flusher
 try:
@@ -168,7 +168,6 @@ from rotation_executor import sync_confirmed_to_rotation_log  # header-safe Plan
 from council_ledger import ensure_ledger_tabs
 from telemetry_digest import run_telemetry_digest
 from unified_snapshot import run_unified_snapshot
-from telemetry_mirror import _compact_wallet_monitor_if_needed
 
 _schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="12:10")
 
@@ -312,9 +311,6 @@ def _kick_once_and_threads():
     
     info("Running Unified Snapshot…")
     _safe_call("Unified Snapshot", "unified_snapshot", "run_unified_snapshot"); _sleep_jitter()
-
-    info("Wallet Monitor Compactor…")
-    _safe_call("Wallet Monitor Compactor", "telemetry_mirror", "_compact_wallet_monitor_if_needed"); _sleep_jitter()
                
     # Sentiment-triggered scan (soft)
     info("Sentiment-Triggered Rebuy Scan…")
