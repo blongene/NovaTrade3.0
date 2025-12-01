@@ -168,6 +168,8 @@ from rotation_executor import sync_confirmed_to_rotation_log  # header-safe Plan
 from council_ledger import ensure_ledger_tabs
 from telemetry_digest import run_telemetry_digest
 from unified_snapshot import run_unified_snapshot
+from telemetry_mirror import _compact_wallet_monitor_if_needed
+
 _schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="12:10")
 
 # --- Boot orchestration ------------------------------------------------------
