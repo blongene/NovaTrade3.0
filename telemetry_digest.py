@@ -89,23 +89,29 @@ def _trim_tail(ws, key_col: int = 1) -> None:
     Remove trailing empty rows after the last non-empty in key_col (default A).
     Controlled by HEARTBEAT_TRIM_TAIL_ON_BOOT.
     """
+    total = ws.row_count
+    last = len(col_a)  # last non-empty row (1-based)
+
+    # No gap after the last data row; nothing to trim.
+    if total <= last:
+        return
+
+    # Start just after the last data row; never above total.
+    start = last + 1
+    end = total
+
+    # Clamp + sanity-check indices before calling Sheets
+    if start > end:
+        return
+
     try:
-        col = ws.col_values(key_col)
-        last = len(col)
-        while last > 1 and (col[last - 1] or "").strip() == "":
-            last -= 1
-
-        total = ws.row_count
-        if total > last:
-            start = last + 1
-            while start <= total:
-                end = min(start + 499, total)
-                ws.delete_rows(start, end)
-                start = end + 1
-            info(f"telemetry_digest: trimmed empty tail rows after {last}")
+        ws.delete_rows(start, end)
+        warn(
+            f"telemetry_digest: trimmed tail rows {start}..{end} "
+            f"(row_count={total}, last_data_row={last})"
+        )
     except Exception as e:
-        warn(f"telemetry_digest: trim tail failed: {e}")
-
+        warn(f"telemetry_digest: trim tail failed: {e!r}")
 
 def _compute_stable_digest(by_venue: Dict[str, Dict[str, float]]) -> Tuple[str, Dict[str, float]]:
     """
