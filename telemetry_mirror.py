@@ -129,69 +129,70 @@ def _compact_wallet_monitor_if_needed() -> None:
     """
     Bounded-history compaction for Wallet_Monitor.
 
-    Strategy (per-agent, but sheet-wide):
-      - Look at column A (Timestamp) to find the last non-empty row.
-      - Keep the header + the most recent WALLET_MONITOR_MAX_ROWS rows.
-      - Delete ONLY full, contiguous blocks of old rows (2..N).
+    Strategy:
+      - If WALLET_MONITOR_MAX_ROWS <= 0: no-op.
+      - Otherwise:
+          * Look at column A (Timestamp) to find the last non-empty row.
+          * If rows > max_rows, delete the oldest surplus rows, keeping header row intact.
     """
     if WALLET_MONITOR_MAX_ROWS <= 0:
-        # 0 or negative = compaction disabled
         return
-
     if not SHEET_URL:
-        warn("[telemetry_mirror] compaction skipped: SHEET_URL not set")
         return
 
-    # 1) Open the sheet
     try:
         ws = get_ws_cached(SHEET_URL, WALLET_MONITOR_WS)
     except Exception as e:
         warn(
-            f"[telemetry_mirror] compaction skipped: "
-            f"cannot open Wallet_Monitor ({WALLET_MONITOR_WS}): {e!r}"
+            f"telemetry_mirror: compaction skipped; cannot open {WALLET_MONITOR_WS}: {e}"
         )
         return
 
-    # 2) Read column A (timestamps)
+    # Read timestamps column (includes header)
     try:
-        col_a = ws.col_values(1)  # 1-based, includes header
+        col = ws.col_values(1)
     except Exception as e:
-        warn(
-            f"[telemetry_mirror] compaction failed reading col A in "
-            f"{WALLET_MONITOR_WS}: {e!r}"
-        )
+        warn(f"telemetry_mirror: compaction failed reading col A: {e}")
         return
 
-    if len(col_a) <= 1:
-        # Only header (or totally empty)
-        return
-
-    last_data_row = len(col_a)         # last non-empty row index (1-based)
-    data_rows = last_data_row - 1      # excluding header row
+    row_count = len(col)
+    # row 1 = header, rows 2..row_count = data
+    data_rows = max(row_count - 1, 0)
 
     if data_rows <= WALLET_MONITOR_MAX_ROWS:
-        # Already within bounds
+        # Nothing to trim
         return
 
-    # 3) Compute the range of old rows to delete
-    delete_count = data_rows - WALLET_MONITOR_MAX_ROWS
+    surplus = data_rows - WALLET_MONITOR_MAX_ROWS  # how many old rows to drop
 
-    # We always keep row 1 (header) and the last N data rows
-    start_row = 2                      # first data row
-    end_row = 1 + delete_count         # inclusive, gspread uses 1-based
+    # Delete rows 2 .. (1 + surplus) (0-based indices 1 .. (1 + surplus))
+    start_index = 1               # keep header at 0
+    end_index = 1 + surplus       # non-inclusive
 
     try:
-        ws.delete_rows(start_row, end_row)
+        ws.spreadsheet.batch_update(
+            {
+                "requests": [
+                    {
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": ws.id,
+                                "dimension": "ROWS",
+                                "startIndex": start_index,
+                                "endIndex": end_index,
+                            }
+                        }
+                    }
+                ]
+            }
+        )
         info(
-            "[telemetry_mirror] compacted Wallet_Monitor: "
-            f"removed {delete_count} old rows (kept last {WALLET_MONITOR_MAX_ROWS})"
+            f"telemetry_mirror: compacted Wallet_Monitor, "
+            f"removed {surplus} old row(s), max_rows={WALLET_MONITOR_MAX_ROWS}"
         )
     except Exception as e:
-        warn(
-            f"[telemetry_mirror] compaction delete_rows({start_row}, {end_row}) "
-            f"failed on {WALLET_MONITOR_WS}: {e!r}"
-        )
-
+        warn(f"telemetry_mirror: compaction batch_update failed: {e}")
+        
 def mirror_telemetry_once() -> None:
     """
     Pull the latest telemetry snapshot and mirror balances into Wallet_Monitor,
