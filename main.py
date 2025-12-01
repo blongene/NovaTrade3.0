@@ -309,6 +309,9 @@ def _kick_once_and_threads():
     
     info("Running Unified Snapshot…")
     _safe_call("Unified Snapshot", "unified_snapshot", "run_unified_snapshot"); _sleep_jitter()
+
+    info("Wallet Monitor Compactor…")
+    _safe_call("Wallet Monitor Compactor", "telemetry_mirror", "_compact_wallet_monitor_if_needed()"); _sleep_jitter()
                
     # Sentiment-triggered scan (soft)
     info("Sentiment-Triggered Rebuy Scan…")
