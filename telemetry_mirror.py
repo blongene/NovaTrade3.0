@@ -124,10 +124,18 @@ def _summarize_by_venue(by_venue: Dict[str, Any]) -> str:
             parts.append(f"{venue}:" + ",".join(frag_parts))
     return "; ".join(parts)
 
-@with_sheet_backoff
-def _open_wallet_monitor_ws(sheet_url: str, ws_name: str):
-    """Open Wallet_Monitor with full Sheets backoff / retry."""
-    return get_ws_cached(sheet_url, ws_name)
+@with_sheet_backoff("Wallet Monitor Compactor")
+def _open_wallet_monitor_ws(
+    sheet_url: str = SHEET_URL,
+    ws_name: str = WALLET_MONITOR_WS,
+) -> Worksheet:
+    """
+    Open the Wallet_Monitor worksheet with backoff + cache.
+
+    get_ws_cached expects the worksheet *name* first, and the sheet URL
+    as a keyword argument, so we must not pass them positionally reversed.
+    """
+    return get_ws_cached(ws_name, sheet_url=sheet_url)
 
 
 @with_sheet_backoff
@@ -162,12 +170,9 @@ def _compact_wallet_monitor_if_needed() -> None:
 
     # 1) Open the worksheet with the same backoff used everywhere else
     try:
-        ws = _open_wallet_monitor_ws(sheet_url, ws_name)
+        ws = _open_wallet_monitor_ws()
     except Exception as e:
-        warn(
-            f"telemetry_mirror: compaction skipped; cannot open {ws_name}: "
-            f"{type(e).__name__}: {e}"
-        )
+        warn(f"telemetry_mirror: compaction skipped; cannot open Wallet_Monitor: {e!r}")
         return
 
     # 2) Read column A (timestamps) to determine how many real rows exist
