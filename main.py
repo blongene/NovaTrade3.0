@@ -167,7 +167,7 @@ from rotation_executor import sync_confirmed_to_rotation_log  # header-safe Plan
 from council_ledger import ensure_ledger_tabs
 from telemetry_digest import run_telemetry_digest
 from unified_snapshot import run_unified_snapshot
-from telemetry_mirror import mirror_telemetry_once
+from telemetry_mirror import run_telemetry_mirror
 
 _schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="12:10")
 
@@ -242,7 +242,7 @@ def _set_schedules():
     _schedule("Rotation Memory Weighted",      "rotation_feedback_enhancer", "run_rotation_feedback_enhancer", every=6,  unit="hours")
     _schedule("Milestone Alerts",              "rotation_signal_engine",     "run_milestone_alerts",           every=1,  unit="hours")
     _schedule("Wallet Monitor",                "wallet_monitor",             "run_wallet_monitor",             every=15, unit="minutes")
-    _schedule("Telemetry Mirror",              "telemetry_mirror",           "mirror_telemetry_once",          every=15, unit="minutes")
+    _schedule("Telemetry Mirror",              "telemetry_mirror",           "run_telemetry_mirror",           every=15, unit="minutes")
     _schedule("Unified Snapshot",              "unified_snapshot",           "run_unified_snapshot",           every=15, unit="minutes")
     
 def _kick_once_and_threads():
