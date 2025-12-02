@@ -39,11 +39,12 @@ import time
 import requests
 from utils import with_sheet_backoff
 from utils import (
-    sheets_append_rows,
     get_ws_cached,
     warn,
     info,
-)  # type: ignore
+)
+
+from db_backbone import record_telemetry
 
 # Base URL to talk to our own Bus. PORT is present in Render.
 PORT = int(os.getenv("PORT", "10000"))
@@ -168,6 +169,15 @@ def _open_wallet_monitor_ws(
     """
     return get_ws_cached(ws_name)
 
+@with_sheet_backoff
+def _append_wallet_monitor_rows(ws, rows):
+    """
+    Append rows into Wallet_Monitor with Sheets backoff/retry.
+    We bypass utils.sheets_append_rows here to avoid signature mismatch.
+    """
+    # gspread Worksheet.append_rows signature:
+    #   append_rows(values, value_input_option='RAW', insert_data_option=None, table_range=None)
+    ws.append_rows(rows, value_input_option="RAW")
 
 @with_sheet_backoff
 def _delete_wallet_monitor_rows(ws, start_row: int, end_row: int):
@@ -297,17 +307,8 @@ def _write_wallet_monitor_row(data: Dict[str, Any]) -> None:
         )
 
     ws = _open_wallet_monitor_ws()
-    sheets_append_rows(ws, out_rows)
+    _append_wallet_monitor_rows(ws, out_rows)
     info(f"telemetry_mirror: appended {len(out_rows)} Wallet_Monitor rows.")
-
-from db_backbone import record_telemetry
-
-# inside run_telemetry_mirror(), after you know snapshot is valid
-try:
-    record_telemetry(snapshot.get("agent") or "bus-telemetry", snapshot)
-except Exception:
-    # don't break the Sheet pipeline on DB issues
-    pass
 
 def run_telemetry_mirror() -> None:
     """
@@ -318,12 +319,24 @@ def run_telemetry_mirror() -> None:
     if not data:
         return
 
+    # Phase 19: mirror telemetry snapshot into DB backbone (best-effort)
+    try:
+        agent = ""
+        if isinstance(data, dict):
+            agent = data.get("agent") or ""
+        if not agent:
+            agent = "bus-telemetry"
+
+        record_telemetry(agent, data, kind="snapshot")
+    except Exception:
+        # don't break the Sheet pipeline on DB issues
+        pass
+
     try:
         _write_wallet_monitor_row(data)
     finally:
         # Compaction should not block writes; best-effort.
         _compact_wallet_monitor_if_needed()
-
 
 if __name__ == "__main__":
     run_telemetry_mirror()
