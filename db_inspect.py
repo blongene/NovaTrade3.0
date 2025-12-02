@@ -13,8 +13,8 @@ from db_backbone import (
     get_recent_commands,
     get_recent_receipts,
     get_recent_telemetry,
+    get_recent_trades,
 )
-
 
 def _print_section(title: str) -> None:
     bar = "=" * len(title)
@@ -30,6 +30,18 @@ def main() -> None:
             f"[cmd #{row['id']}] agent={row['agent_id']!r} "
             f"status={row.get('status')!r} "
             f"leased_by={row.get('leased_by')!r} "
+            f"created_at={row['created_at']}"
+        )
+
+    # Trades
+    _print_section("Recent trades")
+    trades: List[Dict[str, Any]] = get_recent_trades(limit=10)
+    for row in trades:
+        print(
+            f"[trade #{row['id']}] {row['venue']} {row['symbol']} "
+            f"{row.get('side') or ''} "
+            f"base={row.get('base_qty')} quote={row.get('quote_qty')} "
+            f"price={row.get('price')} status={row.get('status')} "
             f"created_at={row['created_at']}"
         )
 
