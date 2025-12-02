@@ -32,3 +32,30 @@ create table if not exists telemetry (
   agent_id text not null,
   payload jsonb not null
 );
+
+-- Trades: normalized view of fills, backed by Edge receipts
+CREATE TABLE IF NOT EXISTS trades (
+    id SERIAL PRIMARY KEY,
+    cmd_id INTEGER REFERENCES commands(id) ON DELETE SET NULL,
+    receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL,
+
+    venue TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT,           -- 'BUY' / 'SELL' / etc.
+    base_qty NUMERIC,    -- filled base amount
+    quote_qty NUMERIC,   -- filled quote amount
+    price NUMERIC,       -- effective fill price
+    status TEXT,         -- 'filled', 'partial', 'error', etc.
+
+    raw_payload JSONB,   -- full edge/bus receipt payload for forensics
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_trades_cmd_id
+    ON trades(cmd_id);
+
+CREATE INDEX IF NOT EXISTS idx_trades_receipt_id
+    ON trades(receipt_id);
+
+CREATE INDEX IF NOT EXISTS idx_trades_symbol_time
+    ON trades(venue, symbol, created_at);
