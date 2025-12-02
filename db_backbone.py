@@ -395,3 +395,84 @@ def record_trade_from_receipt(receipt_row: Dict[str, Any]) -> None:
         conn.commit()
     finally:
         cur.close()
+
+def record_trade_live(cmd_id: Optional[int], receipt: Dict[str, Any]) -> None:
+    """
+    Insert a trade row directly from a live Edge/Bus receipt dict.
+
+    This does NOT depend on the receipts table; it's fed by receipt_bridge.
+    """
+    conn = _get_conn()
+    if not conn:
+        return
+
+    # receipt shape we expect from the Bus ACK path:
+    # {
+    #   "id": 123,          # command id
+    #   "ok": true/false,
+    #   "status": "ok|error|...",
+    #   "venue": "BINANCEUS",
+    #   "symbol": "BTC-USD",
+    #   "side": "BUY",
+    #   "base_qty": ...,
+    #   "quote_qty": ...,
+    #   "price": ...,
+    #   "result": { ... }   # venue-native payload
+    # }
+
+    ok = bool(receipt.get("ok", True))
+    venue = receipt.get("venue")
+    symbol = receipt.get("symbol")
+    side = receipt.get("side") or receipt.get("direction")
+
+    # quantities: first check normalized keys, then fall back to nested result
+    base_qty = (
+        receipt.get("base_qty")
+        or receipt.get("filled_base")
+        or (receipt.get("result") or {}).get("filled_base")
+    )
+    quote_qty = (
+        receipt.get("quote_qty")
+        or receipt.get("filled_quote")
+        or (receipt.get("result") or {}).get("filled_quote")
+    )
+    price = (
+        receipt.get("price")
+        or (receipt.get("result") or {}).get("price")
+    )
+
+    status = receipt.get("status") or ("ok" if ok else "error")
+
+    # If we can't even identify where the trade happened, bail quietly
+    if not venue or not symbol:
+        return
+
+    raw_payload = json.dumps(receipt)
+
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO trades (
+                cmd_id, receipt_id,
+                venue, symbol, side,
+                base_qty, quote_qty, price,
+                status, raw_payload
+            )
+            VALUES (%s, NULL, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                int(cmd_id) if cmd_id is not None else None,
+                venue,
+                symbol,
+                side,
+                base_qty,
+                quote_qty,
+                price,
+                status,
+                raw_payload,
+            ),
+        )
+        conn.commit()
+    finally:
+        cur.close()
