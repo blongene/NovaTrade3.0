@@ -10,7 +10,6 @@ from policy_bias_engine import run_policy_bias_builder
 from telegram_summaries import run_telegram_summaries
 from stalled_autotrader import run_stalled_autotrader_shadow
 
-
 # Enable asynchronous Sheets gateway flusher
 try:
     from sheets_bp import start_background_flusher
@@ -168,6 +167,7 @@ from rotation_executor import sync_confirmed_to_rotation_log  # header-safe Plan
 from council_ledger import ensure_ledger_tabs
 from telemetry_digest import run_telemetry_digest
 from unified_snapshot import run_unified_snapshot
+from telemetry_mirror import mirror_telemetry_once
 
 _schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="12:10")
 
