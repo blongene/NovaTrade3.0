@@ -400,54 +400,51 @@ def record_trade_live(cmd_id: Optional[int], receipt: Dict[str, Any]) -> None:
     """
     Insert a trade row directly from a live Edge/Bus receipt dict.
 
-    This does NOT depend on the receipts table; it's fed by receipt_bridge.
+    Expected keys (best-effort, tolerant of missing fields):
+      - id / cmd_id
+      - agent_id
+      - venue, symbol, side
+      - status
+      - fills: list[{qty/size, price}]
+      - note
+      - requested_symbol, resolved_symbol
+      - post_balances (dict)
+      - ts (ISO or unix-ish)
     """
     conn = _get_conn()
     if not conn:
         return
 
-    # receipt shape we expect from the Bus ACK path:
-    # {
-    #   "id": 123,          # command id
-    #   "ok": true/false,
-    #   "status": "ok|error|...",
-    #   "venue": "BINANCEUS",
-    #   "symbol": "BTC-USD",
-    #   "side": "BUY",
-    #   "base_qty": ...,
-    #   "quote_qty": ...,
-    #   "price": ...,
-    #   "result": { ... }   # venue-native payload
-    # }
+    # Normalize a bit
+    venue = (receipt.get("venue") or "").upper() or None
+    symbol = receipt.get("symbol") or receipt.get("requested_symbol") or None
+    side = (receipt.get("side") or receipt.get("direction") or "").upper() or None
+    status = receipt.get("status") or ("ok" if receipt.get("ok") else "error")
+    fills = receipt.get("fills") or []
 
-    ok = bool(receipt.get("ok", True))
-    venue = receipt.get("venue")
-    symbol = receipt.get("symbol")
-    side = receipt.get("side") or receipt.get("direction")
+    # Derive qty / price from fills
+    total_qty = 0.0
+    notional = 0.0
+    for f in fills:
+        try:
+            q = float(f.get("qty") or f.get("size") or 0)
+            p = float(f.get("price") or 0)
+            total_qty += q
+            notional += q * p
+        except Exception:
+            continue
+    avg_price = (notional / total_qty) if total_qty > 0 else None
 
-    # quantities: first check normalized keys, then fall back to nested result
-    base_qty = (
-        receipt.get("base_qty")
-        or receipt.get("filled_base")
-        or (receipt.get("result") or {}).get("filled_base")
-    )
-    quote_qty = (
-        receipt.get("quote_qty")
-        or receipt.get("filled_quote")
-        or (receipt.get("result") or {}).get("filled_quote")
-    )
-    price = (
-        receipt.get("price")
-        or (receipt.get("result") or {}).get("price")
-    )
+    base_qty = total_qty or None
+    quote_qty = notional or None
+    price = avg_price
 
-    status = receipt.get("status") or ("ok" if ok else "error")
-
-    # If we can't even identify where the trade happened, bail quietly
     if not venue or not symbol:
+        # Don't write junk rows
         return
 
     raw_payload = json.dumps(receipt)
+    cmd_id_val = cmd_id or receipt.get("id") or receipt.get("cmd_id")
 
     cur = conn.cursor()
     try:
@@ -462,7 +459,7 @@ def record_trade_live(cmd_id: Optional[int], receipt: Dict[str, Any]) -> None:
             VALUES (%s, NULL, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
-                int(cmd_id) if cmd_id is not None else None,
+                int(cmd_id_val) if cmd_id_val is not None else None,
                 venue,
                 symbol,
                 side,
