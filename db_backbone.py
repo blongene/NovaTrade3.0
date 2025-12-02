@@ -255,21 +255,6 @@ def _fetchall(query: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
     conn = _get_conn()
     if not conn:
         return []
-    try:
-        cur = conn.cursor()
-        cur.execute(query, params)
-        cols = [c[0] for c in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        return rows
-    finally:
-        # PG connection is global + reused; don't close here
-        cur.close()
-
-def _fetchall(query: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
-    """Internal helper to run a query and return dict rows."""
-    conn = _get_conn()
-    if not conn:
-        return []
     cur = conn.cursor()
     try:
         cur.execute(query, params)
