@@ -8,9 +8,14 @@ from utils import sheets_append_rows  # you already use this elsewhere (e.g., te
 
 TAB    = os.getenv("NOVA_TRIGGER_TAB","NovaTrigger")
 SHEET  = os.getenv("SHEET_URL")
-JIT_MIN = float(os.getenv("NOVA_TRIGGER_JITTER_MIN_S","0.3"))
-JIT_MAX = float(os.getenv("NOVA_TRIGGER_JITTER_MAX_S","1.2"))
+NOVA_TRIGGER_JITTER_MIN_S = float(os.getenv("NOVA_TRIGGER_JITTER_MIN_S", "3"))
+NOVA_TRIGGER_JITTER_MAX_S = float(os.getenv("NOVA_TRIGGER_JITTER_MAX_S", "9"))
 
+if NOVA_TRIGGER_JITTER_MAX_S < NOVA_TRIGGER_JITTER_MIN_S:
+    NOVA_TRIGGER_JITTER_MIN_S, NOVA_TRIGGER_JITTER_MAX_S = (
+        NOVA_TRIGGER_JITTER_MAX_S,
+        NOVA_TRIGGER_JITTER_MIN_S,
+    )
 def _open():
     scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
