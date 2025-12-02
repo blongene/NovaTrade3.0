@@ -156,8 +156,6 @@ def _format_compact_fragment(by_venue: Dict[str, Dict[str, float]]) -> str:
     return "; ".join(parts)
 
 
-from gspread.models import Worksheet  # (if not already imported at top)
-
 @with_sheet_backoff
 def _open_wallet_monitor_ws(
     ws_name: str = WALLET_MONITOR_WS,
