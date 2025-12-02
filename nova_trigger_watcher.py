@@ -16,27 +16,25 @@ def _open():
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
     return gspread.authorize(creds).open_by_url(SHEET)
 
-NOVA_TRIGGER_LOG_TAB = os.environ.get("NOVA_TRIGGER_LOG_TAB", "NovaTrigger_Log")
+NOVA_TRIGGER_LOG_WS = os.getenv("NOVA_TRIGGER_LOG_WS", "NovaTrigger_Log")
 
-def _append_novatrigger_log(
-    trigger: str,
-    status: str,
-    policy_ok: bool,
-    enq_ok: bool,
-    reason: str,
-) -> None:
-    """
-    Append a single row into NovaTrigger_Log:
-      Timestamp | Trigger | Notes
-    """
-    sh = _open()
-    ws = sh.worksheet(NOVA_TRIGGER_LOG_TAB)
+def _append_novatrigger_log(raw: str, result: dict) -> None:
+    ws = get_ws_cached(NOVA_TRIGGER_LOG_WS)  # or sheets_open_tab(...)
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    notes = (
+        f"status={result.get('status', 'APPROVED')}; "
+        f"ok={result['decision'].get('ok')}; "
+        f"mode={result.get('mode', 'live')}; "
+        f"enq_ok={result['enqueue'].get('ok')}; "
+        f"reason={result['enqueue'].get('reason','ok')}"
+    )
 
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    notes = f"status={status}; policy_ok={policy_ok}; enq_ok={enq_ok}; reason={reason}"
-
-    rows = [[ts, trigger, notes]]
-    sheets_append_rows(ws, rows)
+    row = [
+        now.isoformat(timespec="seconds"),
+        raw,
+        notes,
+    ]
+    sheets_append_rows(ws, [row])
 
 def check_nova_trigger() -> None:
     print("▶ Nova trigger check …")
@@ -54,6 +52,21 @@ def check_nova_trigger() -> None:
     # --- MANUAL_REBUY flow -------------------------------------------------
     if raw.upper().startswith("MANUAL_REBUY"):
         out = route_manual(raw)
+    
+        # NEW: log to NovaTrigger_Log
+        try:
+            _append_novatrigger_log(raw, out)  # or whatever helper name we defined
+        except Exception as e:
+            print(f"⚠ NovaTrigger log append failed: {e}")
+    
+        print(
+            f"✅ Manual routed: policy_ok={out['decision'].get('ok')} "
+            f"enq={out['enqueue'].get('ok')}"
+        )
+    
+        # Clear after handling
+        ws.update_acell("A1", "")
+        return
 
         decision = out.get("decision") or {}
         enqueue = out.get("enqueue") or {}
