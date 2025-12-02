@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 # Our utils provides rate-limited, budgeted appends + auth fallbacks
 from utils import sheets_append_rows
+from db_backbone import record_trade_live  # Phase 19: mirror trades into Postgres
 
 # ----------- config ----------
 DB_PATH                = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
@@ -52,7 +53,7 @@ def _parse_iso(ts: Any) -> Optional[datetime]:
         s = s.replace("Z", "+00:00")
         # Accept unix seconds
         if s.isdigit():
-            return datetime.fromtimestamp(int(s), tz=timezone.utc)
+            return datetime.fromtimestamp(int(s), tz=timezone=timezone.utc)
         return datetime.fromisoformat(s)
     except Exception:
         return None
@@ -163,6 +164,68 @@ def _append_rows(rows: List[List[Any]]) -> int:
     sheets_append_rows(SHEET_URL, TRADE_LOG_WS, rows)
     return len(rows)
 
+def _mirror_trade_to_db(rcp_id: int, j: Dict[str, Any]) -> None:
+    """
+    Normalize this bridge payload into the generic record_trade_live() shape.
+    Best-effort: failures are swallowed so Sheets logging is never blocked.
+    """
+    try:
+        rec  = j.get("receipt") or {}
+        cmd  = j.get("command") or {}
+        meta = j.get("meta")    or {}
+
+        cmd_id = (
+            j.get("cmd_id")
+            or meta.get("cmd_id")
+            or cmd.get("id")
+            or j.get("id")
+            or rcp_id
+        )
+
+        venue  = (rec.get("venue") or cmd.get("venue") or "").upper()
+        symbol = rec.get("symbol") or cmd.get("symbol") or cmd.get("pair") or ""
+        side   = (rec.get("side") or cmd.get("side") or "").upper()
+        status = (rec.get("status") or j.get("status") or "").lower()
+
+        # Quantities / price (best-effort)
+        base_qty = rec.get("executed_qty") or rec.get("base_qty")
+        quote_qty = (
+            rec.get("amount_quote")
+            or cmd.get("amount_quote")
+            or cmd.get("amount_usd")
+        )
+        price = rec.get("avg_price") or rec.get("price")
+
+        note  = rec.get("note") or rec.get("message") or rec.get("error") or ""
+        fills = rec.get("fills") or []
+
+        req_sym = cmd.get("symbol") or cmd.get("pair") or ""
+        res_sym = rec.get("resolved_symbol") or rec.get("symbol") or ""
+        post_bal = rec.get("post_balances") or rec.get("post_balances_compact")
+
+        payload = {
+            "id": cmd_id,
+            "agent_id": meta.get("agent_id") or cmd.get("agent_id") or j.get("agent_id"),
+            "venue": venue,
+            "symbol": symbol,
+            "side": side,
+            "status": status,
+            "txid": rec.get("txid") or rec.get("order_id") or rec.get("trade_id") or "",
+            "fills": fills,
+            "note": note,
+            "requested_symbol": req_sym,
+            "resolved_symbol": res_sym,
+            "post_balances": post_bal,
+            "base_qty": base_qty,
+            "quote_qty": quote_qty,
+            "price": price,
+        }
+
+        record_trade_live(cmd_id, payload)
+    except Exception:
+        # Absolutely non-fatal; this is an observability mirror only.
+        return
+
 # ----------- main tick ----------
 
 def run_once() -> Tuple[int, int]:
@@ -192,9 +255,12 @@ def run_once() -> Tuple[int, int]:
         except Exception:
             # Bad JSON payload — skip but move state forward to avoid loop
             continue
+
         row = _build_row(it["id"], j)
         if row:
             to_write.append(row)
+            # New: mirror trade into Postgres backbone (best-effort)
+            _mirror_trade_to_db(it["id"], j)
 
     written = 0
     # batch quietly (single append if <= BATCH_SIZE)
