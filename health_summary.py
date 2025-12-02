@@ -4,6 +4,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta
 from utils import send_telegram_message, is_cold_boot
+from db_backbone import outbox_stats
 
 DB = os.getenv("BUS_TELEMETRY_DB", "bus_telemetry.db")
 
@@ -41,6 +42,13 @@ def run_health_summary():
         f"Mode: `{mode}`\n"
     )
 
+    stats = outbox_stats() or {}
+    q = stats.get("queued", "?")
+    l = stats.get("leased", "?")
+    d = stats.get("done", "?")
+    
+    msg = f"Queue q:{q} l:{l} d:{d} • (DB backbone)"
+    # include this in your Nova Daily telegram body
     if stale_agents:
         msg += f"🚨 Stale agents: {', '.join(stale_agents)}"
     else:
