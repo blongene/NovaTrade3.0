@@ -300,6 +300,14 @@ def _write_wallet_monitor_row(data: Dict[str, Any]) -> None:
     sheets_append_rows(ws, out_rows)
     info(f"telemetry_mirror: appended {len(out_rows)} Wallet_Monitor rows.")
 
+from db_backbone import record_telemetry
+
+# inside run_telemetry_mirror(), after you know snapshot is valid
+try:
+    record_telemetry(snapshot.get("agent") or "bus-telemetry", snapshot)
+except Exception:
+    # don't break the Sheet pipeline on DB issues
+    pass
 
 def run_telemetry_mirror() -> None:
     """
