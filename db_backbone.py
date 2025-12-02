@@ -23,7 +23,7 @@ import json
 import os
 import threading
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import psycopg2
@@ -248,3 +248,66 @@ def record_telemetry(agent_id: str, payload: Dict[str, Any], kind: str = None) -
     except Exception as e:
         print(f"[db_backbone] record_telemetry failed: {e}")
         traceback.print_exc()
+      
+# --- DB observability helpers (Phase 19 Step 3) -----------------------------
+def _fetchall(query: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+    """Internal helper to run a query and return dict rows."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            cols = [c[0] for c in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def get_recent_commands(limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Return the most recent commands from the DB backbone.
+
+    Schema expectation (db_schema.sql):
+      commands(id, agent_id, status, leased_by, payload, created_at, lease_expires_at)
+    """
+    sql = """
+        SELECT id, agent_id, status, leased_by, created_at
+        FROM commands
+        ORDER BY id DESC
+        LIMIT %s
+    """
+    return _fetchall(sql, (limit,))
+
+
+def get_recent_receipts(limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Return the most recent receipts.
+
+    Schema expectation:
+      receipts(id, cmd_id, ok, payload, created_at)
+    """
+    sql = """
+        SELECT id, cmd_id, ok, created_at
+        FROM receipts
+        ORDER BY id DESC
+        LIMIT %s
+    """
+    return _fetchall(sql, (limit,))
+
+
+def get_recent_telemetry(limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Return the most recent telemetry rows (the raw snapshots being stored
+    by telemetry_mirror / Edge pushes).
+
+    Schema expectation:
+      telemetry(id, agent_id, payload, created_at)
+    """
+    sql = """
+        SELECT id, agent_id, created_at, payload
+        FROM telemetry
+        ORDER BY id DESC
+        LIMIT %s
+    """
+    return _fetchall(sql, (limit,))
