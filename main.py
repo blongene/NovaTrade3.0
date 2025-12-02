@@ -168,6 +168,7 @@ from council_ledger import ensure_ledger_tabs
 from telemetry_digest import run_telemetry_digest
 from unified_snapshot import run_unified_snapshot
 from telemetry_mirror import run_telemetry_mirror
+from wallet_monitor import run_wallet_monitor
 
 _schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="13:10")
 
