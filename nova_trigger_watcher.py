@@ -2,6 +2,9 @@
 import os, time, random, gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from nova_trigger import route_manual
+from datetime import datetime
+
+from utils import sheets_append_rows  # you already use this elsewhere (e.g., telemetry_mirror)
 
 TAB    = os.getenv("NOVA_TRIGGER_TAB","NovaTrigger")
 SHEET  = os.getenv("SHEET_URL")
@@ -13,25 +16,88 @@ def _open():
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
     return gspread.authorize(creds).open_by_url(SHEET)
 
-def check_nova_trigger():
+NOVA_TRIGGER_LOG_TAB = os.environ.get("NOVA_TRIGGER_LOG_TAB", "NovaTrigger_Log")
+
+def _append_novatrigger_log(
+    trigger: str,
+    status: str,
+    policy_ok: bool,
+    enq_ok: bool,
+    reason: str,
+) -> None:
+    """
+    Append a single row into NovaTrigger_Log:
+      Timestamp | Trigger | Notes
+    """
+    sh = _open()
+    ws = sh.worksheet(NOVA_TRIGGER_LOG_TAB)
+
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    notes = f"status={status}; policy_ok={policy_ok}; enq_ok={enq_ok}; reason={reason}"
+
+    rows = [[ts, trigger, notes]]
+    sheets_append_rows(ws, rows)
+
+def check_nova_trigger() -> None:
     print("▶ Nova trigger check …")
-    time.sleep(random.uniform(JIT_MIN,JIT_MAX))
+    # keep your existing jitter constants
+    time.sleep(random.uniform(NOVA_TRIGGER_JITTER_MIN_S, NOVA_TRIGGER_JITTER_MAX_S))
+
     sh = _open()
     ws = sh.worksheet(TAB)
 
     raw = (ws.acell("A1").value or "").strip()
     if not raw:
-        print(f"ℹ️ {TAB} empty; no trigger.")
+        print(f"🔹 {TAB} empty; no trigger.")
         return
 
-    # Route manual commands only when line starts with MANUAL_REBUY
+    # --- MANUAL_REBUY flow -------------------------------------------------
     if raw.upper().startswith("MANUAL_REBUY"):
         out = route_manual(raw)
-        print(f"✅ Manual routed: policy_ok={out['decision'].get('ok')} enq={out['enqueue'].get('ok')}")
-        # clear after handling
-        ws.update_acell("A1", "")
+
+        decision = out.get("decision") or {}
+        enqueue = out.get("enqueue") or {}
+
+        policy_ok = bool(decision.get("ok"))
+        enq_ok = bool(enqueue.get("ok"))
+
+        status = "APPROVED" if policy_ok else "DENIED"
+        reason = (
+            enqueue.get("reason")
+            or enqueue.get("error")
+            or decision.get("reason")
+            or "ok"
+        )
+
+        print(
+            f"✅ Manual routed: policy_ok={policy_ok} "
+            f"enq_ok={enq_ok} status={status} reason={reason}"
+        )
+
+        # Always log to NovaTrigger_Log
+        try:
+            _append_novatrigger_log(
+                trigger=raw,
+                status=status,
+                policy_ok=policy_ok,
+                enq_ok=enq_ok,
+                reason=reason,
+            )
+        except Exception as e:
+            # Log but don't break the watcher
+            print(f"⚠ Failed to write NovaTrigger_Log row: {e!r}")
+
+        # Only clear A1 if everything actually went through
+        if policy_ok and enq_ok:
+            ws.update_acell("A1", "")
+            print("🧹 Cleared manual trigger after successful enqueue.")
+        else:
+            # Keep the trigger value so you can adjust / re-fire if needed
+            print("⏸ Keeping manual trigger in A1 (policy or enqueue failed).")
+
         return
 
-    # Keep other values for your internal flows (e.g., SOS/FYI); just clear after a ping
+    # --- Non-manual triggers (SOS/FYI/etc.) --------------------------------
+    # For everything that is NOT MANUAL_REBUY, keep the old behaviour:
     ws.update_acell("A1", "")
-    print(f"ℹ️ Cleared non-manual trigger: {raw}")
+    print(f"🧹 Cleared non-manual trigger: {raw}")
