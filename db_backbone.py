@@ -252,17 +252,18 @@ def record_telemetry(agent_id: str, payload: Dict[str, Any], kind: str = None) -
 # --- DB observability helpers (Phase 19 Step 3) -----------------------------
 def _fetchall(query: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
     """Internal helper to run a query and return dict rows."""
-    conn = get_conn()
+    conn = _get_conn()
+    if not conn:
+        return []
     try:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            cols = [c[0] for c in cur.description]
-            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        conn.commit()
+        cur = conn.cursor()
+        cur.execute(query, params)
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
         return rows
     finally:
-        conn.close()
-
+        # PG connection is global + reused; don't close here
+        cur.close()
 
 def get_recent_commands(limit: int = 20) -> List[Dict[str, Any]]:
     """
