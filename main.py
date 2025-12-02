@@ -169,7 +169,7 @@ from telemetry_digest import run_telemetry_digest
 from unified_snapshot import run_unified_snapshot
 from telemetry_mirror import run_telemetry_mirror
 
-_schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="12:10")
+_schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="13:10")
 
 # --- Boot orchestration ------------------------------------------------------
 def _boot_serialize_first_minute():
