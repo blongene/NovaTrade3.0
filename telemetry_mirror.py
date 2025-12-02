@@ -156,9 +156,19 @@ def _format_compact_fragment(by_venue: Dict[str, Dict[str, float]]) -> str:
     return "; ".join(parts)
 
 
+from gspread.models import Worksheet  # (if not already imported at top)
+
 @with_sheet_backoff
-def _open_wallet_monitor_ws():
-    return get_ws_cached(WALLET_MONITOR_WS, SHEET_URL)
+def _open_wallet_monitor_ws(
+    ws_name: str = WALLET_MONITOR_WS,
+) -> "Worksheet":
+    """
+    Open the Wallet_Monitor worksheet with backoff + cache.
+
+    get_ws_cached(name, ttl_s=None) uses SHEET_URL from utils internally,
+    so we only pass the worksheet name here.
+    """
+    return get_ws_cached(ws_name)
 
 
 @with_sheet_backoff
