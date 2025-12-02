@@ -3,7 +3,7 @@ import os, time
 from flask import Blueprint, request, jsonify
 from outbox_db import init as db_init, pull as db_pull, ack as db_ack, enqueue as db_enqueue, reap_expired
 from hmac_auth import require_hmac
-from db_backbone import record_receipt
+from db_backbone import record_command_enqueued, record_receipt
 
 bp = Blueprint("api_commands", __name__, url_prefix="/api/commands")
 
