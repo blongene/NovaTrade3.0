@@ -1,84 +1,250 @@
 # db_backbone.py
 """
-DB backbone helper — thin wrapper around bus_store_pg.get_store()
+NovaTrade DB backbone (Phase 19, Step 1)
 
 Goals:
-- Safe, no-op if DB_URL / psycopg2 aren't available.
-- Simple helpers for receipts + telemetry + basic stats.
+- Provide a *safe* Postgres ledger for:
+  - Enqueued commands
+  - Receipts (Edge ACKs)
+  - Telemetry payloads
+- Never break the existing command bus flows:
+  - If DB_URL / psycopg2 are missing, all functions become no-ops.
+  - SQLite outbox + Sheets remain the operational path.
+
+Usage:
+- Call record_command_enqueued(...) in /api/commands/enqueue
+- Call record_receipt(...) in /api/commands/ack
+- Call record_telemetry(...) in telemetry ingestion (optional)
 """
 
 from __future__ import annotations
 
+import json
+import os
+import threading
 import traceback
 from typing import Any, Dict, Optional
 
 try:
-    from bus_store_pg import get_store  # PGStore / SQLiteStore
-except Exception:  # very defensive
-    get_store = None  # type: ignore[assignment]
+    import psycopg2
+    import psycopg2.extras
+except Exception:
+    psycopg2 = None  # type: ignore[assignment]
 
-_store = None  # type: ignore[assignment]
-
-
-def _get_store():
-    """Return a singleton PG/SQLite store or None if unavailable."""
-    global _store
-    if _store is not None:
-        return _store
-    if not get_store:
-        print("[db_backbone] bus_store_pg.get_store not available; DB backbone disabled.")
-        _store = None
-        return _store
-    try:
-        _store = get_store()
-        return _store
-    except Exception as e:
-        print(f"[db_backbone] get_store() failed; DB backbone disabled: {e}")
-        traceback.print_exc()
-        _store = None
-        return _store
+_DB_URL = os.getenv("DB_URL")
+_conn_lock = threading.Lock()
+_conn = None  # type: ignore[assignment]
+_schema_initialized = False
 
 
-def record_receipt(agent_id: str, cmd_id: Optional[int], receipt: Dict[str, Any], ok: bool = True) -> None:
-    """
-    Fire-and-forget logging of a normalized receipt into Postgres.
-    Does *not* affect command state; still handled by outbox_db.
-    """
-    store = _get_store()
-    if not store or not hasattr(store, "save_receipt"):
+def _get_conn():
+    """Get (and lazily initialize) a global PG connection, or None if unavailable."""
+    global _conn
+    if not _DB_URL or not psycopg2:
+        return None
+
+    with _conn_lock:
+        if _conn is not None:
+            # Quick health check: if connection is dead, reset.
+            try:
+                cur = _conn.cursor()
+                cur.execute("SELECT 1")
+                _conn.commit()
+                return _conn
+            except Exception:
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+                _conn = None
+
+        try:
+            _conn = psycopg2.connect(_DB_URL)
+            _conn.autocommit = True
+            return _conn
+        except Exception as e:
+            print(f"[db_backbone] Failed to connect to DB_URL: {e}")
+            traceback.print_exc()
+            _conn = None
+            return None
+
+
+def _ensure_schema() -> None:
+    """Create Phase-19 tables if they don't exist yet."""
+    global _schema_initialized
+    if _schema_initialized:
+        return
+    conn = _get_conn()
+    if not conn:
         return
     try:
-        store.save_receipt(agent_id, cmd_id, receipt, ok=ok)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nova_commands (
+                id          BIGSERIAL PRIMARY KEY,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                agent_id    TEXT NOT NULL,
+                payload     JSONB NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nova_receipts (
+                id             BIGSERIAL PRIMARY KEY,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                agent_id       TEXT NOT NULL,
+                cmd_id         BIGINT,
+                ok             BOOLEAN,
+                status         TEXT,
+                venue          TEXT,
+                symbol         TEXT,
+                base           TEXT,
+                quote          TEXT,
+                notional_usd   NUMERIC,
+                payload        JSONB NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nova_telemetry (
+                id          BIGSERIAL PRIMARY KEY,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                agent_id    TEXT NOT NULL,
+                kind        TEXT,
+                payload     JSONB NOT NULL
+            );
+            """
+        )
+        _schema_initialized = True
     except Exception as e:
-        print(f"[db_backbone] save_receipt failed: {e}")
+        print(f"[db_backbone] Failed to ensure schema: {e}")
         traceback.print_exc()
 
 
-def record_telemetry(agent_id: str, payload: Dict[str, Any]) -> None:
+def _safe_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, default=str)
+    except Exception:
+        return json.dumps({"_bad": True, "repr": repr(obj)})
+
+
+def record_command_enqueued(agent_id: str, payload: Dict[str, Any]) -> None:
     """
-    Fire-and-forget logging of telemetry payloads (balances, snapshots, etc.).
+    Log an enqueued command into Postgres.
+
+    This does *not* change how the command bus behaves; it's a ledger-only write.
     """
-    store = _get_store()
-    if not store or not hasattr(store, "save_telemetry"):
+    conn = _get_conn()
+    if not conn:
         return
+    _ensure_schema()
     try:
-        store.save_telemetry(agent_id, payload)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO nova_commands (agent_id, payload)
+            VALUES (%s, %s)
+            """,
+            (agent_id, psycopg2.extras.Json(payload)),
+        )
     except Exception as e:
-        print(f"[db_backbone] save_telemetry failed: {e}")
+        print(f"[db_backbone] record_command_enqueued failed: {e}")
         traceback.print_exc()
 
 
-def outbox_stats() -> Dict[str, Any]:
+def record_receipt(
+    agent_id: str,
+    cmd_id: Optional[int],
+    receipt: Dict[str, Any],
+    ok: Optional[bool] = None,
+) -> None:
     """
-    Basic stats: {"queued": ..., "leased": ..., "done": ...}
-    Useful for health checks / Nova Daily.
+    Log a normalized receipt into Postgres.
+
+    Fields like venue/symbol/notional_usd are *best-effort* extractions
+    from the receipt dict; if missing, they remain NULL.
     """
-    store = _get_store()
-    if not store or not hasattr(store, "stats"):
-        return {}
+    conn = _get_conn()
+    if not conn:
+        return
+    _ensure_schema()
+
+    ok_val = ok
+    if ok_val is None:
+        # Try to infer from receipt structure
+        if "ok" in receipt:
+            try:
+                ok_val = bool(receipt["ok"])
+            except Exception:
+                ok_val = None
+
+    # Try to pull out some top-level fields for fast queries
+    venue = None
+    symbol = None
+    base = None
+    quote = None
+    notional_usd = None
+
     try:
-        return store.stats() or {}
+        venue = receipt.get("venue") or receipt.get("exchange")
+        symbol = receipt.get("symbol")
+        base = receipt.get("base")
+        quote = receipt.get("quote")
+        notional_usd = receipt.get("notional_usd")
+    except Exception:
+        pass
+
+    status = receipt.get("status")
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO nova_receipts
+                (agent_id, cmd_id, ok, status,
+                 venue, symbol, base, quote, notional_usd, payload)
+            VALUES (%s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                agent_id,
+                int(cmd_id) if cmd_id is not None else None,
+                ok_val,
+                status,
+                venue,
+                symbol,
+                base,
+                quote,
+                notional_usd,
+                psycopg2.extras.Json(receipt),
+            ),
+        )
     except Exception as e:
-        print(f"[db_backbone] stats() failed: {e}")
+        print(f"[db_backbone] record_receipt failed: {e}")
         traceback.print_exc()
-        return {}
+
+
+def record_telemetry(agent_id: str, payload: Dict[str, Any], kind: str = None) -> None:
+    """
+    Log telemetry payloads into Postgres.
+
+    'kind' is a short free-text tag like 'balances', 'snapshot', etc.
+    """
+    conn = _get_conn()
+    if not conn:
+        return
+    _ensure_schema()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO nova_telemetry (agent_id, kind, payload)
+            VALUES (%s, %s, %s)
+            """,
+            (agent_id, kind, psycopg2.extras.Json(payload)),
+        )
+    except Exception as e:
+        print(f"[db_backbone] record_telemetry failed: {e}")
+        traceback.print_exc()
