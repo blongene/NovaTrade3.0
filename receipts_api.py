@@ -1,7 +1,8 @@
-# receipts_api.py
+# receipts_api.py — legacy /api/receipts/ack → Sheet + Postgres trades
 import os, time, json, hmac, hashlib, sqlite3
 from flask import Blueprint, request, jsonify
 from utils import get_gspread_client, send_telegram_message_dedup  # already in your app
+from db_backbone import record_trade_live  # Phase 19: mirror trades into Postgres
 
 bp = Blueprint("receipts_api", __name__)
 
@@ -47,9 +48,6 @@ def receipts_ack():
     if not sig:
         return jsonify(ok=False, error="missing hmac"), 400
 
-    # Optional skew check if client sends X-Timestamp; we accept body["ts"] ISO too.
-    # If you want strict, add your own ts check here.
-
     if not _hmac_ok(body, sig):
         return jsonify(ok=False, error="bad hmac"), 401
 
@@ -91,7 +89,6 @@ def receipts_ack():
         send_telegram_message_dedup(f"⚠️ receipts: sheet open failed: {e}", "rcpt_sheet_open", 30)
         return jsonify(ok=False, error=f"sheet open failed: {e}"), 500
 
-    # Adapt these columns to your tab (safe defaults below)
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     row = [
         now,               # A: ts_utc
@@ -111,7 +108,25 @@ def receipts_ack():
     try:
         ws.append_row(row, value_input_option="RAW")
         _mark_logged(conn, rid)
-        return jsonify(ok=True, id=rid)
     except Exception as e:
         send_telegram_message_dedup(f"⚠️ receipts: append failed: {e}", "rcpt_sheet_append", 30)
         return jsonify(ok=False, error=f"append failed: {e}"), 500
+
+    # Mirror into Postgres trades (Phase 19) — best-effort
+    try:
+        trade_payload = {
+            "id": rid,
+            "agent_id": agent_id,
+            "venue": venue,
+            "symbol": symbol,
+            "side": side,
+            "status": status,
+            "txid": txid,
+            "fills": fills,
+            "note": note,
+        }
+        record_trade_live(rid, trade_payload)
+    except Exception:
+        pass
+
+    return jsonify(ok=True, id=rid)
