@@ -265,6 +265,20 @@ def _fetchall(query: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
         # PG connection is global + reused; don't close here
         cur.close()
 
+def _fetchall(query: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+    """Internal helper to run a query and return dict rows."""
+    conn = _get_conn()
+    if not conn:
+        return []
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        return rows
+    finally:
+        cur.close()
+
 def get_recent_commands(limit: int = 20) -> List[Dict[str, Any]]:
     """
     Return the most recent commands from the DB backbone.
@@ -312,3 +326,87 @@ def get_recent_telemetry(limit: int = 10) -> List[Dict[str, Any]]:
         LIMIT %s
     """
     return _fetchall(sql, (limit,))
+
+def get_recent_trades(limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Return the most recent normalized trades from the DB.
+    """
+    sql = """
+        SELECT id, venue, symbol, side,
+               base_qty, quote_qty, price, status,
+               created_at
+        FROM trades
+        ORDER BY id DESC
+        LIMIT %s
+    """
+    return _fetchall(sql, (limit,))
+
+def record_trade_from_receipt(receipt_row: Dict[str, Any]) -> None:
+    """
+    Normalize an Edge receipt into the trades table.
+
+    expected receipt_row keys (from receipts table + payload JSON):
+      - id, cmd_id, ok, payload (dict)
+    """
+    conn = _get_conn()
+    if not conn:
+        return
+
+    payload = receipt_row.get("payload") or {}
+    # In case we ever wrap under 'trade'
+    trade = payload.get("trade") or payload
+
+    venue = trade.get("venue") or payload.get("venue")
+    symbol = trade.get("symbol") or payload.get("symbol")
+    side = trade.get("side") or trade.get("direction")
+    base_qty = (
+        trade.get("filled_base")
+        or trade.get("base_qty")
+        or trade.get("amount_base")
+    )
+    quote_qty = (
+        trade.get("filled_quote")
+        or trade.get("quote_qty")
+        or trade.get("amount_quote")
+    )
+    price = trade.get("price")
+    status = (
+        trade.get("status")
+        or ("ok" if receipt_row.get("ok") else "error")
+    )
+
+    # If we somehow can't even tell venue/symbol, don't insert junk.
+    if not venue or not symbol:
+        return
+
+    cmd_id = receipt_row.get("cmd_id")
+    receipt_id = receipt_row.get("id")
+
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO trades (
+                cmd_id, receipt_id,
+                venue, symbol, side,
+                base_qty, quote_qty, price,
+                status, raw_payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                cmd_id,
+                receipt_id,
+                venue,
+                symbol,
+                side,
+                base_qty,
+                quote_qty,
+                price,
+                status,
+                json.dumps(payload),
+            ),
+        )
+        conn.commit()
+    finally:
+        cur.close()
