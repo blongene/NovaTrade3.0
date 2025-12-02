@@ -157,17 +157,8 @@ def _format_compact_fragment(by_venue: Dict[str, Dict[str, float]]) -> str:
 
 
 @with_sheet_backoff
-def _open_wallet_monitor_ws(
-    sheet_url: str = SHEET_URL,
-    ws_name: str = WALLET_MONITOR_WS,
-):
-    """
-    Open the Wallet_Monitor worksheet with backoff + cache.
-
-    get_ws_cached expects the worksheet *name* first, and the sheet URL
-    as a keyword argument, so we must not pass them positionally reversed.
-    """
-    return get_ws_cached(ws_name, sheet_url=sheet_url)
+def _open_wallet_monitor_ws():
+    return get_ws_cached(WALLET_MONITOR_WS, SHEET_URL)
 
 
 @with_sheet_backoff
