@@ -64,3 +64,30 @@ def telemetry_push_balances():
         return jsonify({"ok": True, "rows": n})
     except Exception as e:
         return jsonify({"ok": False, "err": str(e)}), 500
+
+from db_backbone import record_telemetry
+
+@bp.route("/api/telemetry/push_balances", methods=["POST"])
+def telemetry_push_balances():
+    try:
+        payload = request.get_json(force=True, silent=False)
+    except Exception as e:
+        return jsonify({"ok": False, "err": f"bad json: {e}"}), 400
+
+    balances = (payload or {}).get("balances", {})
+    agent_id = (payload or {}).get("agent_id") or "edge-unknown"
+
+    if not isinstance(balances, dict) or not balances:
+        return jsonify({"ok": False, "err": "missing or empty balances"}), 400
+
+    # Phase 19: mirror raw payload into telemetry backbone
+    try:
+        record_telemetry(agent_id, {"kind": "balances", **(payload or {})})
+    except Exception:
+        pass
+
+    try:
+        n = _upsert_wallet_monitor(balances)
+        return jsonify({"ok": True, "rows": n})
+    except Exception as e:
+        return jsonify({"ok": False, "err": str(e)}), 500
