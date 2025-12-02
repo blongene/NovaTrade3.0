@@ -1,4 +1,4 @@
-# receipt_bus.py — Receipts API with provenance → Google Sheet
+# receipt_bus.py — Receipts API with provenance → Google Sheet + Postgres trades
 from __future__ import annotations
 import os, json, time
 from typing import Any, Dict, Tuple
@@ -6,6 +6,7 @@ from flask import Blueprint, request, jsonify
 
 from hmac_auth import require_hmac
 from utils import get_gspread_client  # you already use this elsewhere
+from db_backbone import record_trade_live  # Phase 19: mirror trades into Postgres
 
 bp = Blueprint("receipts_api", __name__, url_prefix="/api/receipts")
 
@@ -144,5 +145,26 @@ def ack():
     except Exception as e:
         # Non-fatal: still return OK so Edge doesn’t retry forever
         return jsonify({"ok": True, "id": str(rid), "sheet": "error", "error": str(e)}), 200
+
+    # Mirror into Postgres trades (Phase 19) — also best-effort
+    try:
+        trade_payload = {
+            "id": rid,
+            "agent_id": agent,
+            "venue": venue,
+            "symbol": symbol,
+            "side": side,
+            "status": status,
+            "txid": txid,
+            "fills": fills,
+            "note": note,
+            "requested_symbol": req_sym,
+            "resolved_symbol": res_sym,
+            "post_balances": post_bal,
+        }
+        record_trade_live(rid, trade_payload)
+    except Exception:
+        # Never break Edge acknowledgements on DB mirror issues
+        pass
 
     return jsonify({"ok": True, "id": str(rid)}), 200
