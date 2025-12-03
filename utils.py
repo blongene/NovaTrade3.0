@@ -12,7 +12,8 @@ import os, time, json, threading, functools, hashlib, hmac, random, traceback
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from typing import Any
-
+from functools import wraps
+from typing import Callable, Iterable, Tuple, Type
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
@@ -114,6 +115,52 @@ def get_sheet_client():
     ]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
     return gspread.authorize(creds)
+
+def retry_on_exception(
+    retries: int = 3,
+    delay_seconds: float = 1.0,
+    backoff_factor: float = 2.0,
+    allowed_exceptions: Tuple[Type[BaseException], ...] = (Exception,),
+    label: str = "",
+) -> Callable:
+    """
+    Decorator to retry a function on specific exceptions.
+
+    Example:
+        @retry_on_exception(
+            retries=3,
+            delay_seconds=2,
+            backoff_factor=2,
+            allowed_exceptions=(requests.RequestException,),
+            label="price fetch",
+        )
+        def fetch_price(...):
+            ...
+
+    If all retries fail, the last exception is re-raised.
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            attempt = 0
+            delay = delay_seconds
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except allowed_exceptions as e:
+                    if attempt >= retries:
+                        # Out of retries -> bubble up
+                        raise
+                    attempt += 1
+                    msg = label or func.__name__
+                    print(
+                        f"[retry_on_exception] {msg}: attempt {attempt}/{retries} "
+                        f"failed with {e!r}; retrying in {delay} sec"
+                    )
+                    time.sleep(delay)
+                    delay *= backoff_factor
+        return wrapper
+    return decorator
     
 # ========= Requests Session (Telegram reliability) =========
 def _requests_session():
