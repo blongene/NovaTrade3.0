@@ -1,11 +1,12 @@
 # nova_trigger_watcher.py — reads NovaTrigger!A1 and routes manual commands
+
 import os
 import random
 import time
 from datetime import datetime, timezone
 
 from nova_trigger import route_manual
-from utils import get_ws, sheets_append_rows
+from utils import get_ws  # <-- only use get_ws; no sheets_append_rows here
 
 TAB = os.getenv("NOVA_TRIGGER_TAB", "NovaTrigger")
 LOG_TAB = os.getenv("NOVA_TRIGGER_LOG_TAB", "NovaTrigger_Log")
@@ -14,13 +15,20 @@ JIT_MAX = float(os.getenv("NOVA_TRIGGER_JITTER_MAX_S", "1.2"))
 
 
 def _append_novatrigger_log(trigger: str, policy_ok: bool, enq_ok: bool, reason: str) -> None:
-    """Best-effort append into NovaTrigger_Log (TS, Trigger, Notes)."""
+    """
+    Best-effort append into NovaTrigger_Log:
+
+      A: timestamp (UTC)
+      B: raw trigger string
+      C: notes (policy_ok / enq_ok / reason)
+    """
     try:
         ws_log = get_ws(LOG_TAB)
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         notes = f"policy_ok={policy_ok}; enq_ok={enq_ok}; reason={reason}"
-        rows = [[ts, trigger, notes]]
-        sheets_append_rows(ws_log, rows)
+
+        # gspread's append_row signature: append_row(list_of_values, value_input_option='RAW', insert_data_option=None, table_range=None)
+        ws_log.append_row([ts, trigger, notes], value_input_option="USER_ENTERED")
     except Exception as e:
         print(f"⚠ NovaTrigger log append failed: {e!r}")
 
