@@ -21,25 +21,24 @@ def _open():
     creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
     return gspread.authorize(creds).open_by_url(SHEET)
 
-NOVA_TRIGGER_LOG_WS = os.getenv("NOVA_TRIGGER_LOG_WS", "NovaTrigger_Log")
+from datetime import datetime, timezone
 
-def _append_novatrigger_log(raw: str, result: dict) -> None:
-    ws = get_ws_cached(NOVA_TRIGGER_LOG_WS)  # or sheets_open_tab(...)
-    now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    notes = (
-        f"status={result.get('status', 'APPROVED')}; "
-        f"ok={result['decision'].get('ok')}; "
-        f"mode={result.get('mode', 'live')}; "
-        f"enq_ok={result['enqueue'].get('ok')}; "
-        f"reason={result['enqueue'].get('reason','ok')}"
-    )
+NOVA_TRIGGER_LOG_TAB = "NovaTrigger_Log"
+SHEET_URL = os.environ["SHEET_URL"]
 
-    row = [
-        now.isoformat(timespec="seconds"),
-        raw,
-        notes,
-    ]
-    sheets_append_rows(ws, [row])
+def _append_novatrigger_log(trigger: str, notes: str) -> None:
+    """
+    Best-effort append to NovaTrigger_Log.
+    Does NOT raise – failures are only printed so we don't break the watcher.
+    """
+    try:
+        ws = get_ws_cached(NOVA_TRIGGER_LOG_TAB, SHEET_URL)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rows = [[ts, trigger, notes]]
+        sheets_append_rows(ws, rows)
+    except Exception as e:
+        # Don’t crash the watcher if logging fails
+        print(f"⚠ NovaTrigger log append failed: {e!r}")
 
 def check_nova_trigger() -> None:
     print("▶ Nova trigger check …")
@@ -55,65 +54,28 @@ def check_nova_trigger() -> None:
         return
 
     # --- MANUAL_REBUY flow -------------------------------------------------
-    if raw.upper().startswith("MANUAL_REBUY"):
-        out = route_manual(raw)
-    
-        # NEW: log to NovaTrigger_Log
-        try:
-            _append_novatrigger_log(raw, out)  # or whatever helper name we defined
-        except Exception as e:
-            print(f"⚠ NovaTrigger log append failed: {e}")
-    
-        print(
-            f"✅ Manual routed: policy_ok={out['decision'].get('ok')} "
-            f"enq={out['enqueue'].get('ok')}"
-        )
-    
-        # Clear after handling
-        ws.update_acell("A1", "")
-        return
+    if raw.upper().startsWith("MANUAL_REBUY"):
+    out = route_manual(raw)
 
-        decision = out.get("decision") or {}
-        enqueue = out.get("enqueue") or {}
+    decision = out.get("decision", {}) or {}
+    enqueue  = out.get("enqueue", {}) or {}
 
-        policy_ok = bool(decision.get("ok"))
-        enq_ok = bool(enqueue.get("ok"))
+    policy_ok = bool(decision.get("ok"))
+    enq_ok    = bool(enqueue.get("ok"))
+    enq_reason = enqueue.get("reason", "ok")
+    mode      = decision.get("mode", "live")
 
-        status = "APPROVED" if policy_ok else "DENIED"
-        reason = (
-            enqueue.get("reason")
-            or enqueue.get("error")
-            or decision.get("reason")
-            or "ok"
-        )
+    notes = (
+        f"status=APPROVED; ok={policy_ok}; "
+        f"mode={mode}; enq_ok={enq_ok}; enq_reason={enq_reason}"
+    )
+    _append_novatrigger_log(raw, notes)
 
-        print(
-            f"✅ Manual routed: policy_ok={policy_ok} "
-            f"enq_ok={enq_ok} status={status} reason={reason}"
-        )
+    print(f"✅ Manual routed: policy_ok={policy_ok} enq={enq_ok}")
 
-        # Always log to NovaTrigger_Log
-        try:
-            _append_novatrigger_log(
-                trigger=raw,
-                status=status,
-                policy_ok=policy_ok,
-                enq_ok=enq_ok,
-                reason=reason,
-            )
-        except Exception as e:
-            # Log but don't break the watcher
-            print(f"⚠ Failed to write NovaTrigger_Log row: {e!r}")
-
-        # Only clear A1 if everything actually went through
-        if policy_ok and enq_ok:
-            ws.update_acell("A1", "")
-            print("🧹 Cleared manual trigger after successful enqueue.")
-        else:
-            # Keep the trigger value so you can adjust / re-fire if needed
-            print("⏸ Keeping manual trigger in A1 (policy or enqueue failed).")
-
-        return
+    # clear trigger cell after handling manual command
+    ws.update_acell("A1", "")
+    return
 
     # --- Non-manual triggers (SOS/FYI/etc.) --------------------------------
     # For everything that is NOT MANUAL_REBUY, keep the old behaviour:
