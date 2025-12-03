@@ -1,103 +1,62 @@
-"""
-Nova Trigger Watcher
-
-Polls the NovaTrigger tab for commands and routes them through nova_trigger.route_manual.
-Also appends an audit row into NovaTrigger_Log.
-"""
-
-from __future__ import annotations
-
+# nova_trigger_watcher.py — reads NovaTrigger!A1 and routes manual commands
 import os
 import random
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
 
 from nova_trigger import route_manual
-from utils import SHEET_URL, get_ws, get_ws_cached, sheets_append_rows, with_backoff
+from utils import get_ws, sheets_append_rows
 
 TAB = os.getenv("NOVA_TRIGGER_TAB", "NovaTrigger")
 LOG_TAB = os.getenv("NOVA_TRIGGER_LOG_TAB", "NovaTrigger_Log")
-
-# Small random jitter so multiple jobs don't hammer Sheets in lock-step
-JIT_MIN_S = float(os.getenv("NOVA_TRIGGER_JITTER_MIN_S", "3"))
-JIT_MAX_S = float(os.getenv("NOVA_TRIGGER_JITTER_MAX_S", "8"))
+JIT_MIN = float(os.getenv("NOVA_TRIGGER_JITTER_MIN_S", "0.3"))
+JIT_MAX = float(os.getenv("NOVA_TRIGGER_JITTER_MAX_S", "1.2"))
 
 
-def _append_novatrigger_log(
-    *,
-    trigger: str,
-    status: str,
-    policy_ok: bool,
-    enq_ok: bool,
-    reason: str,
-) -> None:
-    """
-    Append an audit row into NovaTrigger_Log.
-
-    Columns (A-C):
-      A: Timestamp (UTC ISO)
-      B: Trigger string (raw A1 contents)
-      C: Notes (status / policy_ok / enq_ok / reason)
-    """
-    ws = get_ws_cached(LOG_TAB)
-
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    notes = (
-        f"status={status}; "
-        f"policy_ok={policy_ok}; "
-        f"enq_ok={enq_ok}; "
-        f"reason={reason}"
-    )
-
-    rows = [[ts, trigger, notes]]
-    sheets_append_rows(ws, rows)
+def _append_novatrigger_log(trigger: str, policy_ok: bool, enq_ok: bool, reason: str) -> None:
+    """Best-effort append into NovaTrigger_Log (TS, Trigger, Notes)."""
+    try:
+        ws_log = get_ws(LOG_TAB)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        notes = f"policy_ok={policy_ok}; enq_ok={enq_ok}; reason={reason}"
+        rows = [[ts, trigger, notes]]
+        sheets_append_rows(ws_log, rows)
+    except Exception as e:
+        print(f"⚠ NovaTrigger log append failed: {e!r}")
 
 
-@with_backoff
 def check_nova_trigger() -> None:
     print("▶ Nova trigger check …")
 
-    # Jitter per run
-    time.sleep(random.uniform(JIT_MIN_S, JIT_MAX_S))
+    # jitter so multiple jobs don't slam Sheets at once
+    try:
+        delay = random.uniform(JIT_MIN, JIT_MAX)
+        time.sleep(delay)
+    except Exception:
+        pass
 
     ws = get_ws(TAB)
-
     raw = (ws.acell("A1").value or "").strip()
     if not raw:
-        print(f"🟦 {TAB} empty; no trigger.")
+        print(f"ℹ️ {TAB} empty; no trigger.")
         return
 
-    # Manual rebuy path
+    # Manual rebuy commands
     if raw.upper().startswith("MANUAL_REBUY"):
-        out: Dict[str, Any] = route_manual(raw)
-
+        out = route_manual(raw)
         decision = out.get("decision") or {}
-        policy_ok = bool(decision.get("ok"))
-        status = decision.get("status", "UNKNOWN")
-
         enqueue = out.get("enqueue") or {}
+
+        policy_ok = bool(decision.get("ok"))
         enq_ok = bool(enqueue.get("ok"))
         reason = enqueue.get("reason") or decision.get("reason") or "n/a"
 
-        print(
-            f"✅ Manual routed: policy_ok={policy_ok} "
-            f"enq_ok={enq_ok} status={status} reason={reason}"
-        )
+        print(f"✅ Manual routed: policy_ok={policy_ok} enq_ok={enq_ok} reason={reason}")
 
-        # Always log to NovaTrigger_Log – even if policy or enqueue failed
-        try:
-            _append_novatrigger_log(
-                trigger=raw,
-                status=status,
-                policy_ok=policy_ok,
-                enq_ok=enq_ok,
-                reason=reason,
-            )
-        except Exception as e:  # pragma: no cover – best-effort
-            print(f"⚠ NovaTrigger log append failed: {e!r}")
+        # Always try to log, even if policy/enqueue failed
+        _append_novatrigger_log(raw, policy_ok, enq_ok, reason)
 
-        # Only clear A1 when the intent *actually* made it into the queue
+        # Clear trigger only if it actually enqueued
         if policy_ok and enq_ok:
             ws.update_acell("A1", "")
             print("🧹 Cleared manual trigger after successful enqueue.")
@@ -106,9 +65,9 @@ def check_nova_trigger() -> None:
 
         return
 
-    # Non-manual triggers (SOS / FYI / etc) keep the old behaviour:
+    # Non-manual triggers (SOS/FYI/etc.): just clear after a ping
     ws.update_acell("A1", "")
-    print(f"🧹 Cleared non-manual trigger: {raw}")
+    print(f"ℹ️ Cleared non-manual trigger: {raw}")
 
 
 if __name__ == "__main__":
