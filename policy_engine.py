@@ -471,6 +471,77 @@ def evaluate(intent: Dict[str, Any]) -> Dict[str, Any]:
     """
     return evaluate_intent(intent, context=None)
 
+from typing import Any, Dict, Optional
+
+def evaluate_manual_rebuy(intent: Dict[str, Any], asset_state: Optional[dict] = None) -> Dict[str, Any]:
+    """
+    Backwards-compat helper for older manual-rebuy flows.
+
+    - Takes a 'manual' intent like:
+        {
+          "token": "BTC",
+          "quote": "USDT",
+          "venue": "BINANCEUS",
+          "amount_usd": 11.0,
+          "price_usd": 43250.0,
+          ...
+        }
+
+    - Wraps it into a generic trade intent and passes through the main policy
+      engine (evaluate_intent).
+
+    asset_state is accepted for compatibility but is optional; we treat it as an
+    optional context.
+    """
+    # Import local helpers
+    # (we're in the same module, so _float / evaluate_intent are already defined above)
+    token = (intent.get("token") or intent.get("base") or "").upper()
+    quote = (intent.get("quote") or "USDT").upper()
+    venue = (intent.get("venue") or intent.get("exchange") or "").upper()
+
+    # Action: manual rebuy is always a BUY
+    side = (intent.get("action") or "buy").lower()
+
+    price = _float(intent.get("price_usd"))
+    amt_usd = _float(intent.get("amount_usd"))
+
+    if price and amt_usd:
+        amount = amt_usd / price
+    else:
+        amount = _float(intent.get("amount"), 0.0)
+
+    # Build a generic trade intent for the new engine
+    symbol = f"{token}/{quote}" if token else intent.get("symbol") or ""
+
+    trade_intent: Dict[str, Any] = {
+        "venue": venue,
+        "symbol": symbol,
+        "side": side,
+        "amount": amount,
+        "price_usd": price,
+    }
+    if amt_usd:
+        trade_intent["notional_usd"] = amt_usd
+
+    # Allow asset_state to be treated as context if provided
+    context = asset_state if isinstance(asset_state, dict) else None
+
+    decision = evaluate_intent(trade_intent, context=context)
+
+    # Make sure patched_intent has the fields manual flows expect
+    patched = decision.get("patched_intent") or {}
+    if "patched_intent" not in decision:
+        decision["patched_intent"] = patched
+
+    patched.setdefault("venue", venue)
+    patched.setdefault("symbol", symbol)
+    patched.setdefault("amount", amount)
+    if amt_usd:
+        patched.setdefault("amount_usd", amt_usd)
+    patched.setdefault("quote", quote)
+
+    return decision
+
 # ---------- Backward-compat wrapper for older imports ----------
 class PolicyEngine:
     """
