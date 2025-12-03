@@ -1,83 +1,115 @@
-# nova_trigger_watcher.py — reads NovaTrigger!A1 and routes manual commands
-import os, time, random, gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from nova_trigger import route_manual
-from datetime import datetime
-from sheets_gateway import get_ws_cached, sheets_append_rows
-from utils import SHEET_URL, get_ws, get_ws_cached, sheets_append_rows
+"""
+Nova Trigger Watcher
 
-TAB    = os.getenv("NOVA_TRIGGER_TAB","NovaTrigger")
-SHEET  = os.getenv("SHEET_URL")
-NOVA_TRIGGER_JITTER_MIN_S = float(os.getenv("NOVA_TRIGGER_JITTER_MIN_S", "3"))
-NOVA_TRIGGER_JITTER_MAX_S = float(os.getenv("NOVA_TRIGGER_JITTER_MAX_S", "9"))
+Polls the NovaTrigger tab for commands and routes them through nova_trigger.route_manual.
+Also appends an audit row into NovaTrigger_Log.
+"""
 
-if NOVA_TRIGGER_JITTER_MAX_S < NOVA_TRIGGER_JITTER_MIN_S:
-    NOVA_TRIGGER_JITTER_MIN_S, NOVA_TRIGGER_JITTER_MAX_S = (
-        NOVA_TRIGGER_JITTER_MAX_S,
-        NOVA_TRIGGER_JITTER_MIN_S,
-    )
-def _open():
-    scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sentiment-log-service.json", scope)
-    return gspread.authorize(creds).open_by_url(SHEET)
+from __future__ import annotations
 
+import os
+import random
+import time
 from datetime import datetime, timezone
+from typing import Any, Dict
 
-NOVA_TRIGGER_LOG_TAB = "NovaTrigger_Log"
-SHEET_URL = os.environ["SHEET_URL"]
+from nova_trigger import route_manual
+from utils import SHEET_URL, get_ws, get_ws_cached, sheets_append_rows, with_backoff
 
-def _append_novatrigger_log(trigger: str, notes: str) -> None:
+TAB = os.getenv("NOVA_TRIGGER_TAB", "NovaTrigger")
+LOG_TAB = os.getenv("NOVA_TRIGGER_LOG_TAB", "NovaTrigger_Log")
+
+# Small random jitter so multiple jobs don't hammer Sheets in lock-step
+JIT_MIN_S = float(os.getenv("NOVA_TRIGGER_JITTER_MIN_S", "3"))
+JIT_MAX_S = float(os.getenv("NOVA_TRIGGER_JITTER_MAX_S", "8"))
+
+
+def _append_novatrigger_log(
+    *,
+    trigger: str,
+    status: str,
+    policy_ok: bool,
+    enq_ok: bool,
+    reason: str,
+) -> None:
     """
-    Best-effort append to NovaTrigger_Log.
-    Does NOT raise – failures are only printed so we don't break the watcher.
-    """
-    try:
-        ws = get_ws_cached(NOVA_TRIGGER_LOG_TAB, SHEET_URL)
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        rows = [[ts, trigger, notes]]
-        sheets_append_rows(ws, rows)
-    except Exception as e:
-        # Don’t crash the watcher if logging fails
-        print(f"⚠ NovaTrigger log append failed: {e!r}")
+    Append an audit row into NovaTrigger_Log.
 
+    Columns (A-C):
+      A: Timestamp (UTC ISO)
+      B: Trigger string (raw A1 contents)
+      C: Notes (status / policy_ok / enq_ok / reason)
+    """
+    ws = get_ws_cached(LOG_TAB)
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    notes = (
+        f"status={status}; "
+        f"policy_ok={policy_ok}; "
+        f"enq_ok={enq_ok}; "
+        f"reason={reason}"
+    )
+
+    rows = [[ts, trigger, notes]]
+    sheets_append_rows(ws, rows)
+
+
+@with_backoff
 def check_nova_trigger() -> None:
     print("▶ Nova trigger check …")
-    # keep your existing jitter constants
-    time.sleep(random.uniform(NOVA_TRIGGER_JITTER_MIN_S, NOVA_TRIGGER_JITTER_MAX_S))
 
-    sh = _open()
-    ws = sh.worksheet(TAB)
+    # Jitter per run
+    time.sleep(random.uniform(JIT_MIN_S, JIT_MAX_S))
+
+    ws = get_ws(TAB)
 
     raw = (ws.acell("A1").value or "").strip()
     if not raw:
-        print(f"🔹 {TAB} empty; no trigger.")
+        print(f"🟦 {TAB} empty; no trigger.")
         return
 
-    # --- MANUAL_REBUY flow -------------------------------------------------
-    if raw.upper().startsWith("MANUAL_REBUY"):
-    out = route_manual(raw)
+    # Manual rebuy path
+    if raw.upper().startswith("MANUAL_REBUY"):
+        out: Dict[str, Any] = route_manual(raw)
 
-    decision = out.get("decision", {}) or {}
-    enqueue  = out.get("enqueue", {}) or {}
+        decision = out.get("decision") or {}
+        policy_ok = bool(decision.get("ok"))
+        status = decision.get("status", "UNKNOWN")
 
-    policy_ok = bool(decision.get("ok"))
-    enq_ok    = bool(enqueue.get("ok"))
-    enq_reason = enqueue.get("reason", "ok")
-    mode      = decision.get("mode", "live")
+        enqueue = out.get("enqueue") or {}
+        enq_ok = bool(enqueue.get("ok"))
+        reason = enqueue.get("reason") or decision.get("reason") or "n/a"
 
-    notes = (
-        f"status=APPROVED; ok={policy_ok}; "
-        f"mode={mode}; enq_ok={enq_ok}; enq_reason={enq_reason}"
-    )
-    _append_novatrigger_log(raw, notes)
+        print(
+            f"✅ Manual routed: policy_ok={policy_ok} "
+            f"enq_ok={enq_ok} status={status} reason={reason}"
+        )
 
-    print(f"✅ Manual routed: policy_ok={policy_ok} enq={enq_ok}")
+        # Always log to NovaTrigger_Log – even if policy or enqueue failed
+        try:
+            _append_novatrigger_log(
+                trigger=raw,
+                status=status,
+                policy_ok=policy_ok,
+                enq_ok=enq_ok,
+                reason=reason,
+            )
+        except Exception as e:  # pragma: no cover – best-effort
+            print(f"⚠ NovaTrigger log append failed: {e!r}")
 
-    # clear trigger cell after handling manual command
-    ws.update_acell("A1", "")
-    return
+        # Only clear A1 when the intent *actually* made it into the queue
+        if policy_ok and enq_ok:
+            ws.update_acell("A1", "")
+            print("🧹 Cleared manual trigger after successful enqueue.")
+        else:
+            print("⏸ Keeping manual trigger in A1 (policy or enqueue failed).")
 
-    # --- Non-manual triggers (SOS/FYI/etc.) --------------------------------
-    # For everything that is NOT MANUAL_REBUY, keep the old behaviour:
+        return
+
+    # Non-manual triggers (SOS / FYI / etc) keep the old behaviour:
     ws.update_acell("A1", "")
     print(f"🧹 Cleared non-manual trigger: {raw}")
+
+
+if __name__ == "__main__":
+    check_nova_trigger()
