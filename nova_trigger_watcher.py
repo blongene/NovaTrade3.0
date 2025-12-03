@@ -4,7 +4,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from nova_trigger import route_manual
 from datetime import datetime
 
-from utils import sheets_append_rows  # you already use this elsewhere (e.g., telemetry_mirror)
+from utils import SHEET_URL, get_ws, get_ws_cached, sheets_append_rows
 
 TAB    = os.getenv("NOVA_TRIGGER_TAB","NovaTrigger")
 SHEET  = os.getenv("SHEET_URL")
