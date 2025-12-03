@@ -3,7 +3,7 @@ import os, time, random, gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from nova_trigger import route_manual
 from datetime import datetime
-
+from sheets_gateway import get_ws_cached, sheets_append_rows
 from utils import SHEET_URL, get_ws, get_ws_cached, sheets_append_rows
 
 TAB    = os.getenv("NOVA_TRIGGER_TAB","NovaTrigger")
