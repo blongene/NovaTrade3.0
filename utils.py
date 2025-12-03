@@ -84,6 +84,37 @@ def get_env_str(name: str, default: Optional[str] = None) -> Optional[str]:
         return default
     return str(val)
 
+def get_sheet_client():
+    """
+    Return a gspread client using the service account JSON from env.
+
+    Looks for SVC_JSON (preferred) or GOOGLE_SERVICE_JSON containing the
+    raw JSON keyfile contents.
+    """
+    svc_json = (
+        os.getenv("SVC_JSON")
+        or os.getenv("GOOGLE_SERVICE_JSON")
+        or os.getenv("GOOGLE_SVC_JSON")
+    )
+    if not svc_json:
+        raise RuntimeError("No service account JSON found in SVC_JSON/GOOGLE_SERVICE_JSON")
+
+    # Accept either raw JSON or a path-like string
+    svc_json = svc_json.strip()
+    if svc_json.startswith("{"):
+        info = json.loads(svc_json)
+    else:
+        # Treat as a file path
+        with open(svc_json, "r", encoding="utf-8") as f:
+            info = json.load(f)
+
+    scopes = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
+    return gspread.authorize(creds)
+    
 # ========= Requests Session (Telegram reliability) =========
 def _requests_session():
     s = requests.Session()
