@@ -45,6 +45,17 @@ def _ts(): return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 def info(msg):  print(f"[{_ts()}] INFO  {msg}")
 def warn(msg):  print(f"[{_ts()}] WARN  {msg}")
 def error(msg): print(f"[{_ts()}] ERROR {msg}")
+def get_env_bool(name: str, default: bool = False) -> bool:
+    """
+    Read an environment variable as a boolean.
+
+    Truthy values: "1", "true", "yes", "y", "on" (case-insensitive)
+    Falsy values:  "0", "false", "no", "n", "off" or missing
+    """
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
 # ========= Requests Session (Telegram reliability) =========
 def _requests_session():
