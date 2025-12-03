@@ -161,6 +161,58 @@ def retry_on_exception(
                     delay *= backoff_factor
         return wrapper
     return decorator
+
+def with_backoff(
+    func: Callable = None,
+    *,
+    retries: int = 3,
+    delay_seconds: float = 1.0,
+    backoff_factor: float = 2.0,
+    allowed_exceptions: Tuple[Type[BaseException], ...] = (Exception,),
+    label: str = "",
+):
+    """
+    Decorator to run a function with simple exponential backoff.
+
+    Can be used with or without args:
+
+        @with_backoff
+        def foo(...):
+
+        @with_backoff(retries=5, delay_seconds=2)
+        def bar(...):
+
+    If all retries fail, the last exception is re-raised.
+    """
+
+    def _decorate(f: Callable) -> Callable:
+        @wraps(f)
+        def _wrapped(*args, **kwargs):
+            attempt = 0
+            delay = delay_seconds
+            while True:
+                try:
+                    return f(*args, **kwargs)
+                except allowed_exceptions as e:
+                    if attempt >= retries:
+                        # out of retries; bubble up
+                        raise
+                    attempt += 1
+                    name = label or f.__name__
+                    print(
+                        f"Sheets backoff ({name}): {e!r}; "
+                        f"attempt {attempt}/{retries}, retrying in {delay}s"
+                    )
+                    time.sleep(delay)
+                    delay *= backoff_factor
+
+        return _wrapped
+
+    # Support bare @with_backoff usage (no parentheses)
+    if func is not None and callable(func):
+        return _decorate(func)
+
+    return _decorate
     
 # ========= Requests Session (Telegram reliability) =========
 def _requests_session():
