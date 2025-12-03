@@ -5,6 +5,7 @@
 
 import os, json, time, re
 from typing import Any, Dict, Optional, Tuple, List
+from sheets_gateway import get_ws_cached, sheets_append_rows
 
 # 1. Safe Import Block
 try:
