@@ -9,8 +9,11 @@ from typing import Any, Dict, Optional, Tuple, List
 # 1. Safe Import Block
 try:
     from utils import (
+        SHEET_URL,
         get_ws, 
-        get_sheet, 
+        get_ws_cached,
+        get_sheet,
+        sheets_append_rows,
         warn, 
         info, 
         send_telegram_message_dedup, 
