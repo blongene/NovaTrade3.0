@@ -473,72 +473,67 @@ def evaluate(intent: Dict[str, Any]) -> Dict[str, Any]:
 
 from typing import Any, Dict, Optional
 
-def evaluate_manual_rebuy(intent: Dict[str, Any], asset_state: Optional[dict] = None) -> Dict[str, Any]:
+
+def evaluate_manual_rebuy(
+    *,
+    token: str,
+    venue: str,
+    quote_size: float,
+    base_size: float,
+    price: float,
+    quote: Optional[str] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
     """
-    Backwards-compat helper for older manual-rebuy flows.
+    Backwards-compat helper for manual rebuy flows.
 
-    - Takes a 'manual' intent like:
-        {
-          "token": "BTC",
-          "quote": "USDT",
-          "venue": "BINANCEUS",
-          "amount_usd": 11.0,
-          "price_usd": 43250.0,
-          ...
-        }
+    NovaTrigger / route_manual currently calls this as:
 
-    - Wraps it into a generic trade intent and passes through the main policy
-      engine (evaluate_intent).
+        evaluate_manual_rebuy(
+            token=intent.token,
+            venue=intent.venue,
+            quote_size=size_quote,
+            base_size=size_base,
+            price=price,
+        )
 
-    asset_state is accepted for compatibility but is optional; we treat it as an
-    optional context.
+    We translate that into a generic trade intent and pass it to evaluate_intent().
     """
-    # Import local helpers
-    # (we're in the same module, so _float / evaluate_intent are already defined above)
-    token = (intent.get("token") or intent.get("base") or "").upper()
-    quote = (intent.get("quote") or "USDT").upper()
-    venue = (intent.get("venue") or intent.get("exchange") or "").upper()
+    token_u = (token or "").upper()
+    venue_u = (venue or "").upper()
+    quote_u = (quote or "USDT").upper()
 
-    # Action: manual rebuy is always a BUY
-    side = (intent.get("action") or "buy").lower()
+    # Manual rebuy is always a BUY
+    side = "buy"
 
-    price = _float(intent.get("price_usd"))
-    amt_usd = _float(intent.get("amount_usd"))
+    # Engine expects symbols like "BTC/USDT"
+    symbol = f"{token_u}/{quote_u}"
 
-    if price and amt_usd:
-        amount = amt_usd / price
-    else:
-        amount = _float(intent.get("amount"), 0.0)
-
-    # Build a generic trade intent for the new engine
-    symbol = f"{token}/{quote}" if token else intent.get("symbol") or ""
-
-    trade_intent: Dict[str, Any] = {
-        "venue": venue,
+    # Build an intent for the main policy engine
+    intent: Dict[str, Any] = {
+        "venue": venue_u,
         "symbol": symbol,
         "side": side,
-        "amount": amount,
-        "price_usd": price,
+        "amount": float(base_size or 0.0),
+        "notional_usd": float(quote_size or 0.0),
+        "price_usd": float(price or 0.0),
+        "kind": "manual_rebuy",
     }
-    if amt_usd:
-        trade_intent["notional_usd"] = amt_usd
+    # Carry through any extra fields if present
+    intent.update({k: v for k, v in kwargs.items() if k not in intent})
 
-    # Allow asset_state to be treated as context if provided
-    context = asset_state if isinstance(asset_state, dict) else None
+    decision = evaluate_intent(intent, context=None)
 
-    decision = evaluate_intent(trade_intent, context=context)
-
-    # Make sure patched_intent has the fields manual flows expect
+    # Ensure patched_intent exists and has the fields manual flows expect
     patched = decision.get("patched_intent") or {}
-    if "patched_intent" not in decision:
-        decision["patched_intent"] = patched
+    decision["patched_intent"] = patched
 
-    patched.setdefault("venue", venue)
+    patched.setdefault("venue", venue_u)
     patched.setdefault("symbol", symbol)
-    patched.setdefault("amount", amount)
-    if amt_usd:
-        patched.setdefault("amount_usd", amt_usd)
-    patched.setdefault("quote", quote)
+    patched.setdefault("amount", float(base_size or 0.0))
+    patched.setdefault("notional_usd", float(quote_size or 0.0))
+    patched.setdefault("token", token_u)
+    patched.setdefault("quote", quote_u)
 
     return decision
 
