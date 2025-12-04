@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime
 from typing import Dict, List, Tuple, Any
 
-from utils import get_ws, warn, info
+from utils import get_ws, warn, info,clear_and_append_rows
 from utils import get_ws_cached, with_sheet_backoff
 
+UNIFIED_SNAPSHOT_SRC_WS = os.getenv("UNIFIED_SNAPSHOT_SRC_WS", "Wallet_Monitor")
 UNIFIED_SNAPSHOT_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
 WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
 
