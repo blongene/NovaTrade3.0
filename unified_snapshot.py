@@ -165,7 +165,17 @@ def run_unified_snapshot() -> None:
         except Exception:
             for r in out_rows:
                 ws.append_row(r, value_input_option="USER_ENTERED")
+    
+    if len(latest) < 3:
+        warn(f"unified_snapshot: too few venue/asset keys ({len(latest)}); aborting snapshot for safety.")
+        return
 
+    for v in VENUES:
+        for a in STABLES:
+            if (v, a) not in latest:
+                warn(f"unified_snapshot: missing ({v}, {a}) pair; aborting.")
+                return
+ 
     except Exception as e:
         warn(f"unified_snapshot: write failed: {e}")
         return
