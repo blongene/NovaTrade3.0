@@ -27,7 +27,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
 
-from utils import get_ws, warn, info,clear_and_append_rows
+from utils import get_ws, warn, info
 from utils import get_ws_cached, with_sheet_backoff
 
 UNIFIED_SNAPSHOT_SRC_WS = os.getenv("UNIFIED_SNAPSHOT_SRC_WS", "Wallet_Monitor")
@@ -177,6 +177,52 @@ def build_snapshot(rows: List[Dict[str, str]]) -> List[List[Any]]:
 
     return out
 
+@with_sheet_backoff
+def _open_ws(name: str):
+    """Open a worksheet with cache + backoff."""
+    return get_ws_cached(name)
+
+
+@with_sheet_backoff
+def _replace_unified_rows(ws, rows: List[List[Any]]):
+    """
+    Replace all data rows in Unified_Snapshot while keeping the header.
+
+    - Keeps row 1 (header) if present.
+    - Shrinks the sheet to 1 row, then appends new data.
+    """
+    # Try to keep existing header; if missing, create a default one.
+    try:
+        header = ws.row_values(1)
+    except Exception:
+        header = []
+
+    if not header:
+        header = [
+            "Timestamp",
+            "Venue",
+            "Asset",
+            "Free",
+            "Locked",
+            "Total",
+            "IsQuote",
+            "QuoteSymbol",
+            "Equity_USD",
+        ]
+
+    # Keep just the header row
+    try:
+        ws.resize(rows=1)
+    except Exception:
+        # If resize fails, we still attempt to overwrite from row 2 down
+        pass
+
+    # Ensure header row is written
+    ws.update("A1", [header])
+
+    # Append new data rows
+    if rows:
+        ws.append_rows(rows, value_input_option="RAW")
 
 def run_unified_snapshot() -> None:
     """Standalone executable for cron/scheduler."""
@@ -191,11 +237,10 @@ def run_unified_snapshot() -> None:
         return
 
     # Write output
-    out_ws = get_ws_cached(UNIFIED_SNAPSHOT_WS)
-    clear_and_append_rows(out_ws, out)
-
+    out_ws = _open_unified_ws()
+    _replace_unified_rows(out_ws, out)
+    
     info(f"unified_snapshot: wrote {len(out)} rows to Unified_Snapshot")
-
 
 if __name__ == "__main__":
     run_unified_snapshot()
