@@ -160,10 +160,12 @@ def run_unified_snapshot() -> None:
         try:
             from utils import sheets_append_rows
 
-            sheets_append_rows(ws, out_rows)
+            # FIX: pass rows as a keyword so the helper sees it
+            sheets_append_rows(ws, rows=out_rows)
         except Exception:
             for r in out_rows:
                 ws.append_row(r, value_input_option="USER_ENTERED")
+
     except Exception as e:
         warn(f"unified_snapshot: write failed: {e}")
         return
