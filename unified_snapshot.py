@@ -103,6 +103,10 @@ def _load_wallet_rows(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
     try:
         ws = sh.worksheet(WALLET_MONITOR_WS)
         data = ws.get_all_records()
+        print(f"unified_snapshot: Wallet_Monitor rows from Sheets: {len(data)}")
+        if data:
+            # Print first row for debugging
+            print("unified_snapshot: sample Wallet_Monitor row:", data[0])
     except Exception as e:
         warn(f"unified_snapshot: unable to read Wallet_Monitor: {e}")
         return rows
@@ -153,7 +157,8 @@ def run_unified_snapshot() -> None:
 
     wallet_rows = _load_wallet_rows(sh)
     if not wallet_rows:
-        print("ℹ️ unified_snapshot: no Wallet_Monitor rows found; Unified_Snapshot will be empty (ok).")
+        print("ℹ️ unified_snapshot: no Wallet_Monitor rows found; Unified_Snapshot will NOT be updated.")
+        return
 
     # Collapse Wallet_Monitor into latest row per (venue, asset)
     latest_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
