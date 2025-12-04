@@ -58,6 +58,23 @@ WALLET_MONITOR_MAX_ROWS = int(os.getenv("WALLET_MONITOR_MAX_ROWS", "500"))
 TELEMETRY_MIRROR_MIN_BALANCE = float(
     os.getenv("TELEMETRY_MIRROR_MIN_BALANCE", "0.0000001")
 )
+# Telemetry sanity defaults (tunable via env)
+TELEMETRY_MAX_AGE_SEC = float(
+    os.getenv("TELEMETRY_MAX_AGE_SEC", "900")  # 15 minutes
+)
+
+TELEMETRY_REQUIRED_VENUES = {
+    v.strip().upper()
+    for v in os.getenv(
+        "TELEMETRY_REQUIRED_VENUES",
+        "COINBASE,BINANCEUS,KRAKEN",
+    ).split(",")
+    if v.strip()
+}
+
+TELEMETRY_MIN_TOTAL_STABLE = float(
+    os.getenv("TELEMETRY_MIN_TOTAL_STABLE", "0.0")  # no minimum by default
+)
 
 # Simple stables list so we can tag Quote column
 STABLES = {"USD", "USDT", "USDC"}
@@ -310,6 +327,85 @@ def _write_wallet_monitor_row(data: Dict[str, Any]) -> None:
     _append_wallet_monitor_rows(ws, out_rows)
     info(f"telemetry_mirror: appended {len(out_rows)} Wallet_Monitor rows.")
 
+def _telemetry_ok_for_sheet(data: Dict[str, Any]) -> bool:
+    """
+    Decide whether this telemetry snapshot is safe to mirror into Wallet_Monitor.
+
+    We ALWAYS try to record into the DB backbone, but we only write into Sheets
+    when:
+      - data is a dict with a non-empty by_venue mapping
+      - snapshot age <= TELEMETRY_MAX_AGE_SEC
+      - all TELEMETRY_REQUIRED_VENUES are present
+      - no negative balances detected
+      - total stables >= TELEMETRY_MIN_TOTAL_STABLE (if configured)
+    """
+    if not isinstance(data, dict):
+        warn("telemetry_mirror: telemetry data is not a dict; skipping Wallet_Monitor write.")
+        return False
+
+    by_venue = data.get("by_venue") or {}
+    if not isinstance(by_venue, dict) or not by_venue:
+        warn("telemetry_mirror: telemetry missing by_venue; skipping Wallet_Monitor write.")
+        return False
+
+    # --- Age check ---
+    ts = data.get("ts") or time.time()
+    try:
+        ts_f = float(ts)
+    except Exception:
+        ts_f = time.time()
+
+    # Accept seconds or ms
+    if ts_f > 10_000_000_000:
+        ts_f /= 1000.0
+
+    age = time.time() - ts_f
+    if age > TELEMETRY_MAX_AGE_SEC:
+        warn(
+            f"telemetry_mirror: snapshot too old for sheet "
+            f"({age:.0f}s > {TELEMETRY_MAX_AGE_SEC:.0f}s); skipping Wallet_Monitor write."
+        )
+        return False
+
+    # --- Venue completeness check ---
+    venues_present = {str(v).upper() for v in by_venue.keys()}
+    missing = sorted(TELEMETRY_REQUIRED_VENUES - venues_present)
+    if missing:
+        warn(
+            f"telemetry_mirror: missing required venues in snapshot: {missing}. "
+            "Will record telemetry in DB but skip Wallet_Monitor write."
+        )
+        return False
+
+    # --- Negative + stable-sum sanity ---
+    total_stables = 0.0
+    for v, balances in by_venue.items():
+        if not isinstance(balances, dict):
+            continue
+        for asset, qty in balances.items():
+            try:
+                qf = float(qty or 0.0)
+            except Exception:
+                continue
+            if qf < 0:
+                warn(
+                    f"telemetry_mirror: negative balance {qf} for {v}/{asset}; "
+                    "skipping Wallet_Monitor write."
+                )
+                return False
+            if asset.upper() in STABLES:
+                total_stables += qf
+
+    if total_stables < TELEMETRY_MIN_TOTAL_STABLE:
+        warn(
+            f"telemetry_mirror: total stable balance {total_stables:g} below "
+            f"TELEMETRY_MIN_TOTAL_STABLE={TELEMETRY_MIN_TOTAL_STABLE:g}; "
+            "skipping Wallet_Monitor write."
+        )
+        return False
+
+    return True
+
 def run_telemetry_mirror() -> None:
     """
     Public entrypoint: mirror latest telemetry snapshot into Wallet_Monitor
@@ -331,6 +427,10 @@ def run_telemetry_mirror() -> None:
     except Exception:
         # don't break the Sheet pipeline on DB issues
         pass
+
+    # Only write to Wallet_Monitor if the snapshot looks sane
+    if not _telemetry_ok_for_sheet(data):
+        return
 
     try:
         _write_wallet_monitor_row(data)
