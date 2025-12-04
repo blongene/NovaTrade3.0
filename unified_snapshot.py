@@ -102,86 +102,96 @@ def _latest_per_venue_asset(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str],
     return latest
 
 
-def run_unified_snapshot() -> None:
-    info("📸 unified_snapshot: building Unified_Snapshot from Wallet_Monitor…")
+def build_snapshot(rows: List[Dict[str, str]]) -> List[List[Any]]:
+    """
+    Convert Wallet_Monitor rows into the 9-row Unified_Snapshot format.
 
-    rows = _load_wallet_rows()
-    if not rows:
-        print("unified_snapshot: no Wallet_Monitor rows; aborting snapshot.")
-        return
+    Output rows:
+        Timestamp, Venue, Asset, Free, Locked, Total, IsQuote, QuoteSymbol, Equity_USD
+    """
+    # (venue, asset) → latest row
+    latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-    latest = _latest_per_venue_asset(rows)
-    if not latest:
-        print("unified_snapshot: no usable (venue, asset) pairs; aborting snapshot.")
-        return
+    for row in rows:
+        venue = (row.get("Venue") or "").upper()
+        asset = (row.get("Asset") or "").upper()
+        ts_raw = row.get("Timestamp") or ""
 
-    ts_now = int(time.time())
-    ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts_now))
+        if not venue or not asset:
+            continue
 
-    out_rows: List[List[Any]] = []
-
-    # 3×3 stable grid (venues × stables)
-    for venue in VENUES:
-        for asset in STABLES:
-            key = (venue, asset)
-            vals = latest.get(key, {"free": 0.0, "locked": 0.0})
-            free = vals["free"]
-            locked = vals["locked"]
-            total = free + locked
-            is_quote = True
-            quote_sym = asset
-            equity_usd = total  # treat stables as 1:1 USD
-
-            out_rows.append(
-                [
-                    ts_str,
-                    venue,
-                    asset,
-                    free,
-                    locked,
-                    total,
-                    is_quote,
-                    quote_sym,
-                    equity_usd,
-                ]
-            )
-
-    # (Optional) You can extend here to add alt-coins below the 3×3 grid later.
-
-    try:
-        ws = get_ws(UNIFIED_SNAPSHOT_WS)
-    except Exception as e:
-        warn(f"unified_snapshot: cannot open Unified_Snapshot: {e}")
-        return
-
-    try:
-        ws.clear()
-        ws.append_row(US_HEADER, value_input_option="USER_ENTERED")
+        # Use timestamp as tie-breaker
         try:
-            from utils import sheets_append_rows
-
-            # FIX: pass rows as a keyword so the helper sees it
-            sheets_append_rows(ws, rows=out_rows)
+            ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
         except Exception:
-            for r in out_rows:
-                ws.append_row(r, value_input_option="USER_ENTERED")
-    
-    if len(latest) < 3:
-        warn(f"unified_snapshot: too few venue/asset keys ({len(latest)}); aborting snapshot for safety.")
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", ""))
+            except Exception:
+                continue
+
+        key = (venue, asset)
+        prev = latest.get(key)
+        if prev:
+            try:
+                prev_ts = datetime.strptime(prev["Timestamp"], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                prev_ts = ts  # fallback but won't override
+            if prev_ts >= ts:
+                continue
+
+        latest[key] = {
+            "Timestamp": ts_raw,
+            "Venue": venue,
+            "Asset": asset,
+            "Free": row.get("Free") or 0,
+            "Locked": row.get("Locked") or 0,
+            "Quote": row.get("Class") == "QUOTE",
+        }
+
+    # Now format rows for Unified_Snapshot
+    out = []
+    for (venue, asset), rec in sorted(latest.items()):
+        free = float(rec["Free"] or 0)
+        locked = float(rec["Locked"] or 0)
+        total = free + locked
+        is_quote = rec["Quote"]
+        quote_symbol = asset if is_quote else ""
+        equity = total if is_quote else ""
+
+        out.append(
+            [
+                rec["Timestamp"],
+                venue,
+                asset,
+                free,
+                locked,
+                total,
+                is_quote,
+                quote_symbol,
+                equity,
+            ]
+        )
+
+    return out
+
+
+def run_unified_snapshot() -> None:
+    """Standalone executable for cron/scheduler."""
+    info("📊 unified_snapshot: building Unified_Snapshot from Wallet_Monitor…")
+
+    ws = get_ws_cached(UNIFIED_SNAPSHOT_SRC_WS)
+    rows = ws.get_all_records()
+
+    out = build_snapshot(rows)
+    if not out:
+        warn("unified_snapshot: no usable (venue, asset) pairs; aborting snapshot.")
         return
 
-    for v in VENUES:
-        for a in STABLES:
-            if (v, a) not in latest:
-                warn(f"unified_snapshot: missing ({v}, {a}) pair; aborting.")
-                return
- 
-    except Exception as e:
-        warn(f"unified_snapshot: write failed: {e}")
-        return
+    # Write output
+    out_ws = get_ws_cached(UNIFIED_SNAPSHOT_WS)
+    clear_and_append_rows(out_ws, out)
 
-    info(f"✅ unified_snapshot: wrote {len(out_rows)} rows to {UNIFIED_SNAPSHOT_WS}")
-    print(f"unified_snapshot: wrote {len(out_rows)} rows to {UNIFIED_SNAPSHOT_WS}")
+    info(f"unified_snapshot: wrote {len(out)} rows to Unified_Snapshot")
 
 
 if __name__ == "__main__":
