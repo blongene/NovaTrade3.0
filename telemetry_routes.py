@@ -1,12 +1,12 @@
 # telemetry_routes.py — Bus-side telemetry ingestion for NovaTrade 3.0
 #
 # Handles:
-#   - /api/telemetry/heartbeat   (Edge → Bus)
-#   - /api/telemetry/push        (Edge → Bus)
+#   - /api/heartbeat          (Edge → Bus)
+#   - /api/telemetry/push     (Edge → Bus)
 #
 # Accepts HMAC-signed JSON from telemetry_sync.py on the Edge.
 # Stores last-known telemetry in memory (for fast reads),
-# and mirrors into Sheets + DB if configured.
+# and mirrors into Sheets if configured.
 
 from __future__ import annotations
 
@@ -14,8 +14,9 @@ import os
 import hmac
 import hashlib
 import time
-from flask import Blueprint, request, jsonify
 from typing import Dict, Any
+
+from flask import Blueprint, request, jsonify
 
 # ---- Imports from utils.py --------------------------------------------------
 
@@ -51,32 +52,41 @@ _last_telemetry_ts: float = 0.0
 # HMAC verification
 # -----------------------------------------------------------------------------
 def verify_signature(body: Dict[str, Any], signature: str) -> bool:
+    """
+    Edge (telemetry_sync.py) signs JSON body with TELEMETRY_SECRET and sends
+    it in the 'X-Signature' header.
+    """
     if not TELEMETRY_SECRET:
-        return True  # If no secret set, accept all (debug mode)
+        # If no secret set, accept all — useful in dev, but set TELEMETRY_SECRET in prod.
+        return True
     if not signature:
         return False
-    payload = (
-        __import__("json")
-        .dumps(body, separators=(",", ":"), sort_keys=True)
-        .encode("utf-8")
-    )
+    import json
+    payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
     expected = hmac.new(
-        TELEMETRY_SECRET.encode("utf-8"),
-        payload,
-        hashlib.sha256
+        TELEMETRY_SECRET.encode("utf-8"), payload, hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
 
 
 # -----------------------------------------------------------------------------
-# /api/telemetry/heartbeat  (Edge → Bus)
+# /api/heartbeat  (Edge → Bus)
 # -----------------------------------------------------------------------------
-@bp_telemetry.route("/api/telemetry/heartbeat", methods=["POST"])
+@bp_telemetry.route("/api/heartbeat", methods=["POST"])
 def telemetry_heartbeat():
+    """
+    Heartbeat endpoint for Edge Agent.
+
+    Edge sends JSON:
+        { "agent": "...", "ts": 1234567890, "latency_ms": 42 }
+    with header:
+        X-Signature: hmac_sha256(secret, raw_json)
+    """
     global _last_heartbeat
 
+    # Edge sends raw bytes with Content-Type: application/json
     body = request.get_json(force=True, silent=True) or {}
-    sig = request.headers.get("X-Nova-Signature", "")
+    sig = request.headers.get("X-Signature", "")
 
     if not verify_signature(body, sig):
         warn(f"heartbeat: invalid signature from agent={body.get('agent')}")
@@ -116,10 +126,26 @@ def telemetry_heartbeat():
 # -----------------------------------------------------------------------------
 @bp_telemetry.route("/api/telemetry/push", methods=["POST"])
 def telemetry_push():
+    """
+    Aggregated telemetry endpoint.
+
+    Edge sends JSON:
+        {
+          "agent": "...",
+          "ts": 1234567890,
+          "aggregates": {
+              "trades_24h": {...},
+              "last_balances": { "COINBASE":{"BTC":0.01,...}, ... },
+              "last_heartbeat": {...}
+          }
+        }
+    with header:
+        X-Signature: hmac_sha256(secret, raw_json)
+    """
     global _last_balances, _last_aggregates, _last_telemetry_ts
 
     body = request.get_json(force=True, silent=True) or {}
-    sig = request.headers.get("X-Nova-Signature", "")
+    sig = request.headers.get("X-Signature", "")
 
     if not verify_signature(body, sig):
         warn(f"telemetry: invalid signature from agent={body.get('agent')}")
@@ -128,7 +154,7 @@ def telemetry_push():
     agent = body.get("agent") or "unknown"
     ts = int(body.get("ts") or time.time())
     aggregates = body.get("aggregates") or {}
-    last_balances = (aggregates.get("last_balances") or {})
+    last_balances = aggregates.get("last_balances") or {}
 
     _last_aggregates = aggregates
     _last_balances = last_balances
@@ -139,7 +165,7 @@ def telemetry_push():
         f"{list(last_balances.keys())} ts={ts}"
     )
 
-    # Optional mirror to Sheets
+    # Optional mirror to Sheets (one row per venue/asset)
     try:
         ws = get_ws(TELEMETRY_LOG_SHEET)
         rows = []
