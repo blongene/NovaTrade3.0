@@ -370,13 +370,70 @@ def telemetry_push_balances():
 @flask_app.get("/api/telemetry/last")
 def telemetry_last():
     """
-    Simple JSON view of the last telemetry snapshot (_last_tel).
-    Used by offline jobs like telemetry_mirror.py via HTTP.
+    Simple JSON view of the last telemetry snapshot.
+
+    Phase 19:
+      • Prefer the new DB-backed telemetry_routes state
+        (Edge → Bus via /api/telemetry/push).
+      • Fallback to the legacy _last_tel dict for backward compatibility.
+
+    This keeps telemetry_mirror.py and any external callers working
+    without caring how telemetry is ingested.
     """
+    # --- Preferred path: telemetry_routes (DB + in-memory caches) ---
+    try:
+        from telemetry_routes import (
+            get_latest_balances,
+            get_latest_aggregates,
+            get_telemetry_age_sec,
+        )
+
+        balances = get_latest_balances() or {}
+        aggregates = get_latest_aggregates() or {}
+        age_sec = float(get_telemetry_age_sec() or 0.0)
+
+        if balances:
+            # Build a flat token view by summing across venues
+            flat: Dict[str, float] = {}
+            for venue, assets in balances.items():
+                if not isinstance(assets, dict):
+                    continue
+                for asset, qty in (assets or {}).items():
+                    try:
+                        qf = float(qty or 0.0)
+                    except Exception:
+                        continue
+                    sym = str(asset).upper()
+                    flat[sym] = flat.get(sym, 0.0) + qf
+
+            # Try to recover an agent id from aggregates
+            agent = "edge"
+            hb = aggregates.get("last_heartbeat") or {}
+            if isinstance(hb, dict):
+                agent = hb.get("agent") or agent
+
+            # ts is approximate: "now minus age"
+            import time as _time
+            if age_sec and age_sec < 9e8:
+                ts = int(_time.time() - age_sec)
+            else:
+                ts = int(_time.time())
+
+            data = {
+                "agent": agent,
+                "flat": flat,
+                "by_venue": balances,
+                "ts": ts,
+            }
+            return jsonify(ok=True, data=data, source="telemetry_routes"), 200
+
+    except Exception as e:
+        log.warning("telemetry_last: telemetry_routes path degraded: %s", e)
+
+    # --- Legacy fallback: use _last_tel if telemetry_routes has nothing ---
     global _last_tel
-    # Return a copy so callers can't mutate our global
     data = dict(_last_tel or {})
-    return jsonify(ok=True, data=data), 200
+    return jsonify(ok=True, data=data, source="legacy"), 200
 
 @flask_app.post("/api/edge/balances")
 def edge_balances():
