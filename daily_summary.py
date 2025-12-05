@@ -1,81 +1,112 @@
+#!/usr/bin/env python3
 # daily_summary.py — Phase-5 Telegram digest (runs ~09:00 ET)
-# Improvements:
+#
+# Key features:
 # • Env-driven service account path (SVC_JSON)
 # • Robust Google Sheets retries/backoff for 429/5xx
-# • Safer parsing of booleans/timestamps
+# • Safer parsing of booleans/timestamps/strings (no .strip() on ints)
 # • One-per-day de-dupe (per ET day)
 # • Optional Bus outbox snapshot if BASE_URL is provided
 # • Clean HTML escaping + consistent timeouts
 
-import os, time, json, math, hashlib, pathlib
+import os
+import time
+import json
+import math
+import hashlib
+import pathlib
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
+from zoneinfo import ZoneInfo
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # ---- Config (env) -----------------------------------------------------------
 
-BOT_TOKEN         = os.getenv("BOT_TOKEN", "")
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
-SHEET_URL         = os.getenv("SHEET_URL", "")
-SVC_JSON          = os.getenv("SVC_JSON", "sentiment-log-service.json")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SHEET_URL = os.getenv("SHEET_URL", "")
+SVC_JSON = os.getenv("SVC_JSON", "sentiment-log-service.json")
 
-VAULT_WS_NAME     = os.getenv("VAULT_INTELLIGENCE_WS", "Vault Intelligence")
-POLICY_LOG_WS     = os.getenv("POLICY_LOG_WS", "Policy_Log")
+VAULT_WS_NAME = os.getenv("VAULT_INTELLIGENCE_WS", "Vault Intelligence")
+POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
 WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
+
 STABLE_TOKENS = {"USD", "USDT", "USDC", "ZUSD"}
+
 # Optional: include a tiny Bus health line if this is set
-BASE_URL          = os.getenv("BASE_URL", "").rstrip("/")
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
 # Change if you want a different send window / label
-DAILY_HOUR_ET     = int(os.getenv("DAILY_SUMMARY_HOUR_ET", "9"))
+DAILY_HOUR_ET = int(os.getenv("DAILY_SUMMARY_HOUR_ET", "9"))
 
-HTTP_TIMEOUT      = 15
-MAX_RETRIES       = 5
-RETRY_BASE_SEC    = 1.5
+HTTP_TIMEOUT = 15
+MAX_RETRIES = 5
+RETRY_BASE_SEC = 1.5
 
 # De-dupe marker lives on ephemeral disk (fine for Render)
-DEDUP_DIR         = pathlib.Path("/tmp/daily-summary")
+DEDUP_DIR = pathlib.Path("/tmp/daily-summary")
 DEDUP_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---- Utilities --------------------------------------------------------------
+# ---- Helpers / utilities ----------------------------------------------------
+
 
 def _to_bool(v) -> bool:
+    """Best-effort boolean parser."""
     s = str(v).strip().lower()
     return s in ("true", "yes", "y", "1")
 
+
 def _safe_iso(ts: str):
-    """Parse ISO timestamp into a UTC-aware datetime object."""
+    """Parse ISO timestamp into a UTC-aware datetime object; None on failure."""
     if not ts:
         return None
     try:
-        dt = datetime.fromisoformat(ts)
+        dt = datetime.fromisoformat(str(ts))
         if dt.tzinfo is None:
             return dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
+
+def _safe_stripped(v, default: str = "") -> str:
+    """
+    Safely call .strip() on arbitrary values.
+
+    Handles ints, floats, None, etc. Always returns a string.
+    """
+    if v is None:
+        return default
+    try:
+        return str(v).strip()
+    except Exception:
+        return default
+
+
 def _open_sheet():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
     creds = ServiceAccountCredentials.from_json_keyfile_name(SVC_JSON, scope)
     client = gspread.authorize(creds)
     return client.open_by_url(SHEET_URL)
 
+
 def _retry(op, *args, **kwargs):
-    # Simple exponential backoff retry for Sheets/API
+    """Simple exponential backoff retry for Sheets/API calls."""
     for i in range(1, MAX_RETRIES + 1):
         try:
             return op(*args, **kwargs)
         except Exception as e:
-            # Common Sheets “429: Rate Limit Exceeded”/5xx -> backoff
             if i == MAX_RETRIES:
                 raise
             sleep = RETRY_BASE_SEC * (2 ** (i - 1)) + (0.1 * i)
             time.sleep(sleep)
+
 
 def _tg_send(msg_html: str):
     if not (BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -84,7 +115,12 @@ def _tg_send(msg_html: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     r = requests.post(
         url,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": msg_html, "parse_mode": "HTML", "disable_web_page_preview": True},
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg_html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
         timeout=HTTP_TIMEOUT,
     )
     try:
@@ -93,14 +129,17 @@ def _tg_send(msg_html: str):
         ok = r.ok
     return ok
 
-def _dedup_key(et_date: datetime, payload: str) -> pathlib.Path:
-    # one-per-day key for the ET date + payload hash (makes it resilient to code changes)
+
+def _dedup_key(et_date, payload: str) -> pathlib.Path:
+    """One-per-day key for the ET date + payload hash."""
     h = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    # et_date may be a date or datetime; both support strftime
     return DEDUP_DIR / f"phase5_{et_date:%Y-%m-%d}_{h}.sent"
+
 
 def _send_once_per_day(msg_html: str):
     et_now = datetime.now(ZoneInfo("America/New_York"))
-    key = _dedup_key(et_now.date() if isinstance(et_now, datetime) else et_now, msg_html)
+    key = _dedup_key(et_now.date(), msg_html)
     if key.exists():
         print("Daily summary already sent today. (dedup)")
         return
@@ -110,7 +149,9 @@ def _send_once_per_day(msg_html: str):
     else:
         print("Telegram send failed (no dedup file written).")
 
+
 def _bus_outbox_snapshot():
+    """Optional Bus outbox health line."""
     if not BASE_URL:
         return None
     try:
@@ -124,47 +165,7 @@ def _bus_outbox_snapshot():
     except Exception:
         return None
 
-def _load_recent_policy_log(ws, hours: int = 24) -> list[dict]:
-    """
-    Load recent decisions from Policy_Log for the last `hours`.
-    Column assumptions:
-      A: timestamp (ISO)
-      B: asset
-      C: source (e.g. STALL_DETECTOR, MANUAL_REBUY, etc.)
-      D: ?
-      E: approved? (YES/NO)
-      F: reason/notes
-      G: venue (optional)
-    """
-    since_utc = datetime.now(timezone.utc) - timedelta(hours=hours)
-    rows = ws.get_all_values()
-    header, data = rows[0], rows[1:]
-    out: list[dict] = []
 
-    for row in data:
-        if not row or not row[0]:
-            continue
-        t = _safe_iso(row[0])
-        # If we couldn't parse the timestamp, or it's too old, skip
-        if not t or t < since_utc:
-            continue
-
-        asset = row[1]
-        source = row[2]
-        approved_flag = (row[4] or "").strip().upper() == "YES"
-        reason = (row[5] or "").strip()
-        venue = (row[6] or "").strip()
-
-        out.append({
-            "ts": t,
-            "asset": asset,
-            "source": source,
-            "approved": approved_flag,
-            "reason": reason,
-            "venue": venue,
-        })
-
-    return out
 def _safe_float_or_zero(val):
     """Best-effort float conversion; returns 0.0 on any failure."""
     try:
@@ -180,7 +181,7 @@ def _latest_wallet_snapshot(sheet):
     Read Wallet_Monitor and return (snapshot_ts_utc_str, summary_line) or None.
 
     summary_line example:
-      'COINBASE: 2 tokens, ~19.30 stable; BINANCEUS: 1 tokens, ~17.47 stable'
+        'COINBASE: 2 tokens, ~19.30 stable; BINANCEUS: 1 tokens, ~17.47 stable'
     """
     try:
         ws = _retry(sheet.worksheet, WALLET_MONITOR_WS)
@@ -191,17 +192,16 @@ def _latest_wallet_snapshot(sheet):
     if not rows:
         return None
 
-    # Find the most recent timestamp
     best_ts = None
     best_rows = []
 
+    # Find the most recent timestamp
     for r in rows:
         ts_raw = r.get("Timestamp") or r.get("timestamp") or ""
         t = _safe_iso(ts_raw)
         if not t:
             continue
 
-        # Normalize to aware UTC
         if t.tzinfo is None:
             t = t.replace(tzinfo=timezone.utc)
         else:
@@ -220,16 +220,19 @@ def _latest_wallet_snapshot(sheet):
     by_venue = {}
 
     for r in best_rows:
-        venue = (r.get("Venue") or r.get("venue") or "").strip() or "?"
-        asset = (r.get("Asset") or r.get("asset") or "").strip().upper()
-        free  = _safe_float_or_zero(r.get("Free") or r.get("free"))
+        venue = _safe_stripped(
+            r.get("Venue") or r.get("venue") or "?"
+        ) or "?"
+        asset = _safe_stripped(
+            r.get("Asset") or r.get("asset") or ""
+        ).upper()
+        free = _safe_float_or_zero(r.get("Free") or r.get("free"))
 
         info = by_venue.setdefault(venue, {"tokens": 0, "stable": 0.0})
         info["tokens"] += 1
         if asset in STABLE_TOKENS:
             info["stable"] += free
 
-    # Format summary parts
     parts = []
     for venue in sorted(by_venue.keys()):
         info = by_venue[venue]
@@ -247,10 +250,9 @@ def _latest_wallet_snapshot(sheet):
     summary_line = "; ".join(parts)
     return ts_str, summary_line
 
+
 # ---- Core logic -------------------------------------------------------------
 
-from datetime import datetime, timedelta, timezone  # make sure this is at the top
-# from zoneinfo import ZoneInfo  # already present above
 
 def daily_phase5_summary():
     if not SHEET_URL:
@@ -298,23 +300,24 @@ def daily_phase5_summary():
         ts = r.get("Timestamp") or r.get("timestamp") or ""
         t = _safe_iso(ts)
 
-        # Skip if we can’t parse
         if not t:
             continue
 
-        # Normalize to UTC + make sure it's aware
         if t.tzinfo is None:
             t = t.replace(tzinfo=timezone.utc)
         else:
             t = t.astimezone(timezone.utc)
 
-        # Only keep events in the last 24h
         if t < since:
             continue
 
-        ok = r.get("OK")
-        ok_b = _to_bool(ok)
-        reason = (r.get("Reason") or r.get("reason") or "ok").strip() or "ok"
+        ok_val = r.get("OK")
+        ok_b = _to_bool(ok_val)
+
+        raw_reason = r.get("Reason")
+        if raw_reason in (None, ""):
+            raw_reason = r.get("reason")
+        reason = _safe_stripped(raw_reason, default="ok") or "ok"
 
         if ok_b:
             appr += 1
@@ -324,80 +327,23 @@ def daily_phase5_summary():
 
     # Top 3 denial reasons
     top_denials = sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:3]
-    reason_str = ", ".join([f"{k} ({v})" for k, v in top_denials]) if top_denials else "—"
+    reason_str = (
+        ", ".join([f"{k} ({v})" for k, v in top_denials]) if top_denials else "—"
+    )
 
     # ------------------------------------------------------------------ #
     # Wallet snapshot from Wallet_Monitor (latest timestamp only)
     # ------------------------------------------------------------------ #
-    WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
-    STABLE_TOKENS = {"USD", "USDT", "USDC", "ZUSD"}
-
     wallet_line = ""
-
+    snapshot = None
     try:
-        wm_ws = _retry(sh.worksheet, WALLET_MONITOR_WS)
-        wm_rows = _retry(wm_ws.get_all_records)
+        snapshot = _latest_wallet_snapshot(sh)
     except Exception:
-        wm_rows = []
+        snapshot = None
 
-    if wm_rows:
-        best_ts = None
-        best_rows = []
-
-        # Find the most recent timestamp
-        for r in wm_rows:
-            ts_raw = r.get("Timestamp") or r.get("timestamp") or ""
-            t = _safe_iso(ts_raw)
-            if not t:
-                continue
-
-            # Normalize to aware UTC
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone.utc)
-            else:
-                t = t.astimezone(timezone.utc)
-
-            if best_ts is None or t > best_ts:
-                best_ts = t
-                best_rows = [r]
-            elif t == best_ts:
-                best_rows.append(r)
-
-        if best_ts and best_rows:
-            by_venue = {}
-
-            def _safe_float_or_zero(val):
-                try:
-                    if val is None or val == "":
-                        return 0.0
-                    return float(val)
-                except Exception:
-                    return 0.0
-
-            for r in best_rows:
-                venue = (r.get("Venue") or r.get("venue") or "").strip() or "?"
-                asset = (r.get("Asset") or r.get("asset") or "").strip().upper()
-                free = _safe_float_or_zero(r.get("Free") or r.get("free"))
-
-                info = by_venue.setdefault(venue, {"tokens": 0, "stable": 0.0})
-                info["tokens"] += 1
-                if asset in STABLE_TOKENS:
-                    info["stable"] += free
-
-            parts = []
-            for venue in sorted(by_venue.keys()):
-                info = by_venue[venue]
-                tokens = info["tokens"]
-                stable = info["stable"]
-                if stable > 0:
-                    parts.append(f"{venue}: {tokens} tokens, ~{stable:.2f} stable")
-                else:
-                    parts.append(f"{venue}: {tokens} tokens")
-
-            if parts:
-                ts_str = best_ts.strftime("%Y-%m-%d %H:%M")
-                desc = "; ".join(parts)
-                wallet_line = f"Wallets (snapshot {ts_str} UTC): {desc}\n"
+    if snapshot:
+        ts_str, desc = snapshot
+        wallet_line = f"Wallets (snapshot {ts_str} UTC): {desc}\n"
 
     # ------------------------------------------------------------------ #
     # Optional Bus outbox snapshot
@@ -416,6 +362,7 @@ def daily_phase5_summary():
     # ------------------------------------------------------------------ #
     et_now = datetime.now(ZoneInfo("America/New_York"))
     mode = os.getenv("REBUY_MODE", os.getenv("MODE", "dryrun"))
+
     msg = (
         "🧠 <b>NovaTrade Daily Summary</b>\n"
         f"Date (ET): <code>{et_now:%Y-%m-%d}</code> around {DAILY_HOUR_ET:02d}:00\n"
@@ -427,6 +374,7 @@ def daily_phase5_summary():
     )
 
     _send_once_per_day(msg)
+
 
 # ---- CLI entry --------------------------------------------------------------
 
