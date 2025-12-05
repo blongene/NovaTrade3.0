@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 manual_rebuy_policy.py
 
@@ -6,6 +7,7 @@ Wrapper around PolicyEngine for MANUAL_REBUY intents.
 Responsibilities:
   - Normalize the incoming intent (token/venue/amount_usd/price_usd).
   - Apply C-Series venue budget clamp (Unified_Snapshot-based) BEFORE policy.
+  - Apply Exchange Rule Validator (min notional, known pairs, remaps).
   - Call PolicyEngine.validate(...) for sizing & risk checks.
   - Append a lightweight row into Policy_Log.
   - Send a short Telegram summary.
@@ -16,7 +18,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from policy_engine import PolicyEngine
 from venue_budget import get_budget_for_intent
@@ -25,8 +27,26 @@ from utils import sheets_append_rows, send_telegram_message_dedup, warn
 SHEET_URL = os.getenv("SHEET_URL", "")
 POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
 
+# ---------------------------------------------------------------------------
+# Optional Exchange Rule Validator import (Pin 5)
+# If the module is missing or broken, we degrade gracefully and treat it as
+# a no-op so boot is never blocked.
+# ---------------------------------------------------------------------------
 
-def _append_policy_log_row(intent: Dict[str, Any], ok: bool, reason: str, patched: Dict[str, Any]) -> None:
+try:  # pragma: no cover - defensive import
+    from exchange_rules import validate_exchange_rules as _validate_exchange_rules
+except Exception:  # pragma: no cover
+    def _validate_exchange_rules(intent: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        """Fallback no-op exchange rule validator."""
+        return True, "exchange_rules_disabled", dict(intent)
+
+
+def _append_policy_log_row(
+    intent: Dict[str, Any],
+    ok: bool,
+    reason: str,
+    patched: Dict[str, Any],
+) -> None:
     """Best-effort append into Policy_Log; never raises."""
     if not SHEET_URL:
         return
@@ -58,7 +78,12 @@ def _append_policy_log_row(intent: Dict[str, Any], ok: bool, reason: str, patche
         warn(f"manual_rebuy_policy: failed to append Policy_Log row: {e}")
 
 
-def _format_telegram_summary(intent: Dict[str, Any], ok: bool, reason: str, patched: Dict[str, Any]) -> str:
+def _format_telegram_summary(
+    intent: Dict[str, Any],
+    ok: bool,
+    reason: str,
+    patched: Dict[str, Any],
+) -> str:
     token = str(intent.get("token") or "").upper()
     venue = str(intent.get("venue") or "").upper()
     quote = str(intent.get("quote") or "").upper()
@@ -99,6 +124,32 @@ def _format_telegram_summary(intent: Dict[str, Any], ok: bool, reason: str, patc
     return "\n".join(lines)
 
 
+def _deny_early(
+    intent: Dict[str, Any],
+    reason: str,
+    patched: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Shared early-deny helper: logs row + telegram and returns policy result.
+    Used by venue-budget layer and exchange-rule layer.
+    """
+    patched_intent = patched or dict(intent)
+    ok = False
+
+    _append_policy_log_row(intent, ok, reason, patched_intent)
+
+    try:
+        msg = _format_telegram_summary(intent, ok, reason, patched_intent)
+        token = str(intent.get("token") or "").upper()
+        venue = str(intent.get("venue") or "").upper()
+        key = f"manual_rebuy_policy:{token}:{venue}"
+        send_telegram_message_dedup(msg, key)
+    except Exception as e:  # pragma: no cover
+        warn(f"manual_rebuy_policy: failed to send Telegram summary (early deny): {e}")
+
+    return {"ok": ok, "reason": reason, "patched_intent": patched_intent}
+
+
 def evaluate_manual_rebuy(
     intent: Dict[str, Any],
     asset_state: Optional[Dict[str, Any]] = None,
@@ -122,7 +173,9 @@ def evaluate_manual_rebuy(
     Returns:
       {"ok": bool, "reason": str, "patched_intent": dict}
     """
-    # Normalize fields
+    # -----------------------------------------------------------------------
+    # Normalize core fields
+    # -----------------------------------------------------------------------
     token = (intent.get("token") or "").upper()
     venue = (intent.get("venue") or "").upper()
     quote = (intent.get("quote") or "").upper()
@@ -141,6 +194,9 @@ def evaluate_manual_rebuy(
     except Exception:
         return {"ok": False, "reason": "invalid amount_usd", "patched_intent": intent}
 
+    if amount_usd_f <= 0:
+        return {"ok": False, "reason": "non_positive amount_usd", "patched_intent": intent}
+
     patched_intent: Dict[str, Any] = dict(intent)
     patched_intent["token"] = token
     patched_intent["venue"] = venue
@@ -151,6 +207,7 @@ def evaluate_manual_rebuy(
         try:
             patched_intent["price_usd"] = float(price_usd)
         except Exception:
+            # leave price_usd as-is if it can't be parsed
             pass
 
     # -----------------------------------------------------------------------
@@ -165,21 +222,30 @@ def evaluate_manual_rebuy(
         if budget_usd <= 0:
             # No usable quote after reserve/keepback → DENY
             reason = f"venue_budget_zero ({budget_reason})"
-            ok = False
-            patched = dict(patched_intent)
-            patched["amount_usd"] = 0.0
-            _append_policy_log_row(patched_intent, ok, reason, patched)
-            try:
-                msg = _format_telegram_summary(patched_intent, ok, reason, patched)
-                key = f"manual_rebuy_policy:{token}:{venue}"
-                send_telegram_message_dedup(msg, key)
-            except Exception as e:  # pragma: no cover
-                warn(f"manual_rebuy_policy: failed to send Telegram summary (budget_zero): {e}")
-            return {"ok": ok, "reason": reason, "patched_intent": patched}
+            patched_zero = dict(patched_intent)
+            patched_zero["amount_usd"] = 0.0
+            return _deny_early(patched_intent, reason, patched_zero)
 
-        # If user requested more than venue budget, clamp down before PolicyEngine
+        # If user requested more than venue budget, clamp down before rules/policy
         if amount_usd_f > budget_usd:
             patched_intent["amount_usd"] = budget_usd
+
+    # -----------------------------------------------------------------------
+    # Pin 5: Exchange Rule Validator (min notional, known pairs, remaps)
+    # -----------------------------------------------------------------------
+    try:
+        rules_ok, rules_reason, rules_patched = _validate_exchange_rules(patched_intent)
+    except Exception as e:  # pragma: no cover
+        warn(f"manual_rebuy_policy: exchange_rules error: {e}")
+        rules_ok, rules_reason, rules_patched = True, f"exchange_rules_error:{type(e).__name__}", patched_intent
+
+    if not rules_ok:
+        # Hard deny at exchange-rule layer (e.g., below min notional or unknown pair)
+        return _deny_early(patched_intent, rules_reason, rules_patched or patched_intent)
+
+    # Carry forward any remaps (e.g., Kraken OCEAN/USDT -> OCEAN/USD)
+    if isinstance(rules_patched, dict):
+        patched_intent = dict(rules_patched)
 
     # -----------------------------------------------------------------------
     # B-3: use PolicyEngine wrapper for final sizing & risk checks
