@@ -3,7 +3,7 @@
 # - Auto-injects price_usd from Unified_Snapshot to resolve "price unknown" denials.
 # - Uses SAFE IMPORTS to prevent crashes if utils.py is mid-update.
 
-import os, json, time, re, hmac, hashlib
+import os, json, time, re, hmac, hashlib, uuid
 from typing import Any, Dict, Optional, Tuple, List
 
 import requests  # NEW: for fallback enqueue
@@ -15,7 +15,6 @@ try:
         get_ws,
         get_ws_cached,
         get_sheet,
-        sheets_append_rows,
         warn,
         info,
         send_telegram_message_dedup,
@@ -63,43 +62,41 @@ except ImportError:
             os.getenv("DEFAULT_AGENT_TARGET")
             or os.getenv("AGENT_ID")
             or "edge-primary"
-        ).split(",")[0].strip()
+        )
 
-        body: Dict[str, Any] = {
+        if not secret:
+            warn("nova_trigger: no OUTBOX_SECRET/EDGE_SECRET; cannot sign enqueue")
+            return {"ok": False, "reason": "enqueue_secret_missing"}
+
+        # Prepare payload
+        payload = {
             "agent_id": agent_id,
             "intent": intent,
-            "source": intent.get("source") or "manual_rebuy",
+        }
+        raw = _canon(payload)
+        ts = str(int(time.time()))
+        mac = hmac.new(secret.encode(), raw + ts.encode(), hashlib.sha256).hexdigest()
+        headers = {
+            "Content-Type": "application/json",
+            "X-Signature": f"sha256={mac}",
+            "X-Timestamp": ts,
         }
 
-        headers = {"Content-Type": "application/json"}
-        if secret:
-            sig = hmac.new(secret.encode(), _canon(body), hashlib.sha256).hexdigest()
-            headers["X-Nova-Signature"] = sig
-
         try:
-            r = requests.post(url, json=body, headers=headers, timeout=15)
+            r = requests.post(url, data=raw, headers=headers, timeout=15.0)
+            try:
+                body = r.json()
+            except Exception:
+                body = {"raw": r.text}
+            if not body.get("ok"):
+                warn(f"nova_trigger: enqueue failed: {body}")
+            return {"ok": bool(body.get("ok")), "reason": body.get("error") or ""}
         except Exception as e:
-            warn(f"nova_trigger: enqueue HTTP error: {e}")
-            return {"ok": False, "reason": f"http_error:{e}"}
-
-        ok = r.ok
-        try:
-            j = r.json()
-        except Exception:
-            j = {}
-
-        # Prefer structured reason if present
-        reason = j.get("reason")
-        if not reason:
-            if ok:
-                reason = "ok"
-            else:
-                reason = f"{r.status_code} {r.text[:160]}"
-
-        return {"ok": bool(ok), "reason": reason}
+            warn(f"nova_trigger: enqueue exception: {e}")
+            return {"ok": False, "reason": str(e)}
 
 
-# We might need the policy engine
+# 2. Manual Rebuy Policy Import (with fallback)
 try:
     from manual_rebuy_policy import evaluate_manual_rebuy
 except ImportError:
@@ -123,7 +120,8 @@ except ImportError:
         return None
 
 
-# === Config & Constants ===
+# === Config & Const
+
 UNIFIED_SNAPSHOT_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
 PRICE_CACHE_TTL_SEC = int(os.getenv("PRICE_CACHE_TTL_SEC", "180"))
 TELEGRAM_DEDUP_TTL = int(os.getenv("TELEGRAM_DEDUP_TTL_SEC", "120"))
@@ -140,13 +138,13 @@ def _load_price_snapshot(force: bool = False) -> List[Dict[str, Any]]:
     now = time.time()
     if (
         not force
-        and _price_cache.get("rows")
-        and now - float(_price_cache.get("ts", 0.0)) < PRICE_CACHE_TTL_SEC
+        and _price_cache.get("ts", 0.0) > 0
+        and now - _price_cache["ts"] < PRICE_CACHE_TTL_SEC
     ):
         return _price_cache["rows"]
 
     try:
-        ws = get_ws(UNIFIED_SNAPSHOT_WS)
+        ws = get_ws_cached(SHEET_URL, UNIFIED_SNAPSHOT_WS)
         rows = ws.get_all_records()
         _price_cache["ts"] = now
         _price_cache["rows"] = rows or []
@@ -162,68 +160,84 @@ def _get_price_usd_from_snapshot(token: str) -> Tuple[Optional[float], str]:
         return None, "no_token"
 
     rows = _load_price_snapshot()
-    if not rows:
-        return None, "no_snapshot_rows"
-
-    # Fuzzy match columns
-    price_cols = ["Price_USD", "Price", "Current Price", "USD Price", "value"]
-    sym_cols = ["Token", "Symbol", "Asset"]
-
     for r in rows:
-        found_sym = False
-        for c in sym_cols:
-            if str(r.get(c, "")).upper() == token_up:
-                found_sym = True
-                break
+        row_token = (r.get("Token") or "").upper()
+        if row_token != token_up:
+            continue
+        price = r.get("Price_USD")
+        if price is None:
+            return None, "no_price"
+        try:
+            return float(price), "ok"
+        except Exception:
+            return None, "bad_price"
 
-        if found_sym:
-            for pc in price_cols:
-                val = r.get(pc)
-                if val is not None and str(val).strip() != "":
-                    try:
-                        p = float(str(val).replace(",", "").replace("$", "").strip())
-                        if p > 0:
-                            return p, "ok"
-                    except Exception:
-                        continue
     return None, "not_found"
 
 
-def _get_price_usd(token: str, quote: str, venue: Optional[str]) -> Tuple[Optional[float], str]:
+def _get_price_usd(token: str, quote: str = "USDT", venue: str | None = None) -> Tuple[Optional[float], str]:
     """
-    Unified price helper:
-    1) Try Unified_Snapshot (if it ever gets a Price_USD column)
-    2) If not found, fall back to direct venue price via price_feed.get_price_usd
+    Price resolution strategy for manual rebuys:
+
+      1) Unified_Snapshot (fast, sheet driven)
+      2) Venue-specific feed (price_feed.get_price_usd)
     """
-    snap_price, snap_reason = _get_price_usd_from_snapshot(token)
-    if snap_price is not None:
-        return snap_price, "snapshot_ok"
+    # 1) Snapshot first
+    p, reason = _get_price_usd_from_snapshot(token)
+    if p is not None:
+        return p, "snapshot"
 
-    price = _feed_get_price_usd(token, quote or "USDT", venue)
-    if price is not None:
-        return price, "venue_feed_ok"
+    # 2) Fallback to venue feed
+    p2 = _feed_get_price_usd(token, quote=quote, venue=venue)
+    if p2 is None:
+        return None, f"no_price ({reason}, feed_none)"
+    return p2, "feed"
 
-    return None, f"snapshot:{snap_reason};feed_not_found"
+
+# ---------------------------------------------------------------------------
+# Telegram summary helper
+# ---------------------------------------------------------------------------
+def _send_summary(raw: str, intent: Dict[str, Any], decision: Dict[str, Any], enq_ok: bool, enq_reason: Optional[str], mode: str) -> None:
+    """
+    Emit a short Telegram summary for manual rebuys.
+    """
+    try:
+        token = (intent.get("token") or "").upper()
+        venue = (intent.get("venue") or "").upper()
+        amount = intent.get("amount_usd")
+        reason = decision.get("reason") or ""
+        ok = bool(decision.get("ok"))
+
+        lines = [
+            f"MANUAL_REBUY {token} @ {venue}",
+            f"Amount: {amount}",
+            f"Policy: {'OK' if ok else 'DENIED'} ({reason})",
+            f"Mode: {mode.upper()}",
+            f"Enqueue: {'OK' if enq_ok else 'FAIL'} ({enq_reason or 'n/a'})",
+        ]
+
+        text = "\n".join(lines)
+        send_telegram_message_dedup(text, ttl_seconds=TELEGRAM_DEDUP_TTL)
+    except Exception as e:
+        warn(f"nova_trigger: summary telegram failed: {e}")
 
 
-# -----------------------------------------------------------------------
-# Core Router
-# -----------------------------------------------------------------------
-def route_manual(raw: str) -> dict:
+# ---------------------------------------------------------------------------
+# Main handler: process MANUAL_REBUY string
+# ---------------------------------------------------------------------------
+def handle_manual_rebuy(raw: str) -> dict:
+    """
+    Entry point for a MANUAL_REBUY command, e.g.:
+
+        MANUAL_REBUY BTC 500 VENUE=BINANCEUS
+
+    Returns a dict summarizing policy + enqueue result.
+    """
     parsed = parse_manual(raw)
-    if not parsed["ok"]:
-        return {"ok": False, "reason": parsed["reason"], "decision": {}, "enqueue": {}}
+    if not parsed.get("ok"):
+        return {"ok": False, "reason": parsed.get("reason")}
 
-    intent = {
-        "source": "manual_rebuy",
-        "token": parsed["token"],
-        "action": "BUY",
-        "amount_usd": parsed["amount_usd"],
-        "venue": parsed["venue"],
-        "quote": parsed["quote"],
-        "ts": time.time(),
-        "raw_msg": raw,
-    }
+    intent = parsed["intent"]
 
     # B-2: Auto Price Fetch (snapshot → venue feed)
     price_usd, p_reason = _get_price_usd(
@@ -236,6 +250,22 @@ def route_manual(raw: str) -> dict:
 
     # Policy Check
     decision = evaluate_manual_rebuy(intent, asset_state={})
+    # Ensure every manual rebuy decision carries a stable decision_id
+    try:
+        if not decision.get("decision_id"):
+            decision["decision_id"] = uuid.uuid4().hex
+    except Exception:
+        # If decision is not a dict or mutating fails, skip decision_id enrichment
+        pass
+    # Log to Policy_Log (best-effort; failure must not break flow)
+    try:
+        from policy_logger import log_decision as _log_policy_decision
+        _log_policy_decision(decision, intent)
+    except Exception as _e:
+        try:
+            warn(f"nova_trigger: policy logging failed: {_e}")
+        except Exception:
+            pass
     policy_ok = bool(decision.get("ok"))
 
     enq_ok: bool = False
@@ -255,6 +285,8 @@ def route_manual(raw: str) -> dict:
                 "amount_quote": patched.get("amount_usd"),
                 "source": "manual_rebuy",
                 "ts": int(time.time()),
+                # Carry policy decision linkage through to the command
+                "decision_id": decision.get("decision_id"),
             }
             if intent.get("price_usd") is not None:
                 payload["price_usd"] = intent["price_usd"]
@@ -282,41 +314,51 @@ def parse_manual(raw: str) -> dict:
     if len(parts) < 3:
         return {"ok": False, "reason": "formatting_error"}
 
+    cmd = parts[0].upper()
+    if cmd != "MANUAL_REBUY":
+        return {"ok": False, "reason": "not_manual_rebuy"}
+
     token = parts[1].upper()
     try:
-        amt = float(parts[2])
+        amount_usd = float(parts[2])
     except Exception:
-        return {"ok": False, "reason": "invalid_amount"}
+        return {"ok": False, "reason": "amount_not_number"}
 
-    venue = None
+    venue = "BINANCEUS"
     quote = "USDT"
 
+    # Parse optional k=v pairs
     for p in parts[3:]:
-        if p.startswith("VENUE="):
-            venue = p.split("=", 1)[1].upper()
-        if p.startswith("QUOTE="):
-            quote = p.split("=", 1)[1].upper()
+        if "=" not in p:
+            continue
+        k, v = p.split("=", 1)
+        k = k.upper()
+        v = v.upper()
+        if k == "VENUE":
+            venue = v
+        elif k == "QUOTE":
+            quote = v
 
-    return {"ok": True, "token": token, "amount_usd": amt, "venue": venue, "quote": quote}
+    intent = {
+        "token": token,
+        "amount_usd": amount_usd,
+        "venue": venue,
+        "quote": quote,
+        "action": "BUY",
+        "source": "manual_rebuy",
+        "raw_msg": raw,
+    }
+    return {"ok": True, "intent": intent}
 
 
-def _send_summary(raw, intent, decision, enq_ok, enq_reason, mode):
-    icon = "✅" if decision.get("ok") else "❌"
-    lines = [
-        f"{icon} <b>Manual Rebuy</b>",
-        f"Cmd: <code>{raw}</code>",
-        f"Policy: {decision.get('reason')}",
-    ]
-    if intent.get("price_usd"):
-        lines.append(f"Price: ${intent['price_usd']:,.2f}")
+# Optional CLI for quick testing
+if __name__ == "__main__":
+    import sys
 
-    if mode == "live":
-        e_icon = "🚀" if enq_ok else "⚠️"
-        lines.append(f"Enqueue: {e_icon} {enq_reason or 'OK'}")
-    else:
-        lines.append("Mode: DRYRUN (Not Enqueued)")
+    if len(sys.argv) < 2:
+        print("Usage: python nova_trigger.py 'MANUAL_REBUY BTC 500 VENUE=BINANCEUS'")
+        sys.exit(1)
 
-    text = "\n".join(lines)
-    send_telegram_message_dedup(
-        text, key=f"manual:{int(time.time())}", ttl_min=1
-    )
+    raw = sys.argv[1]
+    out = handle_manual_rebuy(raw)
+    print(json.dumps(out, indent=2, default=str))
