@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # telemetry_digest.py — Phase 9D/18 bridge
 #
 # Pulls /api/telemetry/last (local) and:
@@ -5,7 +6,6 @@
 #   2. Sends a tiny Telegram digest of per-venue stable balances.
 #
 import os
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Tuple
 
@@ -15,7 +15,7 @@ SHEET_URL = os.getenv("SHEET_URL", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Optional one-shot housekeeping
+# Optional one-shot housekeeping (can safely run on every boot)
 HEARTBEAT_TRIM_TAIL_ON_BOOT = os.getenv("HEARTBEAT_TRIM_TAIL_ON_BOOT", "1") in (
     "1",
     "true",
@@ -42,7 +42,9 @@ except Exception:
     def get_gspread_client():  # type: ignore
         raise RuntimeError("get_gspread_client unavailable")
 
-    def send_telegram_message_dedup(message: str, key: str, ttl_min: int = 15) -> None:  # type: ignore
+    def send_telegram_message_dedup(  # type: ignore
+        message: str, key: str, ttl_min: int = 15
+    ) -> None:
         if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
             return
         print("[TG]", key, message)
@@ -73,7 +75,9 @@ def _open_or_create_worksheet(sh, name: str, headers) -> Any:
     try:
         ws = sh.worksheet(name)
     except Exception:
-        ws = sh.add_worksheet(title=name, rows=2000, cols=max(8, len(headers) + 2))
+        ws = sh.add_worksheet(
+            title=name, rows=2000, cols=max(8, len(headers) + 2)
+        )
 
     try:
         first = ws.row_values(1)
@@ -87,20 +91,39 @@ def _open_or_create_worksheet(sh, name: str, headers) -> Any:
 def _trim_tail(ws, key_col: int = 1) -> None:
     """
     Remove trailing empty rows after the last non-empty in key_col (default A).
-    Controlled by HEARTBEAT_TRIM_TAIL_ON_BOOT.
-    """
-    total = ws.row_count
-    last = len(col_a)  # last non-empty row (1-based)
 
-    # No gap after the last data row; nothing to trim.
+    This is designed to be safe and idempotent: if there is no trailing
+    empty region, it becomes a fast no-op.
+    """
+    try:
+        # All values in the key column (e.g., "Timestamp")
+        col_vals = ws.col_values(key_col)
+    except Exception as e:
+        warn(f"telemetry_digest: failed to read column {key_col}: {e!r}")
+        return
+
+    if not col_vals:
+        # Entire column empty; nothing to trim.
+        return
+
+    # Find index of last non-empty cell (1-based)
+    last = len(col_vals)
+    while last > 0 and not str(col_vals[last - 1]).strip():
+        last -= 1
+
+    if last == 0:
+        # No non-empty rows; nothing to do.
+        return
+
+    total = ws.row_count
+
+    # No gap after last data row => nothing to delete.
     if total <= last:
         return
 
-    # Start just after the last data row; never above total.
     start = last + 1
     end = total
 
-    # Clamp + sanity-check indices before calling Sheets
     if start > end:
         return
 
@@ -113,7 +136,10 @@ def _trim_tail(ws, key_col: int = 1) -> None:
     except Exception as e:
         warn(f"telemetry_digest: trim tail failed: {e!r}")
 
-def _compute_stable_digest(by_venue: Dict[str, Dict[str, float]]) -> Tuple[str, Dict[str, float]]:
+
+def _compute_stable_digest(
+    by_venue: Dict[str, Dict[str, float]]
+) -> Tuple[str, Dict[str, float]]:
     """
     Return:
         digest_str, per_venue_totals
@@ -175,6 +201,7 @@ def run_telemetry_digest() -> None:
         or j.get("agent")
         or ""
     )
+
     by_venue = data.get("by_venue") or {}
     if not isinstance(by_venue, dict):
         by_venue = {}
