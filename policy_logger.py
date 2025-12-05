@@ -156,6 +156,36 @@ def _append_sheet_row(row: Dict[str, Any]) -> None:
 
 
 def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = None) -> None:
+    """
+    Log a policy decision both locally (JSONL) and to the Policy_Log sheet.
+
+    This is tolerant of different decision shapes:
+
+      * Trade guard decisions:
+          {
+            "ok": bool,
+            "status": "...",
+            "reason": "...",
+            "intent": {...},
+            "patched": {...},
+            "decision_id": "...",
+            "meta": {...},
+            ...
+          }
+
+      * Manual policy decisions:
+          {
+            "ok": bool,
+            "reason": "...",
+            "patched_intent": {...},
+            ...
+          }
+
+    We always:
+      - Record the full decision JSON in the 'Decision' column.
+      - Derive a human-friendly snapshot in the core columns.
+      - If decision_id is present, include `decision_id=<id>` in Notes.
+    """
     if not LOG_ENABLED:
         return
 
@@ -184,10 +214,18 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
     liquidity = decision.get("liquidity", "")
     cooldown_min = decision.get("cooldown_min", "")
 
+    # Collect flags + decision_id into Notes
     flags = decision.get("flags") or []
-    notes = ""
+    notes_parts = []
+
     if flags:
-        notes = ",".join(sorted(str(f) for f in flags))
+        notes_parts.extend(sorted(str(f) for f in flags))
+
+    decision_id = decision.get("decision_id") or ""
+    if decision_id:
+        notes_parts.append(f"decision_id={decision_id}")
+
+    notes = ",".join(notes_parts)
 
     intent_id = (
         intent.get("id")
