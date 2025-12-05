@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 trade_guard.py
 
@@ -15,6 +16,17 @@ Responsibilities:
           "reason": str,
           "intent": { ... original-ish ... },
           "patched": { ... final payload ... },
+          "decision_id": str,
+          "created_at": iso8601,
+          "meta": {
+              "source": "...",
+              "venue": "...",
+              "symbol": "...",
+              "base": "...",
+              "quote": "...",
+              "requested_amount_usd": float | null,
+              "approved_amount_usd": float | null,
+          }
         }
 
 This is the "big red gate" that other modules (nova_trigger, rebuy_driver,
@@ -25,7 +37,7 @@ from __future__ import annotations
 
 from typing import Dict, Any, Tuple
 import os
-import time
+import time  # kept for compatibility; safe to remove if truly unused
 
 from policy_engine import PolicyEngine
 from venue_budget import get_budget_for_intent
@@ -175,6 +187,9 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
         "reason": str,
         "intent": { ... },
         "patched": { ... },
+        "decision_id": str,
+        "created_at": iso8601,
+        "meta": { ... }  # optional extra context
       }
     """
     base = _normalize_base_intent(intent)
@@ -187,39 +202,44 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     try:
         amount_usd_f = float(amount_usd)
     except Exception:
-        return {
-            "ok": False,
-            "status": "DENIED",
-            "reason": f"invalid amount_usd: {amount_usd!r}",
-            "intent": base,
-            "patched": dict(base),
-        }
+        # Invalid notional – build a canonical decision and bail.
+        patched = dict(base)
+        return _make_policy_decision(
+            base=base,
+            patched=patched,
+            ok=False,
+            status="DENIED",
+            reason=f"invalid amount_usd: {amount_usd!r}",
+        )
 
     if amount_usd_f <= 0:
-        return {
-            "ok": False,
-            "status": "DENIED",
-            "reason": "amount_usd <= 0",
-            "intent": base,
-            "patched": dict(base),
-        }
+        patched = dict(base)
+        return _make_policy_decision(
+            base=base,
+            patched=patched,
+            ok=False,
+            status="DENIED",
+            reason="amount_usd <= 0",
+        )
 
     if not token:
-        return {
-            "ok": False,
-            "status": "DENIED",
-            "reason": "missing token",
-            "intent": base,
-            "patched": dict(base),
-        }
+        patched = dict(base)
+        return _make_policy_decision(
+            base=base,
+            patched=patched,
+            ok=False,
+            status="DENIED",
+            reason="missing token",
+        )
     if not venue:
-        return {
-            "ok": False,
-            "status": "DENIED",
-            "reason": "missing venue",
-            "intent": base,
-            "patched": dict(base),
-        }
+        patched = dict(base)
+        return _make_policy_decision(
+            base=base,
+            patched=patched,
+            ok=False,
+            status="DENIED",
+            reason="missing venue",
+        )
 
     base["token"] = token
     base["venue"] = venue
@@ -227,6 +247,51 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
         base["quote"] = quote
     base["amount_usd"] = amount_usd_f
     base["action"] = action
+
+    # Helper to build canonical decisions for all exits from this point on.
+    def _safe_float(val):
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    def _make_decision_local(
+        ok: bool,
+        status: str,
+        reason: str,
+        intent_dict: Dict[str, Any],
+        patched_dict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Wrap PolicyDecision construction so every outcome has a decision_id/meta.
+        """
+        symbol = (patched_dict.get("symbol") or intent_dict.get("symbol") or "").upper()
+        quote_local = (
+            patched_dict.get("quote")
+            or intent_dict.get("quote")
+            or quote
+            or ""
+        ).upper()
+
+        decision = PolicyDecision(
+            ok=bool(ok),
+            status=status,
+            reason=reason or "",
+            intent=intent_dict,
+            patched=patched_dict,
+            source=intent_dict.get("source") or "trade_guard",
+            venue=venue,
+            symbol=symbol,
+            base=token,
+            quote=quote_local,
+            requested_amount_usd=_safe_float(intent_dict.get("amount_usd")),
+            approved_amount_usd=_safe_float(patched_dict.get("amount_usd")),
+        )
+        return decision.to_dict()
+
+    # Rebind outer helper for earlier-return cases already above.
+    global _make_policy_decision
+    _make_policy_decision = _make_decision_local
 
     # --- Kraken: telemetry-only by default ---------------------------------
     if venue == "KRAKEN" and os.getenv("AUTO_ENABLE_KRAKEN", "0").lower() not in {
@@ -237,26 +302,26 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     }:
         patched = dict(base)
         patched["amount_usd"] = 0.0
-        return {
-            "ok": False,
-            "status": "DENIED",
-            "reason": "venue_autotrade_disabled",
-            "intent": base,
-            "patched": patched,
-        }
+        return _make_decision_local(
+            ok=False,
+            status="DENIED",
+            reason="venue_autotrade_disabled",
+            intent_dict=base,
+            patched_dict=patched,
+        )
 
     # --- Venue min-notional guard (e.g., BinanceUS 10 USDT) ----------------
     min_notional = _get_min_notional_usd(venue, quote)
     if min_notional is not None and amount_usd_f + 1e-9 < min_notional:
         patched = dict(base)
         patched["amount_usd"] = 0.0
-        return {
-            "ok": False,
-            "status": "DENIED",
-            "reason": f"below_venue_min_notional:{min_notional}",
-            "intent": base,
-            "patched": patched,
-        }
+        return _make_decision_local(
+            ok=False,
+            status="DENIED",
+            reason=f"below_venue_min_notional:{min_notional}",
+            intent_dict=base,
+            patched_dict=patched,
+        )
 
     # --- Venue budget clamp (Unified_Snapshot) -----------------------------
     try:
@@ -269,13 +334,13 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
         if budget_usd <= 0:
             patched = dict(base)
             patched["amount_usd"] = 0.0
-            return {
-                "ok": False,
-                "status": "DENIED",
-                "reason": f"venue_budget_zero ({budget_reason})",
-                "intent": base,
-                "patched": patched,
-            }
+            return _make_decision_local(
+                ok=False,
+                status="DENIED",
+                reason=f"venue_budget_zero ({budget_reason})",
+                intent_dict=base,
+                patched_dict=patched,
+            )
         if amount_usd_f > budget_usd:
             base["amount_usd"] = budget_usd
 
@@ -318,13 +383,13 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
             if est_qty + 1e-12 < float(min_vol):
                 # Hard deny: below minimum base quantity for this pair.
                 patched["amount_usd"] = 0.0
-                return {
-                    "ok": False,
-                    "status": "DENIED",
-                    "reason": f"below_venue_min_volume:{min_vol}",
-                    "intent": base,
-                    "patched": patched,
-                }
+                return _make_decision_local(
+                    ok=False,
+                    status="DENIED",
+                    reason=f"below_venue_min_volume:{min_vol}",
+                    intent_dict=base,
+                    patched_dict=patched,
+                )
 
     # --- Final status (APPROVED / CLIPPED / DENIED) ------------------------
     if not ok:
@@ -337,10 +402,10 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             status = "APPROVED" if ok else "DENIED"
 
-    return {
-        "ok": bool(ok),
-        "status": status,
-        "reason": reason or "",
-        "intent": base,
-        "patched": patched,
-    }
+    return _make_decision_local(
+        ok=bool(ok),
+        status=status,
+        reason=reason or "",
+        intent_dict=base,
+        patched_dict=patched,
+    )
