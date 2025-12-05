@@ -6,6 +6,7 @@ Central gate for trade intents before they hit the Outbox or Edge.
 Responsibilities:
   - Normalize a generic trade intent (BUY/SELL, token, venue, quote, amount_usd, price_usd).
   - Apply C-Series venue budget clamp (Unified_Snapshot-based).
+  - Enforce venue min-notional and min-volume rules.
   - Run through PolicyEngine for final sizing & risk checks.
   - Return a normalized decision:
         {
@@ -31,7 +32,6 @@ from venue_budget import get_budget_for_intent
 from utils import warn
 
 # ---- Venue min-notional config ---------------------------------------------
-
 # Conservative defaults; you can override with env vars:
 #   MIN_NOTIONAL_<VENUE>_<QUOTE>, e.g. MIN_NOTIONAL_BINANCEUS_USDT=10
 MIN_NOTIONAL_DEFAULTS = {
@@ -42,6 +42,29 @@ MIN_NOTIONAL_DEFAULTS = {
     # Kraken is *telemetry-only* by default; we still define a bucket for later.
     "KRAKEN": {},
 }
+
+# ---- Venue min-volume config (base-asset quantity) -------------------------
+#
+# These are *base* quantities per trading pair. They’re intentionally sparse;
+# you can override or extend via env vars of the form:
+#   MIN_VOLUME_<VENUE>_<BASE>_<QUOTE>
+#
+# Example:
+#   MIN_VOLUME_BINANCEUS_BTC_USDT=1e-05
+#
+MIN_VOLUME_DEFAULTS = {
+    "BINANCEUS": {
+        # This matches the error you observed: "min volume 1e-05 not met"
+        "BTC_USDT": 1e-05,
+    },
+    "COINBASE": {
+        # Add pairs here as needed.
+    },
+    "KRAKEN": {
+        # Kraken spot minimums vary; keep telemetry-only unless explicitly enabled.
+    },
+}
+
 
 def _get_min_notional_usd(venue: str, quote: str) -> float | None:
     """
@@ -69,6 +92,36 @@ def _get_min_notional_usd(venue: str, quote: str) -> float | None:
             pass
 
     return MIN_NOTIONAL_DEFAULTS.get(v, {}).get(q)
+
+
+def _get_min_volume(venue: str, base: str, quote: str) -> float | None:
+    """
+    Per-venue, per-(base,quote) minimum *base* quantity.
+
+    Precedence:
+      1) Env var MIN_VOLUME_<VENUE>_<BASE>_<QUOTE>
+      2) MIN_VOLUME_DEFAULTS above
+    """
+    v = (venue or "").upper()
+    b = (base or "").upper()
+    q = (quote or "").upper()
+    if not v or not b or not q:
+        return None
+
+    env_key = f"MIN_VOLUME_{v}_{b}_{q}"
+    raw = os.getenv(env_key, "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except Exception:
+            # Ignore bad env and fall back to defaults
+            pass
+
+    key = f"{b}_{q}"
+    return MIN_VOLUME_DEFAULTS.get(v, {}).get(key)
+
 
 def _normalize_base_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -109,7 +162,20 @@ def _normalize_base_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
 
     return out
 
+
 def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Main entry.
+
+    Returns a dict:
+      {
+        "ok": bool,
+        "status": "APPROVED" | "CLIPPED" | "DENIED",
+        "reason": str,
+        "intent": { ... },
+        "patched": { ... },
+      }
+    """
     base = _normalize_base_intent(intent)
     token = (base.get("token") or "").upper()
     venue = (base.get("venue") or "").upper()
@@ -230,14 +296,42 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
+    # --- Min-volume guard (base quantity, after policy) --------------------
     patched_amount_usd = patched.get("amount_usd", base.get("amount_usd"))
+    try:
+        amt_f = float(patched_amount_usd)
+    except Exception:
+        amt_f = amount_usd_f
 
+    price = patched.get("price_usd") or base.get("price_usd")
+    min_vol = _get_min_volume(venue, token, quote)
+
+    if min_vol is not None and price not in (None, 0, 0.0):
+        try:
+            price_f = float(price)
+        except Exception:
+            price_f = 0.0
+
+        if price_f > 0:
+            est_qty = amt_f / price_f  # base units
+            if est_qty + 1e-12 < float(min_vol):
+                # Hard deny: below minimum base quantity for this pair.
+                patched["amount_usd"] = 0.0
+                return {
+                    "ok": False,
+                    "status": "DENIED",
+                    "reason": f"below_venue_min_volume:{min_vol}",
+                    "intent": base,
+                    "patched": patched,
+                }
+
+    # --- Final status (APPROVED / CLIPPED / DENIED) ------------------------
     if not ok:
         status = "DENIED"
     else:
         try:
-            pa = float(patched_amount_usd)
             ba = float(base["amount_usd"])
+            pa = float(patched_amount_usd)
             status = "CLIPPED" if pa + 1e-9 < ba else "APPROVED"
         except Exception:
             status = "APPROVED" if ok else "DENIED"
