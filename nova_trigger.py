@@ -307,6 +307,12 @@ def handle_manual_rebuy(raw: str) -> dict:
         "mode": mode,
     }
 
+def route_manual(raw: str) -> dict:
+    """
+    Thin wrapper so nova_trigger_watcher and other callers can import route_manual.
+    Delegates to handle_manual_rebuy(raw).
+    """
+    return handle_manual_rebuy(raw)
 
 def parse_manual(raw: str) -> dict:
     # MANUAL_REBUY BTC 500 VENUE=BINANCEUS
