@@ -7,6 +7,7 @@ import time
 import json
 from typing import Dict, Any
 
+import requests
 from flask import Blueprint, request, jsonify
 
 # ---- Imports from utils.py --------------------------------------------------
@@ -39,9 +40,12 @@ TELEMETRY_SECRET = (
 
 TELEMETRY_LOG_SHEET = os.getenv("TELEMETRY_LOG_WS", "Telemetry_Log")
 HEARTBEAT_LOG_SHEET = os.getenv("HEARTBEAT_LOG_WS", "Heartbeat_Log")
-BUS_TELEMETRY_DB = os.getenv("BUS_TELEMETRY_DB", "bus_telemetry.db")
 
-# In-memory latest state (best-effort cache)
+# Base URL to talk to our own /api/telemetry/last endpoint (same as telemetry_mirror)
+PORT = int(os.getenv("PORT", "10000"))
+LAST_URL = os.getenv("TELEMETRY_LAST_URL", f"http://127.0.0.1:{PORT}/api/telemetry/last")
+
+# In-memory latest state (best-effort cache for quick peeks)
 _last_balances: Dict[str, Any] = {}
 _last_heartbeat: Dict[str, Any] = {}
 _last_aggregates: Dict[str, Any] = {}
@@ -49,7 +53,7 @@ _last_telemetry_ts: float = 0.0
 
 
 # -----------------------------------------------------------------------------
-# DB persistence helpers
+# DB persistence helpers (best-effort, no hard failures)
 # -----------------------------------------------------------------------------
 def _store_heartbeat(agent: str, ts: int, latency_ms: float) -> None:
     if telemetry_store is None:
@@ -128,7 +132,7 @@ def telemetry_heartbeat():
 
     info(f"heartbeat ok from {agent} latency={latency}ms")
 
-    # Persist to DB
+    # Persist to DB (best-effort)
     _store_heartbeat(agent, ts, latency)
 
     # Optional: mirror to Sheets
@@ -176,13 +180,15 @@ def telemetry_push():
         f"{list(last_balances.keys())} ts={ts}"
     )
 
-    # Persist to DB
+    # Persist to DB (best-effort)
     _store_push(agent, ts, aggregates)
 
     # Optional mirror to Sheets (one row per venue/asset)
     try:
         rows = []
         for venue, assets in last_balances.items():
+            if not isinstance(assets, dict):
+                continue
             for asset, amount in assets.items():
                 rows.append(
                     [
@@ -194,7 +200,6 @@ def telemetry_push():
                     ]
                 )
         if rows and SHEET_URL:
-            # utils.sheets_append_rows(sheet_url, worksheet_name, rows)
             sheets_append_rows(SHEET_URL, TELEMETRY_LOG_SHEET, rows)
     except Exception as e:
         warn(f"telemetry sheet append failed: {e}")
@@ -203,7 +208,7 @@ def telemetry_push():
 
 
 # -----------------------------------------------------------------------------
-# Public accessors (for other modules if needed)
+# Simple getters (if other modules need quick in-process peeks)
 # -----------------------------------------------------------------------------
 def get_latest_balances() -> Dict[str, Any]:
     return dict(_last_balances)
@@ -224,87 +229,99 @@ def get_telemetry_age_sec() -> float:
 
 
 # -----------------------------------------------------------------------------
-# DB-backed telemetry health
+# /api/telemetry/health — wrapper around /api/telemetry/last
 # -----------------------------------------------------------------------------
 @bp_telemetry.route("/api/telemetry/health", methods=["GET"])
 def telemetry_health():
     """
-    DB-backed health view.
+    Health view built on top of the same /api/telemetry/last endpoint that
+    telemetry_mirror.py uses.
 
-    Reads from BUS_TELEMETRY_DB (same tables as telemetry_read.py) so that
-    health reflects real pushes/heartbeats even if this process was restarted.
+    We *do not* query SQLite directly here; instead we:
+      - GET LAST_URL (usually http://127.0.0.1:PORT/api/telemetry/last)
+      - Expect: {"ok": true, "data": {...}, "age_sec": 7.3}
+      - Summarize venues and top-level keys from the inner telemetry dict.
     """
-    import sqlite3
-
     try:
-        con = sqlite3.connect(BUS_TELEMETRY_DB)
-        con.row_factory = sqlite3.Row
-        with con:
-            hb_rows = con.execute(
-                "SELECT agent, MAX(ts) AS ts, MAX(latency_ms) AS latency_ms "
-                "FROM telemetry_heartbeat GROUP BY agent"
-            ).fetchall()
-            push_rows = con.execute(
-                "SELECT agent, aggregates_json, MAX(id) AS id "
-                "FROM telemetry_push GROUP BY agent"
-            ).fetchall()
+        resp = requests.get(LAST_URL, timeout=5)
     except Exception as e:
-        warn(f"telemetry_health DB query failed: {e}")
-        # Fallback to in-memory snapshot so endpoint still works
-        hb = get_latest_heartbeat()
-        balances = get_latest_balances()
-        aggregates = get_latest_aggregates()
-        age_sec = get_telemetry_age_sec()
-        venues = sorted(balances.keys()) if isinstance(balances, dict) else []
-        agg_keys = sorted(aggregates.keys()) if isinstance(aggregates, dict) else []
+        warn(f"telemetry_health: error calling {LAST_URL}: {e}")
         return jsonify(
             {
-                "ok": True,
-                "heartbeats": [] if not hb else [hb],
-                "age_sec": age_sec,
-                "venues": venues,
-                "aggregates_keys": agg_keys,
-                "source": "memory",
+                "ok": False,
+                "error": "unreachable",
+                "age_sec": 9e9,
+                "venues": [],
+                "aggregates_keys": [],
+                "agent": "",
+                "source": "last_url_error",
             }
         )
 
-    now = time.time()
-
-    heartbeats = []
-    last_ts = 0
-    venues = set()
-    aggregates_keys = set()
-
-    for r in hb_rows:
-        heartbeats.append(
-            {"agent": r["agent"], "ts": r["ts"], "latency_ms": r["latency_ms"]}
+    if not resp.ok:
+        warn(f"telemetry_health: HTTP {resp.status_code} from {LAST_URL}: {resp.text}")
+        return jsonify(
+            {
+                "ok": False,
+                "error": f"http_{resp.status_code}",
+                "age_sec": 9e9,
+                "venues": [],
+                "aggregates_keys": [],
+                "agent": "",
+                "source": "last_url_http",
+            }
         )
-        if r["ts"] and r["ts"] > last_ts:
-            last_ts = r["ts"]
 
-    for r in push_rows:
-        try:
-            agg = json.loads(r["aggregates_json"] or "{}")
-        except Exception:
-            agg = {}
-        if isinstance(agg, dict):
-            aggregates_keys.update(agg.keys())
-            lb = agg.get("last_balances") or {}
-            if isinstance(lb, dict):
-                venues.update(lb.keys())
-            ts_val = agg.get("ts")
-            if isinstance(ts_val, (int, float)) and ts_val > last_ts:
-                last_ts = ts_val
+    try:
+        body = resp.json()
+    except Exception as e:
+        warn(f"telemetry_health: bad JSON from {LAST_URL}: {e}")
+        return jsonify(
+            {
+                "ok": False,
+                "error": "bad_json",
+                "age_sec": 9e9,
+                "venues": [],
+                "aggregates_keys": [],
+                "agent": "",
+                "source": "last_url_bad_json",
+            }
+        )
 
-    age_sec = (now - last_ts) if last_ts else 9e9
+    if not isinstance(body, dict):
+        return jsonify(
+            {
+                "ok": False,
+                "error": "non_dict_body",
+                "age_sec": 9e9,
+                "venues": [],
+                "aggregates_keys": [],
+                "agent": "",
+                "source": "last_url_non_dict",
+            }
+        )
+
+    ok = bool(body.get("ok", True))
+    age_sec = float(body.get("age_sec") or 9e9)
+    data = body.get("data") or {}
+    if not isinstance(data, dict):
+        data = {}
+
+    by_venue = data.get("by_venue") or {}
+    if not isinstance(by_venue, dict):
+        by_venue = {}
+
+    venues = sorted(by_venue.keys())
+    aggregates_keys = sorted(data.keys())
+    agent = str(data.get("agent") or "")
 
     return jsonify(
         {
-            "ok": True,
-            "heartbeats": heartbeats,
+            "ok": ok,
             "age_sec": age_sec,
-            "venues": sorted(venues),
-            "aggregates_keys": sorted(aggregates_keys),
-            "source": "db",
+            "venues": venues,
+            "aggregates_keys": aggregates_keys,
+            "agent": agent,
+            "source": "last_url",
         }
     )
