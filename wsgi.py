@@ -1180,28 +1180,27 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
         if not isinstance(norm, dict):
             norm = {}
 
-        # Try to find a decision_id from several candidate dicts
-        decision_id = ""
-
-        def _find_decision_id(d: Any) -> str:
-            if isinstance(d, dict):
-                v = d.get("decision_id")
+        # Try to find a decision_id anywhere in the nested structures
+        def _find_decision_id_any(obj: Any) -> str:
+            """Depth-first search for decision_id inside nested dicts/lists."""
+            if isinstance(obj, dict):
+                v = obj.get("decision_id")
                 if v:
                     return str(v)
+                for value in obj.values():
+                    found = _find_decision_id_any(value)
+                    if found:
+                        return found
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    found = _find_decision_id_any(item)
+                    if found:
+                        return found
             return ""
 
-        # candidates: intent, norm, receipt["raw_intent"], receipt["raw"]["intent"], receipt["raw"]["payload"]
-        raw_intent = receipt.get("raw_intent")
-        raw = receipt.get("raw") if isinstance(receipt.get("raw"), dict) else {}
-        raw_inner_intent = raw.get("intent") if isinstance(raw, dict) else None
-        raw_payload = None
-        if isinstance(raw_inner_intent, dict):
-            raw_payload = raw_inner_intent.get("payload")
+        # Priority: intent first (closest to the trade), then receipt as a whole
+        decision_id = _find_decision_id_any(intent) or _find_decision_id_any(receipt)
 
-        for cand in (intent, norm, raw_intent, raw_inner_intent, raw_payload, receipt):
-            decision_id = _find_decision_id(cand)
-            if decision_id:
-                break
 
         # columns expected:
         # A: Timestamp, B: Venue, C: Symbol, D: Side,
