@@ -1,16 +1,22 @@
+# telemetry_routes.py — Bus-side telemetry ingestion for NovaTrade 3.0
+#
+# Handles:
+#   - /api/heartbeat          (Edge → Bus)
+#   - /api/telemetry/push     (Edge → Bus)
+#
+# Accepts HMAC-signed JSON from telemetry_sync.py on the Edge.
+# Stores last-known telemetry in memory (for fast reads),
+# and mirrors into Sheets if configured.
+
 from __future__ import annotations
 
 import os
 import hmac
 import hashlib
 import time
-import json
 from typing import Dict, Any
 
-import requests
 from flask import Blueprint, request, jsonify
-
-# ---- Imports from utils.py --------------------------------------------------
 
 try:
     from utils import warn, info, get_ws, sheets_append_rows, SHEET_URL
@@ -20,13 +26,6 @@ except Exception:  # pragma: no cover
     def get_ws(name): raise RuntimeError("utils.get_ws unavailable")
     def sheets_append_rows(*a, **k): pass
     SHEET_URL = ""
-
-# ---- Optional DB warehouse (telemetry_store) -------------------------------
-
-try:
-    import telemetry_store  # provides store_heartbeat, store_push
-except Exception:  # pragma: no cover
-    telemetry_store = None  # type: ignore
 
 # -----------------------------------------------------------------------------
 
@@ -41,11 +40,7 @@ TELEMETRY_SECRET = (
 TELEMETRY_LOG_SHEET = os.getenv("TELEMETRY_LOG_WS", "Telemetry_Log")
 HEARTBEAT_LOG_SHEET = os.getenv("HEARTBEAT_LOG_WS", "Heartbeat_Log")
 
-# Base URL to talk to our own /api/telemetry/last endpoint (same as telemetry_mirror)
-PORT = int(os.getenv("PORT", "10000"))
-LAST_URL = os.getenv("TELEMETRY_LAST_URL", f"http://127.0.0.1:{PORT}/api/telemetry/last")
-
-# In-memory latest state (best-effort cache for quick peeks)
+# In-memory latest state (the Bus uses this as Unified Snapshot feeder)
 _last_balances: Dict[str, Any] = {}
 _last_heartbeat: Dict[str, Any] = {}
 _last_aggregates: Dict[str, Any] = {}
@@ -53,52 +48,19 @@ _last_telemetry_ts: float = 0.0
 
 
 # -----------------------------------------------------------------------------
-# DB persistence helpers (best-effort, no hard failures)
-# -----------------------------------------------------------------------------
-def _store_heartbeat(agent: str, ts: int, latency_ms: float) -> None:
-    if telemetry_store is None:
-        return
-    try:
-        telemetry_store.store_heartbeat(
-            agent=str(agent),
-            ts=int(ts),
-            latency_ms=int(latency_ms),
-        )
-    except Exception as e:
-        try:
-            warn(f"telemetry_store.store_heartbeat failed: {e}")
-        except Exception:
-            pass
-
-
-def _store_push(agent: str, ts: int, aggregates: Dict[str, Any]) -> None:
-    if telemetry_store is None:
-        return
-    try:
-        telemetry_store.store_push(
-            agent=str(agent),
-            ts=int(ts),
-            aggregates=aggregates or {},
-        )
-    except Exception as e:
-        try:
-            warn(f"telemetry_store.store_push failed: {e}")
-        except Exception:
-            pass
-
-
-# -----------------------------------------------------------------------------
 # HMAC verification
 # -----------------------------------------------------------------------------
 def verify_signature(body: Dict[str, Any], signature: str) -> bool:
     """
-    Edge signs JSON body with TELEMETRY_SECRET and sends it in 'X-Signature'.
+    Edge (telemetry_sync.py) signs JSON body with TELEMETRY_SECRET and sends
+    it in the 'X-Signature' header.
     """
     if not TELEMETRY_SECRET:
         # If no secret set, accept all — useful in dev, but set TELEMETRY_SECRET in prod.
         return True
     if not signature:
         return False
+    import json
     payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
     expected = hmac.new(
         TELEMETRY_SECRET.encode("utf-8"), payload, hashlib.sha256
@@ -111,6 +73,16 @@ def verify_signature(body: Dict[str, Any], signature: str) -> bool:
 # -----------------------------------------------------------------------------
 @bp_telemetry.route("/api/heartbeat", methods=["POST"])
 def telemetry_heartbeat():
+    """
+    Heartbeat endpoint for Edge Agent.
+
+    Expected JSON:
+      {
+        "agent": "edge-primary",
+        "ts": 1699999999,
+        "latency_ms": 123.4
+      }
+    """
     global _last_heartbeat
 
     body = request.get_json(force=True, silent=True) or {}
@@ -122,34 +94,32 @@ def telemetry_heartbeat():
 
     agent = body.get("agent") or "unknown"
     ts = int(body.get("ts") or time.time())
-    latency = float(body.get("latency_ms") or 0.0)
+    latency_ms = float(body.get("latency_ms") or 0.0)
 
     _last_heartbeat = {
         "agent": agent,
         "ts": ts,
-        "latency_ms": latency,
+        "latency_ms": latency_ms,
     }
 
-    info(f"heartbeat ok from {agent} latency={latency}ms")
+    info(f"heartbeat ok from {agent} latency={latency_ms}ms")
 
-    # Persist to DB (best-effort)
-    _store_heartbeat(agent, ts, latency)
-
-    # Optional: mirror to Sheets
+    # Optional: mirror to Sheets (best effort, non-fatal)
     try:
-        ws = get_ws(HEARTBEAT_LOG_SHEET)
-        ws.append_row(
-            [
-                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)),
-                agent,
-                latency,
-            ],
-            value_input_option="USER_ENTERED",
-        )
+        if SHEET_URL:
+            ws = get_ws(HEARTBEAT_LOG_SHEET)
+            ws.append_row(
+                [
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)),
+                    agent,
+                    latency_ms,
+                ],
+                value_input_option="USER_ENTERED",
+            )
     except Exception as e:
-        warn(f"heartbeat sheet append failed: {e}")
+        warn(f"heartbeat sheet append failed (non-fatal): {e}")
 
-    return jsonify({"ok": True, "age_sec": time.time() - ts})
+    return jsonify({"ok": True, "age_sec": max(0.0, time.time() - ts)})
 
 
 # -----------------------------------------------------------------------------
@@ -157,7 +127,22 @@ def telemetry_heartbeat():
 # -----------------------------------------------------------------------------
 @bp_telemetry.route("/api/telemetry/push", methods=["POST"])
 def telemetry_push():
+    """
+    Ingest telemetry snapshots from Edge Agent.
+
+    Expected JSON (schema-lenient, but typically):
+      {
+        "agent": "edge-primary",
+        "ts": 1699999999,
+        "aggregates": {
+          "last_balances": { "BINANCEUS": { "USDT": 123.45, ... }, ... },
+          ... other aggregates ...
+        }
+      }
+    """
     global _last_balances, _last_aggregates, _last_telemetry_ts
+
+    import json as _json
 
     body = request.get_json(force=True, silent=True) or {}
     sig = request.headers.get("X-Signature", "")
@@ -171,21 +156,23 @@ def telemetry_push():
     aggregates = body.get("aggregates") or {}
     last_balances = aggregates.get("last_balances") or {}
 
+    if not isinstance(aggregates, dict):
+        aggregates = {}
+    if not isinstance(last_balances, dict):
+        last_balances = {}
+
     _last_aggregates = aggregates
     _last_balances = last_balances
     _last_telemetry_ts = ts
 
     info(
-        f"telemetry: balances from {agent} venues="
-        f"{list(last_balances.keys())} ts={ts}"
+        f"telemetry: received aggregates from {agent} "
+        f"venues={list(last_balances.keys())} ts={ts}"
     )
 
-    # Persist to DB (best-effort)
-    _store_push(agent, ts, aggregates)
-
-    # Optional mirror to Sheets (one row per venue/asset)
+    # Optional: mirror balances to Sheets (one row per venue/asset)
+    rows = []
     try:
-        rows = []
         for venue, assets in last_balances.items():
             if not isinstance(assets, dict):
                 continue
@@ -202,13 +189,13 @@ def telemetry_push():
         if rows and SHEET_URL:
             sheets_append_rows(SHEET_URL, TELEMETRY_LOG_SHEET, rows)
     except Exception as e:
-        warn(f"telemetry sheet append failed: {e}")
+        warn(f"telemetry sheet append failed (non-fatal): {e}")
 
     return jsonify({"ok": True})
 
 
 # -----------------------------------------------------------------------------
-# Simple getters (if other modules need quick in-process peeks)
+# Simple in-process getters (used by Unified Snapshot & health)
 # -----------------------------------------------------------------------------
 def get_latest_balances() -> Dict[str, Any]:
     return dict(_last_balances)
@@ -229,99 +216,67 @@ def get_telemetry_age_sec() -> float:
 
 
 # -----------------------------------------------------------------------------
-# /api/telemetry/health — wrapper around /api/telemetry/last
+# /api/telemetry/health — in-process summary (no HTTP self-call)
 # -----------------------------------------------------------------------------
 @bp_telemetry.route("/api/telemetry/health", methods=["GET"])
 def telemetry_health():
-    """
-    Health view built on top of the same /api/telemetry/last endpoint that
-    telemetry_mirror.py uses.
+    """Return a small JSON health summary of Edge telemetry.
 
-    We *do not* query SQLite directly here; instead we:
-      - GET LAST_URL (usually http://127.0.0.1:PORT/api/telemetry/last)
-      - Expect: {"ok": true, "data": {...}, "age_sec": 7.3}
-      - Summarize venues and top-level keys from the inner telemetry dict.
+    This endpoint is intentionally lightweight and **never** calls back into
+    our own HTTP server (to avoid deadlocks on single-worker deployments).
+
+    It uses only the in-process caches maintained by:
+      - telemetry_heartbeat()   -> _last_heartbeat
+      - telemetry_push()        -> _last_balances, _last_aggregates, _last_telemetry_ts
     """
     try:
-        resp = requests.get(LAST_URL, timeout=5)
+        age_sec = float(get_telemetry_age_sec())
+        aggregates = get_latest_aggregates() or {}
+        heartbeat = get_latest_heartbeat() or {}
+        balances = get_latest_balances() or {}
+
+        if not isinstance(aggregates, dict):
+            aggregates = {}
+        if not isinstance(heartbeat, dict):
+            heartbeat = {}
+        if not isinstance(balances, dict):
+            balances = {}
+
+        venues = sorted(balances.keys())
+        aggregates_keys = sorted(aggregates.keys())
+
+        # Prefer the agent recorded in aggregates; fall back to heartbeat.
+        agent = str(aggregates.get("agent") or heartbeat.get("agent") or "")
+
+        # Optional soft health flag: consider "ok" if we've seen telemetry
+        # within the last TELEMETRY_HEALTH_MAX_AGE_SEC seconds.
+        max_age = float(os.getenv("TELEMETRY_HEALTH_MAX_AGE_SEC", "900"))  # 15 minutes default
+        ok = bool(age_sec < max_age)
+
+        return jsonify(
+            {
+                "ok": ok,
+                "age_sec": age_sec,
+                "venues": venues,
+                "aggregates_keys": aggregates_keys,
+                "agent": agent,
+                "source": "memory",
+            }
+        )
     except Exception as e:
-        warn(f"telemetry_health: error calling {LAST_URL}: {e}")
+        # Never let health checks raise; just return a degraded blob.
+        try:
+            warn(f"telemetry_health error: {e}")
+        except Exception:
+            pass
         return jsonify(
             {
                 "ok": False,
-                "error": "unreachable",
+                "error": "exception",
                 "age_sec": 9e9,
                 "venues": [],
                 "aggregates_keys": [],
                 "agent": "",
-                "source": "last_url_error",
+                "source": "memory_error",
             }
         )
-
-    if not resp.ok:
-        warn(f"telemetry_health: HTTP {resp.status_code} from {LAST_URL}: {resp.text}")
-        return jsonify(
-            {
-                "ok": False,
-                "error": f"http_{resp.status_code}",
-                "age_sec": 9e9,
-                "venues": [],
-                "aggregates_keys": [],
-                "agent": "",
-                "source": "last_url_http",
-            }
-        )
-
-    try:
-        body = resp.json()
-    except Exception as e:
-        warn(f"telemetry_health: bad JSON from {LAST_URL}: {e}")
-        return jsonify(
-            {
-                "ok": False,
-                "error": "bad_json",
-                "age_sec": 9e9,
-                "venues": [],
-                "aggregates_keys": [],
-                "agent": "",
-                "source": "last_url_bad_json",
-            }
-        )
-
-    if not isinstance(body, dict):
-        return jsonify(
-            {
-                "ok": False,
-                "error": "non_dict_body",
-                "age_sec": 9e9,
-                "venues": [],
-                "aggregates_keys": [],
-                "agent": "",
-                "source": "last_url_non_dict",
-            }
-        )
-
-    ok = bool(body.get("ok", True))
-    age_sec = float(body.get("age_sec") or 9e9)
-    data = body.get("data") or {}
-    if not isinstance(data, dict):
-        data = {}
-
-    by_venue = data.get("by_venue") or {}
-    if not isinstance(by_venue, dict):
-        by_venue = {}
-
-    venues = sorted(by_venue.keys())
-    aggregates_keys = sorted(data.keys())
-    agent = str(data.get("agent") or "")
-
-    return jsonify(
-        {
-            "ok": ok,
-            "age_sec": age_sec,
-            "venues": venues,
-            "aggregates_keys": aggregates_keys,
-            "agent": agent,
-            "source": "last_url",
-        }
-    )
