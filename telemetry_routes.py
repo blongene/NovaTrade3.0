@@ -23,12 +23,13 @@ from flask import Blueprint, request, jsonify
 # ---- Imports from utils.py --------------------------------------------------
 
 try:
-    from utils import warn, info, get_ws, sheets_append_rows
+    from utils import warn, info, get_ws, sheets_append_rows, SHEET_URL
 except Exception:  # pragma: no cover - defensive fallback
     def warn(msg): print(f"[WARN] {msg}")
     def info(msg): print(f"[INFO] {msg}")
     def get_ws(name): raise RuntimeError("utils.get_ws unavailable")
     def sheets_append_rows(*a, **k): pass
+    SHEET_URL = ""
 
 # ---- Optional DB warehouse (telemetry_store) -------------------------------
 
@@ -241,7 +242,6 @@ def telemetry_push():
 
     # Optional mirror to Sheets (one row per venue/asset)
     try:
-        ws = get_ws(TELEMETRY_LOG_SHEET)
         rows = []
         for venue, assets in last_balances.items():
             for asset, amount in assets.items():
@@ -254,8 +254,9 @@ def telemetry_push():
                         amount,
                     ]
                 )
-        if rows:
-            sheets_append_rows(ws, rows)
+        if rows and SHEET_URL:
+            # utils.sheets_append_rows(sheet_url, worksheet_name, rows)
+            sheets_append_rows(SHEET_URL, TELEMETRY_LOG_SHEET, rows)
     except Exception as e:
         warn(f"telemetry sheet append failed: {e}")
 
