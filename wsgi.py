@@ -1169,6 +1169,15 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
         if not isinstance(norm, dict):
             norm = {}
 
+        # --- Derive decision_id if present anywhere -------------------------
+        decision_id = (
+            intent.get("decision_id")
+            or command.get("decision_id")
+            or norm.get("decision_id")
+            or receipt.get("decision_id")
+            or ""
+        )
+
         # columns expected:
         # A: Timestamp, B: Venue, C: Symbol, D: Side,
         # E: Amount_Quote, F: Executed_Qty, G: Avg_Price,
@@ -1188,7 +1197,13 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
         if not status:
             status = receipt.get("status") or ""
 
-        notes   = norm.get("note") or receipt.get("message") or ""
+        base_notes = norm.get("note") or receipt.get("message") or ""
+        if decision_id:
+            extra = f"decision_id={decision_id}"
+            notes = f"{base_notes}; {extra}" if base_notes else extra
+        else:
+            notes = base_notes
+
         cmd_id  = command.get("id", "")
         rcpt_id = norm.get("receipt_id") or receipt.get("receipt_id") or ""
 
