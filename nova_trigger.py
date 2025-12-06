@@ -197,30 +197,30 @@ def _get_price_usd(token: str, quote: str = "USDT", venue: str | None = None) ->
 # ---------------------------------------------------------------------------
 # Telegram summary helper
 # ---------------------------------------------------------------------------
-def _send_summary(raw: str, intent: Dict[str, Any], decision: Dict[str, Any], enq_ok: bool, enq_reason: Optional[str], mode: str) -> None:
-    """
-    Emit a short Telegram summary for manual rebuys.
-    """
-    try:
-        token = (intent.get("token") or "").upper()
-        venue = (intent.get("venue") or "").upper()
-        amount = intent.get("amount_usd")
-        reason = decision.get("reason") or ""
-        ok = bool(decision.get("ok"))
+def _send_summary(raw, intent, decision, enq_ok, enq_reason, mode):
+    icon = "✅" if decision.get("ok") else "❌"
+    lines = [
+        f"{icon} <b>Manual Rebuy</b>",
+        f"Cmd: <code>{raw}</code>",
+        f"Policy: {decision.get('reason')}",
+    ]
+    if intent.get("price_usd"):
+        lines.append(f"Price: ${intent['price_usd']:,.2f}")
 
-        lines = [
-            f"MANUAL_REBUY {token} @ {venue}",
-            f"Amount: {amount}",
-            f"Policy: {'OK' if ok else 'DENIED'} ({reason})",
-            f"Mode: {mode.upper()}",
-            f"Enqueue: {'OK' if enq_ok else 'FAIL'} ({enq_reason or 'n/a'})",
-        ]
+    if mode == "live":
+        e_icon = "🚀" if enq_ok else "⚠️"
+        lines.append(f"Enqueue: {e_icon} {enq_reason or 'OK'}")
+    else:
+        lines.append("Mode: DRYRUN (Not Enqueued)")
 
-        text = "\n".join(lines)
-        send_telegram_message_dedup(text)
-    except Exception as e:
-        warn(f"nova_trigger: summary telegram failed: {e}")
+    text = "\n".join(lines)
 
+    # utils.send_telegram_message_dedup(message, key, ttl_min=15)
+    send_telegram_message_dedup(
+        text,
+        key=f"manual_rebuy:{intent.get('token', 'UNKNOWN')}:{intent.get('venue', 'UNKNOWN')}",
+        ttl_min=1,
+    )
 
 # ---------------------------------------------------------------------------
 # Main handler: process MANUAL_REBUY string
