@@ -217,7 +217,7 @@ def _send_summary(raw: str, intent: Dict[str, Any], decision: Dict[str, Any], en
         ]
 
         text = "\n".join(lines)
-        send_telegram_message_dedup(text, ttl_seconds=TELEGRAM_DEDUP_TTL)
+        send_telegram_message_dedup(text)
     except Exception as e:
         warn(f"nova_trigger: summary telegram failed: {e}")
 
