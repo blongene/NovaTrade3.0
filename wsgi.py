@@ -1165,18 +1165,43 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
         if not isinstance(intent, dict):
             intent = {}
 
+        # Some paths put the real payload under "payload"
+        payload = intent.get("payload")
+        if isinstance(payload, dict):
+            # Don't overwrite keys like venue/symbol/side if they are already present
+            merged_intent = dict(payload)
+            merged_intent.setdefault("venue", intent.get("venue"))
+            merged_intent.setdefault("symbol", intent.get("symbol"))
+            merged_intent.setdefault("side", intent.get("side"))
+            intent = merged_intent
+
+        # In many receipts, "normalized" is just a flag (bool), not a dict
         norm = receipt.get("normalized")
         if not isinstance(norm, dict):
             norm = {}
 
-        # --- Derive decision_id if present anywhere -------------------------
-        decision_id = (
-            intent.get("decision_id")
-            or command.get("decision_id")
-            or norm.get("decision_id")
-            or receipt.get("decision_id")
-            or ""
-        )
+        # Try to find a decision_id from several candidate dicts
+        decision_id = ""
+
+        def _find_decision_id(d: Any) -> str:
+            if isinstance(d, dict):
+                v = d.get("decision_id")
+                if v:
+                    return str(v)
+            return ""
+
+        # candidates: intent, norm, receipt["raw_intent"], receipt["raw"]["intent"], receipt["raw"]["payload"]
+        raw_intent = receipt.get("raw_intent")
+        raw = receipt.get("raw") if isinstance(receipt.get("raw"), dict) else {}
+        raw_inner_intent = raw.get("intent") if isinstance(raw, dict) else None
+        raw_payload = None
+        if isinstance(raw_inner_intent, dict):
+            raw_payload = raw_inner_intent.get("payload")
+
+        for cand in (intent, norm, raw_intent, raw_inner_intent, raw_payload, receipt):
+            decision_id = _find_decision_id(cand)
+            if decision_id:
+                break
 
         # columns expected:
         # A: Timestamp, B: Venue, C: Symbol, D: Side,
@@ -1232,6 +1257,7 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
 
     except Exception as e:
         log.error("bus: trade_log append failed (non-fatal): %s", e)
+
 
 # --- DEBUG & TELEGRAM DIAGNOSTICS (restored) ---------------------------------
 def _guess_base_url() -> Optional[str]:
