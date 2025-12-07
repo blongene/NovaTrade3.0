@@ -1466,6 +1466,11 @@ def api_debug_selftest():
         log.warning("selftest failed: %s", e)
         return jsonify(ok=False, error=str(e), db="postgres"), 200
 
+@flask_app.route("/api/autonomy/status")
+def api_autonomy_status():
+    from autonomy_modes import get_autonomy_state
+    return jsonify(get_autonomy_state()), 200
+
 # ========== ASGI ==========
 try:
     from asgiref.wsgi import WsgiToAsgi
