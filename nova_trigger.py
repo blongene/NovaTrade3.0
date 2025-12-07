@@ -119,6 +119,14 @@ except ImportError:
         warn("nova_trigger: price_feed missing; _feed_get_price_usd returns None")
         return None
 
+# Autonomy status (Phase 20B)
+try:
+    from autonomy_modes import get_autonomy_state, format_autonomy_status
+except Exception:  # fail-open if module not available
+    def get_autonomy_state():
+        return {}
+    def format_autonomy_status(state=None) -> str:
+        return ""
 
 # === Config & Const
 
