@@ -31,18 +31,28 @@ Responsibilities:
 
 This is the "big red gate" that other modules (nova_trigger, rebuy_driver,
 rotation_executor, etc.) should call before enqueueing.
+
+Wave 2 upgrade:
+  - Every decision built by this module is now logged once to Policy_Log
+    via policy_logger.log_decision(...), if available.
 """
 
 from __future__ import annotations
 
 from typing import Dict, Any
 import os
-import time  # kept for compatibility; safe to remove if truly unused
 
 from policy_engine import PolicyEngine
 from venue_budget import get_budget_for_intent
 from utils import warn
 from policy_decision import PolicyDecision
+
+# Optional Policy_Log integration (fail-open if logger missing)
+try:  # pragma: no cover - defensive import
+    from policy_logger import log_decision as _log_policy_decision
+except Exception:  # pragma: no cover
+    def _log_policy_decision(decision: Dict[str, Any], intent: Dict[str, Any], when=None) -> None:
+        return
 
 # ---- Venue min-notional config ---------------------------------------------
 # Conservative defaults; you can override with env vars:
@@ -213,7 +223,8 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
         patched_dict: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        Wrap PolicyDecision construction so every outcome has a decision_id/meta.
+        Wrap PolicyDecision construction so every outcome has a decision_id/meta
+        AND is logged once into Policy_Log (if policy_logger is available).
         """
         symbol = (patched_dict.get("symbol") or intent_dict.get("symbol") or "").upper()
         quote_local = (
@@ -223,7 +234,7 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
             or ""
         ).upper()
 
-        decision = PolicyDecision(
+        decision_obj = PolicyDecision(
             ok=bool(ok),
             status=status,
             reason=reason or "",
@@ -237,7 +248,18 @@ def guard_trade_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
             requested_amount_usd=_safe_float(intent_dict.get("amount_usd")),
             approved_amount_usd=_safe_float(patched_dict.get("amount_usd")),
         )
-        return decision.to_dict()
+        decision_dict = decision_obj.to_dict()
+
+        # Best-effort log; never raise back to callers.
+        try:
+            _log_policy_decision(decision_dict, intent_dict)
+        except Exception as e:  # pragma: no cover
+            try:
+                warn(f"trade_guard: policy_logger failed: {e}")
+            except Exception:
+                pass
+
+        return decision_dict
 
     # ---- Basic validation --------------------------------------------------
     try:
