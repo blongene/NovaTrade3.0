@@ -14,7 +14,7 @@ import os
 import hmac
 import hashlib
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from flask import Blueprint, request, jsonify
 
@@ -200,6 +200,57 @@ def telemetry_push():
 def get_latest_balances() -> Dict[str, Any]:
     return dict(_last_balances)
 
+def update_from_push(
+    agent: str,
+    balances: Dict[str, Any],
+    aggregates: Optional[Dict[str, Any]] = None,
+    ts: Optional[int] = None,
+) -> None:
+    """
+    Called from wsgi.py when a telemetry push (balances snapshot) arrives.
+
+    It keeps the in-memory cache in sync so that:
+      • /api/telemetry/last prefers this cache
+      • /api/telemetry/health can report something meaningful
+    """
+    global _last_balances, _last_aggregates, _last_telemetry_ts
+
+    if not isinstance(balances, dict):
+        balances = {}
+
+    if aggregates is None or not isinstance(aggregates, dict):
+        aggregates = {}
+
+    # Update balances + timestamp
+    _last_balances = balances
+    now_ts = int(ts or time.time())
+    _last_telemetry_ts = float(now_ts)
+
+    # Merge aggregates and make sure we have a heartbeat-ish record
+    agg = dict(_last_aggregates)
+    agg.update(aggregates)
+
+    hb = agg.get("last_heartbeat") or {}
+    if not isinstance(hb, dict):
+        hb = {}
+    hb.setdefault("agent", agent)
+    hb["ts"] = now_ts
+    agg["last_heartbeat"] = hb
+
+    _last_aggregates = agg
+
+    # Optional: also persist into telemetry_store if available
+    try:
+        import telemetry_store
+
+        telemetry_store.store_push(
+            agent=agent,
+            ts=now_ts,
+            aggregates=_last_aggregates,
+        )
+    except Exception:
+        # Soft-fail only; we don’t want telemetry to break because SQLite is unhappy
+        pass
 
 def get_latest_heartbeat() -> Dict[str, Any]:
     return dict(_last_heartbeat)
