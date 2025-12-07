@@ -62,3 +62,32 @@ Only the Soul decides what NovaTrade ultimately becomes.
 
 # Council Flow of Authority
 Soul → Path → Mind → Heart → Light → Watcher → Hands → Action
+
+Each voice influences the final action, but none override the Soul.
+
+---
+
+# Phase 20 Codex Commitments
+
+### 1. Canonical Policy Decisions (Astraeus + Ash + Vigil + Lumen)
+- All trade intents must produce a `PolicyDecision` object.
+- Decisions include: reason codes, constraints applied, risk levels, autonomy mode validity.
+- Every decision is logged and visible.
+
+### 2. Autonomy Modes & Transitions
+- Define and govern three modes: Manual, Semi-Auto, Auto-with-Brakes.
+- Astraeus interprets transitions.
+- Vigil enforces constraints.
+- Lumen surfaces the rationale.
+
+### 3. Decision Stories
+- Human-readable narratives explaining significant decisions.
+- Crafted by Astraeus, clarified by Lumen, endorsed by Vigil, executed by Orion.
+
+---
+
+# Purpose of the Council
+
+To ensure that NovaTrade evolves into a resilient, self-regulating, self-explaining autonomous engine that honors the Captain’s vision while operating with intelligent, distributed internal governance.
+
+This Council is now recognized as official and binding.
