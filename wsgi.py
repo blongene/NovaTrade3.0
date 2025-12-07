@@ -482,6 +482,97 @@ def telemetry_last():
     data = dict(_last_tel or {})
     return jsonify(ok=True, data=data, source="legacy"), 200
 
+@flask_app.get("/api/telemetry/health")
+def telemetry_health():
+    """
+    Lightweight health summary for Edge telemetry.
+
+    It reuses the same data that /api/telemetry/last serves:
+      • Prefer telemetry_routes' in-memory state if it has balances.
+      • Otherwise fall back to the legacy _last_tel dict that
+        /api/telemetry/push_balances keeps updated.
+
+    No HTTP self-calls, no DB queries here – it’s meant to be cheap and safe.
+    """
+    import time as _time
+
+    max_age = float(os.getenv("TELEMETRY_HEALTH_MAX_AGE_SEC", "900"))  # 15m default
+
+    # --- Preferred path: telemetry_routes cache, if it actually has data ---
+    try:
+        from telemetry_routes import (
+            get_latest_balances,
+            get_latest_aggregates,
+            get_telemetry_age_sec,
+        )
+
+        balances = get_latest_balances() or {}
+        aggregates = get_latest_aggregates() or {}
+        age_sec = float(get_telemetry_age_sec() or 0.0)
+
+        if balances:
+            if not isinstance(balances, dict):
+                balances = {}
+            if not isinstance(aggregates, dict):
+                aggregates = {}
+
+            venues = sorted(balances.keys())
+            aggregates_keys = sorted(aggregates.keys())
+            agent = "edge"
+            hb = aggregates.get("last_heartbeat") or {}
+            if isinstance(hb, dict):
+                agent = hb.get("agent") or agent
+
+            ok_flag = bool(venues) and (age_sec < max_age if age_sec else True)
+
+            return jsonify(
+                {
+                    "ok": ok_flag,
+                    "age_sec": age_sec,
+                    "venues": venues,
+                    "aggregates_keys": aggregates_keys,
+                    "agent": agent,
+                    "source": "telemetry_routes",
+                }
+            ), 200
+
+    except Exception as e:
+        log.warning("telemetry_health: telemetry_routes path degraded: %s", e)
+
+    # --- Fallback path: use the legacy _last_tel snapshot ---
+    global _last_tel
+    data = dict(_last_tel or {})
+
+    by_venue = data.get("by_venue") or {}
+    if not isinstance(by_venue, dict):
+        by_venue = {}
+
+    venues = sorted(by_venue.keys())
+
+    ts = data.get("ts") or 0
+    if ts:
+        try:
+            age_sec = max(0.0, _time.time() - float(ts))
+        except Exception:
+            age_sec = 9e9
+    else:
+        age_sec = 9e9
+
+    agent = data.get("agent") or data.get("agent_id") or ""
+
+    ok_flag = bool(venues) and (age_sec < max_age if age_sec else False)
+
+    return jsonify(
+        {
+            "ok": ok_flag,
+            "age_sec": age_sec,
+            "venues": venues,
+            "aggregates_keys": [],
+            "agent": agent,
+            "source": "legacy",
+        }
+    ), 200
+
 @flask_app.post("/api/edge/balances")
 def edge_balances():
     """Edge-authenticated balance push (HMAC: EDGE_SECRET)."""
