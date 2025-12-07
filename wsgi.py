@@ -302,16 +302,45 @@ def _normalize_balances(raw) -> Tuple[dict, dict]:
 
 @flask_app.post("/api/telemetry/push")
 def telemetry_push():
-    # Use robust verify
+    """Edge → Bus: telemetry (balances + meta)."""
     ok, body, provided, expected = _verify_hmac_json("TELEMETRY_SECRET", "X-TELEMETRY-SIGN")
     if REQUIRE_HMAC_TELEMETRY and not ok:
         return jsonify(ok=False, error="invalid_signature"), 401
-        
+
     agent_id = body.get("agent_id") or "edge"
     flat, by_venue = _normalize_balances(body.get("balances") or {})
-    _last_tel.update({"agent_id": agent_id, "flat": flat, "by_venue": by_venue, "ts": int(time.time())})
-    venues_line = ", ".join(f"{v}:{len(t)}" for v,t in by_venue.items()) or "—"
-    log.info("📡 Telemetry from %s | venues=%s | flat_tokens=%d", agent_id, venues_line, len(flat))
+
+    now_ts = int(time.time())
+    global _last_tel
+    _last_tel.update(
+        {
+            "agent_id": agent_id,
+            "flat": flat,
+            "by_venue": by_venue,
+            "ts": now_ts,
+        }
+    )
+
+    # NEW: also feed telemetry_routes cache + SQLite store
+    try:
+        from telemetry_routes import update_from_push
+
+        update_from_push(
+            agent=agent_id,
+            balances=by_venue,
+            aggregates={"last_push": {"agent": agent_id, "ts": now_ts}},
+            ts=now_ts,
+        )
+    except Exception as e:
+        log.info("telemetry_push: unable to update telemetry_routes cache: %s", e)
+
+    venues_line = ", ".join(f"{v}:{len(t)}" for v, t in by_venue.items()) or "—"
+    log.info(
+        "📡 Telemetry from %s | venues=%s | flat_tokens=%d",
+        agent_id,
+        venues_line,
+        len(flat),
+    )
     return jsonify(ok=True, received=(len(by_venue) or len(flat))), 200
 
 @flask_app.post("/api/telemetry/push_balances")
@@ -352,20 +381,38 @@ def telemetry_push_balances():
     flat_count  = len(flat)
     venue_count = len(by_venue)
 
-    log.info("📊 Telemetry snapshot from %s — venues=[%s] tokens=%d ts=%s",
-             agent_id, venues_line, flat_count, ts)
+    log.info(
+        "📊 Telemetry snapshot from %s — venues=[%s] tokens=%d ts=%s",
+        agent_id,
+        venues_line,
+        flat_count,
+        ts,
+    )
 
-    # NEW: update global last snapshot for mirror jobs
+    # Update global last snapshot for mirror jobs
+    now_ts = int(time.time())
     global _last_tel
     _last_tel = {
         "agent_id": agent_id,
         "by_venue": by_venue,
         "flat": flat,
-        "ts": int(time.time()),
+        "ts": now_ts,
     }
 
-    # TODO: persist by_venue/flat if desired
-    return jsonify(ok=True, received=flat_count, venues=venue_count), 200
+    # NEW: also update telemetry_routes cache + SQLite
+    try:
+        from telemetry_routes import update_from_push
+
+        update_from_push(
+            agent=agent_id,
+            balances=by_venue,
+            aggregates={"last_push": {"agent": agent_id, "ts": now_ts}},
+            ts=now_ts,
+        )
+    except Exception as e:
+        log.info("telemetry_push_balances: unable to update telemetry_routes cache: %s", e)
+
+    return jsonify(ok=True, received=flat_count), 200
 
 @flask_app.get("/api/telemetry/last")
 def telemetry_last():
