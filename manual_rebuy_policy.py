@@ -9,23 +9,25 @@ Responsibilities:
   - Apply C-Series venue budget clamp (Unified_Snapshot-based) BEFORE policy.
   - Apply Exchange Rule Validator (min notional, known pairs, remaps).
   - Call PolicyEngine.validate(...) for sizing & risk checks.
-  - Append a lightweight row into Policy_Log.
-  - Send a short Telegram summary.
+  - Emit a short Telegram summary.
   - Return a dict: {"ok": bool, "reason": str, "patched_intent": dict}
+
+NOTE
+----
+This module no longer writes directly to Policy_Log.
+
+Structured logging is handled centrally via policy_logger.log_decision(...)
+which is invoked by nova_trigger after this function returns. This avoids
+duplicate / misaligned rows and keeps Policy_Log schema consistent.
 """
 
 from __future__ import annotations
 
-import os
-from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from policy_engine import PolicyEngine
 from venue_budget import get_budget_for_intent
-from utils import sheets_append_rows, send_telegram_message_dedup, warn
-
-SHEET_URL = os.getenv("SHEET_URL", "")
-POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
+from utils import send_telegram_message_dedup, warn
 
 # ---------------------------------------------------------------------------
 # Optional Exchange Rule Validator import (Pin 5)
@@ -39,43 +41,6 @@ except Exception:  # pragma: no cover
     def _validate_exchange_rules(intent: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
         """Fallback no-op exchange rule validator."""
         return True, "exchange_rules_disabled", dict(intent)
-
-
-def _append_policy_log_row(
-    intent: Dict[str, Any],
-    ok: bool,
-    reason: str,
-    patched: Dict[str, Any],
-) -> None:
-    """Best-effort append into Policy_Log; never raises."""
-    if not SHEET_URL:
-        return
-
-    try:
-        ts = datetime.now(timezone.utc).isoformat()
-        src = str(intent.get("source") or "manual_rebuy")
-        token = str(intent.get("token") or "").upper()
-        venue = str(intent.get("venue") or "").upper()
-        quote = str(intent.get("quote") or "").upper()
-        amt_usd = intent.get("amount_usd")
-        price_usd = intent.get("price_usd")
-        patched_amt_usd = patched.get("amount_usd", amt_usd)
-
-        row = [
-            ts,
-            src,
-            token,
-            venue,
-            quote,
-            amt_usd,
-            price_usd,
-            patched_amt_usd,
-            "OK" if ok else "DENIED",
-            reason,
-        ]
-        sheets_append_rows(SHEET_URL, POLICY_LOG_WS, [row])
-    except Exception as e:  # pragma: no cover
-        warn(f"manual_rebuy_policy: failed to append Policy_Log row: {e}")
 
 
 def _format_telegram_summary(
@@ -130,13 +95,16 @@ def _deny_early(
     patched: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Shared early-deny helper: logs row + telegram and returns policy result.
+    Shared early-deny helper: sends Telegram and returns policy result.
+
     Used by venue-budget layer and exchange-rule layer.
+
+    NOTE: Policy_Log logging is handled upstream in nova_trigger via
+    policy_logger.log_decision(...). We intentionally do NOT write to Sheets
+    from here to avoid duplicate/misaligned rows.
     """
     patched_intent = patched or dict(intent)
     ok = False
-
-    _append_policy_log_row(intent, ok, reason, patched_intent)
 
     try:
         msg = _format_telegram_summary(intent, ok, reason, patched_intent)
@@ -253,8 +221,7 @@ def evaluate_manual_rebuy(
     pe = PolicyEngine()
     ok, reason, patched = pe.validate(patched_intent, asset_state=asset_state)
 
-    # Logging + Telegram side effects
-    _append_policy_log_row(patched_intent, ok, reason, patched)
+    # Telegram side-effects (central Policy_Log happens upstream)
     try:
         msg = _format_telegram_summary(patched_intent, ok, reason, patched)
         key = f"manual_rebuy_policy:{token}:{venue}"
