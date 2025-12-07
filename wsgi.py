@@ -11,6 +11,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from sheets_bp import SHEETS_ROUTES, start_background_flusher
 from telemetry_routes import bp_telemetry
+from autonomy_modes import get_autonomy_state
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
@@ -1466,10 +1467,22 @@ def api_debug_selftest():
         log.warning("selftest failed: %s", e)
         return jsonify(ok=False, error=str(e), db="postgres"), 200
 
-@flask_app.route("/api/autonomy/status")
-def api_autonomy_status():
-    from autonomy_modes import get_autonomy_state
-    return jsonify(get_autonomy_state()), 200
+@app.route("/api/autonomy/status", methods=["GET"])
+def autonomy_status():
+    """
+    Lightweight JSON snapshot of the current autonomy state.
+
+    Example response:
+      {
+        "mode": "AUTO_WITH_BRAKES",
+        "edge_mode": "dryrun",
+        "holds": { "cloud": false, "edge": false, "nova": false },
+        "switches": { "nt_enqueue_live": true, "auto_enable_kraken": false },
+        "limits": { "canary_max_usd": 11.0, "quote_floors": {...} }
+      }
+    """
+    state = get_autonomy_state()
+    return jsonify(state), 200
 
 # ========== ASGI ==========
 try:
