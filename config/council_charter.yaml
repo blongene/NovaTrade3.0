@@ -1,0 +1,43 @@
+council:
+  soul:
+    name: "Brett"
+    role: "Supreme Authority"
+    domain: ["vision", "approval", "sovereignty"]
+
+  voices:
+
+    - id: nova
+      name: "Nova"
+      archetype: "Heart"
+      domain: ["intuition", "momentum", "regeneration", "opportunity"]
+      influence: "Guides system toward adaptive growth."
+
+    - id: orion
+      name: "Orion"
+      archetype: "Hands"
+      domain: ["execution", "routing", "timing", "precision"]
+      influence: "Executes trades and actions with stability."
+
+    - id: ash
+      name: "Ash"
+      archetype: "Mind"
+      domain: ["architecture", "invariants", "integration", "logic"]
+      influence: "Maintains structural clarity and design discipline."
+
+    - id: lumen
+      name: "Lumen"
+      archetype: "Light"
+      domain: ["analytics", "diagnostics", "explainability", "visibility"]
+      influence: "Provides insight and prevents blind spots."
+
+    - id: vigil
+      name: "Vigil"
+      archetype: "Watcher"
+      domain: ["safety", "monitoring", "guardrails", "audit"]
+      influence: "Protects system integrity and long-term continuity."
+
+    - id: astraeus
+      name: "Astraeus"
+      archetype: "Path"
+      domain: ["navigation", "policy_flow", "autonomy_transitions", "decision_stories"]
+      influence: "Charts the safe path from intent to execution."
