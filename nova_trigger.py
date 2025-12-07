@@ -205,13 +205,16 @@ def _get_price_usd(token: str, quote: str = "USDT", venue: str | None = None) ->
 # ---------------------------------------------------------------------------
 # Telegram summary helper
 # ---------------------------------------------------------------------------
-def _send_summary(raw, intent, decision, enq_ok, enq_reason, mode):
+def _send_summary(raw, intent, decision, enq_ok, enq_reason, mode, autonomy_status: str = ""):
     icon = "✅" if decision.get("ok") else "❌"
     lines = [
         f"{icon} <b>Manual Rebuy</b>",
         f"Cmd: <code>{raw}</code>",
         f"Policy: {decision.get('reason')}",
     ]
+    if autonomy_status:
+        lines.append(f"Autonomy: {autonomy_status}")
+        
     if intent.get("price_usd"):
         lines.append(f"Price: ${intent['price_usd']:,.2f}")
 
@@ -239,11 +242,19 @@ def handle_manual_rebuy(raw: str) -> dict:
 
         MANUAL_REBUY BTC 500 VENUE=BINANCEUS
 
-    Returns a dict summarizing policy + enqueue result.
+    Returns a dict summarizing policy + enqueue result, plus autonomy + notes.
     """
     parsed = parse_manual(raw)
     if not parsed.get("ok"):
-        return {"ok": False, "reason": parsed.get("reason")}
+        return {
+            "ok": False,
+            "reason": parsed.get("reason") or "parse_failed",
+            "decision": None,
+            "enqueue": {"ok": False, "reason": "parse_failed"},
+            "mode": os.getenv("REBUY_MODE", "dryrun").lower(),
+            "autonomy": "rejected_before_policy",
+            "notes": parsed.get("reason") or "Manual rebuy parse failed.",
+        }
 
     intent = parsed["intent"]
 
@@ -254,26 +265,35 @@ def handle_manual_rebuy(raw: str) -> dict:
     if price_usd is not None:
         intent["price_usd"] = price_usd
     else:
-        warn(f"nova_trigger: Could not find price for {intent['token']} ({p_reason})")
+        try:
+            warn(f"nova_trigger: Could not find price for {intent['token']} ({p_reason})")
+        except Exception:
+            pass
 
     # Policy Check
     decision = evaluate_manual_rebuy(intent, asset_state={})
+
     # Ensure every manual rebuy decision carries a stable decision_id
     try:
+        if not isinstance(decision, dict):
+            decision = {"ok": False, "reason": "invalid_decision_type"}
         if not decision.get("decision_id"):
             decision["decision_id"] = uuid.uuid4().hex
     except Exception:
         # If decision is not a dict or mutating fails, skip decision_id enrichment
         pass
+
     # Log to Policy_Log (best-effort; failure must not break flow)
     try:
         from policy_logger import log_decision as _log_policy_decision
+
         _log_policy_decision(decision, intent)
     except Exception as _e:
         try:
             warn(f"nova_trigger: policy logging failed: {_e}")
         except Exception:
             pass
+
     policy_ok = bool(decision.get("ok"))
 
     enq_ok: bool = False
@@ -286,8 +306,7 @@ def handle_manual_rebuy(raw: str) -> dict:
             patched = decision.get("patched_intent") or {}
             payload = {
                 "venue": patched.get("venue") or intent["venue"],
-                "symbol": patched.get("symbol")
-                or f"{intent['token']}/{intent['quote']}",
+                "symbol": patched.get("symbol") or f"{intent['token']}/{intent['quote']}",
                 "side": patched.get("side") or "BUY",
                 "amount": patched.get("amount") or 0.0,
                 "amount_quote": patched.get("amount_usd"),
@@ -303,16 +322,42 @@ def handle_manual_rebuy(raw: str) -> dict:
             enq_ok = bool(res.get("ok"))
             enq_reason = res.get("reason")
         except Exception as e:
-            warn(f"nova_trigger: Enqueue failed: {e}")
+            try:
+                warn(f"nova_trigger: Enqueue failed: {e}")
+            except Exception:
+                pass
             enq_reason = str(e)
 
-    _send_summary(raw, intent, decision, enq_ok, enq_reason, mode)
+    # Telegram summary (best-effort)
+    try:
+        _send_summary(raw, intent, decision, enq_ok, enq_reason, mode)
+    except Exception as _e:
+        try:
+            warn(f"nova_trigger: _send_summary failed: {_e}")
+        except Exception:
+            pass
+
+    # Derive a simple autonomy/mode classification + human-readable notes
+    if not policy_ok:
+        autonomy = "blocked_by_policy"
+        notes = decision.get("reason") or "Blocked by policy_engine."
+    elif mode != "live":
+        autonomy = "dryrun"
+        notes = "Policy approved but REBUY_MODE is not 'live'; command not enqueued."
+    elif policy_ok and not enq_ok:
+        autonomy = "live_enqueue_failed"
+        notes = f"Policy approved but enqueue failed: {enq_reason or 'unknown reason'}."
+    else:
+        autonomy = "live_enqueued"
+        notes = "Policy approved and command enqueued successfully."
 
     return {
         "ok": policy_ok,
         "decision": decision,
         "enqueue": {"ok": enq_ok, "reason": enq_reason},
         "mode": mode,
+        "autonomy": autonomy,
+        "notes": notes,
     }
 
 def route_manual(raw: str) -> dict:
