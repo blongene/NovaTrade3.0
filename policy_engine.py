@@ -1,7 +1,9 @@
-# policy_engine.py — Phase 8B-ready (context-aware reserves, notional caps, ledger logging, symbol normalization)
+# policy_engine.py — Phase 8B-ready + Phase 20 Wave 2 (PolicyDecision integration)
 from __future__ import annotations
 import os, json, hmac, hashlib
 from typing import Any, Dict, Optional, Tuple
+
+from policy_decision import PolicyDecision  # Phase 20: canonical decision wrapper
 
 # Prefer Unified_Snapshot (via venue_budget) for quote reserves when available
 try:
@@ -294,6 +296,69 @@ def _cap_notional(cfg: dict, notional: Optional[float]) -> Tuple[Optional[float]
         return cap, flags
     return notional, flags
 
+# --------------------------- PolicyDecision integration ---------------------------
+
+def _attach_policy_decision(
+    intent: Dict[str, Any],
+    decision: Dict[str, Any],
+    *,
+    venue: str,
+    base: str,
+    quote: str,
+) -> Dict[str, Any]:
+    """
+    Phase 20: Wrap a raw decision dict with a PolicyDecision object.
+
+    - Keeps the existing decision shape (ok, reason, patched_intent, flags).
+    - Adds:
+        * decision_id
+        * created_at
+        * meta: {venue, symbol, base, quote, requested_amount_usd,
+                 approved_amount_usd, limits_applied, council_trace}
+        * intent / patched (canonical fields for other subsystems)
+
+    If anything goes wrong, we fall back to the original decision dict.
+    """
+    try:
+        ok = bool(decision.get("ok", True))
+        reason = decision.get("reason", "")
+        status = "ok" if ok else "blocked"
+
+        patched_intent = decision.get("patched_intent") or {}
+        flags = decision.get("flags") or []
+
+        pd = PolicyDecision(
+            ok=ok,
+            status=status,
+            reason=reason,
+            intent=dict(intent),
+            patched=dict(patched_intent),
+            source=str(intent.get("source") or ""),
+            venue=venue,
+            symbol=str(intent.get("symbol") or ""),
+            base=base,
+            quote=quote,
+            requested_amount_usd=_notional_usd(intent),
+            approved_amount_usd=_notional_usd(patched_intent) if patched_intent else None,
+            limits_applied=list(flags),
+            council_trace={
+                "astraeus": {
+                    "role": "path",
+                    "stage": "post_engine",
+                }
+            },
+        )
+
+        pd_dict = pd.to_dict()
+        # Merge raw decision on top so legacy fields stay exactly as they were
+        merged = dict(pd_dict)
+        merged.update(decision)
+        # Ensure patched_intent is always present alongside 'patched'
+        merged.setdefault("patched_intent", patched_intent)
+        return merged
+    except Exception:
+        return decision
+
 # --------------------------- Engine ---------------------------
 
 class Engine:
@@ -313,11 +378,16 @@ class Engine:
 
         # Blocklist guard
         if base in [s.upper() for s in (cfg.get("blocked_symbols") or [])]:
-            decision = {"ok": False, "reason": f"blocked symbol {base}",
-                        "patched_intent": {}, "flags": ["blocked"]}
+            decision = {
+                "ok": False,
+                "reason": f"blocked symbol {base}",
+                "patched_intent": {},
+                "flags": ["blocked"],
+            }
+            decision = _attach_policy_decision(intent, decision, venue=venue, base=base, quote=quote)
             _policy_log(decision=decision, intent=intent, when=None)
-            _ledger("policy_check", False, f"blocked symbol {base}", base, side, intent.get("notional_usd",""),
-                    venue, quote, "", "")
+            _ledger("policy_check", False, f"blocked symbol {base}", base, side,
+                    intent.get("notional_usd",""), venue, quote, "", "")
             return decision
 
         # Normalize final symbol form for venue
@@ -348,8 +418,9 @@ class Engine:
                 "ok": False,
                 "reason": f"min notional {min_notional:.2f} USD not met (got {n:.2f})",
                 "patched_intent": {},
-                "flags": ["below_min_notional"]
+                "flags": ["below_min_notional"],
             }
+            decision = _attach_policy_decision(intent, decision, venue=venue, base=base, quote=quote)
             _policy_log(decision=decision, intent=intent, when=None)
             _ledger("policy_check", False, decision["reason"], base, side, n, venue, quote, "", "")
             return decision
@@ -373,22 +444,33 @@ class Engine:
 
         if side == "buy":
             if price is None and not cfg.get("allow_price_unknown", False):
-                decision = {"ok": False, "reason": "price unknown; sizing requires price",
-                            "patched_intent": patched, "flags": flags + ["price_unknown"]}
+                decision = {
+                    "ok": False,
+                    "reason": "price unknown; sizing requires price",
+                    "patched_intent": patched,
+                    "flags": flags + ["price_unknown"],
+                }
+                decision = _attach_policy_decision(intent, decision, venue=venue, base=base, quote=quote)
                 _policy_log(decision=decision, intent=intent, when=None)
-                _ledger("policy_check", False, decision["reason"], base, side, intent.get("notional_usd",""),
-                        venue, quote, json.dumps(patched) if patched else "", "")
+                _ledger("policy_check", False, decision["reason"], base, side,
+                        intent.get("notional_usd",""), venue, quote,
+                        json.dumps(patched) if patched else "", "")
                 return decision
 
             if isinstance(quote_reserve, (int, float)):
                 if min_reserve and float(quote_reserve) < float(min_reserve):
                     patched["amount"] = 0.0
-                    decision = {"ok": False,
-                                "reason": f"quote below min reserve (${quote_reserve:.2f} < ${min_reserve:.2f})",
-                                "patched_intent": patched, "flags": flags + ["below_min_reserve"]}
+                    decision = {
+                        "ok": False,
+                        "reason": f"quote below min reserve (${quote_reserve:.2f} < ${min_reserve:.2f})",
+                        "patched_intent": patched,
+                        "flags": flags + ["below_min_reserve"],
+                    }
+                    decision = _attach_policy_decision(intent, decision, venue=venue, base=base, quote=quote)
                     _policy_log(decision=decision, intent=intent, when=None)
-                    _ledger("policy_check", False, decision["reason"], base, side, intent.get("notional_usd",""),
-                            venue, quote, json.dumps(patched) if patched else "", "")
+                    _ledger("policy_check", False, decision["reason"], base, side,
+                            intent.get("notional_usd",""), venue, quote,
+                            json.dumps(patched) if patched else "", "")
                     return decision
 
                 usable = max(0.0, float(quote_reserve) - (keepback or 0.0))
@@ -403,12 +485,20 @@ class Engine:
                             patched["amount"] = target_amount
                             flags.append("auto_resized")
                         else:
-                            decision = {"ok": False,
-                                        "reason": f"insufficient quote: have ${quote_reserve:.2f}, usable ${usable:.2f}",
-                                        "patched_intent": patched, "flags": flags + ["insufficient_quote"]}
+                            decision = {
+                                "ok": False,
+                                "reason": (
+                                    f"insufficient quote: have ${quote_reserve:.2f}, "
+                                    f"usable ${usable:.2f}"
+                                ),
+                                "patched_intent": patched,
+                                "flags": flags + ["insufficient_quote"],
+                            }
+                            decision = _attach_policy_decision(intent, decision, venue=venue, base=base, quote=quote)
                             _policy_log(decision=decision, intent=intent, when=None)
-                            _ledger("policy_check", False, decision["reason"], base, side, intent.get("notional_usd",""),
-                                    venue, quote, json.dumps(patched) if patched else "", "")
+                            _ledger("policy_check", False, decision["reason"], base, side,
+                                    intent.get("notional_usd",""), venue, quote,
+                                    json.dumps(patched) if patched else "", "")
                             return decision
                 else:
                     flags.append("price_unknown")
@@ -421,11 +511,26 @@ class Engine:
                 patched["amount"] = float(f"{min_floor:.8f}")
                 flags.append("min_qty_floor")
 
-        decision = {"ok": True, "reason": "ok", "patched_intent": patched, "flags": flags}
+        decision = {
+            "ok": True,
+            "reason": "ok",
+            "patched_intent": patched,
+            "flags": flags,
+        }
+        decision = _attach_policy_decision(intent, decision, venue=venue, base=base, quote=quote)
         _policy_log(decision=decision, intent=intent, when=None)
-        _ledger("policy_check", True, "ok", base, side,
-                decision["patched_intent"].get("notional_usd", intent.get("notional_usd","")),
-                venue, quote, json.dumps(patched) if patched else "", "")
+        _ledger(
+            "policy_check",
+            True,
+            "ok",
+            base,
+            side,
+            decision["patched_intent"].get("notional_usd", intent.get("notional_usd","")),
+            venue,
+            quote,
+            json.dumps(patched) if patched else "",
+            "",
+        )
         return decision
 
 # --------------------------- Public API ---------------------------
