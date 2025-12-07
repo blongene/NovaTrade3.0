@@ -1467,7 +1467,7 @@ def api_debug_selftest():
         log.warning("selftest failed: %s", e)
         return jsonify(ok=False, error=str(e), db="postgres"), 200
 
-@app.route("/api/autonomy/status", methods=["GET"])
+@flask_app.route("/api/autonomy/status", methods=["GET"])
 def autonomy_status():
     """
     Lightweight JSON snapshot of the current autonomy state.
