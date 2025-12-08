@@ -213,19 +213,43 @@ def _get_price_usd(token: str, quote: str = "USDT", venue: str | None = None) ->
 # ---------------------------------------------------------------------------
 # Telegram summary helper
 # ---------------------------------------------------------------------------
-def _send_summary(raw, intent, decision, enq_ok, enq_reason, mode, autonomy_status: str = ""):
+def _send_summary(
+    raw: str,
+    intent: dict,
+    decision: dict,
+    enq_ok: bool,
+    enq_reason: Optional[str],
+    mode: str,
+    story: Optional[str] = None,
+) -> None:
+    """
+    Telegram summary for a manual rebuy.
+
+    Phase 20C: if a decision story is provided, it becomes the primary explanation.
+    """
     icon = "✅" if decision.get("ok") else "❌"
+
     lines = [
         f"{icon} <b>Manual Rebuy</b>",
         f"Cmd: <code>{raw}</code>",
-        f"Policy: {decision.get('reason')}",
     ]
-    if autonomy_status:
-        lines.append(f"Autonomy: {autonomy_status}")
-        
-    if intent.get("price_usd"):
-        lines.append(f"Price: ${intent['price_usd']:,.2f}")
 
+    # Story (Phase 20C) – preferred explanation
+    if story:
+        lines.append(f"Story: {story}")
+    else:
+        # Fallback: legacy policy reason
+        lines.append(f"Policy: {decision.get('reason')}")
+
+    # Price line if available
+    price_usd = intent.get("price_usd")
+    if price_usd is not None:
+        try:
+            lines.append(f"Price: ${float(price_usd):,.2f}")
+        except Exception:
+            lines.append(f"Price: {price_usd}")
+
+    # Enqueue / mode line
     if mode == "live":
         e_icon = "🚀" if enq_ok else "⚠️"
         lines.append(f"Enqueue: {e_icon} {enq_reason or 'OK'}")
@@ -235,11 +259,17 @@ def _send_summary(raw, intent, decision, enq_ok, enq_reason, mode, autonomy_stat
     text = "\n".join(lines)
 
     # utils.send_telegram_message_dedup(message, key, ttl_min=15)
-    send_telegram_message_dedup(
-        text,
-        key=f"manual_rebuy:{intent.get('token', 'UNKNOWN')}:{intent.get('venue', 'UNKNOWN')}",
-        ttl_min=1,
-    )
+    try:
+        send_telegram_message_dedup(
+            text,
+            key=f"manual_rebuy:{intent.get('token', 'UNKNOWN')}:{intent.get('venue', 'UNKNOWN')}",
+            ttl_min=1,
+        )
+    except Exception as e:
+        try:
+            warn(f"nova_trigger: Telegram summary failed: {e}")
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Main handler: process MANUAL_REBUY string
@@ -250,18 +280,20 @@ def handle_manual_rebuy(raw: str) -> dict:
 
         MANUAL_REBUY BTC 500 VENUE=BINANCEUS
 
-    Returns a dict summarizing policy + enqueue result, plus autonomy + notes.
+    Returns a dict summarizing policy + enqueue result, plus autonomy, notes, story.
     """
     parsed = parse_manual(raw)
     if not parsed.get("ok"):
+        reason = parsed.get("reason") or "parse_failed"
         return {
             "ok": False,
-            "reason": parsed.get("reason") or "parse_failed",
+            "reason": reason,
             "decision": None,
             "enqueue": {"ok": False, "reason": "parse_failed"},
             "mode": os.getenv("REBUY_MODE", "dryrun").lower(),
             "autonomy": "rejected_before_policy",
-            "notes": parsed.get("reason") or "Manual rebuy parse failed.",
+            "notes": reason,
+            "story": reason,
         }
 
     intent = parsed["intent"]
@@ -291,10 +323,22 @@ def handle_manual_rebuy(raw: str) -> dict:
         # If decision is not a dict or mutating fails, skip decision_id enrichment
         pass
 
+    # Build a decision story (Phase 20C) and attach to decision
+    story = ""
+    try:
+        story = generate_decision_story(intent, decision, autonomy_state=None)
+        if isinstance(decision, dict):
+            decision["story"] = story
+    except Exception as e:
+        try:
+            warn(f"nova_trigger: generate_decision_story failed: {e}")
+        except Exception:
+            pass
+        story = str(decision.get("reason") or "")
+
     # Log to Policy_Log (best-effort; failure must not break flow)
     try:
         from policy_logger import log_decision as _log_policy_decision
-
         _log_policy_decision(decision, intent)
     except Exception as _e:
         try:
@@ -336,9 +380,9 @@ def handle_manual_rebuy(raw: str) -> dict:
                 pass
             enq_reason = str(e)
 
-    # Telegram summary (best-effort)
+    # Telegram summary (best-effort; include story)
     try:
-        _send_summary(raw, intent, decision, enq_ok, enq_reason, mode)
+        _send_summary(raw, intent, decision, enq_ok, enq_reason, mode, story)
     except Exception as _e:
         try:
             warn(f"nova_trigger: _send_summary failed: {_e}")
@@ -348,16 +392,20 @@ def handle_manual_rebuy(raw: str) -> dict:
     # Derive a simple autonomy/mode classification + human-readable notes
     if not policy_ok:
         autonomy = "blocked_by_policy"
-        notes = decision.get("reason") or "Blocked by policy_engine."
+        base_notes = decision.get("reason") or "Blocked by policy_engine."
     elif mode != "live":
         autonomy = "dryrun"
-        notes = "Policy approved but REBUY_MODE is not 'live'; command not enqueued."
+        base_notes = "Policy approved but REBUY_MODE is not 'live'; command not enqueued."
     elif policy_ok and not enq_ok:
         autonomy = "live_enqueue_failed"
-        notes = f"Policy approved but enqueue failed: {enq_reason or 'unknown reason'}."
+        base_notes = f"Policy approved but enqueue failed: {enq_reason or 'unknown reason'}."
     else:
         autonomy = "live_enqueued"
-        notes = "Policy approved and command enqueued successfully."
+        base_notes = "Policy approved and command enqueued successfully."
+
+    notes = base_notes
+    if story and story not in notes:
+        notes = f"{story} | {base_notes}"
 
     return {
         "ok": policy_ok,
@@ -366,6 +414,7 @@ def handle_manual_rebuy(raw: str) -> dict:
         "mode": mode,
         "autonomy": autonomy,
         "notes": notes,
+        "story": story,
     }
 
 def route_manual(raw: str) -> dict:
