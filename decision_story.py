@@ -85,6 +85,17 @@ def generate_decision_story(
         edge_mode = autonomy_state.get("edge_mode")
         holds = autonomy_state.get("holds") or {}
 
+    auto_fragments = []
+    if autonomy_label:
+        auto_fragments.append(f"autonomy={autonomy_label}")
+    if mode_label and mode_label != autonomy_label:
+        auto_fragments.append(f"mode={mode_label}")
+    if edge_mode:
+        auto_fragments.append(f"edge={edge_mode}")
+    active_holds = [name for name, on in holds.items() if on]
+    if active_holds:
+        auto_fragments.append("holds=" + ",".join(active_holds))
+
     # --- Prefix: what trade is this? ---------------------------------------
     if token and venue:
         if amt_req is not None:
