@@ -128,6 +128,14 @@ except Exception:  # fail-open if module not available
     def format_autonomy_status(state=None) -> str:
         return ""
 
+# Decision Stories (Phase 20C)
+try:
+    from decision_story import generate_decision_story
+except Exception:  # fail-open if module missing
+    def generate_decision_story(intent, decision, autonomy_state=None) -> str:
+        # Fallback: just echo the reason
+        return str(decision.get("reason") or "")
+
 # === Config & Const
 
 UNIFIED_SNAPSHOT_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
