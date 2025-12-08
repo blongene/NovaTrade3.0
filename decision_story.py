@@ -75,11 +75,13 @@ def generate_decision_story(
     reason = str(decision.get("reason") or "")
 
     # Autonomy context (optional)
-    mode = None
+    autonomy_label = None
+    mode_label = None
     edge_mode = None
     holds = {}
     if isinstance(autonomy_state, dict):
-        mode = autonomy_state.get("mode") or autonomy_state.get("autonomy")
+        autonomy_label = autonomy_state.get("autonomy")
+        mode_label = autonomy_state.get("mode")
         edge_mode = autonomy_state.get("edge_mode")
         holds = autonomy_state.get("holds") or {}
 
@@ -113,16 +115,15 @@ def generate_decision_story(
         parts.append(reason)
 
     auto_fragments = []
-    if mode:
-        auto_fragments.append(f"autonomy={mode}")
+    if autonomy_label:
+        auto_fragments.append(f"autonomy={autonomy_label}")
+    if mode_label and mode_label != autonomy_label:
+        auto_fragments.append(f"mode={mode_label}")
     if edge_mode:
         auto_fragments.append(f"edge={edge_mode}")
     active_holds = [name for name, on in holds.items() if on]
     if active_holds:
         auto_fragments.append("holds=" + ",".join(active_holds))
-
-    if auto_fragments:
-        parts.append(", ".join(auto_fragments))
 
     council_text = _format_council(decision)
     if council_text:
