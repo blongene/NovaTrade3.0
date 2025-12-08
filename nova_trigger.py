@@ -280,11 +280,22 @@ def handle_manual_rebuy(raw: str) -> dict:
 
         MANUAL_REBUY BTC 500 VENUE=BINANCEUS
 
-    Returns a dict summarizing policy + enqueue result, plus autonomy, notes, story.
+    Returns a dict summarizing policy + enqueue result, plus
+    autonomy, notes, story, and council influence.
     """
     parsed = parse_manual(raw)
     if not parsed.get("ok"):
         reason = parsed.get("reason") or "parse_failed"
+        # Parse failed before a policy decision existed; treat as
+        # a rejected-before-policy event.
+        council = {
+            "soul": 1.0,
+            "nova": 1.0,
+            "orion": 0.0,
+            "ash": 0.0,
+            "lumen": 0.0,
+            "vigil": 0.0,
+        }
         return {
             "ok": False,
             "reason": reason,
@@ -294,6 +305,7 @@ def handle_manual_rebuy(raw: str) -> dict:
             "autonomy": "rejected_before_policy",
             "notes": reason,
             "story": reason,
+            "council": council,
         }
 
     intent = parsed["intent"]
@@ -320,31 +332,7 @@ def handle_manual_rebuy(raw: str) -> dict:
         if not decision.get("decision_id"):
             decision["decision_id"] = uuid.uuid4().hex
     except Exception:
-        # If decision is not a dict or mutating fails, skip decision_id enrichment
         pass
-
-    # Build a decision story (Phase 20C) and attach to decision
-    story = ""
-    try:
-        story = generate_decision_story(intent, decision, autonomy_state=None)
-        if isinstance(decision, dict):
-            decision["story"] = story
-    except Exception as e:
-        try:
-            warn(f"nova_trigger: generate_decision_story failed: {e}")
-        except Exception:
-            pass
-        story = str(decision.get("reason") or "")
-
-    # Log to Policy_Log (best-effort; failure must not break flow)
-    try:
-        from policy_logger import log_decision as _log_policy_decision
-        _log_policy_decision(decision, intent)
-    except Exception as _e:
-        try:
-            warn(f"nova_trigger: policy logging failed: {_e}")
-        except Exception:
-            pass
 
     policy_ok = bool(decision.get("ok"))
 
@@ -354,7 +342,6 @@ def handle_manual_rebuy(raw: str) -> dict:
 
     if policy_ok and mode == "live":
         try:
-            # Construct payload for enqueue
             patched = decision.get("patched_intent") or {}
             payload = {
                 "venue": patched.get("venue") or intent["venue"],
@@ -364,7 +351,6 @@ def handle_manual_rebuy(raw: str) -> dict:
                 "amount_quote": patched.get("amount_usd"),
                 "source": "manual_rebuy",
                 "ts": int(time.time()),
-                # Carry policy decision linkage through to the command
                 "decision_id": decision.get("decision_id"),
             }
             if intent.get("price_usd") is not None:
@@ -380,16 +366,7 @@ def handle_manual_rebuy(raw: str) -> dict:
                 pass
             enq_reason = str(e)
 
-    # Telegram summary (best-effort; include story)
-    try:
-        _send_summary(raw, intent, decision, enq_ok, enq_reason, mode, story)
-    except Exception as _e:
-        try:
-            warn(f"nova_trigger: _send_summary failed: {_e}")
-        except Exception:
-            pass
-
-    # Derive a simple autonomy/mode classification + human-readable notes
+    # Autonomy classification
     if not policy_ok:
         autonomy = "blocked_by_policy"
         base_notes = decision.get("reason") or "Blocked by policy_engine."
@@ -403,9 +380,66 @@ def handle_manual_rebuy(raw: str) -> dict:
         autonomy = "live_enqueued"
         base_notes = "Policy approved and command enqueued successfully."
 
+    # Council influence tagging (20D)
+    council = {
+        "soul": 1.0,
+        "nova": 1.0,
+        "orion": 0.0,
+        "ash": 0.0,
+        "lumen": 0.0,
+        "vigil": 0.0,
+    }
+    try:
+        from council_influence import apply_council_influence
+        council = apply_council_influence(intent, decision, {"autonomy": autonomy, "mode": mode})
+    except Exception as e:
+        try:
+            warn(f"nova_trigger: council influence tagging failed: {e}")
+        except Exception:
+            pass
+
+    # Attach back onto the decision for Policy_Log / downstreams
+    try:
+        decision["autonomy"] = autonomy
+        decision["council"] = council
+    except Exception:
+        pass
+
+    # Story + notes
+    story = ""
+    try:
+        auto_state = {"autonomy": autonomy, "mode": mode}
+        story = generate_decision_story(intent, decision, autonomy_state=auto_state)
+        decision["story"] = story
+    except Exception as e:
+        try:
+            warn(f"nova_trigger: generate_decision_story failed: {e}")
+        except Exception:
+            pass
+        story = str(decision.get("reason") or "")
+
     notes = base_notes
     if story and story not in notes:
         notes = f"{story} | {base_notes}"
+
+    # Log to Policy_Log (best-effort)
+    try:
+        from policy_logger import log_decision as _log_policy_decision
+        _log_policy_decision(decision, intent)
+    except Exception as _e:
+        try:
+            warn(f"nova_trigger: policy logging failed: {_e}")
+        except Exception:
+            pass
+
+    # Telegram summary (best-effort; includes story)
+    try:
+        _send_summary(raw, intent, decision, enq_ok, enq_reason, mode, story)
+    except Exception as _e:
+        try:
+            warn(f"nova_trigger: _send_summary failed: {_e}")
+        except Exception:
+            pass
 
     return {
         "ok": policy_ok,
@@ -415,6 +449,7 @@ def handle_manual_rebuy(raw: str) -> dict:
         "autonomy": autonomy,
         "notes": notes,
         "story": story,
+        "council": council,
     }
 
 def route_manual(raw: str) -> dict:
