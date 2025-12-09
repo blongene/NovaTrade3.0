@@ -14,6 +14,8 @@ from __future__ import annotations
 import os, json, hmac, hashlib, sqlite3, time, traceback
 from typing import Any, Dict, List
 from flask import Blueprint, request, jsonify
+from logging import getLogger
+log = getLogger(__name__)
 
 bp = Blueprint("ops_api", __name__, url_prefix="/api")
 
@@ -61,7 +63,7 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
     cur.execute("""
     CREATE TABLE IF NOT EXISTS receipts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      payload TEXT NOT NULL,              -- full JSON {cmd_id, command, receipt, meta}
+      payload TEXT NOT NULL,              -- full  {cmd_id, command, receipt, meta}
       ts TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
@@ -107,7 +109,7 @@ def commands_pull():
     try:
         raw = request.get_data(cache=False) or b"{}"
         try:
-            j = json.loads(raw.decode("utf-8"))
+            j = .loads(raw.decode("utf-8"))
         except Exception:
             j = {}
         limit = int(j.get("limit") or MAX_PULL)
@@ -128,11 +130,11 @@ def commands_pull():
         rows = cur.fetchall()
         cmds = [_row_to_cmd(r) for r in rows]
 
-        return jsonify(cmds), 200
+        return ify(cmds), 200
     except Exception as e:
         print(f"[ops_api] pull error: {e}")
         traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return ify({"ok": False, "error": str(e)}), 500
 
 @bp.route("/commands/ack", methods=["POST"])
 def commands_ack():
@@ -150,9 +152,9 @@ def commands_ack():
     try:
         raw = request.get_data(cache=False) or b"{}"
         if not _verify_signature(raw):
-            return jsonify({"ok": False, "error": "invalid signature"}), 401
+            return ify({"ok": False, "error": "invalid signature"}), 401
 
-        j = json.loads(raw.decode("utf-8"))
+        j = .loads(raw.decode("utf-8"))
         cid     = int(j.get("id") or j.get("cmd_id") or 0)
         status  = str(j.get("status") or "").lower() or "ok"
         receipt = j.get("receipt") or {}
@@ -160,10 +162,10 @@ def commands_ack():
         command = j.get("command") or {}
 
         if not cid:
-            return jsonify({"ok": False, "error": "missing id"}), 400
+            return ify({"ok": False, "error": "missing id"}), 400
 
         # mirror for bridge
-        payload = json.dumps({
+        payload = .dumps({
             "cmd_id": cid,
             "status": status,
             "receipt": receipt,
@@ -185,11 +187,11 @@ def commands_ack():
             # tolerate legacy outbox without status column (should be fixed by ensure_schema)
             pass
 
-        return jsonify({"ok": True}), 200
+        return ify({"ok": True}), 200
     except Exception as e:
         print(f"[ops_api] ack error: {e}")
         traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return ify({"ok": False, "error": str(e)}), 500
 
 @app.route("/api/insight/<decision_id>", methods=["GET"])
 def get_insight(decision_id):
