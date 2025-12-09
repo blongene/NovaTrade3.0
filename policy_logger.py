@@ -389,26 +389,6 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
         # Also mirror into council_insights.jsonl for Ops API / Council_Insight sheet
     try:
         log_decision_insight(decision, intent)
-    except Exception:
-        # Never let insight logging break the main flow
-        pass
-
-def log_decision_insight(decision: Dict[str, Any],
-                         intent: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Append a single CouncilInsight record to council_insights.jsonl.
-    This is analytics only, so it must never break trading.
-    """
-    try:
-        from insight_model import CouncilInsight
-    except Exception:
-        # If the model isn't available for some reason, just bail quietly.
-        return
-
-    try:
-        ci = CouncilInsight.from_decision(decision, intent or {})
-        with open(INSIGHT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(ci.to_dict(), sort_keys=True) + "\n")
-    except Exception:
-        # Completely swallow errors here: policy logging is best-effort only.
-        return
+    except Exception as e:
+        warn(f"policy_logger: insight logging failed: {e}")
+        
