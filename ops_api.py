@@ -23,8 +23,7 @@ bp = Blueprint("ops_api", __name__, url_prefix="/api")
 OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
 OUTBOX_SECRET  = os.getenv("OUTBOX_SECRET", "")  # if empty => no signature required
 MAX_PULL       = int(os.getenv("MAX_PULL", "50"))
-INSIGHT_LOGFILE = "council_insights.jsonl"
-INSIGHT_LOG_PATH = os.path.join(os.path.dirname(__file__), INSIGHT_LOGFILE)
+INSIGHT_LOG_PATH = "/data/council_insights.jsonl"
 
 # ------------ SQLite helpers ------------
 
@@ -201,7 +200,7 @@ def commands_ack():
 @bp.route("/insight/<decision_id>", methods=["GET"])
 def get_insight(decision_id):
     try:
-        with open("council_insights.jsonl", "r") as f:
+        with open(INSIGHT_LOG_PATH, "r") as f:
             for line in f:
                 if not line.strip():
                     continue
@@ -225,7 +224,7 @@ def recent_insights():
 
     try:
         entries = []
-        with open("council_insights.jsonl", "r") as f:
+        with open(INSIGHT_LOG_PATH, "r") as f:
             for line in f:
                 if not line.strip():
                     continue
@@ -245,7 +244,7 @@ def recent_insights():
 @bp.route("/insight/<decision_id>/view")  # you can use /view or leave it as /insight/<id>
 def insight_html(decision_id):
     try:
-        with open("council_insights.jsonl", "r") as f:
+        with open(INSIGHT_LOG_PATH, "r") as f:
             for line in f:
                 entry = json.loads(line.strip())
                 if entry.get("decision_id") == decision_id:
