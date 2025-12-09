@@ -4,11 +4,14 @@ import os
 import json
 from datetime import datetime
 from typing import Any, Dict, Optional
+import time
+from insight_model import CouncilInsight
 
 SHEET_URL = os.getenv("SHEET_URL")
 POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
 LOG_ENABLED = os.getenv("POLICY_LOG_ENABLE", "1").lower() in ("1", "true", "yes", "on")
 LOCAL_FALLBACK_PATH = os.getenv("POLICY_LOG_LOCAL", "./policy_log.jsonl")
+INSIGHT_LOGFILE = "council_insights.jsonl"
 
 try:
     # Prefer Bus-wide Sheets helpers if available
@@ -271,3 +274,30 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
             _log_warn(f"Policy_Log append failed: {e}")
         except Exception:
             pass
+            
+def log_decision_insight(decision: dict, intent: dict):
+    try:
+        insight = CouncilInsight(
+            decision_id = decision.get("decision_id"),
+            ts = time.time(),
+            autonomy = decision.get("autonomy"),
+            council = decision.get("council", {}),
+            story = decision.get("story"),
+            ok = decision.get("ok"),
+            reason = decision.get("reason"),
+            flags = decision.get("flags", []),
+            raw_intent = intent,
+            patched_intent = decision.get("patched_intent", {}),
+            venue = decision.get("venue") or (decision.get("patched_intent") or {}).get("venue"),
+            symbol = decision.get("symbol") or (decision.get("patched_intent") or {}).get("symbol"),
+        )
+
+        # append to file
+        with open(INSIGHT_LOGFILE, "a") as f:
+            f.write(json.dumps(insight.to_dict()) + "\n")
+
+        return insight
+
+    except Exception as e:
+        print(f"[CouncilInsight] Logging failure: {e}")
+        return None
