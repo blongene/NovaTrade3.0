@@ -203,3 +203,51 @@ def get_insight(decision_id):
         return jsonify({"ok": False, "error": "decision_id not found"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+@app.route("/api/insight/recent", methods=["GET"])
+def recent_insights():
+    limit = int(request.args.get("limit", 50))
+    try:
+        entries = []
+        with open("council_insights.jsonl", "r") as f:
+            for line in f:
+                entries.append(json.loads(line.strip()))
+        return jsonify({
+            "ok": True,
+            "count": len(entries[-limit:]),
+            "insights": entries[-limit:]
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+@app.route("/insight/<decision_id>")
+def insight_html(decision_id):
+    try:
+        with open("council_insights.jsonl", "r") as f:
+            for line in f:
+                entry = json.loads(line.strip())
+                if entry.get("decision_id") == decision_id:
+                    council = entry.get("council", {})
+                    html = f"""
+                    <html>
+                    <body style='font-family:sans-serif;padding:20px'>
+                      <h2>Decision {decision_id}</h2>
+                      <p><b>Story:</b> {entry.get('story')}</p>
+                      <p><b>Autonomy:</b> {entry.get('autonomy')}</p>
+                      <h3>Council Influence</h3>
+                      <pre>{json.dumps(council, indent=2)}</pre>
+                      <h3>Raw Intent</h3>
+                      <pre>{json.dumps(entry.get('raw_intent'), indent=2)}</pre>
+                      <h3>Patched Intent</h3>
+                      <pre>{json.dumps(entry.get('patched_intent'), indent=2)}</pre>
+                      <h3>Flags</h3>
+                      <pre>{json.dumps(entry.get('flags'), indent=2)}</pre>
+                    </body>
+                    </html>
+                    """
+                    return html
+        return "Not found", 404
+    except Exception as e:
+        return f"Error: {e}", 500
+
+
