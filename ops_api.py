@@ -18,7 +18,7 @@ from logging import getLogger
 
 log = logging.getLogger(__name__)
 
-bp = Blueprint("ops_api", __name__)
+bp = Blueprint("ops_api", __name__, url_prefix="/api")
 
 OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
 OUTBOX_SECRET  = os.getenv("OUTBOX_SECRET", "")  # if empty => no signature required
@@ -199,129 +199,50 @@ def commands_ack():
 # ---------------- Council Insight API ----------------
 
 @bp.route("/insight/<decision_id>", methods=["GET"])
-def get_insight(decision_id: str):
-    """
-    Look up a single CouncilInsight by decision_id.
-
-    Final URL (because of blueprint registration in main.py):
-      GET /api/insight/<decision_id>
-    """
-    path = INSIGHT_LOG_PATH
-
-    if not os.path.exists(path):
-        return jsonify({"ok": False, "error": "no_insights"}), 404
-
+def get_insight(decision_id):
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open("council_insights.jsonl", "r") as f:
             for line in f:
-                line = line.strip()
-                if not line:
+                if not line.strip():
                     continue
-
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    # skip bad lines
-                    continue
-
+                obj = json.loads(line.strip())
                 if obj.get("decision_id") == decision_id:
                     return jsonify({"ok": True, "insight": obj})
-
         return jsonify({"ok": False, "error": "decision_id_not_found"}), 404
-
+    except FileNotFoundError:
+        return jsonify({"ok": False, "error": "not_found"}), 404
     except Exception as e:
-        log.exception("council_insights: get_insight failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@bp.route("/insight/recent", methods=["GET"])
+@bp.route("/insight/recent", methods=["GET"])   # <-- this is the important change
 def recent_insights():
-    """
-    Return the most recent CouncilInsight entries from council_insights.jsonl.
-
-    Final URL:
-      GET /api/insight/recent?limit=50
-    """
-    limit = int(request.args.get("limit", 50))
-    path = INSIGHT_LOG_PATH
-
-    # If file doesn't exist yet, treat as "no insights yet".
-    if not os.path.exists(path):
-        return jsonify({"ok": True, "count": 0, "entries": []})
-
-    entries = []
+    # how many to return
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+
+    try:
+        entries = []
+        with open("council_insights.jsonl", "r") as f:
             for line in f:
-                line = line.strip()
-                if not line:
+                if not line.strip():
                     continue
-                try:
-                    entries.append(json.loads(line))
-                except Exception as e:
-                    log.warning("council_insights: failed to parse line: %s", e)
+                entries.append(json.loads(line.strip()))
 
         if not entries:
             return jsonify({"ok": True, "count": 0, "entries": []})
 
-        subset = entries[-limit:]
-        return jsonify({"ok": True, "count": len(subset), "entries": subset})
-
+        recent = entries[-limit:]
+        return jsonify({"ok": True, "count": len(recent), "entries": recent})
+    except FileNotFoundError:
+        return jsonify({"ok": False, "error": "not_found"}), 404
     except Exception as e:
-        log.exception("council_insights: recent_insights failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@bp.route("/insight/<decision_id>/view")
-def insight_html(decision_id: str):
-    """
-    Simple HTML view for a single decision.
-    Final URL:
-      GET /api/insight/<decision_id>/view
-    """
-    path = INSIGHT_LOG_PATH
-
-    if not os.path.exists(path):
-        return "No insights yet", 404
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except Exception:
-                    continue
-                if entry.get("decision_id") == decision_id:
-                    council = entry.get("council", {})
-                    html = f"""
-                    <html>
-                      <body style='font-family:sans-serif;padding:20px'>
-                        <h2>Decision {decision_id}</h2>
-                        <p><b>Story:</b> {entry.get('story')}</p>
-                        <p><b>Autonomy:</b> {entry.get('autonomy')}</p>
-                        <h3>Council Influence</h3>
-                        <pre>{json.dumps(council, indent=2)}</pre>
-                        <h3>Raw Intent</h3>
-                        <pre>{json.dumps(entry.get('raw_intent'), indent=2)}</pre>
-                        <h3>Patched Intent</h3>
-                        <pre>{json.dumps(entry.get('patched_intent'), indent=2)}</pre>
-                        <h3>Flags</h3>
-                        <pre>{json.dumps(entry.get('flags'), indent=2)}</pre>
-                      </body>
-                    </html>
-                    """
-                    return html
-
-        return "Not found", 404
-
-    except Exception as e:
-        log.exception("council_insights: insight_html failed: %s", e)
-        return f"Error: {e}", 500
-
-@bp.route("/insight/<decision_id>")
+@bp.route("/insight/<decision_id>/view")  # you can use /view or leave it as /insight/<id>
 def insight_html(decision_id):
     try:
         with open("council_insights.jsonl", "r") as f:
