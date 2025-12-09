@@ -190,3 +190,16 @@ def commands_ack():
         print(f"[ops_api] ack error: {e}")
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/api/insight/<decision_id>", methods=["GET"])
+def get_insight(decision_id):
+    try:
+        entries = []
+        with open("council_insights.jsonl", "r") as f:
+            for line in f:
+                obj = json.loads(line.strip())
+                if obj.get("decision_id") == decision_id:
+                    return jsonify({"ok": True, "insight": obj})
+        return jsonify({"ok": False, "error": "decision_id not found"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
