@@ -422,13 +422,17 @@ def handle_manual_rebuy(raw: str) -> dict:
     if story and story not in notes:
         notes = f"{story} | {base_notes}"
 
-    # Log to Policy_Log + Council Insight (best-effort; failures must not break flow)
+    # Log to Policy_Log and Council_Insight (best-effort)
     try:
-        from policy_logger import log_decision_insight
-        log_decision_insight(decision, intent)
+        from policy_logger import (
+            log_decision as _log_policy_decision,
+            log_decision_insight as _log_policy_insight,
+        )
+        _log_policy_decision(decision, intent)
+        _log_policy_insight(decision, intent)
     except Exception as _e:
         try:
-            warn(f"nova_trigger: insight logging failed: {_e}")
+            warn(f"nova_trigger: policy logging failed: {_e}")
         except Exception:
             pass
 
