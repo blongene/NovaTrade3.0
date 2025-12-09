@@ -13,6 +13,9 @@ LOG_ENABLED = os.getenv("POLICY_LOG_ENABLE", "1").lower() in ("1", "true", "yes"
 LOCAL_FALLBACK_PATH = os.getenv("POLICY_LOG_LOCAL", "./policy_log.jsonl")
 INSIGHT_LOG_PATH = os.path.join(os.path.dirname(__file__), "council_insights.jsonl")
 COUNCIL_INSIGHT_LOG = os.environ.get("COUNCIL_INSIGHT_LOG", "council_insights.jsonl")
+COUNCIL_INSIGHTS_FILE = os.environ.get(
+    "COUNCIL_INSIGHTS_FILE", "council_insights.jsonl"
+)
 
 try:
     # Prefer Bus-wide Sheets helpers if available
@@ -177,98 +180,6 @@ def _append_jsonl(path: str, obj: Dict[str, Any]) -> None:
         except Exception:
             pass
 
-def log_decision_insight(decision: Dict[str, Any], intent: Dict[str, Any]) -> None:
-    """
-    Mirror a policy decision into council_insights.jsonl for Ops API / Council_Insight sheet.
-    Uses the CouncilInsight model if available, otherwise writes a simple dict.
-    """
-    try:
-        from insight_model import CouncilInsight  # local import so this file works even if model is absent
-    except Exception:
-        CouncilInsight = None  # type: ignore
-
-    try:
-        meta = decision.get("meta") or {}
-
-        raw_intent: Dict[str, Any] = (decision.get("intent") or {}) or (intent or {})
-        patched: Dict[str, Any] = decision.get("patched_intent") or {}
-
-        flags: List[str] = (
-            decision.get("flags")
-            or meta.get("limits_applied")
-            or []
-        )
-
-        decision_id = (
-            decision.get("decision_id")
-            or meta.get("decision_id")
-            or ""
-        )
-
-        ts = (
-            decision.get("ts")
-            or meta.get("created_at_ts")
-            or time.time()
-        )
-
-        autonomy = decision.get("autonomy") or meta.get("autonomy") or ""
-        council = decision.get("council") or {}
-        story = decision.get("story") or ""
-        ok = bool(decision.get("ok"))
-        reason = decision.get("reason") or ""
-
-        venue = (
-            raw_intent.get("venue")
-            or patched.get("venue")
-            or meta.get("venue")
-        )
-        symbol = (
-            raw_intent.get("symbol")
-            or patched.get("symbol")
-            or meta.get("symbol")
-        )
-
-        if CouncilInsight is not None:
-            ci = CouncilInsight(
-                decision_id=decision_id,
-                ts=ts,
-                autonomy=autonomy,
-                council=council,
-                story=story,
-                ok=ok,
-                reason=reason,
-                flags=flags,
-                raw_intent=raw_intent,
-                patched_intent=patched,
-                venue=venue,
-                symbol=symbol,
-            )
-            payload = ci.to_dict()
-        else:
-            # Fallback: plain dict with the same keys
-            payload = {
-                "decision_id": decision_id,
-                "ts": ts,
-                "autonomy": autonomy,
-                "council": council,
-                "story": story,
-                "ok": ok,
-                "reason": reason,
-                "flags": flags,
-                "raw_intent": raw_intent,
-                "patched_intent": patched,
-                "venue": venue,
-                "symbol": symbol,
-            }
-
-        _append_jsonl(COUNCIL_INSIGHT_LOG, payload)
-
-    except Exception as e:
-        try:
-            warn(f"policy_logger: log_decision_insight failed: {e}")
-        except Exception:
-            pass
-
 def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = None) -> None:
     """
     Log a policy decision both locally (JSONL) and to the Policy_Log sheet.
@@ -392,3 +303,79 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
     except Exception as e:
         warn(f"policy_logger: insight logging failed: {e}")
         
+def log_decision_insight(decision: Dict[str, Any], intent: Dict[str, Any]) -> None:
+    """
+    Best-effort: append a CouncilInsight row to council_insights.jsonl.
+    Does NOT hit Sheets – it's purely for the small local log that ops_api reads.
+    """
+    try:
+        decision_id = decision.get("decision_id") or decision.get("id")
+        if not decision_id:
+            return  # nothing to correlate
+
+        ts = time.time()
+
+        autonomy = (
+            decision.get("autonomy")
+            or decision.get("autonomy_mode")
+            or decision.get("autonomy_state")
+            or ""
+        )
+
+        story = decision.get("story") or ""
+        ok = bool(decision.get("ok", True))
+        reason = decision.get("reason") or decision.get("status") or ""
+
+        # flags / tags
+        flags = decision.get("flags") or decision.get("applied") or []
+        if isinstance(flags, str):
+            flags = [flags]
+
+        # council trace (who influenced this)
+        council = (
+            decision.get("council_trace")
+            or decision.get("council")
+            or {}
+        )
+
+        # intents
+        raw_intent = decision.get("intent") or intent or {}
+        patched_intent = (
+            decision.get("patched_intent")
+            or decision.get("patched")
+            or {}
+        )
+
+        venue = (patched_intent.get("venue") or raw_intent.get("venue") or "").upper()
+        symbol = (
+            patched_intent.get("symbol")
+            or raw_intent.get("symbol")
+            or None
+        )
+
+        ci = CouncilInsight(
+            decision_id=decision_id,
+            ts=ts,
+            autonomy=autonomy,
+            council=council,
+            story=story,
+            ok=ok,
+            reason=reason,
+            flags=flags,
+            raw_intent=raw_intent,
+            patched_intent=patched_intent,
+            venue=venue,
+            symbol=symbol,
+        )
+
+        line = json.dumps(ci.to_dict(), sort_keys=True)
+
+        with open(COUNCIL_INSIGHTS_FILE, "a") as f:
+            f.write(line + "\n")
+
+    except Exception as e:
+        # Never break the trading path for this
+        try:
+            _log_warn(f"CouncilInsight append failed: {e}")
+        except Exception:
+            pass
