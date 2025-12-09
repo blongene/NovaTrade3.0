@@ -432,6 +432,9 @@ def handle_manual_rebuy(raw: str) -> dict:
         except Exception:
             pass
 
+    from policy_logger import log_decision_insight
+    log_decision_insight(decision, intent)
+
     # Telegram summary (best-effort; includes story)
     try:
         _send_summary(raw, intent, decision, enq_ok, enq_reason, mode, story)
