@@ -11,7 +11,7 @@ SHEET_URL = os.getenv("SHEET_URL")
 POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
 LOG_ENABLED = os.getenv("POLICY_LOG_ENABLE", "1").lower() in ("1", "true", "yes", "on")
 LOCAL_FALLBACK_PATH = os.getenv("POLICY_LOG_LOCAL", "./policy_log.jsonl")
-INSIGHT_LOGFILE = "council_insights.jsonl"
+INSIGHT_LOG_PATH = os.path.join(os.path.dirname(__file__), "council_insights.jsonl")
 
 try:
     # Prefer Bus-wide Sheets helpers if available
@@ -275,29 +275,22 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
         except Exception:
             pass
             
-def log_decision_insight(decision: dict, intent: dict):
+def log_decision_insight(decision: Dict[str, Any],
+                         intent: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Append a single CouncilInsight record to council_insights.jsonl.
+    This is analytics only, so it must never break trading.
+    """
     try:
-        insight = CouncilInsight(
-            decision_id = decision.get("decision_id"),
-            ts = time.time(),
-            autonomy = decision.get("autonomy"),
-            council = decision.get("council", {}),
-            story = decision.get("story"),
-            ok = decision.get("ok"),
-            reason = decision.get("reason"),
-            flags = decision.get("flags", []),
-            raw_intent = intent,
-            patched_intent = decision.get("patched_intent", {}),
-            venue = decision.get("venue") or (decision.get("patched_intent") or {}).get("venue"),
-            symbol = decision.get("symbol") or (decision.get("patched_intent") or {}).get("symbol"),
-        )
+        from insight_model import CouncilInsight
+    except Exception:
+        # If the model isn't available for some reason, just bail quietly.
+        return
 
-        # append to file
-        with open(INSIGHT_LOGFILE, "a") as f:
-            f.write(json.dumps(insight.to_dict()) + "\n")
-
-        return insight
-
-    except Exception as e:
-        print(f"[CouncilInsight] Logging failure: {e}")
-        return None
+    try:
+        ci = CouncilInsight.from_decision(decision, intent or {})
+        with open(INSIGHT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ci.to_dict(), sort_keys=True) + "\n")
+    except Exception:
+        # Completely swallow errors here: policy logging is best-effort only.
+        return
