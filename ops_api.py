@@ -193,36 +193,76 @@ def commands_ack():
         traceback.print_exc()
         return ify({"ok": False, "error": str(e)}), 500
 
-@app.route("/api/insight/<decision_id>", methods=["GET"])
+@bp.route("/api/insight/<decision_id>", methods=["GET"])
 def get_insight(decision_id):
+    """
+    Look up a single CouncilInsight by decision_id.
+    """
+    path = "council_insights.jsonl"
+
+    if not os.path.exists(path):
+        return jsonify({"ok": False, "error": "no_insights"}), 404
+
     try:
-        entries = []
-        with open("council_insights.jsonl", "r") as f:
+        with open(path, "r") as f:
             for line in f:
-                obj = json.loads(line.strip())
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
                 if obj.get("decision_id") == decision_id:
                     return jsonify({"ok": True, "insight": obj})
-        return jsonify({"ok": False, "error": "decision_id not found"})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
 
-@app.route("/api/insight/recent", methods=["GET"])
+        return jsonify({"ok": False, "error": "decision_id not found"}), 404
+
+    except Exception as e:
+        log.exception(f"council_insights: get_insight failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@bp.route("/api/insight/recent", methods=["GET"])
 def recent_insights():
-    limit = int(request.args.get("limit", 50))
-    try:
-        entries = []
-        with open("council_insights.jsonl", "r") as f:
-            for line in f:
-                entries.append(json.loads(line.strip()))
-        return jsonify({
-            "ok": True,
-            "count": len(entries[-limit:]),
-            "insights": entries[-limit:]
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+    """
+    Return the most recent CouncilInsight entries from council_insights.jsonl.
 
-@app.route("/insight/<decision_id>")
+    Always returns:
+      { "ok": true, "count": <int>, "entries": [ ... ] }
+
+    If the file does not exist or has no valid entries, returns count=0, entries=[].
+    """
+    limit = int(request.args.get("limit", 50))
+    path = "council_insights.jsonl"
+
+    # If file doesn't exist yet, treat as "no insights yet" rather than error.
+    if not os.path.exists(path):
+        return jsonify({"ok": True, "count": 0, "entries": []})
+
+    entries = []
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception as e:
+                    # Don't fail the whole endpoint on a single bad line.
+                    log.warning(f"council_insights: failed to parse line: {e}")
+
+        if not entries:
+            return jsonify({"ok": True, "count": 0, "entries": []})
+
+        subset = entries[-limit:]
+        return jsonify({"ok": True, "count": len(subset), "entries": subset})
+
+    except Exception as e:
+        log.exception(f"council_insights: recent_insights failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@bp.route("/insight/<decision_id>")
 def insight_html(decision_id):
     try:
         with open("council_insights.jsonl", "r") as f:
@@ -251,5 +291,3 @@ def insight_html(decision_id):
         return "Not found", 404
     except Exception as e:
         return f"Error: {e}", 500
-
-
