@@ -18,6 +18,7 @@ from logging import getLogger
 log = getLogger(__name__)
 
 bp = Blueprint("ops_api", __name__, url_prefix="/api")
+bp = Blueprint("ops_api", __name__)
 
 OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
 OUTBOX_SECRET  = os.getenv("OUTBOX_SECRET", "")  # if empty => no signature required
