@@ -193,7 +193,7 @@ def commands_ack():
         traceback.print_exc()
         return ify({"ok": False, "error": str(e)}), 500
 
-@bp.route("/api/insight/<decision_id>", methods=["GET"])
+@bp.route("/insight/<decision_id>", methods=["GET"])
 def get_insight(decision_id):
     """
     Look up a single CouncilInsight by decision_id.
@@ -222,7 +222,7 @@ def get_insight(decision_id):
         log.exception(f"council_insights: get_insight failed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@bp.route("/api/insight/recent", methods=["GET"])
+@bp.route("/insight/recent", methods=["GET"])
 def recent_insights():
     """
     Return the most recent CouncilInsight entries from council_insights.jsonl.
