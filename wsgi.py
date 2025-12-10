@@ -1283,97 +1283,163 @@ def _now_et_str():
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
 def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None:
-    """Append one row to Trade_Log. Never raise."""
+    """Append one row to Trade_Log. Never raise.
+
+    Columns (Trade_Log):
+      Timestamp, Venue, Symbol, Side, Amount_Quote, Executed_Qty,
+      Avg_Price, Status, Notes, Cmd_ID, Receipt_ID, Note, Source,
+      requested_symbol, resolved_symbol, post_balances_compact
+    """
     try:
-        # Ensure we always have dicts so .get() is safe.
+        # Ensure safe dicts so .get() calls never explode.
         if not isinstance(command, dict):
             command = {"id": getattr(command, "id", None), "intent": command or {}}
 
         if not isinstance(receipt, dict):
-            # Legacy / non-dict receipts get wrapped.
             status = getattr(receipt, "status", None)
             ok_val = getattr(receipt, "ok", None)
             if isinstance(ok_val, bool) and not status:
                 status = "ok" if ok_val else "error"
             receipt = {"status": status, "ok": ok_val, "raw": receipt}
 
-        if not isinstance(command, dict):
-            command = {}
-        if not isinstance(receipt, dict):
-            receipt = {}
-
-        intent = command.get("intent")
-        if not isinstance(intent, dict):
-            intent = {}
+        # Normalized view of command/intent
+        cmd_id = command.get("id") or command.get("cmd_id") or ""
+        intent = command.get("intent") or {}
+        if isinstance(intent, str):
+            try:
+                intent = json.loads(intent)
+            except Exception:
+                intent = {"raw": intent}
 
         # Some paths put the real payload under "payload"
         payload = intent.get("payload")
         if isinstance(payload, dict):
-            # Don't overwrite keys like venue/symbol/side if they are already present
             merged_intent = dict(payload)
             merged_intent.setdefault("venue", intent.get("venue"))
             merged_intent.setdefault("symbol", intent.get("symbol"))
             merged_intent.setdefault("side", intent.get("side"))
             intent = merged_intent
 
-        # In many receipts, "normalized" is just a flag (bool), not a dict
+        # Receipt normalized dict
         norm = receipt.get("normalized")
         if not isinstance(norm, dict):
             norm = {}
 
         # Try to find a decision_id anywhere in the nested structures
-        def _find_decision_id_any(obj: Any) -> str:
-            """Depth-first search for decision_id inside nested dicts/lists."""
-            if isinstance(obj, dict):
-                v = obj.get("decision_id")
-                if v:
-                    return str(v)
-                for value in obj.values():
-                    found = _find_decision_id_any(value)
-                    if found:
-                        return found
-            elif isinstance(obj, (list, tuple)):
-                for item in obj:
-                    found = _find_decision_id_any(item)
-                    if found:
-                        return found
-            return ""
-
-        # Priority: intent first (closest to the trade), then receipt as a whole
+        # (_find_decision_id_any is defined below in this file)
         decision_id = _find_decision_id_any(intent) or _find_decision_id_any(receipt)
 
+        # Timestamp (ET)
+        ts_str = _now_et_str()
 
-        # columns expected:
-        # A: Timestamp, B: Venue, C: Symbol, D: Side,
-        # E: Amount_Quote, F: Executed_Qty, G: Avg_Price,
-        # H: Status, I: Notes, J: Cmd_ID, K: Receipt_ID, L: Note, M: Source
-        ts_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        # Venue / symbol / side
+        venue = (
+            intent.get("venue")
+            or norm.get("venue")
+            or receipt.get("venue")
+            or ""
+        )
+        symbol = (
+            intent.get("symbol")
+            or norm.get("symbol")
+            or receipt.get("symbol")
+            or ""
+        )
+        side = (
+            intent.get("side")
+            or norm.get("side")
+            or receipt.get("side")
+            or ""
+        )
 
-        venue  = norm.get("venue")  or intent.get("venue")  or ""
-        symbol = norm.get("symbol") or intent.get("symbol") or ""
-        side   = norm.get("side")   or intent.get("side")   or ""
+        # Notional & execution metrics
+        amt_q = (
+            norm.get("amount_quote")
+            or intent.get("amount_quote")
+            or intent.get("amount_usd")
+            or ""
+        )
+        exec_qty = (
+            norm.get("executed_qty")
+            or norm.get("filled_qty")
+            or receipt.get("executed_qty")
+            or ""
+        )
+        avg_px = (
+            norm.get("avg_price")
+            or norm.get("price")
+            or intent.get("price_usd")
+            or ""
+        )
 
-        amt_q  = intent.get("amount") or intent.get("quote_amount") or ""
+        # Status & ok flag
+        status = receipt.get("status")
+        ok_val = receipt.get("ok")
+        if not status and isinstance(ok_val, bool):
+            status = "ok" if ok_val else "error"
+        status = status or ""
 
-        exec_qty = norm.get("executed_qty", "")
-        avg_px   = norm.get("avg_price", "")
+        # Build Notes: base note + decision_id hint
+        note_pieces = []
 
-        status = norm.get("status")
-        if not status:
-            status = receipt.get("status") or ""
+        base_note = receipt.get("note") or receipt.get("reason")
+        if base_note:
+            note_pieces.append(str(base_note))
 
-        base_notes = norm.get("note") or receipt.get("message") or ""
+        # Some exchanges tuck a short message under "message" or "msg"
+        short_msg = receipt.get("message") or receipt.get("msg")
+        if short_msg and short_msg not in note_pieces:
+            note_pieces.append(str(short_msg))
+
         if decision_id:
-            extra = f"decision_id={decision_id}"
-            notes = f"{base_notes}; {extra}" if base_notes else extra
-        else:
-            notes = base_notes
+            note_pieces.append(f"decision_id={decision_id}")
 
-        cmd_id  = command.get("id", "")
-        rcpt_id = norm.get("receipt_id") or receipt.get("receipt_id") or ""
+        notes = ", ".join([p for p in note_pieces if p])
 
-        note   = ""         # spare column L
-        source = "EdgeBus"  # column M
+        # Secondary note column (rarely used; keep compact)
+        extra_note = ""
+        if status and status.lower() not in ("ok", "done", "filled"):
+            extra_note = status
+
+        # Receipt ID if present
+        rec_id = (
+            receipt.get("id")
+            or receipt.get("order_id")
+            or receipt.get("client_order_id")
+            or ""
+        )
+
+        source = command.get("source") or "EdgeBus"
+
+        requested_symbol = intent.get("requested_symbol") or intent.get("symbol") or ""
+        resolved_symbol = norm.get("symbol") or receipt.get("resolved_symbol") or ""
+
+        post_balances_compact = receipt.get("post_balances_compact") or ""
+
+        # Open Trade_Log and ensure headers
+        ws = _open_ws(gc, sheet_url, "Trade_Log")
+        headers = ws.row_values(1)
+        expected = [
+            "Timestamp",
+            "Venue",
+            "Symbol",
+            "Side",
+            "Amount_Quote",
+            "Executed_Qty",
+            "Avg_Price",
+            "Status",
+            "Notes",
+            "Cmd_ID",
+            "Receipt_ID",
+            "Note",
+            "Source",
+            "requested_symbol",
+            "resolved_symbol",
+            "post_balances_compact",
+        ]
+        if not headers:
+            ws.append_row(expected)
+            headers = expected
 
         row = [
             ts_str,
@@ -1386,18 +1452,23 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             status,
             notes,
             cmd_id,
-            rcpt_id,
-            note,
+            rec_id,
+            extra_note,
             source,
+            requested_symbol,
+            resolved_symbol,
+            json.dumps(post_balances_compact)
+            if isinstance(post_balances_compact, (dict, list))
+            else post_balances_compact,
         ]
 
-        sh = gc.open_by_url(sheet_url)
-        ws = sh.worksheet("Trade_Log")
         ws.append_row(row, value_input_option="USER_ENTERED")
-
     except Exception as e:
-        log.error("bus: trade_log append failed (non-fatal): %s", e)
-
+        # Never raise; log and move on.
+        try:
+            log.warning("log_trade_to_sheet failed: %s", e)
+        except Exception:
+            pass
 
 # --- DEBUG & TELEGRAM DIAGNOSTICS (restored) ---------------------------------
 def _guess_base_url() -> Optional[str]:
