@@ -11,7 +11,7 @@ SHEET_URL = os.getenv("SHEET_URL")
 POLICY_LOG_WS = os.getenv("POLICY_LOG_WS", "Policy_Log")
 LOG_ENABLED = os.getenv("POLICY_LOG_ENABLE", "1").lower() in ("1", "true", "yes", "on")
 LOCAL_FALLBACK_PATH = os.getenv("POLICY_LOG_LOCAL", "./policy_log.jsonl")
-INSIGHT_LOG_PATH = os.path.join(os.path.dirname(__file__), "council_insights.jsonl")
+INSIGHT_LOG_PATH = os.getenv("COUNCIL_INSIGHT_LOG", "council_insights.jsonl")
 COUNCIL_INSIGHT_LOG = os.environ.get("COUNCIL_INSIGHT_LOG", "council_insights.jsonl")
 COUNCIL_INSIGHTS_FILE = os.environ.get(
     "COUNCIL_INSIGHTS_FILE", "council_insights.jsonl"
