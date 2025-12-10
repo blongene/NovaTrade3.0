@@ -18,12 +18,17 @@ from logging import getLogger
 
 log = logging.getLogger(__name__)
 
-bp = Blueprint("ops_api", __name__, url_prefix="/api")
+bp = Blueprint("ops_api", __name__)
 
 OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "/data/outbox.db")
 OUTBOX_SECRET  = os.getenv("OUTBOX_SECRET", "")  # if empty => no signature required
 MAX_PULL       = int(os.getenv("MAX_PULL", "50"))
-INSIGHT_LOG_PATH = "/data/council_insights.jsonl"
+
+# Council Insight log – local JSONL that policy_logger writes
+INSIGHT_LOG_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "council_insights.jsonl",
+)
 
 # ------------ SQLite helpers ------------
 
@@ -200,16 +205,19 @@ def commands_ack():
 @bp.route("/insight/<decision_id>", methods=["GET"])
 def get_insight(decision_id):
     try:
-        with open(INSIGHT_LOG_PATH, "r") as f:
+        if not os.path.exists(INSIGHT_LOG_PATH):
+            return jsonify({"ok": False, "error": "not_found"}), 404
+
+        with open(INSIGHT_LOG_PATH, "r", encoding="utf-8") as f:
             for line in f:
-                if not line.strip():
+                line = line.strip()
+                if not line:
                     continue
-                obj = json.loads(line.strip())
+                obj = json.loads(line)
                 if obj.get("decision_id") == decision_id:
                     return jsonify({"ok": True, "insight": obj})
+
         return jsonify({"ok": False, "error": "decision_id_not_found"}), 404
-    except FileNotFoundError:
-        return jsonify({"ok": False, "error": "not_found"}), 404
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -219,18 +227,17 @@ def recent_insights():
     """
     Return the most recent CouncilInsight rows from council_insights.jsonl.
 
-    Shape:
+    Response:
     {
       "ok": true,
       "count": N,
       "insights": [ ...most recent first... ]
     }
-
-    If the file is missing or empty, we still return ok=true with an empty list.
     """
     limit = int(request.args.get("limit", 50))
 
     entries: list[dict] = []
+
     if os.path.exists(INSIGHT_LOG_PATH):
         try:
             with open(INSIGHT_LOG_PATH, "r", encoding="utf-8") as f:
@@ -242,27 +249,34 @@ def recent_insights():
                         obj = json.loads(line)
                         entries.append(obj)
                     except Exception:
+                        # skip malformed lines
                         continue
         except Exception:
-            # If the file is somehow unreadable, just behave like "no insights yet"
+            # behave like "no insights yet"
             entries = []
 
     if not entries:
         return jsonify({"ok": True, "count": 0, "insights": []})
 
-    # Sort newest first by ts, fallback to insertion order
+    # newest first by ts (fallback 0)
     entries.sort(key=lambda r: r.get("ts", 0), reverse=True)
     sliced = entries[:limit]
 
     return jsonify({"ok": True, "count": len(sliced), "insights": sliced})
 
 
-@bp.route("/insight/<decision_id>/view")  # you can use /view or leave it as /insight/<id>
+@bp.route("/insight/<decision_id>/view")
 def insight_html(decision_id):
     try:
-        with open(INSIGHT_LOG_PATH, "r") as f:
+        if not os.path.exists(INSIGHT_LOG_PATH):
+            return "Not found", 404
+
+        with open(INSIGHT_LOG_PATH, "r", encoding="utf-8") as f:
             for line in f:
-                entry = json.loads(line.strip())
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
                 if entry.get("decision_id") == decision_id:
                     council = entry.get("council", {})
                     html = f"""
