@@ -214,31 +214,47 @@ def get_insight(decision_id):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@bp.route("/insight/recent", methods=["GET"])   # <-- this is the important change
+@bp.route("/insight/recent", methods=["GET"])
 def recent_insights():
-    # how many to return
-    try:
-        limit = int(request.args.get("limit", 50))
-    except (TypeError, ValueError):
-        limit = 50
+    """
+    Return the most recent CouncilInsight rows from council_insights.jsonl.
 
-    try:
-        entries = []
-        with open(INSIGHT_LOG_PATH, "r") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                entries.append(json.loads(line.strip()))
+    Shape:
+    {
+      "ok": true,
+      "count": N,
+      "insights": [ ...most recent first... ]
+    }
 
-        if not entries:
-            return jsonify({"ok": True, "count": 0, "entries": []})
+    If the file is missing or empty, we still return ok=true with an empty list.
+    """
+    limit = int(request.args.get("limit", 50))
 
-        recent = entries[-limit:]
-        return jsonify({"ok": True, "count": len(recent), "entries": recent})
-    except FileNotFoundError:
-        return jsonify({"ok": False, "error": "not_found"}), 404
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    entries: list[dict] = []
+    if os.path.exists(INSIGHT_LOG_PATH):
+        try:
+            with open(INSIGHT_LOG_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        entries.append(obj)
+                    except Exception:
+                        continue
+        except Exception:
+            # If the file is somehow unreadable, just behave like "no insights yet"
+            entries = []
+
+    if not entries:
+        return jsonify({"ok": True, "count": 0, "insights": []})
+
+    # Sort newest first by ts, fallback to insertion order
+    entries.sort(key=lambda r: r.get("ts", 0), reverse=True)
+    sliced = entries[:limit]
+
+    return jsonify({"ok": True, "count": len(sliced), "insights": sliced})
 
 
 @bp.route("/insight/<decision_id>/view")  # you can use /view or leave it as /insight/<id>
