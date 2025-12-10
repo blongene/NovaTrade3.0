@@ -12,6 +12,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from sheets_bp import SHEETS_ROUTES, start_background_flusher
 from telemetry_routes import bp_telemetry
 from autonomy_modes import get_autonomy_state
+from ops_api import bp as ops_bp
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
@@ -1190,6 +1191,7 @@ flask_app.register_blueprint(_receipts_bp)
 import telemetry_api
 flask_app.register_blueprint(telemetry_api.bp)
 flask_app.register_blueprint(bp_telemetry)
+flask_app.register_blueprint(ops_bp, url_prefix="/api")
 
 # --- Start Nova loops when the web app loads (once) -------------------------
 try:
