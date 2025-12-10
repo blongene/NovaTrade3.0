@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 import os, json, hmac, hashlib, sqlite3, time, traceback
+import logging
 from typing import Any, Dict, List
 from flask import Blueprint, request, jsonify
 from logging import getLogger
