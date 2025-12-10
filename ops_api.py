@@ -109,39 +109,24 @@ def _row_to_cmd(row: sqlite3.Row) -> Dict[str, Any]:
 
 @bp.route("/commands/pull", methods=["POST"])
 def commands_pull():
-    """
-    Input:  {"limit": 10}  (optional)
-    Output: [{"id":..., "venue":..., "symbol":..., ...}, ...]
-    """
     try:
-        raw = request.get_data(cache=False) or b"{}"
+        raw = request.get_data()
         try:
-            j = .loads(raw.decode("utf-8"))
+            j = json.loads(raw.decode("utf-8"))
         except Exception:
-            j = {}
-        limit = int(j.get("limit") or MAX_PULL)
-        limit = max(1, min(limit, MAX_PULL))
+            return jsonify({"ok": False, "error": "invalid_json"}), 400
 
-        con = _open_db(); con.row_factory = sqlite3.Row
-        _ensure_schema(con)
-        cur = con.cursor()
+        agent_id = j.get("agent_id")
+        limit = int(j.get("limit", 20))
+        if not agent_id:
+            return jsonify({"ok": False, "error": "missing_agent_id"}), 400
 
-        # pick NEW first; if you prefer queued, add additional status here
-        cur.execute("""
-            SELECT id, venue, symbol, side, amount_usd, amount_base, note, mode, agent_id, cmd_id
-            FROM outbox
-            WHERE status='NEW'
-            ORDER BY id ASC
-            LIMIT ?
-        """, (limit,))
-        rows = cur.fetchall()
-        cmds = [_row_to_cmd(r) for r in rows]
-
-        return ify(cmds), 200
+        rows = _pull_commands(agent_id=agent_id, limit=limit)
+        return jsonify({"ok": True, "commands": rows})
     except Exception as e:
-        print(f"[ops_api] pull error: {e}")
         traceback.print_exc()
-        return ify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @bp.route("/commands/ack", methods=["POST"])
 def commands_ack():
