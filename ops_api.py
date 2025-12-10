@@ -25,10 +25,11 @@ OUTBOX_SECRET  = os.getenv("OUTBOX_SECRET", "")  # if empty => no signature requ
 MAX_PULL       = int(os.getenv("MAX_PULL", "50"))
 
 # Council Insight log – local JSONL that policy_logger writes
-INSIGHT_LOG_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "council_insights.jsonl",
-)
+INSIGHT_LOG_PATH = os.getenv("COUNCIL_INSIGHTS_FILE", "council_insights.jsonl")
+
+def ify(*args, **kwargs):
+    """Alias so older code that calls `ify(...)` still works."""
+    return jsonify(*args, **kwargs)
 
 # ------------ SQLite helpers ------------
 
@@ -146,7 +147,7 @@ def commands_ack():
         if not _verify_signature(raw):
             return ify({"ok": False, "error": "invalid signature"}), 401
 
-        j = .loads(raw.decode("utf-8"))
+        j = json.loads(raw.decode("utf-8"))
         cid     = int(j.get("id") or j.get("cmd_id") or 0)
         status  = str(j.get("status") or "").lower() or "ok"
         receipt = j.get("receipt") or {}
@@ -157,7 +158,7 @@ def commands_ack():
             return ify({"ok": False, "error": "missing id"}), 400
 
         # mirror for bridge
-        payload = .dumps({
+        payload = json.dumps({
             "cmd_id": cid,
             "status": status,
             "receipt": receipt,
