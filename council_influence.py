@@ -23,6 +23,11 @@ from typing import Any, Dict, Optional
 
 VOICE_KEYS = ("soul", "nova", "orion", "ash", "lumen", "vigil")
 
+try:
+    from ace_bias import apply_ace_bias  # Phase 21 – ACE bias
+except Exception:  # hard fallback if module is missing
+    def apply_ace_bias(council):
+        return council
 
 def _base_council() -> Dict[str, float]:
     return {k: 0.0 for k in VOICE_KEYS}
@@ -121,5 +126,11 @@ def apply_council_influence(
 
         if "blocked" in auto or "manual_only" in auto:
             council["vigil"] = max(council["vigil"], 0.7)
+
+    try:
+        council = apply_ace_bias(council)
+    except Exception:
+        # If anything goes wrong, keep original weights
+        pass
 
     return council
