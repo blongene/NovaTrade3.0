@@ -305,16 +305,19 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
         
 def log_decision_insight(decision: Dict[str, Any], intent: Dict[str, Any]) -> None:
     """
-    Best-effort: append a CouncilInsight row to council_insights.jsonl.
-    Does NOT hit Sheets – it's purely for the small local log that ops_api reads.
+    Best-effort: append a CouncilInsight-style row to council_insights.jsonl.
+    This is a small local log that ops_api / Apps Script can read. It never
+    touches Sheets and must never break the trading path.
     """
     try:
+        # Correlation id
         decision_id = decision.get("decision_id") or decision.get("id")
         if not decision_id:
-            return  # nothing to correlate
+            return
 
         ts = time.time()
 
+        # Autonomy mode / state
         autonomy = (
             decision.get("autonomy")
             or decision.get("autonomy_mode")
@@ -326,19 +329,19 @@ def log_decision_insight(decision: Dict[str, Any], intent: Dict[str, Any]) -> No
         ok = bool(decision.get("ok", True))
         reason = decision.get("reason") or decision.get("status") or ""
 
-        # flags / tags
+        # Flags / tags
         flags = decision.get("flags") or decision.get("applied") or []
         if isinstance(flags, str):
             flags = [flags]
 
-        # council trace (who influenced this)
+        # Council trace (who influenced this)
         council = (
             decision.get("council_trace")
             or decision.get("council")
             or {}
         )
 
-        # intents
+        # Intents
         raw_intent = decision.get("intent") or intent or {}
         patched_intent = (
             decision.get("patched_intent")
@@ -353,24 +356,25 @@ def log_decision_insight(decision: Dict[str, Any], intent: Dict[str, Any]) -> No
             or None
         )
 
-        ci = CouncilInsight(
-            decision_id=decision_id,
-            ts=ts,
-            autonomy=autonomy,
-            council=council,
-            story=story,
-            ok=ok,
-            reason=reason,
-            flags=flags,
-            raw_intent=raw_intent,
-            patched_intent=patched_intent,
-            venue=venue,
-            symbol=symbol,
-        )
+        # Build the record (schema matches insight_model.CouncilInsight.to_dict())
+        record = {
+            "decision_id": decision_id,
+            "ts": ts,
+            "autonomy": autonomy,
+            "council": council,
+            "story": story,
+            "ok": ok,
+            "reason": reason,
+            "flags": flags,
+            "raw_intent": raw_intent,
+            "patched_intent": patched_intent,
+            "venue": venue,
+            "symbol": symbol,
+        }
 
-        line = json.dumps(ci.to_dict(), sort_keys=True)
+        line = json.dumps(record, sort_keys=True)
 
-        with open(COUNCIL_INSIGHTS_FILE, "a") as f:
+        with open(INSIGHT_LOG_PATH, "a") as f:
             f.write(line + "\n")
 
     except Exception as e:
