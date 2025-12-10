@@ -13,9 +13,7 @@ LOG_ENABLED = os.getenv("POLICY_LOG_ENABLE", "1").lower() in ("1", "true", "yes"
 LOCAL_FALLBACK_PATH = os.getenv("POLICY_LOG_LOCAL", "./policy_log.jsonl")
 INSIGHT_LOG_PATH = os.getenv("COUNCIL_INSIGHT_LOG", "council_insights.jsonl")
 COUNCIL_INSIGHT_LOG = os.environ.get("COUNCIL_INSIGHT_LOG", "council_insights.jsonl")
-COUNCIL_INSIGHTS_FILE = os.environ.get(
-    "COUNCIL_INSIGHTS_FILE", "council_insights.jsonl"
-)
+COUNCIL_INSIGHTS_FILE = os.environ.get("COUNCIL_INSIGHTS_FILE", "council_insights.jsonl")
 
 try:
     # Prefer Bus-wide Sheets helpers if available
@@ -305,19 +303,16 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
         
 def log_decision_insight(decision: Dict[str, Any], intent: Dict[str, Any]) -> None:
     """
-    Best-effort: append a CouncilInsight-style row to council_insights.jsonl.
-    This is a small local log that ops_api / Apps Script can read. It never
-    touches Sheets and must never break the trading path.
+    Best-effort: append a CouncilInsight row to council_insights.jsonl.
+    Does NOT hit Sheets – it's purely for the small local log that ops_api reads.
     """
     try:
-        # Correlation id
         decision_id = decision.get("decision_id") or decision.get("id")
         if not decision_id:
-            return
+            return  # nothing to correlate
 
         ts = time.time()
 
-        # Autonomy mode / state
         autonomy = (
             decision.get("autonomy")
             or decision.get("autonomy_mode")
@@ -329,19 +324,16 @@ def log_decision_insight(decision: Dict[str, Any], intent: Dict[str, Any]) -> No
         ok = bool(decision.get("ok", True))
         reason = decision.get("reason") or decision.get("status") or ""
 
-        # Flags / tags
         flags = decision.get("flags") or decision.get("applied") or []
         if isinstance(flags, str):
             flags = [flags]
 
-        # Council trace (who influenced this)
         council = (
             decision.get("council_trace")
             or decision.get("council")
             or {}
         )
 
-        # Intents
         raw_intent = decision.get("intent") or intent or {}
         patched_intent = (
             decision.get("patched_intent")
@@ -356,30 +348,57 @@ def log_decision_insight(decision: Dict[str, Any], intent: Dict[str, Any]) -> No
             or None
         )
 
-        # Build the record (schema matches insight_model.CouncilInsight.to_dict())
-        record = {
-            "decision_id": decision_id,
-            "ts": ts,
-            "autonomy": autonomy,
-            "council": council,
-            "story": story,
-            "ok": ok,
-            "reason": reason,
-            "flags": flags,
-            "raw_intent": raw_intent,
-            "patched_intent": patched_intent,
-            "venue": venue,
-            "symbol": symbol,
-        }
+        ash_lens = _derive_ash_lens(decision)
 
-        line = json.dumps(record, sort_keys=True)
+        ci = CouncilInsight(
+            decision_id=decision_id,
+            ts=ts,
+            autonomy=autonomy,
+            council=council,
+            story=story,
+            ok=ok,
+            reason=reason,
+            flags=flags,
+            raw_intent=raw_intent,
+            patched_intent=patched_intent,
+            venue=venue,
+            symbol=symbol,
+            ash_lens=ash_lens,
+        )
 
-        with open(INSIGHT_LOG_PATH, "a") as f:
+        line = json.dumps(ci.to_dict(), sort_keys=True)
+        with open(COUNCIL_INSIGHTS_FILE, "a") as f:
             f.write(line + "\n")
 
     except Exception as e:
-        # Never break the trading path for this
         try:
             _log_warn(f"CouncilInsight append failed: {e}")
         except Exception:
             pass
+
+def _derive_ash_lens(decision: Dict[str, Any]) -> str:
+    """
+    Lightweight 'Ash's Lens' summary.
+    Prefer an explicit field if present, then Story, then a compact fallback.
+    """
+    # explicit override from the caller (future-proof)
+    if "ash_lens" in decision and decision["ash_lens"]:
+        return str(decision["ash_lens"])
+
+    story = (decision.get("story") or "").strip()
+    if story:
+        return story
+
+    reason = (decision.get("reason") or decision.get("status") or "").strip()
+    autonomy = (decision.get("autonomy") or decision.get("autonomy_mode") or "").strip()
+    venue = (decision.get("venue") or decision.get("patched_intent", {}).get("venue") or "").upper()
+
+    bits = []
+    if autonomy:
+        bits.append(f"Mode: {autonomy}")
+    if venue:
+        bits.append(f"Venue: {venue}")
+    if reason:
+        bits.append(f"Reason: {reason}")
+
+    return " | ".join(bits) if bits else "Decision recorded."
