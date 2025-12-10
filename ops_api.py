@@ -255,29 +255,29 @@ def recent_insights():
 @bp.route("/insight/<decision_id>/view")
 def insight_html(decision_id):
     try:
-        if not os.path.exists(INSIGHT_LOG_PATH):
-            return "Not found", 404
-
-        with open(INSIGHT_LOG_PATH, "r", encoding="utf-8") as f:
+        with open(INSIGHT_LOG_PATH, "r") as f:
             for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                entry = json.loads(line)
+                entry = json.loads(line.strip())
                 if entry.get("decision_id") == decision_id:
                     council = entry.get("council", {})
+                    ash_lens = entry.get("ash_lens", "")
                     html = f"""
                     <html>
                     <body style='font-family:sans-serif;padding:20px'>
                       <h2>Decision {decision_id}</h2>
                       <p><b>Story:</b> {entry.get('story')}</p>
                       <p><b>Autonomy:</b> {entry.get('autonomy')}</p>
+                      <p><b>Ash's Lens:</b> {ash_lens}</p>
+
                       <h3>Council Influence</h3>
                       <pre>{json.dumps(council, indent=2)}</pre>
+
                       <h3>Raw Intent</h3>
                       <pre>{json.dumps(entry.get('raw_intent'), indent=2)}</pre>
+
                       <h3>Patched Intent</h3>
                       <pre>{json.dumps(entry.get('patched_intent'), indent=2)}</pre>
+
                       <h3>Flags</h3>
                       <pre>{json.dumps(entry.get('flags'), indent=2)}</pre>
                     </body>
