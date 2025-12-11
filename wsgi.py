@@ -1,7 +1,7 @@
 # wsgi.py — NovaTrade Bus (Phase 7A: policy wired with telemetry context)
 # FULL INTEGRITY VERSION: Preserves all logic, fixes HMAC, fixes NameError.
 from __future__ import annotations
-import os, json, hmac, hashlib, logging, threading, time, uuid
+import os, json, hmac, hashlib, logging, threading, time, uuid, re
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
