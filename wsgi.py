@@ -1299,6 +1299,32 @@ def _now_et_str():
     now = datetime.now(pytz.timezone(tz))
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
+def _tag_decision_id(notes: str, decision_id: str) -> str:
+    """
+    Ensure the notes string contains 'decision_id=<id>' exactly once.
+    If no decision_id is provided, returns notes unchanged.
+    """
+    notes = notes or ""
+    decision_id = (decision_id or "").strip()
+    if not decision_id:
+        return notes
+
+    tag = f"decision_id={decision_id}"
+
+    # If we already have this exact tag, don't duplicate it.
+    if tag in notes:
+        return notes
+
+    # If some *other* decision_id is present, just append the new one.
+    if "decision_id=" in notes:
+        return f"{notes}; {tag}"
+
+    # No decision tag at all yet.
+    if notes:
+        return f"{notes}; {tag}"
+    else:
+        return tag
+
 def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None:
     """Append one row to Trade_Log. Never raise.
 
@@ -1413,23 +1439,21 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             or ""
         )
 
-        # --- Attach decision_id in Notes ------------------------------------
+        # --- Attach decision_id in Notes (robust + de-duped) ----------------
+        # Prefer an explicit decision_id on the command first.
         decision_id = (
-            _find_decision_id_any(intent)
+            command.get("decision_id")
+            or _find_decision_id_any(intent)
             or _find_decision_id_any(receipt)
             or _find_decision_id_any(command)
-            or str(command.get("decision_id") or "")
         )
+        decision_id = str(decision_id or "").strip()
 
-        notes = base_notes
-        if decision_id:
-            if notes:
-                notes = f"{notes}; decision_id={decision_id}"
-            else:
-                notes = f"decision_id={decision_id}"
+        notes = _tag_decision_id(base_notes, decision_id)
+        # ---------------------------------------------------------------------
 
-        note = ""          # legacy free-text column
-        source = "EdgeBus" # column M
+        note = ""           # legacy free-text column
+        source = "EdgeBus"  # column M
 
         row = [
             ts_str,
