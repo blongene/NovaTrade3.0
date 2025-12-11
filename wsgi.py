@@ -1264,6 +1264,23 @@ def _get_gspread():
     creds = ServiceAccountCredentials.from_json_keyfile_name(svc_json, scopes)
     return gspread.authorize(creds)
 
+def _find_decision_id_any(obj: Any) -> str:
+    """Depth-first search for 'decision_id' inside nested dicts/lists."""
+    if isinstance(obj, dict):
+        v = obj.get("decision_id")
+        if v:
+            return str(v)
+        for value in obj.values():
+            found = _find_decision_id_any(value)
+            if found:
+                return found
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            found = _find_decision_id_any(item)
+            if found:
+                return found
+    return ""
+  
 # --- add near your other imports ---
 import pytz
 from datetime import datetime
@@ -1320,14 +1337,18 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             merged_intent.setdefault("side", intent.get("side"))
             intent = merged_intent
 
-        # Receipt normalized dict
+        # In many receipts, "normalized" is just a flag (bool), not a dict
         norm = receipt.get("normalized")
         if not isinstance(norm, dict):
             norm = {}
 
-        # Try to find a decision_id anywhere in the nested structures
-        # (_find_decision_id_any is defined below in this file)
-        decision_id = _find_decision_id_any(intent) or _find_decision_id_any(receipt)
+        # Priority: intent (closest to trade), then receipt, then the command wrapper
+        decision_id = (
+            _find_decision_id_any(intent)
+            or _find_decision_id_any(receipt)
+            or _find_decision_id_any(command)
+            or str(command.get("decision_id") or "")
+        )
 
         # Timestamp (ET)
         ts_str = _now_et_str()
