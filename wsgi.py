@@ -1229,6 +1229,7 @@ if ENABLE_POLICY:
 DAILY_ENABLED   = _env_true("DAILY_ENABLED") or ENABLE_TELEGRAM
 DAILY_UTC_HOUR  = int(os.getenv("DAILY_UTC_HOUR","9"))
 DAILY_UTC_MIN   = int(os.getenv("DAILY_UTC_MIN","0"))
+
 def _compose_daily() -> str:
     try: q = _queue_depth()
     except Exception: q = {}
@@ -1237,12 +1238,14 @@ def _compose_daily() -> str:
             f"as of {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
             f"<b>Telemetry age</b> {age}\n"
             f"<b>Queue</b> q:{q.get('queued',0)} l:{q.get('leased',0)} a:{q.get('acked',0)} f:{q.get('failed',0)}")
+  
 def _sleep_until(h:int,m:int):
     while True:
         now = datetime.now(timezone.utc)
         tgt = now.replace(hour=h, minute=m, second=0, microsecond=0)
         if tgt <= now: tgt = tgt + timedelta(days=1)
         time.sleep((tgt-now).total_seconds()); yield
+      
 def _start_daily():
     if not (DAILY_ENABLED and ENABLE_TELEGRAM and _TELEGRAM_TOKEN and _TELEGRAM_CHAT): return
     def _loop():
@@ -1413,13 +1416,22 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
                 status = "ok" if ok_val else "error"
             receipt = {"status": status, "ok": ok_val, "raw": receipt}
 
-        payload = command.get("payload") or {}
-        intent = (
-            command.get("intent")
-            or payload.get("intent")
-            or command.get("patched_intent")
-            or {}
-        )
+        # Many commands are stored as {"payload": {...}} only.
+        payload = command.get("payload")
+        intent = command.get("intent") or command.get("patched_intent") or {}
+
+        # If there's no explicit "intent", treat payload itself as the intent.
+        # If payload has an "intent" sub-dict, prefer that.
+        if not intent:
+            if isinstance(payload, dict):
+                inner_intent = payload.get("intent")
+                if isinstance(inner_intent, dict):
+                    intent = inner_intent
+                else:
+                    intent = payload
+            else:
+                intent = {}
+
         if not isinstance(intent, dict):
             intent = {}
 
@@ -1499,7 +1511,7 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
         cmd_id = (
             command.get("id")
             or command.get("cmd_id")
-            or payload.get("cmd_id")
+            or (payload or {}).get("cmd_id")
             or ""
         )
         rcpt_id = (
@@ -1508,8 +1520,7 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             or ""
         )
 
-        # --- Attach decision_id in Notes (robust + de-duped) ----------------
-        # Prefer an explicit decision_id on the command first.
+        # --- Attach decision_id in Notes ------------------------------------
         decision_id = (
             command.get("decision_id")
             or _find_decision_id_any(intent)
@@ -1517,28 +1528,26 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             or _find_decision_id_any(command)
             or str(command.get("decision_id") or "")
         )
-        decision_id = str(decision_id or "").strip()
 
         notes = _tag_decision_id(base_notes, decision_id)
-        # ---------------------------------------------------------------------
 
-        note = ""           # legacy free-text column
-        source = "EdgeBus"  # column M
+        note = ""          # legacy free-text column
+        source = "EdgeBus" # column M
 
         row = [
-            ts_str,
-            venue,
-            symbol,
-            side,
-            amt_q,
-            exec_qty,
-            avg_px,
-            status,
-            notes,
-            cmd_id,
-            rcpt_id,
-            note,
-            source,
+            ts_str,   # Timestamp
+            venue,    # Venue
+            symbol,   # Symbol
+            side,     # Side
+            amt_q,    # Amount_Quote
+            exec_qty, # Executed_Qty
+            avg_px,   # Avg_Price
+            status,   # Status
+            notes,    # Notes (with decision_id=...)
+            cmd_id,   # Cmd_ID
+            rcpt_id,  # Receipt_ID
+            note,     # Note (legacy)
+            source,   # Source
         ]
 
         ws = _open_ws(gc, sheet_url, "Trade_Log")
