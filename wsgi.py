@@ -1280,6 +1280,75 @@ def _find_decision_id_any(obj: Any) -> str:
             if found:
                 return found
     return ""
+
+_DECISION_ID_RE = re.compile(r"decision_id=([0-9a-f]{32})")
+_HEX32_RE = re.compile(r"\b[0-9a-f]{32}\b")
+
+def _extract_decision_id_any(obj: Any, _depth: int = 0, _max_depth: int = 6) -> str:
+    """
+    Aggressively hunt for a decision_id inside nested dicts/lists/strings.
+
+    Priority:
+      1) explicit 'decision_id' keys
+      2) strings containing 'decision_id=<hex>'
+      3) bare 32-char hex strings that look like decision_ids
+    """
+    if obj is None or _depth > _max_depth:
+        return ""
+
+    # 1) If it's a dict, check explicit key first
+    if isinstance(obj, dict):
+        # direct key
+        if "decision_id" in obj and obj["decision_id"]:
+            val = str(obj["decision_id"])
+            m = _HEX32_RE.search(val)
+            if m:
+                return m.group(0)
+
+        # also check common "meta" / "council_trace" wrappers
+        for key in ("meta", "council", "intent", "payload"):
+            if key in obj:
+                v = _extract_decision_id_any(obj.get(key), _depth + 1, _max_depth)
+                if v:
+                    return v
+
+        # then walk all values
+        for v in obj.values():
+            val = _extract_decision_id_any(v, _depth + 1, _max_depth)
+            if val:
+                return val
+        return ""
+
+    # 2) If it's a list/tuple, recurse into each item
+    if isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            val = _extract_decision_id_any(v, _depth + 1, _max_depth)
+            if val:
+                return val
+        return ""
+
+    # 3) If it's a string, look for decision_id patterns
+    if isinstance(obj, str):
+        m = _DECISION_ID_RE.search(obj)
+        if m:
+            return m.group(1)
+        m2 = _HEX32_RE.search(obj)
+        if m2:
+            # Treat any lone 32-char hex as a decision_id candidate
+            return m2.group(0)
+        return ""
+
+    # 4) Fallback: try stringifying weird objects
+    try:
+        s = str(obj)
+    except Exception:
+        return ""
+    return _extract_decision_id_any(s, _depth + 1, _max_depth)
+
+
+# Keep the old name so existing callers still work
+def _find_decision_id_any(obj: Any) -> str:
+    return _extract_decision_id_any(obj) or ""
   
 # --- add near your other imports ---
 import pytz
@@ -1446,6 +1515,7 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             or _find_decision_id_any(intent)
             or _find_decision_id_any(receipt)
             or _find_decision_id_any(command)
+            or str(command.get("decision_id") or "")
         )
         decision_id = str(decision_id or "").strip()
 
