@@ -1302,13 +1302,12 @@ def _now_et_str():
 def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None:
     """Append one row to Trade_Log. Never raise.
 
-    Columns (Trade_Log):
-      Timestamp, Venue, Symbol, Side, Amount_Quote, Executed_Qty,
-      Avg_Price, Status, Notes, Cmd_ID, Receipt_ID, Note, Source,
-      requested_symbol, resolved_symbol, post_balances_compact
+    This function is deliberately conservative: if the receipt shape is odd,
+    we still try to log *something* useful, and we always try to attach
+    the originating decision_id in the Notes column.
     """
     try:
-        # Ensure safe dicts so .get() calls never explode.
+        # --- Normalize inputs into dicts ------------------------------------
         if not isinstance(command, dict):
             command = {"id": getattr(command, "id", None), "intent": command or {}}
 
@@ -1319,30 +1318,102 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
                 status = "ok" if ok_val else "error"
             receipt = {"status": status, "ok": ok_val, "raw": receipt}
 
-        # Normalized view of command/intent
-        cmd_id = command.get("id") or command.get("cmd_id") or ""
-        intent = command.get("intent") or {}
-        if isinstance(intent, str):
-            try:
-                intent = json.loads(intent)
-            except Exception:
-                intent = {"raw": intent}
+        payload = command.get("payload") or {}
+        intent = (
+            command.get("intent")
+            or payload.get("intent")
+            or command.get("patched_intent")
+            or {}
+        )
+        if not isinstance(intent, dict):
+            intent = {}
 
-        # Some paths put the real payload under "payload"
-        payload = intent.get("payload")
-        if isinstance(payload, dict):
-            merged_intent = dict(payload)
-            merged_intent.setdefault("venue", intent.get("venue"))
-            merged_intent.setdefault("symbol", intent.get("symbol"))
-            merged_intent.setdefault("side", intent.get("side"))
-            intent = merged_intent
-
-        # In many receipts, "normalized" is just a flag (bool), not a dict
+        # Many receipts have a `normalized` sub-dict; others don't.
         norm = receipt.get("normalized")
         if not isinstance(norm, dict):
             norm = {}
 
-        # Priority: intent (closest to trade), then receipt, then the command wrapper
+        # --- Derive core fields ---------------------------------------------
+        ts_str = _now_et_str()
+
+        venue = (
+            intent.get("venue")
+            or norm.get("venue")
+            or receipt.get("venue")
+            or ""
+        )
+        venue = str(venue).upper()
+
+        symbol = (
+            intent.get("symbol")
+            or norm.get("symbol")
+            or receipt.get("symbol")
+            or ""
+        )
+
+        # Side/action in various forms.
+        side = (
+            intent.get("side")
+            or intent.get("action")
+            or norm.get("side")
+            or norm.get("action")
+            or receipt.get("side")
+            or ""
+        )
+        side = str(side).upper()
+
+        # Amount in quote terms (USD/USDT/etc).
+        amt_q = (
+            intent.get("amount_quote")
+            or intent.get("amount_usd")
+            or norm.get("amount_quote")
+            or norm.get("amount_usd")
+            or ""
+        )
+
+        # Executed quantity in base terms.
+        exec_qty = (
+            norm.get("executed_qty")
+            or receipt.get("executed_qty")
+            or receipt.get("amount")
+            or ""
+        )
+
+        # Average price in quote per base.
+        avg_px = (
+            norm.get("avg_price")
+            or receipt.get("avg_price")
+            or receipt.get("price")
+            or intent.get("price_usd")
+            or ""
+        )
+
+        status = receipt.get("status")
+        if not status:
+            ok_val = receipt.get("ok")
+            if isinstance(ok_val, bool):
+                status = "ok" if ok_val else "error"
+        status = status or ""
+
+        base_notes = (
+            receipt.get("message")
+            or receipt.get("note")
+            or ""
+        )
+
+        cmd_id = (
+            command.get("id")
+            or command.get("cmd_id")
+            or payload.get("cmd_id")
+            or ""
+        )
+        rcpt_id = (
+            receipt.get("id")
+            or receipt.get("receipt_id")
+            or ""
+        )
+
+        # --- Attach decision_id in Notes ------------------------------------
         decision_id = (
             _find_decision_id_any(intent)
             or _find_decision_id_any(receipt)
@@ -1350,117 +1421,15 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             or str(command.get("decision_id") or "")
         )
 
-        # Timestamp (ET)
-        ts_str = _now_et_str()
-
-        # Venue / symbol / side
-        venue = (
-            intent.get("venue")
-            or norm.get("venue")
-            or receipt.get("venue")
-            or ""
-        )
-        symbol = (
-            intent.get("symbol")
-            or norm.get("symbol")
-            or receipt.get("symbol")
-            or ""
-        )
-        side = (
-            intent.get("side")
-            or norm.get("side")
-            or receipt.get("side")
-            or ""
-        )
-
-        # Notional & execution metrics
-        amt_q = (
-            norm.get("amount_quote")
-            or intent.get("amount_quote")
-            or intent.get("amount_usd")
-            or ""
-        )
-        exec_qty = (
-            norm.get("executed_qty")
-            or norm.get("filled_qty")
-            or receipt.get("executed_qty")
-            or ""
-        )
-        avg_px = (
-            norm.get("avg_price")
-            or norm.get("price")
-            or intent.get("price_usd")
-            or ""
-        )
-
-        # Status & ok flag
-        status = receipt.get("status")
-        ok_val = receipt.get("ok")
-        if not status and isinstance(ok_val, bool):
-            status = "ok" if ok_val else "error"
-        status = status or ""
-
-        # Build Notes: base note + decision_id hint
-        note_pieces = []
-
-        base_note = receipt.get("note") or receipt.get("reason")
-        if base_note:
-            note_pieces.append(str(base_note))
-
-        # Some exchanges tuck a short message under "message" or "msg"
-        short_msg = receipt.get("message") or receipt.get("msg")
-        if short_msg and short_msg not in note_pieces:
-            note_pieces.append(str(short_msg))
-
+        notes = base_notes
         if decision_id:
-            note_pieces.append(f"decision_id={decision_id}")
+            if notes:
+                notes = f"{notes}; decision_id={decision_id}"
+            else:
+                notes = f"decision_id={decision_id}"
 
-        notes = ", ".join([p for p in note_pieces if p])
-
-        # Secondary note column (rarely used; keep compact)
-        extra_note = ""
-        if status and status.lower() not in ("ok", "done", "filled"):
-            extra_note = status
-
-        # Receipt ID if present
-        rec_id = (
-            receipt.get("id")
-            or receipt.get("order_id")
-            or receipt.get("client_order_id")
-            or ""
-        )
-
-        source = command.get("source") or "EdgeBus"
-
-        requested_symbol = intent.get("requested_symbol") or intent.get("symbol") or ""
-        resolved_symbol = norm.get("symbol") or receipt.get("resolved_symbol") or ""
-
-        post_balances_compact = receipt.get("post_balances_compact") or ""
-
-        # Open Trade_Log and ensure headers
-        ws = _open_ws(gc, sheet_url, "Trade_Log")
-        headers = ws.row_values(1)
-        expected = [
-            "Timestamp",
-            "Venue",
-            "Symbol",
-            "Side",
-            "Amount_Quote",
-            "Executed_Qty",
-            "Avg_Price",
-            "Status",
-            "Notes",
-            "Cmd_ID",
-            "Receipt_ID",
-            "Note",
-            "Source",
-            "requested_symbol",
-            "resolved_symbol",
-            "post_balances_compact",
-        ]
-        if not headers:
-            ws.append_row(expected)
-            headers = expected
+        note = ""          # legacy free-text column
+        source = "EdgeBus" # column M
 
         row = [
             ts_str,
@@ -1473,23 +1442,17 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             status,
             notes,
             cmd_id,
-            rec_id,
-            extra_note,
+            rcpt_id,
+            note,
             source,
-            requested_symbol,
-            resolved_symbol,
-            json.dumps(post_balances_compact)
-            if isinstance(post_balances_compact, (dict, list))
-            else post_balances_compact,
         ]
 
+        ws = _open_ws(gc, sheet_url, "Trade_Log")
         ws.append_row(row, value_input_option="USER_ENTERED")
+
     except Exception as e:
-        # Never raise; log and move on.
-        try:
-            log.warning("log_trade_to_sheet failed: %s", e)
-        except Exception:
-            pass
+        # Non-fatal: we never want trading to fail because Sheets logging failed.
+        log.error("bus: trade_log append failed (non-fatal): %s", e)
 
 # --- DEBUG & TELEGRAM DIAGNOSTICS (restored) ---------------------------------
 def _guess_base_url() -> Optional[str]:
