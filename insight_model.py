@@ -1,41 +1,56 @@
-# insight_model.py
+from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, Any, Optional
-import time
-import uuid
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional
+
 
 @dataclass
 class CouncilInsight:
+    """Canonical record for a single council decision.
+
+    This is the schema that is written to `council_insights.jsonl` and later
+    mirrored into Sheets / HTML views. It is intentionally forward-compatible:
+    new optional fields may be added over time without breaking readers.
+    """
+
+    # Core identity / timing
     decision_id: str
-    ts: float
+    ts: float  # unix timestamp (seconds)
+
+    # Governance context
     autonomy: str
-    council: Dict[str, float]
+    council: Dict[str, Any]
+
+    # Human-readable story
     story: str
     ok: bool
     reason: str
-    flags: list
-    raw_intent: Dict[str, Any]
-    patched_intent: Dict[str, Any]
+    flags: List[str] = field(default_factory=list)
+
+    # Intent payloads
+    raw_intent: Dict[str, Any] = field(default_factory=dict)
+    patched_intent: Dict[str, Any] = field(default_factory=dict)
+
+    # Routing metadata
     venue: Optional[str] = None
     symbol: Optional[str] = None
+
+    # Phase 21: Ash's Lens classification (e.g. "clean", "resized", "blocked")
     ash_lens: Optional[str] = None
-    
+
+    # Phase 21.2: execution + outcome metadata (populated later by analytics)
+    exec_status: Optional[str] = None        # "done", "error", "pending", ...
+    exec_notional_usd: Optional[float] = None
+    exec_quote: Optional[str] = None         # e.g. "USDT", "USD"
+    outcome_tag: Optional[str] = None        # "trade_success", "trade_error",
+                                             # "policy_denied", "anomaly", ...
+
     def to_dict(self) -> Dict[str, Any]:
-        data = {
-            "decision_id": self.decision_id,
-            "ts": self.ts,
-            "autonomy": self.autonomy,
-            "council": self.council,
-            "story": self.story,
-            "ok": self.ok,
-            "reason": self.reason,
-            "flags": self.flags,
-            "raw_intent": self.raw_intent,
-            "patched_intent": self.patched_intent,
-            "venue": self.venue,
-            "symbol": self.symbol,
-        }
-        if self.ash_lens is not None:
-            data["ash_lens"] = self.ash_lens
-        return data
+        """Serialize to a JSON-safe dict, omitting empty optionals.
+
+        Older readers that expect only the original fields can simply ignore
+        the newer keys; we keep everything flat and backwards-compatible.
+        """
+        data = asdict(self)
+        # Drop Nones to keep the JSONL lean and stable for existing tooling.
+        return {k: v for k, v in data.items() if v is not None}
