@@ -19,9 +19,10 @@ class CouncilInsight:
     patched_intent: Dict[str, Any]
     venue: Optional[str] = None
     symbol: Optional[str] = None
-
-    def to_dict(self):
-        return {
+    ash_lens: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        data = {
             "decision_id": self.decision_id,
             "ts": self.ts,
             "autonomy": self.autonomy,
@@ -35,3 +36,6 @@ class CouncilInsight:
             "venue": self.venue,
             "symbol": self.symbol,
         }
+        if self.ash_lens is not None:
+            data["ash_lens"] = self.ash_lens
+        return data
