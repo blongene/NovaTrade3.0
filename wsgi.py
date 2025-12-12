@@ -953,7 +953,10 @@ def append_trade_log_safe(cmd_id, agent_id, receipt, status: str, ok_val: bool):
 
         if not isinstance(command, dict):
             command = {"id": cid, "agent_id": agent_id, "intent": command or {}}
-        
+
+        # --- Normalize store.get() shapes into a consistent dict -----------
+        # store.get() may return {"intent": {...}} or {"payload": {...}} depending on backend.
+        # Ensure BOTH keys exist so downstream log_trade_to_sheet can reliably find decision_id.
         try:
             if isinstance(command, dict):
                 if isinstance(command.get("intent"), dict) and not isinstance(command.get("payload"), dict):
@@ -962,7 +965,7 @@ def append_trade_log_safe(cmd_id, agent_id, receipt, status: str, ok_val: bool):
                     command["intent"] = command["payload"]
         except Exception:
             pass
-          
+
         # Normalize receipt for logging
         if not isinstance(receipt, dict):
             receipt = {"raw": receipt}
@@ -1516,9 +1519,16 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             or receipt.get("note")
             or ""
         )
-        embedded = _extract_decision_id_any(base_notes)
-        if embedded and not receipt.get("decision_id"):
-            receipt["decision_id"] = embedded
+
+        # If decision_id is embedded in notes text, recover it (helps legacy receipts)
+        try:
+            embedded = _extract_decision_id_any(base_notes)
+            if embedded and not receipt.get("decision_id"):
+                receipt["decision_id"] = embedded
+        except Exception:
+            pass
+
+
         cmd_id = (
             command.get("id")
             or command.get("cmd_id")
