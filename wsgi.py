@@ -1520,14 +1520,10 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             or ""
         )
 
-        # If decision_id is embedded in notes text, recover it (helps legacy receipts)
-        try:
-            embedded = _extract_decision_id_any(base_notes)
-            if embedded and not receipt.get("decision_id"):
-                receipt["decision_id"] = embedded
-        except Exception:
-            pass
-
+        # If decision_id is embedded in notes text, recover it
+        embedded = _extract_decision_id_any(base_notes)
+        if embedded and not receipt.get("decision_id"):
+            receipt["decision_id"] = embedded
 
         cmd_id = (
             command.get("id")
