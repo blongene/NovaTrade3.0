@@ -953,7 +953,16 @@ def append_trade_log_safe(cmd_id, agent_id, receipt, status: str, ok_val: bool):
 
         if not isinstance(command, dict):
             command = {"id": cid, "agent_id": agent_id, "intent": command or {}}
-
+        
+        try:
+            if isinstance(command, dict):
+                if isinstance(command.get("intent"), dict) and not isinstance(command.get("payload"), dict):
+                    command["payload"] = command["intent"]
+                elif isinstance(command.get("payload"), dict) and not isinstance(command.get("intent"), dict):
+                    command["intent"] = command["payload"]
+        except Exception:
+            pass
+          
         # Normalize receipt for logging
         if not isinstance(receipt, dict):
             receipt = {"raw": receipt}
@@ -1507,7 +1516,9 @@ def log_trade_to_sheet(gc, sheet_url: str, command: dict, receipt: dict) -> None
             or receipt.get("note")
             or ""
         )
-
+        embedded = _extract_decision_id_any(base_notes)
+        if embedded and not receipt.get("decision_id"):
+            receipt["decision_id"] = embedded
         cmd_id = (
             command.get("id")
             or command.get("cmd_id")
