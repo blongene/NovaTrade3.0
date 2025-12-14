@@ -338,6 +338,7 @@ def _attach_policy_decision(
             symbol=str(intent.get("symbol") or ""),
             base=base,
             quote=quote,
+            decision_id=(intent.get("decision_id") or decision.get("decision_id") or None),
             requested_amount_usd=_notional_usd(intent),
             approved_amount_usd=_notional_usd(patched_intent) if patched_intent else None,
             limits_applied=list(flags),
