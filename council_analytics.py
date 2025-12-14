@@ -1,8 +1,9 @@
 # council_analytics.py
-# Utilities for Phase 21.6/21.7 metrics
+# Phase 21.6 helper — compute disagreement and majority from council weights.
+# Safe, dependency-free utilities.
 
 from __future__ import annotations
-from typing import Dict, Tuple
+from typing import Dict
 
 def majority_voice(weights: Dict[str, float]) -> str:
     if not isinstance(weights, dict) or not weights:
@@ -20,9 +21,7 @@ def majority_voice(weights: Dict[str, float]) -> str:
     return best_k
 
 def disagreement_index(weights: Dict[str, float]) -> float:
-    """
-    SD45 definition: 1 - max(council_weights)
-    """
+    # SD45 definition: 1 - max(council_weights)
     if not isinstance(weights, dict) or not weights:
         return 0.0
     mx = 0.0
@@ -34,15 +33,20 @@ def disagreement_index(weights: Dict[str, float]) -> float:
         if fv > mx:
             mx = fv
     di = 1.0 - mx
-    # keep in [0..1]
-    if di < 0.0: di = 0.0
-    if di > 1.0: di = 1.0
+    if di < 0.0:
+        di = 0.0
+    if di > 1.0:
+        di = 1.0
     return round(di, 6)
 
 def split_tag(di: float) -> str:
-    # simple bands; tweak later without breaking schema
-    if di >= 0.55:
+    # simple bands — tweak later without schema breakage
+    try:
+        x = float(di)
+    except Exception:
+        x = 0.0
+    if x >= 0.55:
         return "HIGH"
-    if di >= 0.35:
+    if x >= 0.35:
         return "MED"
     return "LOW"
