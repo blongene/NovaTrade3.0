@@ -405,6 +405,33 @@ def handle_manual_rebuy(raw: str) -> dict:
     except Exception:
         pass
 
+    # ------------------------------------------------------------------
+    # Phase 21.6 — Council Disagreement + Majority (visibility only)
+    # ------------------------------------------------------------------
+    try:
+        from council_analytics import (
+            disagreement_index,
+            majority_voice,
+            split_tag,
+        )
+
+        # Compute metrics from FINAL council weights
+        di = disagreement_index(council)
+        mv = majority_voice(council)
+        tag = split_tag(di)
+
+        # Attach analytics to decision (Policy_Log / Council_Insight safe)
+        decision["Disagreement_Index"] = di
+        decision["Majority_Voice"] = mv
+        decision["Council_Split_Tag"] = tag
+
+    except Exception as e:
+        # Absolute fail-open: never block execution/logging
+        try:
+            warn(f"nova_trigger: council analytics failed: {e}")
+        except Exception:
+            pass
+
     # Story + notes
     story = ""
     try:
