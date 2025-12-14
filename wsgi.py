@@ -676,6 +676,7 @@ def intent_enqueue():
         "price_usd": body.get("price_usd"),
         "notional_usd": body.get("notional_usd"),
         "quote_reserve_usd": body.get("quote_reserve_usd"),
+        "decision_id": body.get("decision_id") or body.get("decisionId") or "",
     }
 
     # --- cooldown gate (anti-thrash) -----------------------------------------
