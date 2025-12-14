@@ -136,7 +136,10 @@ def _build_row(rcp_id: int, j: Dict[str, Any]) -> Optional[List[Any]]:
     side    = rec.get("side") or cmd.get("side") or ""
     status  = rec.get("status") or j.get("status") or ""
     # textual notes / reasons
-    notes   = rec.get("note") or rec.get("message") or rec.get("error") or ""
+    note = rec.get("note") or rec.get("message") or rec.get("error") or ""
+    did = (cmd.get("decision_id") or meta.get("decision_id") or "")
+    if did and "decision_id=" not in str(note):
+        note = (str(note) + " " if note else "") + f"decision_id={did}"
     # amounts
     amt_q   = rec.get("amount_quote") or cmd.get("amount_quote") or cmd.get("amount_usd") or ""
     exec_q  = rec.get("executed_qty") or ""
@@ -150,8 +153,8 @@ def _build_row(rcp_id: int, j: Dict[str, Any]) -> Optional[List[Any]]:
 
     # Produce full, stable row in your column order
     return [
-        ts_str, venue, symbol, side, amt_q, exec_q, avg_px, status,
-        notes, cmd_id, rcpid, "", SOURCE_LABEL, rq_sym, rs_sym, post_bal
+      ts_str, venue, symbol, side, amt_q, exec_q, avg_px, status,
+      notes, cmd_id, rcpid, notes, SOURCE_LABEL, rq_sym, rs_sym, post_bal
     ]
 
 def _append_rows(rows: List[List[Any]]) -> int:
@@ -197,6 +200,9 @@ def _mirror_trade_to_db(rcp_id: int, j: Dict[str, Any]) -> None:
         price = rec.get("avg_price") or rec.get("price")
 
         note  = rec.get("note") or rec.get("message") or rec.get("error") or ""
+        did = (cmd.get("decision_id") or meta.get("decision_id") or rec.get("decision_id") or "")
+        if did and ("decision_id=" not in str(note)):
+            note = (str(note) + " " if note else "") + f"decision_id={did}"
         fills = rec.get("fills") or []
 
         req_sym = cmd.get("symbol") or cmd.get("pair") or ""
