@@ -1,174 +1,172 @@
-#!/usr/bin/env python3
-"""
-ace_bias.py
-Phase 21 – ACE (Autonomous Council Engine) bias helpers.
-
-Reads the Council_Performance sheet and produces per-voice
-weight multipliers used to gently bias council weights.
-
-Safe by design:
-- If anything fails (env, Sheets, auth), it falls back to 1.0 for all voices.
-- Only affects the "council" metadata on decisions, not actual trade policy.
-"""
+# ace_bias.py
+# Phase 21.7 — ACE v1: feedback loop into policy (SOFT influence only)
+# Uses existing env vars from NovaTrade3.0.txt
+#
+# - Mode "log_only": computes multipliers but returns original weights (no influence)
+# - Mode "soft_weight": multiplies weights by bounded multipliers
+# - Fail-open: any error returns original weights
+#
+# Expected Council_Performance columns (flexible casing):
+#   Voice, Trades, Success_Rate, Error_Rate
+#
+# Note: This module does NOT mutate intents. It only adjusts weights.
 
 from __future__ import annotations
+import os, time
+from typing import Any, Dict
 
-import json
-import os
-import threading
-import time
-from typing import Dict
+try:
+    from utils import sheets_get_records_cached
+except Exception:
+    sheets_get_records_cached = None  # fail-open
 
-VOICE_KEYS = ("soul", "nova", "orion", "ash", "lumen", "vigil")
+SHEET_URL = os.getenv("SHEET_URL", "")
 
-ACE_ENABLED = os.getenv("COUNCIL_ACE_ENABLE", "1").lower() in ("1", "true", "yes", "on")
-SHEET_URL = os.getenv("SHEET_URL")
-ACE_WS = os.getenv("COUNCIL_ACE_WS", "Council_Performance")
-ACE_CACHE_SECONDS = int(os.getenv("COUNCIL_ACE_CACHE_SECONDS", "300"))
+# Existing env vars — do NOT rename
+ACE_ENABLED = os.getenv("ACE_FEEDBACK_ENABLED", "0").lower() in {"1","true","yes","on"}
+COUNCIL_ACE_ENABLE = os.getenv("COUNCIL_ACE_ENABLE", "0").lower() in {"1","true","yes","on"}
+ACE_MODE = (os.getenv("ACE_FEEDBACK_MODE", "log_only") or "log_only").strip().lower()  # log_only|soft_weight
 
-_cache_lock = threading.Lock()
-_cache: Dict[str, object] = {
+ACE_MIN = float(os.getenv("ACE_FEEDBACK_MIN", "0.90"))
+ACE_MAX = float(os.getenv("ACE_FEEDBACK_MAX", "1.15"))
+ACE_MAX_STEP = float(os.getenv("ACE_FEEDBACK_MAX_STEP", "0.02"))  # per refresh clamp
+ACE_TTL = int(os.getenv("ACE_FEEDBACK_TTL_SEC", "1800"))
+
+# Your env uses Council_* too; honor both TTLs safely (take min)
+COUNCIL_ACE_WS = os.getenv("COUNCIL_ACE_WS", "Council_Performance")
+COUNCIL_ACE_CACHE_SECONDS = int(os.getenv("COUNCIL_ACE_CACHE_SECONDS", "300"))
+
+# Internal cache: multipliers (voice->mult), plus last applied for step limiting
+_cache = {
     "ts": 0.0,
-    "mult": {k: 1.0 for k in VOICE_KEYS},
+    "mults": {},       # current multipliers
+    "last_mults": {},  # last returned multipliers (for max-step limiting)
 }
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
-def _log(msg: str) -> None:
+def _f(v: Any, default: float = 0.0) -> float:
     try:
-        print(f"[ace_bias] {msg}")
+        if v in ("", None): return default
+        return float(v)
     except Exception:
-        pass
+        return default
 
-
-def _open_worksheet():
-    """Open the Council_Performance worksheet via service account."""
-    import gspread
-    from oauth2client.service_account import ServiceAccountCredentials
-
-    if not SHEET_URL:
-        raise RuntimeError("SHEET_URL not configured")
-
-    svc = (
-        os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        or os.getenv("GOOGLE_CREDENTIALS_JSON")
-        or os.getenv("SVC_JSON")
-        or "sentiment-log-service.json"
-    )
-
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
-    # svc may be a path or a raw JSON string
-    if svc.strip().startswith("{"):
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            json.loads(svc), scope
-        )
-    else:
-        creds = ServiceAccountCredentials.from_json_keyfile_name(svc, scope)
-
-    client = gspread.authorize(creds)
-    sh = client.open_by_url(SHEET_URL)
-    return sh.worksheet(ACE_WS)
-
-
-def _refresh_cache_locked(now: float) -> None:
-    """Reload ACE multipliers from Council_Performance into the cache."""
-    if not SHEET_URL:
-        _log("SHEET_URL not set; ACE disabled.")
-        return
-
+def _i(v: Any, default: int = 0) -> int:
     try:
-        ws = _open_worksheet()
-        values = ws.get_all_values()
-        if not values:
-            return
+        if v in ("", None): return default
+        return int(float(v))
+    except Exception:
+        return default
 
-        headers = values[0]
-        rows = values[1:]  # data rows
+def _ace_score(success_rate: float, error_rate: float) -> float:
+    # SD45-ish: 0.7*success + 0.3*(1-error)
+    s = _clamp(success_rate, 0.0, 1.0)
+    e = _clamp(error_rate, 0.0, 1.0)
+    return _clamp(0.7 * s + 0.3 * (1.0 - e), 0.0, 1.0)
 
-        def idx(name: str) -> int:
-            try:
-                return headers.index(name)
-            except ValueError:
-                return -1
+def _raw_multiplier(score: float) -> float:
+    # 0.95 + 0.20*score, then clamp to env bounds
+    return _clamp(0.95 + 0.20 * score, ACE_MIN, ACE_MAX)
 
-        col_voice = idx("Voice")
-        col_mult = idx("ACE_Weight_Multiplier")
+def _ttl_seconds() -> int:
+    # honor both; pick the smaller to avoid stale ACE in fast-moving ops
+    return max(30, min(ACE_TTL, COUNCIL_ACE_CACHE_SECONDS))
 
-        if col_voice < 0 or col_mult < 0:
-            _log("Missing Voice or ACE_Weight_Multiplier columns; ACE disabled.")
-            return
-
-        mult: Dict[str, float] = {k: 1.0 for k in VOICE_KEYS}
-
-        for row in rows:
-            if not row or len(row) <= max(col_voice, col_mult):
-                continue
-            name = (row[col_voice] or "").strip().lower()
-            if not name:
-                continue
-            try:
-                val = float(row[col_mult])
-            except Exception:
-                continue
-
-            key = name.lower()
-            if key in mult:
-                # Keep within a reasonable range
-                mult[key] = max(0.25, min(2.0, val))
-
-        _cache["ts"] = now
-        _cache["mult"] = mult
-        _log(f"Refreshed ACE multipliers: {mult}")
-    except Exception as e:
-        _log(f"Failed to refresh ACE cache: {e}")
-
-
-def get_ace_multipliers() -> Dict[str, float]:
-    """Return cached ACE multipliers, reloading from Sheets every few minutes."""
-    if not ACE_ENABLED:
-        return {k: 1.0 for k in VOICE_KEYS}
+def _load_multipliers() -> Dict[str, float]:
+    """
+    Returns {voice_lower: multiplier}.
+    Cached with TTL.
+    """
+    if not (ACE_ENABLED and COUNCIL_ACE_ENABLE and SHEET_URL and sheets_get_records_cached):
+        return {}
 
     now = time.time()
-    with _cache_lock:
-        if now - float(_cache["ts"]) > ACE_CACHE_SECONDS:
-            _refresh_cache_locked(now)
-        return dict(_cache["mult"])  # shallow copy
+    if now - _cache["ts"] < _ttl_seconds():
+        return _cache["mults"]
 
+    rows = sheets_get_records_cached(SHEET_URL, COUNCIL_ACE_WS) or []
+    mults: Dict[str, float] = {}
+
+    for r in rows:
+        voice = (r.get("Voice") or r.get("voice") or "").strip()
+        if not voice:
+            continue
+
+        trades = _i(r.get("Trades") or r.get("trades") or 0, 0)
+        # Warmup rule: require at least a handful of outcomes.
+        if trades < 10:
+            continue
+
+        success = _f(r.get("Success_Rate") or r.get("success_rate") or 0.0, 0.0)
+        error = _f(r.get("Error_Rate") or r.get("error_rate") or 0.0, 0.0)
+
+        score = _ace_score(success, error)
+        mults[voice.lower()] = round(_raw_multiplier(score), 6)
+
+    _cache["ts"] = now
+    _cache["mults"] = mults
+    return mults
+
+def _step_limit(new_mults: Dict[str, float]) -> Dict[str, float]:
+    """
+    Limits multiplier movement per refresh using ACE_FEEDBACK_MAX_STEP.
+    Prevents ACE oscillations and keeps it "soft".
+    """
+    last = _cache.get("last_mults") or {}
+    out: Dict[str, float] = {}
+
+    for k, v in new_mults.items():
+        prev = float(last.get(k, v))
+        lo = prev - ACE_MAX_STEP
+        hi = prev + ACE_MAX_STEP
+        out[k] = round(_clamp(float(v), lo, hi), 6)
+
+    _cache["last_mults"] = dict(out)
+    return out
+
+def get_ace_debug_snapshot() -> Dict[str, Any]:
+    """
+    Optional: call this for logging/telemetry.
+    """
+    mults = _step_limit(_load_multipliers())
+    return {
+        "enabled": bool(ACE_ENABLED and COUNCIL_ACE_ENABLE),
+        "mode": ACE_MODE,
+        "ws": COUNCIL_ACE_WS,
+        "ttl_s": _ttl_seconds(),
+        "bounds": {"min": ACE_MIN, "max": ACE_MAX, "max_step": ACE_MAX_STEP},
+        "multipliers": mults,
+    }
 
 def apply_ace_bias(council: Dict[str, float]) -> Dict[str, float]:
     """
-    Apply ACE multipliers to a council weight dict.
-
-    Input: {"soul": 1.0, "nova": 1.0, ...}
-    Output: biased + renormalized dict (max weight = 1.0).
+    Main hook called by council_influence.py.
+    Input:  {voice: weight}
+    Output: adjusted weights if ACE_FEEDBACK_MODE=soft_weight; else original weights.
     """
-    if not ACE_ENABLED:
-        return council
-
     try:
-        mult = get_ace_multipliers()
-    except Exception as e:
-        _log(f"ACE multiplier fetch failed: {e}")
+        if not isinstance(council, dict) or not council:
+            return council
+
+        mults = _step_limit(_load_multipliers())
+        if not mults:
+            return council
+
+        if ACE_MODE == "log_only":
+            return council
+
+        if ACE_MODE != "soft_weight":
+            # Unknown mode -> fail-open (no bias)
+            return council
+
+        out: Dict[str, float] = {}
+        for voice, w in council.items():
+            vw = _f(w, 0.0)
+            m = float(mults.get(str(voice).lower(), 1.0))
+            out[voice] = round(vw * m, 6)
+        return out
+
+    except Exception:
         return council
-
-    # Multiply
-    biased: Dict[str, float] = {}
-    for k, v in council.items():
-        try:
-            m = float(mult.get(k, 1.0))
-            biased[k] = float(v) * m
-        except Exception:
-            biased[k] = float(v) or 0.0
-
-    # Renormalize so the strongest voice is 1.0
-    max_val = max(biased.values() or [0.0])
-    if max_val <= 0:
-        return council
-
-    for k in list(biased.keys()):
-        biased[k] = round(biased[k] / max_val, 3)
-
-    return biased
