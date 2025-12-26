@@ -29,9 +29,14 @@ except Exception:  # hard fallback if module is missing
     def apply_ace_bias(council):
         return council
 
+try:
+    from ace_feedback import apply_ace_to_weights  # Phase 21.7 – ACE feedback (soft influence)
+except Exception:
+    def apply_ace_to_weights(council_weights, decision_id=None, sheet=None, meta=None):
+        return council_weights
+
 def _base_council() -> Dict[str, float]:
     return {k: 0.0 for k in VOICE_KEYS}
-
 
 def apply_council_influence(
     intent: Dict[str, Any],
@@ -127,10 +132,18 @@ def apply_council_influence(
         if "blocked" in auto or "manual_only" in auto:
             council["vigil"] = max(council["vigil"], 0.7)
 
+    # Phase 21.7 — ACE Feedback (soft influence; fail-open)
     try:
-        council = apply_ace_bias(council)
+        meta = decision.setdefault("meta", {})
+        decision_id = decision.get("decision_id") or meta.get("decision_id")
+        council = apply_ace_to_weights(
+            council,
+            decision_id=decision_id,
+            sheet=None,
+            meta=meta,
+        )
     except Exception:
-        # If anything goes wrong, keep original weights
+        # Absolute fail-open: never block execution/logging
         pass
 
     return council
