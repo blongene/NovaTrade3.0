@@ -2,27 +2,23 @@
 """
 unified_snapshot.py — NovaTrade 3.0
 
-Phase 19: build Unified_Snapshot from Wallet_Monitor in a way that is
-robust to schema drift and bad data.
+Build Unified_Snapshot from Wallet_Monitor robustly.
 
-Design goals
-------------
-* Never crash on weird sheet contents (strings like "QUOTE" where numbers
-  are expected, partially-filled rows, etc.).
-* Work with both of these Wallet_Monitor schemas:
+Fixes/enhancements:
+- Fixes sample-row logging bug (was always picking row 0).
+- Tolerates the “shifted columns” situation (Locked == 'QUOTE') gracefully.
+- Works with these Wallet_Monitor schemas:
 
-    Legacy:
-        Timestamp | Venue | Asset | Free | Locked | Quote | Snapshot
+  Legacy:
+    Timestamp | Venue | Asset | Free | Locked | Quote | Snapshot
 
-    Telemetry v2 (from telemetry_mirror.py):
-        Timestamp | Agent | Venue | Asset | Amount | Class | Snapshot
+  Telemetry v2 (7-col):
+    Timestamp | Agent | Venue | Asset | Amount | Class | Snapshot
 
-* Always produce exactly 9 rows in Unified_Snapshot:
-    (COINBASE, BINANCEUS, KRAKEN) × (USD, USDC, USDT)
+  Telemetry v2 (8-col / canonical in your sheet):
+    Timestamp | Agent | Venue | Asset | Free | Locked | Class | Snapshot
 
-The Unified_Snapshot sheet has the header:
-
-    Timestamp | Venue | Asset | Free | Locked | Total | IsQuote | QuoteSymbol | Equity_USD
+- Always emits 9 rows: (COINBASE,BINANCEUS,KRAKEN) × (USD,USDC,USDT)
 """
 
 from __future__ import annotations
@@ -33,9 +29,6 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 from utils import with_sheet_backoff
 from utils import get_ws_cached, info, warn
-
-
-# ---- Config ----
 
 UNIFIED_SNAPSHOT_SRC_WS = os.getenv("UNIFIED_SNAPSHOT_SRC_WS", "Wallet_Monitor")
 UNIFIED_SNAPSHOT_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
@@ -56,42 +49,24 @@ HEADER: List[str] = [
 ]
 
 
-# ---- Sheet helpers (with backoff) ----
-
-
 @with_sheet_backoff
 def _open_ws(name: str):
-    """Open a worksheet by name using the cached Sheets helper."""
     return get_ws_cached(name)
 
 
 @with_sheet_backoff
 def _replace_rows(ws, header: List[str], rows: List[List[Any]]) -> None:
-    """
-    Replace all data in `ws` with the provided header and rows.
-
-    We intentionally bypass any helper around sheets_append_rows because
-    its signature has changed over time. This keeps the function
-    self-contained and stable.
-    """
-    # Clear existing content, then write header + rows.
     ws.clear()
-    all_rows: List[List[Any]] = [header] + rows
-    ws.append_rows(all_rows, value_input_option="RAW")
-
-
-# ---- Utility helpers ----
+    ws.append_rows([header] + rows, value_input_option="RAW")
 
 
 def _safe_float(v: Any) -> float:
-    """Best-effort numeric coercion. Non-numeric values become 0.0."""
     if v is None:
         return 0.0
     try:
         s = str(v).strip()
         if not s:
             return 0.0
-        # tolerate commas in thousands separators
         s = s.replace(",", "")
         return float(s)
     except Exception:
@@ -99,47 +74,50 @@ def _safe_float(v: Any) -> float:
 
 
 def _parse_ts(ts_raw: Any, idx_fallback: int) -> float:
-    """
-    Parse a timestamp string into a float epoch.
-
-    If parsing fails, fall back to the row index so that later rows win.
-    """
     if not ts_raw:
         return float(idx_fallback)
 
     ts_str = str(ts_raw).strip()
-    # Common formats we see in Sheets.
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
-    ):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
         try:
             return datetime.strptime(ts_str.replace("Z", ""), fmt).timestamp()
         except Exception:
             pass
-
     return float(idx_fallback)
 
 
-# ---- Core logic ----
-
-
-def _latest_wallet_records(
-    rows: Iterable[Dict[str, Any]]
-) -> Dict[Tuple[str, str], Dict[str, Any]]:
+def _coerce_record(row: Dict[str, Any]) -> Tuple[float, float]:
     """
-    From raw Wallet_Monitor rows, compute the *latest* record per (venue, asset).
+    Extract (free, locked) from a Wallet_Monitor row across schema variants.
 
-    We support both schemas by probing for Free/Locked first and falling
-    back to Amount when those are empty.
+    Handles:
+    - Free/Locked numeric
+    - Amount numeric (7-col telemetry schema)
+    - Corrupted-shift case where Locked == 'QUOTE' (string), and Free holds the amount.
     """
+    free = _safe_float(row.get("Free"))
+    locked_raw = row.get("Locked")
+    locked = _safe_float(locked_raw)
+
+    amount = _safe_float(row.get("Amount"))
+
+    # If both Free/Locked are zero but Amount is present, use Amount as Free.
+    if free == 0.0 and locked == 0.0 and amount != 0.0:
+        return amount, 0.0
+
+    # If Locked is non-numeric (e.g., 'QUOTE'), treat locked as 0 and trust Free.
+    if isinstance(locked_raw, str) and locked_raw.strip().upper() in ("QUOTE", "BASE"):
+        return free, 0.0
+
+    return free, locked
+
+
+def _latest_wallet_records(rows: Iterable[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
     latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for idx, row in enumerate(rows):
         venue = (row.get("Venue") or "").strip().upper()
         asset = (row.get("Asset") or "").strip().upper()
-
         if not venue or not asset:
             continue
         if venue not in VENUES or asset not in STABLES:
@@ -148,19 +126,11 @@ def _latest_wallet_records(
         ts_raw = row.get("Timestamp") or ""
         ts_val = _parse_ts(ts_raw, idx)
 
-        # Prefer explicit Free/Locked; if both are zero, fall back to Amount.
-        free = _safe_float(row.get("Free"))
-        locked = _safe_float(row.get("Locked"))
-        amount = _safe_float(row.get("Amount"))
-
-        if free == 0.0 and locked == 0.0 and amount != 0.0:
-            free = amount
-            locked = 0.0
+        free, locked = _coerce_record(row)
 
         key = (venue, asset)
         prev = latest.get(key)
         if prev is not None and prev["ts"] >= ts_val:
-            # We already have a newer record for this (venue, asset).
             continue
 
         latest[key] = {
@@ -176,20 +146,12 @@ def _latest_wallet_records(
 
 
 def _build_unified_rows(latest: Dict[Tuple[str, str], Dict[str, Any]]) -> List[List[Any]]:
-    """
-    Turn the latest-per-(venue, asset) dict into the 9 Unified_Snapshot rows.
-
-    If no data exists for a (venue, asset) combination, we still emit a
-    row with zeros so callers always see 9 rows.
-    """
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     out: List[List[Any]] = []
 
     for venue in VENUES:
         for asset in STABLES:
-            key = (venue, asset)
-            rec = latest.get(key)
-
+            rec = latest.get((venue, asset))
             if rec:
                 ts = rec.get("Timestamp") or now_str
                 free = float(rec.get("Free") or 0.0)
@@ -200,52 +162,29 @@ def _build_unified_rows(latest: Dict[Tuple[str, str], Dict[str, Any]]) -> List[L
                 locked = 0.0
 
             total = free + locked
-            is_quote = True  # these are all stables
-            quote_symbol = asset
-            equity_usd = total  # 1:1 with USD-denom stables
-
-            out.append(
-                [
-                    ts,
-                    venue,
-                    asset,
-                    free,
-                    locked,
-                    total,
-                    is_quote,
-                    quote_symbol,
-                    equity_usd,
-                ]
-            )
+            out.append([ts, venue, asset, free, locked, total, True, asset, total])
 
     return out
 
 
 def run_unified_snapshot() -> None:
-    """Public entrypoint used both by the scheduler and manual runs."""
     info("📸 unified_snapshot: building Unified_Snapshot from Wallet_Monitor…")
 
     try:
         src_ws = _open_ws(UNIFIED_SNAPSHOT_SRC_WS)
     except Exception as e:
-        warn(
-            f"unified_snapshot: failed to open source worksheet "
-            f"'{UNIFIED_SNAPSHOT_SRC_WS}': {e}"
-        )
+        warn(f"unified_snapshot: failed to open source worksheet '{UNIFIED_SNAPSHOT_SRC_WS}': {e}")
         return
 
     try:
         rows = src_ws.get_all_records()
     except Exception as e:
-        warn(
-            f"unified_snapshot: get_all_records() failed for "
-            f"'{UNIFIED_SNAPSHOT_SRC_WS}': {e}"
-        )
+        warn(f"unified_snapshot: get_all_records() failed for '{UNIFIED_SNAPSHOT_SRC_WS}': {e}")
         return
 
     info(f"unified_snapshot: Wallet_Monitor get_all_records -> {len(rows)} rows")
     if rows:
-        sample = rows[min(0, len(rows) - 1)]
+        sample = rows[-1]  # fixed
         info(f"unified_snapshot: sample row: {sample}")
 
     latest = _latest_wallet_records(rows)
@@ -256,10 +195,7 @@ def run_unified_snapshot() -> None:
     try:
         out_ws = _open_ws(UNIFIED_SNAPSHOT_WS)
     except Exception as e:
-        warn(
-            f"unified_snapshot: failed to open Unified_Snapshot worksheet "
-            f"'{UNIFIED_SNAPSHOT_WS}': {e}"
-        )
+        warn(f"unified_snapshot: failed to open Unified_Snapshot worksheet '{UNIFIED_SNAPSHOT_WS}': {e}")
         return
 
     try:
