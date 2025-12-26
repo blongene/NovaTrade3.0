@@ -2,48 +2,28 @@
 """
 telemetry_mirror.py — NovaTrade 3.0
 
-Purpose:
-    Read the latest Edge → Bus telemetry snapshot (_last_tel from wsgi)
-    and append a compact balance snapshot into Wallet_Monitor.
+Mirrors latest Edge→Bus telemetry snapshot into Wallet_Monitor in Sheets.
 
-    This keeps Wallet_Monitor fresh using the same telemetry source the
-    rest of the system sees, without putting Sheets in the hot path.
-
-Expected telemetry shape (as used elsewhere in NovaTrade 3.0):
-
-    _last_tel = {
-        "agent": "edge-primary,edge-nl1",
-        "by_venue": {
-            "COINBASE":  {"USDC": 136.38, "USDT": 0.0,    ...},
-            "BINANCEUS": {"USD": 9.77,   "USDC": 0.0,
-                          "USDT": 159.25, ...},
-            "KRAKEN":    {"USDC": 0.00005, "USDT": 155.78, ...},
-        },
-        "flat": {
-            "BTC": 0.015,
-            "ETH": 0.42,
-            ...
-        },
-        "ts": 1700000000,
-    }
+CRITICAL FIX (Dec 2025):
+- Wallet_Monitor header in your sheet is currently 8 columns:
+    Timestamp | Agent | Venue | Asset | Free | Locked | Class | Snapshot
+  but the old telemetry_mirror wrote only 7 columns:
+    Timestamp | Agent | Venue | Asset | Amount | Class | Snapshot
+  causing column shift:
+    Free=Amount, Locked="QUOTE", Class=<compact fragment>, Snapshot=""
+- This drop-in version detects the header and writes the correct format.
 """
 
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
-import json
 import os
 import time
-
 import requests
-from utils import with_sheet_backoff
-from utils import (
-    get_ws_cached,
-    warn,
-    info,
-)
 
+from utils import with_sheet_backoff
+from utils import get_ws_cached, warn, info
 from db_backbone import record_telemetry
 
 # Base URL to talk to our own Bus. PORT is present in Render.
@@ -52,46 +32,30 @@ LAST_URL = os.getenv("TELEMETRY_LAST_URL", f"http://127.0.0.1:{PORT}/api/telemet
 
 SHEET_URL = os.getenv("SHEET_URL", "")
 WALLET_MONITOR_WS = os.getenv("WALLET_MONITOR_WS", "Wallet_Monitor")
-WALLET_MONITOR_MAX_ROWS = int(os.getenv("WALLET_MONITOR_MAX_ROWS", "500"))
 
 # Ignore dust balances below this threshold
-TELEMETRY_MIRROR_MIN_BALANCE = float(
-    os.getenv("TELEMETRY_MIRROR_MIN_BALANCE", "0.0000001")
-)
+TELEMETRY_MIRROR_MIN_BALANCE = float(os.getenv("TELEMETRY_MIRROR_MIN_BALANCE", "0.0000001"))
+
 # Telemetry sanity defaults (tunable via env)
-TELEMETRY_MAX_AGE_SEC = float(
-    os.getenv("TELEMETRY_MAX_AGE_SEC", "900")  # 15 minutes
-)
+TELEMETRY_MAX_AGE_SEC = float(os.getenv("TELEMETRY_MAX_AGE_SEC", "900"))  # 15 minutes
 
 TELEMETRY_REQUIRED_VENUES = {
     v.strip().upper()
-    for v in os.getenv(
-        "TELEMETRY_REQUIRED_VENUES",
-        "COINBASE,BINANCEUS,KRAKEN",
-    ).split(",")
+    for v in os.getenv("TELEMETRY_REQUIRED_VENUES", "COINBASE,BINANCEUS,KRAKEN").split(",")
     if v.strip()
 }
 
-TELEMETRY_MIN_TOTAL_STABLE = float(
-    os.getenv("TELEMETRY_MIN_TOTAL_STABLE", "0.0")  # no minimum by default
-)
+TELEMETRY_MIN_TOTAL_STABLE = float(os.getenv("TELEMETRY_MIN_TOTAL_STABLE", "0.0"))
 
 # Simple stables list so we can tag Quote column
 STABLES = {"USD", "USDT", "USDC"}
 
 # Compaction: keep at most this many data rows (excluding header).
-# 0 or negative disables compaction.
 WALLET_MONITOR_MAX_ROWS = int(os.getenv("WALLET_MONITOR_MAX_ROWS", "1000"))
 
 
+# ---------------- Telemetry fetch ----------------
 def _http_get_last() -> Dict[str, Any]:
-    """
-    Call the local /api/telemetry/last endpoint exposed by wsgi.py and
-    return the inner telemetry dict (same shape as _last_tel).
-
-    The endpoint usually returns:
-        {"ok": true, "data": {...}, "age_sec": 7.3}
-    """
     try:
         resp = requests.get(LAST_URL, timeout=5)
     except Exception as e:
@@ -105,10 +69,7 @@ def _http_get_last() -> Dict[str, Any]:
     except Exception as e:
         warn(f"telemetry_mirror: bad JSON from /api/telemetry/last: {e}")
         return {}
-    if not isinstance(body, dict):
-        warn("telemetry_mirror: non-dict body from /api/telemetry/last")
-        return {}
-    if not body.get("ok"):
+    if not isinstance(body, dict) or not body.get("ok"):
         warn(f"telemetry_mirror: /api/telemetry/last !ok: {body}")
         return {}
     data = body.get("data") or {}
@@ -118,11 +79,64 @@ def _http_get_last() -> Dict[str, Any]:
     return data
 
 
+# ---------------- Sheet helpers ----------------
+@with_sheet_backoff
+def _open_wallet_monitor_ws():
+    return get_ws_cached(WALLET_MONITOR_WS)
+
+
+@with_sheet_backoff
+def _append_rows(ws, rows: List[List[Any]]) -> None:
+    ws.append_rows(rows, value_input_option="RAW")
+
+
+@with_sheet_backoff
+def _delete_rows(ws, start_row: int, end_row: int) -> None:
+    ws.delete_rows(start_row, end_row)
+
+
+@with_sheet_backoff
+def _clear_and_seed_header(ws, header: List[str]) -> None:
+    ws.clear()
+    ws.append_rows([header], value_input_option="RAW")
+
+
+def _read_header(ws) -> List[str]:
+    try:
+        h = ws.row_values(1) or []
+        return [str(x).strip() for x in h]
+    except Exception:
+        return []
+
+
+def _ensure_wallet_monitor_header(ws) -> List[str]:
+    """
+    Ensure Wallet_Monitor has a usable header.
+    Prefer the canonical 8-column header to match your sheet (and avoid shifts).
+    """
+    canonical_8 = ["Timestamp", "Agent", "Venue", "Asset", "Free", "Locked", "Class", "Snapshot"]
+    canonical_7 = ["Timestamp", "Agent", "Venue", "Asset", "Amount", "Class", "Snapshot"]
+
+    header = _read_header(ws)
+    if not header or all(not str(x).strip() for x in header):
+        info("telemetry_mirror: Wallet_Monitor header missing; seeding canonical 8-column header.")
+        _clear_and_seed_header(ws, canonical_8)
+        return canonical_8
+
+    # Normalize for matching
+    norm = [h.strip() for h in header if h is not None]
+    if norm == canonical_8:
+        return canonical_8
+    if norm == canonical_7:
+        return canonical_7
+
+    # If it contains these required columns, we’ll respect it,
+    # but we will choose how to write by checking which fields exist.
+    return norm
+
+
+# ---------------- Data transforms ----------------
 def _flatten_balances(by_venue: Dict[str, Dict[str, float]]) -> List[Tuple[str, str, float]]:
-    """
-    Convert nested by_venue dict to a flat list of (venue, asset, qty) tuples,
-    filtering out dust based on TELEMETRY_MIRROR_MIN_BALANCE.
-    """
     rows: List[Tuple[str, str, float]] = []
     for venue, balances in by_venue.items():
         if not isinstance(balances, dict):
@@ -139,23 +153,11 @@ def _flatten_balances(by_venue: Dict[str, Dict[str, float]]) -> List[Tuple[str, 
 
 
 def _classify_asset(asset: str) -> str:
-    """
-    Tag whether this asset is a stable (used for Quote, etc.).
-    """
     a = (asset or "").upper()
-    if a in STABLES:
-        return "QUOTE"
-    return "BASE"
+    return "QUOTE" if a in STABLES else "BASE"
 
 
 def _format_compact_fragment(by_venue: Dict[str, Dict[str, float]]) -> str:
-    """
-    Build a compact human-readable fragment like:
-
-        BINANCEUS:USDT=159.25,USD=9.77; COINBASE:USDC=136.38
-
-    This is used in the Wallet_Monitor sheet's "Snapshot" column.
-    """
     parts: List[str] = []
     for venue, balances in by_venue.items():
         if not isinstance(balances, dict):
@@ -168,177 +170,14 @@ def _format_compact_fragment(by_venue: Dict[str, Dict[str, float]]) -> str:
                 continue
             if qf <= TELEMETRY_MIRROR_MIN_BALANCE:
                 continue
-            frag_parts.append(f"{asset}={qf:g}")
+            frag_parts.append(f"{str(asset).upper()}={qf:g}")
         if frag_parts:
-            parts.append(f"{venue}:" + ",".join(frag_parts))
+            parts.append(f"{str(venue).upper()}:" + ",".join(frag_parts))
     return "; ".join(parts)
 
 
-@with_sheet_backoff
-def _open_wallet_monitor_ws(
-    ws_name: str = WALLET_MONITOR_WS,
-) -> "Worksheet":
-    """
-    Open the Wallet_Monitor worksheet with backoff + cache.
-
-    get_ws_cached(name, ttl_s=None) uses SHEET_URL from utils internally,
-    so we only pass the worksheet name here.
-    """
-    return get_ws_cached(ws_name)
-
-@with_sheet_backoff
-def _append_wallet_monitor_rows(ws, rows):
-    """
-    Append rows into Wallet_Monitor with Sheets backoff/retry.
-    We bypass utils.sheets_append_rows here to avoid signature mismatch.
-    """
-    # gspread Worksheet.append_rows signature:
-    #   append_rows(values, value_input_option='RAW', insert_data_option=None, table_range=None)
-    ws.append_rows(rows, value_input_option="RAW")
-
-@with_sheet_backoff
-def _delete_wallet_monitor_rows(ws, start_row: int, end_row: int):
-    """Delete a block of rows with backoff / retry."""
-    ws.delete_rows(start_row, end_row)
-
-
-def _compact_wallet_monitor_if_needed() -> None:
-    """
-    Bounded-history compaction for Wallet_Monitor.
-
-    Strategy:
-      - If WALLET_MONITOR_MAX_ROWS <= 0: no-op.
-      - Otherwise:
-          * Look at column A (Timestamp) to find how many rows are actually used.
-          * If used_rows > max_rows, delete the oldest surplus rows, keeping
-            the header row intact.
-    """
-    from utils import info, warn  # already imported at top in this module in your tree
-
-    if WALLET_MONITOR_MAX_ROWS <= 0:
-        return
-
-    try:
-        ws = _open_wallet_monitor_ws()
-    except Exception as e:
-        warn(f"telemetry_mirror: failed to open Wallet_Monitor for compaction: {e}")
-        return
-
-    ws_name = getattr(ws, "title", WALLET_MONITOR_WS)
-
-    try:
-        col_a = ws.col_values(1)  # 1-based column index for Timestamp
-    except Exception as e:
-        warn(f"telemetry_mirror: failed to read Wallet_Monitor col A: {e}")
-        return
-
-    if not col_a:
-        # Completely empty sheet, nothing to do.
-        return
-
-    # Trim trailing empty cells so we don’t treat them as data rows
-    while col_a and not str(col_a[-1]).strip():
-        col_a.pop()
-
-    used_rows = len(col_a)          # includes header row
-    if used_rows <= 1:
-        # Only header present.
-        return
-
-    # We allow WALLET_MONITOR_MAX_ROWS data rows *plus* the header
-    allowed_total_rows = 1 + WALLET_MONITOR_MAX_ROWS
-    if used_rows <= allowed_total_rows:
-        # Under the cap, nothing to compact.
-        return
-
-    surplus = used_rows - allowed_total_rows
-    # Delete the oldest data rows, keeping row 1 as header:
-    #   delete rows 2 .. (1 + surplus)
-    start_row = 2
-    end_row = 1 + surplus
-
-    try:
-        _delete_wallet_monitor_rows(ws, start_row, end_row)
-        info(
-            f"telemetry_mirror: compacted {ws_name}; "
-            f"deleted {surplus} old rows (rows {start_row}-{end_row}), "
-            f"kept latest {WALLET_MONITOR_MAX_ROWS} data rows."
-        )
-    except Exception as e:
-        warn(f"telemetry_mirror: failed to compact {ws_name}: {e}")
-
-
-def _write_wallet_monitor_row(data: Dict[str, Any]) -> None:
-    """
-    Append a single compact snapshot row into Wallet_Monitor.
-
-    Expected row:
-        [Timestamp, Agent, Venue, Asset, Qty, Class, Snapshot]
-
-    Where Snapshot is the compact multi-venue fragment.
-
-    This function assumes data is already validated and flattened.
-    """
-    if not SHEET_URL:
-        warn("telemetry_mirror: SHEET_URL not set; cannot mirror telemetry.")
-        return
-
-    by_venue = data.get("by_venue") or {}
-    if not isinstance(by_venue, dict):
-        warn("telemetry_mirror: telemetry has no by_venue; nothing to mirror.")
-        return
-
-    ts = data.get("ts") or time.time()
-    # Accept either seconds or ms; if ts is large, assume ms
-    if isinstance(ts, (int, float)) and ts > 10_000_000_000:
-        ts = ts / 1000.0
-    dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
-    now_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    info(
-        f"telemetry_mirror: using snapshot agent={data.get('agent')} "
-        f"age={time.time() - float(ts):.0f}s venues={len(by_venue)}"
-    )
-
-    rows = _flatten_balances(by_venue)
-    if not rows:
-        info("telemetry_mirror: no non-dust balances to mirror.")
-        return
-
-    snapshot_frag = _format_compact_fragment(by_venue)
-
-    out_rows: List[List[Any]] = []
-    agent = data.get("agent") or ""
-    for venue, asset, qty in rows:
-        klass = _classify_asset(asset)
-        out_rows.append(
-            [
-                now_str,
-                agent,
-                venue,
-                asset,
-                qty,
-                klass,
-                snapshot_frag,
-            ]
-        )
-
-    ws = _open_wallet_monitor_ws()
-    _append_wallet_monitor_rows(ws, out_rows)
-    info(f"telemetry_mirror: appended {len(out_rows)} Wallet_Monitor rows.")
-
+# ---------------- Safety gating ----------------
 def _telemetry_ok_for_sheet(data: Dict[str, Any]) -> bool:
-    """
-    Decide whether this telemetry snapshot is safe to mirror into Wallet_Monitor.
-
-    We ALWAYS try to record into the DB backbone, but we only write into Sheets
-    when:
-      - data is a dict with a non-empty by_venue mapping
-      - snapshot age <= TELEMETRY_MAX_AGE_SEC
-      - all TELEMETRY_REQUIRED_VENUES are present
-      - no negative balances detected
-      - total stables >= TELEMETRY_MIN_TOTAL_STABLE (if configured)
-    """
     if not isinstance(data, dict):
         warn("telemetry_mirror: telemetry data is not a dict; skipping Wallet_Monitor write.")
         return False
@@ -348,36 +187,25 @@ def _telemetry_ok_for_sheet(data: Dict[str, Any]) -> bool:
         warn("telemetry_mirror: telemetry missing by_venue; skipping Wallet_Monitor write.")
         return False
 
-    # --- Age check ---
     ts = data.get("ts") or time.time()
     try:
         ts_f = float(ts)
     except Exception:
         ts_f = time.time()
-
-    # Accept seconds or ms
     if ts_f > 10_000_000_000:
         ts_f /= 1000.0
 
     age = time.time() - ts_f
     if age > TELEMETRY_MAX_AGE_SEC:
-        warn(
-            f"telemetry_mirror: snapshot too old for sheet "
-            f"({age:.0f}s > {TELEMETRY_MAX_AGE_SEC:.0f}s); skipping Wallet_Monitor write."
-        )
+        warn(f"telemetry_mirror: snapshot too old ({age:.0f}s > {TELEMETRY_MAX_AGE_SEC:.0f}s); skip.")
         return False
 
-    # --- Venue completeness check ---
     venues_present = {str(v).upper() for v in by_venue.keys()}
     missing = sorted(TELEMETRY_REQUIRED_VENUES - venues_present)
     if missing:
-        warn(
-            f"telemetry_mirror: missing required venues in snapshot: {missing}. "
-            "Will record telemetry in DB but skip Wallet_Monitor write."
-        )
+        warn(f"telemetry_mirror: missing required venues in snapshot: {missing}; skip Wallet_Monitor write.")
         return False
 
-    # --- Negative + stable-sum sanity ---
     total_stables = 0.0
     for v, balances in by_venue.items():
         if not isinstance(balances, dict):
@@ -388,55 +216,148 @@ def _telemetry_ok_for_sheet(data: Dict[str, Any]) -> bool:
             except Exception:
                 continue
             if qf < 0:
-                warn(
-                    f"telemetry_mirror: negative balance {qf} for {v}/{asset}; "
-                    "skipping Wallet_Monitor write."
-                )
+                warn(f"telemetry_mirror: negative balance {qf} for {v}/{asset}; skip Wallet_Monitor write.")
                 return False
-            if asset.upper() in STABLES:
+            if str(asset).upper() in STABLES:
                 total_stables += qf
 
     if total_stables < TELEMETRY_MIN_TOTAL_STABLE:
-        warn(
-            f"telemetry_mirror: total stable balance {total_stables:g} below "
-            f"TELEMETRY_MIN_TOTAL_STABLE={TELEMETRY_MIN_TOTAL_STABLE:g}; "
-            "skipping Wallet_Monitor write."
-        )
+        warn(f"telemetry_mirror: total stables {total_stables:g} below min {TELEMETRY_MIN_TOTAL_STABLE:g}; skip.")
         return False
 
     return True
 
+
+# ---------------- Compaction ----------------
+def _compact_wallet_monitor_if_needed() -> None:
+    if WALLET_MONITOR_MAX_ROWS <= 0:
+        return
+    try:
+        ws = _open_wallet_monitor_ws()
+    except Exception as e:
+        warn(f"telemetry_mirror: failed to open Wallet_Monitor for compaction: {e}")
+        return
+
+    try:
+        col_a = ws.col_values(1)
+    except Exception as e:
+        warn(f"telemetry_mirror: failed to read Wallet_Monitor col A: {e}")
+        return
+
+    if not col_a:
+        return
+
+    while col_a and not str(col_a[-1]).strip():
+        col_a.pop()
+
+    used_rows = len(col_a)  # includes header
+    if used_rows <= 1:
+        return
+
+    allowed_total = 1 + WALLET_MONITOR_MAX_ROWS
+    if used_rows <= allowed_total:
+        return
+
+    surplus = used_rows - allowed_total
+    start_row = 2
+    end_row = 1 + surplus
+
+    try:
+        _delete_rows(ws, start_row, end_row)
+        info(
+            f"telemetry_mirror: compacted {WALLET_MONITOR_WS}; "
+            f"deleted {surplus} old rows (rows {start_row}-{end_row}), kept latest {WALLET_MONITOR_MAX_ROWS}."
+        )
+    except Exception as e:
+        warn(f"telemetry_mirror: failed compaction: {e}")
+
+
+# ---------------- Write logic (FIXED) ----------------
+def _write_wallet_monitor_rows(data: Dict[str, Any]) -> None:
+    if not SHEET_URL:
+        warn("telemetry_mirror: SHEET_URL not set; cannot mirror telemetry.")
+        return
+
+    by_venue = data.get("by_venue") or {}
+    if not isinstance(by_venue, dict):
+        warn("telemetry_mirror: telemetry has no by_venue; nothing to mirror.")
+        return
+
+    ts = data.get("ts") or time.time()
+    if isinstance(ts, (int, float)) and ts > 10_000_000_000:
+        ts = ts / 1000.0
+    dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    now_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    agent = data.get("agent") or ""
+    age_s = time.time() - float(ts)
+    info(f"telemetry_mirror: using snapshot agent={agent} age={age_s:.0f}s venues={len(by_venue)}")
+
+    rows = _flatten_balances(by_venue)
+    if not rows:
+        info("telemetry_mirror: no non-dust balances to mirror.")
+        return
+
+    snapshot_frag = _format_compact_fragment(by_venue)
+
+    ws = _open_wallet_monitor_ws()
+    header = _ensure_wallet_monitor_header(ws)
+
+    # Determine schema write mode:
+    # - If header contains Free/Locked -> write 8-column format
+    # - Else if header contains Amount -> write 7-column format
+    header_set = {h.strip() for h in header}
+
+    use_8 = ("Free" in header_set and "Locked" in header_set and "Snapshot" in header_set)
+    use_7 = ("Amount" in header_set and "Snapshot" in header_set)
+
+    out_rows: List[List[Any]] = []
+    for venue, asset, qty in rows:
+        klass = _classify_asset(asset)
+        if use_8:
+            # Timestamp | Agent | Venue | Asset | Free | Locked | Class | Snapshot
+            out_rows.append([now_str, agent, venue, asset, qty, 0.0, klass, snapshot_frag])
+        elif use_7:
+            # Timestamp | Agent | Venue | Asset | Amount | Class | Snapshot
+            out_rows.append([now_str, agent, venue, asset, qty, klass, snapshot_frag])
+        else:
+            # Unknown header. Fail-safe: write the 8-column canonical if header is close-ish,
+            # otherwise fall back to 7 to avoid breaking append_rows.
+            # We choose by expected length if header has >= 8.
+            if len(header) >= 8:
+                out_rows.append([now_str, agent, venue, asset, qty, 0.0, klass, snapshot_frag])
+            else:
+                out_rows.append([now_str, agent, venue, asset, qty, klass, snapshot_frag])
+
+    _append_rows(ws, out_rows)
+    info(f"telemetry_mirror: appended {len(out_rows)} Wallet_Monitor rows.")
+
+
+# ---------------- Entrypoint ----------------
 def run_telemetry_mirror() -> None:
-    """
-    Public entrypoint: mirror latest telemetry snapshot into Wallet_Monitor
-    and compact the sheet if necessary.
-    """
     data = _http_get_last()
     if not data:
         return
 
-    # Phase 19: mirror telemetry snapshot into DB backbone (best-effort)
+    # Best-effort DB backbone recording
     try:
         agent = ""
         if isinstance(data, dict):
             agent = data.get("agent") or ""
         if not agent:
             agent = "bus-telemetry"
-
         record_telemetry(agent, data, kind="snapshot")
     except Exception:
-        # don't break the Sheet pipeline on DB issues
         pass
 
-    # Only write to Wallet_Monitor if the snapshot looks sane
     if not _telemetry_ok_for_sheet(data):
         return
 
     try:
-        _write_wallet_monitor_row(data)
+        _write_wallet_monitor_rows(data)
     finally:
-        # Compaction should not block writes; best-effort.
         _compact_wallet_monitor_if_needed()
+
 
 if __name__ == "__main__":
     run_telemetry_mirror()
