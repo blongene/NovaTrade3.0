@@ -1,46 +1,23 @@
-# council_drift_detector.py
+# council_drift_detector.py (Phase 21.6) — Bus
+# Drift/disagreement detection with minimal noise.
+#
+# IMPORTANT:
+# - Uses utils.get_sheet() (gspread workbook) — does NOT instantiate SheetsGateway.
+# - Fail-open: never crashes the scheduler loop.
+# - Creates Council_Drift tab if missing.
+
 import os
-import time
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-# ---- Optional integrations (use if present in your Bus) ----
-def _try_imports():
-    mod = {}
-    try:
-        from sheets_gateway import SheetsGateway  # type: ignore
-        mod["SheetsGateway"] = SheetsGateway
-    except Exception:
-        mod["SheetsGateway"] = None
-
-    try:
-        # your common wrappers (names vary across phases)
-        from utils import (  # type: ignore
-            get_sheet,
-            with_sheet_backoff,
-            telegram_send_deduped,
-            ensure_worksheet,
-        )
-        mod["get_sheet"] = get_sheet
-        mod["with_sheet_backoff"] = with_sheet_backoff
-        mod["telegram_send_deduped"] = telegram_send_deduped
-        mod["ensure_worksheet"] = ensure_worksheet
-    except Exception:
-        mod["get_sheet"] = None
-        mod["with_sheet_backoff"] = None
-        mod["telegram_send_deduped"] = None
-        mod["ensure_worksheet"] = None
-    return mod
-
-_IMP = _try_imports()
-
+# ---- Config ----
 DRIFT_WS = os.getenv("COUNCIL_DRIFT_WS", "Council_Drift")
 DECISION_ANALYTICS_WS = os.getenv("DECISION_ANALYTICS_WS", "Decision_Analytics")
 COUNCIL_INSIGHT_WS = os.getenv("COUNCIL_INSIGHT_WS", "Council_Insight")
 
 COUNCIL_DRIFT_ENABLED = os.getenv("COUNCIL_DRIFT_ENABLED", "0") == "1"
 WINDOW_N = int(os.getenv("COUNCIL_DRIFT_WINDOW_N", "200"))
+
 THRESH_P95 = float(os.getenv("COUNCIL_DRIFT_DISAGREE_P95", "0.55"))
 THRESH_SHIFT = float(os.getenv("COUNCIL_DRIFT_SHIFT_RATE", "0.35"))
 SUCCESS_MIN = float(os.getenv("COUNCIL_DRIFT_EXEC_SUCCESS_MIN", "0.75"))
@@ -60,6 +37,26 @@ HEADERS = [
     "Notes",
 ]
 
+# ---- Imports from your Bus (safe fallbacks) ----
+def _try_imports():
+    mod = {}
+    try:
+        from utils import get_sheet  # type: ignore
+        mod["get_sheet"] = get_sheet
+    except Exception:
+        mod["get_sheet"] = None
+
+    try:
+        from utils import telegram_send_deduped  # type: ignore
+        mod["telegram_send_deduped"] = telegram_send_deduped
+    except Exception:
+        mod["telegram_send_deduped"] = None
+
+    return mod
+
+_IMP = _try_imports()
+
+
 def _safe_float(x) -> Optional[float]:
     try:
         if x is None:
@@ -71,12 +68,14 @@ def _safe_float(x) -> Optional[float]:
     except Exception:
         return None
 
+
 def _pct95(values: List[float]) -> Optional[float]:
     if not values:
         return None
     v = sorted(values)
     idx = int(round(0.95 * (len(v) - 1)))
     return v[max(0, min(idx, len(v) - 1))]
+
 
 def _mode(values: List[str]) -> str:
     if not values:
@@ -85,6 +84,7 @@ def _mode(values: List[str]) -> str:
     for x in values:
         counts[x] = counts.get(x, 0) + 1
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
 
 def _shift_rate(values: List[str]) -> float:
     if len(values) < 2:
@@ -95,76 +95,69 @@ def _shift_rate(values: List[str]) -> float:
             shifts += 1
     return shifts / float(len(values) - 1)
 
+
 def _boolish_ok(x) -> Optional[bool]:
     if x is None:
         return None
     s = str(x).strip().lower()
-    if s in ("true", "yes", "1", "ok", "success"):
+    if s in ("true", "yes", "1", "ok", "success", "passed"):
         return True
-    if s in ("false", "no", "0", "fail", "error"):
+    if s in ("false", "no", "0", "fail", "error", "failed"):
         return False
     return None
 
-def _open_sheet():
-    # Preferred: your existing gateway
-    if _IMP.get("SheetsGateway"):
-        return _IMP["SheetsGateway"]()
-    if _IMP.get("get_sheet"):
-        return _IMP["get_sheet"]()
-    raise RuntimeError("No Sheets adapter found (SheetsGateway/get_sheet missing).")
 
-def _get_records(sheet, ws_name: str) -> List[dict]:
-    # SheetsGateway commonly exposes get_records_cached/get_all_records-like methods.
-    if hasattr(sheet, "get_records_cached"):
-        return sheet.get_records_cached(ws_name)  # type: ignore
-    ws = sheet.worksheet(ws_name)  # gspread-like
-    return ws.get_all_records()
+def _open_sheet():
+    if not _IMP.get("get_sheet"):
+        raise RuntimeError("utils.get_sheet not available")
+    return _IMP["get_sheet"]()
+
 
 def _ensure_ws(sheet, ws_name: str, headers: List[str]):
-    if hasattr(sheet, "ensure_worksheet"):
-        sheet.ensure_worksheet(ws_name, headers=headers, min_rows=2000, min_cols=len(headers) + 4)  # type: ignore
-        return
-    if _IMP.get("ensure_worksheet"):
-        _IMP["ensure_worksheet"](sheet, ws_name, headers=headers)
-        return
-    # fallback: gspread-ish
+    # gspread workbook object
     try:
         ws = sheet.worksheet(ws_name)
         existing = ws.row_values(1)
         if existing != headers:
             ws.clear()
             ws.append_row(headers)
+        return
     except Exception:
-        ws = sheet.add_worksheet(title=ws_name, rows=2000, cols=len(headers) + 4)
+        # create and seed headers
+        ws = sheet.add_worksheet(title=ws_name, rows=2000, cols=max(20, len(headers) + 4))
         ws.append_row(headers)
 
+
+def _get_records(sheet, ws_name: str) -> List[dict]:
+    ws = sheet.worksheet(ws_name)
+    return ws.get_all_records()
+
+
 def _append_row(sheet, ws_name: str, row: List):
-    if hasattr(sheet, "append_row"):
-        sheet.append_row(ws_name, row)  # type: ignore
-        return
     ws = sheet.worksheet(ws_name)
     ws.append_row(row)
+
 
 def _send_alert(text: str, dedup_key: str):
     if not DRIFT_ALERTS_ENABLED:
         return
-    if _IMP.get("telegram_send_deduped"):
-        # expected signature: telegram_send_deduped(msg, key, ttl_sec=?)
-        ttl = DRIFT_ALERTS_DEDUP_MIN * 60
-        try:
-            _IMP["telegram_send_deduped"](text, dedup_key, ttl_sec=ttl)
-            return
-        except Exception:
-            pass
-    # If you don't have a dedupe sender exposed, drift alerts stay “off by default”.
+    fn = _IMP.get("telegram_send_deduped")
+    if not fn:
+        return
+    ttl = DRIFT_ALERTS_DEDUP_MIN * 60
+    try:
+        fn(text, dedup_key, ttl_sec=ttl)  # type: ignore
+    except Exception:
+        pass
+
 
 def run_council_drift_detector() -> Dict:
     """
     Phase 21.6
     - Reads Decision_Analytics (preferred) else Council_Insight
-    - Computes rolling disagreement + majority stability + exec success rate
-    - Writes a single row into Council_Drift
-    - Optional Telegram ping if flags trip (opt-in)
+    - Computes rolling disagreement + majority stability + exec success
+    - Appends one row to Council_Drift
+    - Optional Telegram ping when flags trip
     """
     if not COUNCIL_DRIFT_ENABLED:
         return {"ok": True, "skipped": True, "reason": "COUNCIL_DRIFT_ENABLED=0"}
@@ -172,23 +165,19 @@ def run_council_drift_detector() -> Dict:
     sheet = _open_sheet()
     _ensure_ws(sheet, DRIFT_WS, HEADERS)
 
-    # Prefer Decision_Analytics (because it already aggregates outcomes)
-    rows = []
-    source = ""
+    # Prefer Decision_Analytics
+    source = DECISION_ANALYTICS_WS
     try:
         rows = _get_records(sheet, DECISION_ANALYTICS_WS)
-        source = DECISION_ANALYTICS_WS
     except Exception:
-        rows = _get_records(sheet, COUNCIL_INSIGHT_WS)
         source = COUNCIL_INSIGHT_WS
+        rows = _get_records(sheet, COUNCIL_INSIGHT_WS)
 
     if not rows:
         return {"ok": True, "skipped": True, "reason": f"No rows in {source}"}
 
     window = rows[-WINDOW_N:] if len(rows) > WINDOW_N else rows
 
-    # expected columns in Decision_Analytics:
-    # Disagreement_Index, Majority_Voice, Exec_OK / Success / Policy_OK, etc.
     disagreements: List[float] = []
     majorities: List[str] = []
     exec_ok: List[bool] = []
@@ -202,13 +191,12 @@ def run_council_drift_detector() -> Dict:
         if mv:
             majorities.append(mv)
 
-        # allow flexible names
         ok = _boolish_ok(r.get("Exec_OK") or r.get("Execution_OK") or r.get("OK") or r.get("Status"))
         if ok is not None:
             exec_ok.append(ok)
 
     disagree_mean = round(sum(disagreements) / len(disagreements), 4) if disagreements else ""
-    disagree_p95 = round(_pct95(disagreements) or 0.0, 4) if disagreements else ""
+    disagree_p95 = round((_pct95(disagreements) or 0.0), 4) if disagreements else ""
 
     majority_mode = _mode(majorities)
     majority_shift = round(_shift_rate(majorities), 4)
@@ -232,7 +220,6 @@ def run_council_drift_detector() -> Dict:
         flags.append("execution_drop")
         notes.append(f"exec_success={success_rate} < {SUCCESS_MIN}")
 
-    # baseline voice shift (compare last 50 vs first 50 within window)
     if len(majorities) >= 100:
         base_mode = _mode(majorities[:50])
         now_mode = _mode(majorities[-50:])
@@ -252,11 +239,12 @@ def run_council_drift_detector() -> Dict:
         ",".join(flags),
         " | ".join(notes)[:240],
     ]
+
     _append_row(sheet, DRIFT_WS, out_row)
 
     if flags:
         _send_alert(
-            f"🧭 Council Drift Detected\n"
+            "🧭 Council Drift Detected\n"
             f"- flags: {', '.join(flags)}\n"
             f"- disagree_p95: {disagree_p95}\n"
             f"- majority_shift: {majority_shift}\n"
@@ -265,9 +253,4 @@ def run_council_drift_detector() -> Dict:
             dedup_key=f"council_drift:{','.join(flags)}",
         )
 
-    return {
-        "ok": True,
-        "source": source,
-        "window": len(window),
-        "flags": flags,
-    }
+    return {"ok": True, "source": source, "window": len(window), "flags": flags}
