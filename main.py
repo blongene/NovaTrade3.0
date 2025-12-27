@@ -250,6 +250,11 @@ def _set_schedules():
     # --- Phase 21.6 — Council Drift Detector (opt-in) ---
     _schedule("Council Drift Detector", "council_drift_detector", "run_council_drift_detector", every=30, unit="minutes")
 
+    # --- Phase 22A — Advisory Writers (opt-in; advisory-only; no execution) ---
+    _schedule("Rebuy Insights (Advisory)",      "rebuy_insights_advisory",   "run_rebuy_insights_advisory",   every=int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN","60")), unit="minutes")
+    _schedule("Scout Decisions (Advisory)",    "scout_decisions_advisory",  "run_scout_decisions_advisory",  every=int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN","60")), unit="minutes")
+    _schedule("Sentiment Log (Advisory)",      "sentiment_log_advisory",    "run_sentiment_log_advisory",    every=int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN","60")), unit="minutes")
+
 def _kick_once_and_threads():
     # Background scheduler loop
     def _scheduler_loop():
