@@ -1,37 +1,49 @@
 # db_parity_validator.py
 """
-Phase 22B — DB Parity Validator
+Phase 22B — DB Parity Validator (DB_READ_JSON edition)
 
-Lightweight safety check for adopting DB reads.
+Purpose
+-------
+Lightweight safety check before adopting DB-first reads widely.
 
 What it checks
 --------------
 1) DB health (URL set, driver present, can query)
 2) Table existence + freshness (age of newest row):
    - commands / receipts / nova_telemetry (if present)
-3) Soft parity signals (when DB sheet mirror is enabled):
-   - receipts vs Trade_Log mirror window (last N hours)
-   - telemetry vs Wallet_Monitor mirror window (last N hours)
+3) Soft parity signals (when DB sheet mirror exists):
+   - mirror window counts for Trade_Log and Wallet_Monitor
 
-This is deliberately NOT a heavy full diff.
+Config (single env var)
+-----------------------
+DB_READ_JSON may include:
+{
+  "parity": {
+    "enabled": 1,
+    "notify": 1,
+    "log_policy": 1,
+    "window_h": 24,
+    "max_rows": 5000
+  }
+}
 
-Env
----
-DB_PARITY_ENABLED=1
-DB_PARITY_NOTIFY=1
-DB_PARITY_LOG_POLICY=1
-DB_PARITY_WINDOW_H=24
-DB_PARITY_MAX_ROWS=5000
+Back-compat (optional)
+----------------------
+If DB_READ_JSON.parity is missing, legacy env vars are honored:
+DB_PARITY_ENABLED, DB_PARITY_NOTIFY, DB_PARITY_LOG_POLICY, DB_PARITY_WINDOW_H, DB_PARITY_MAX_ROWS
+
+This validator is designed to be scheduled safely. It never blocks and never raises.
 """
 
 from __future__ import annotations
 
 import os
+import json
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
-from db_read_adapter import db_health, _choose_table, _max_created_at, _pg
+from db_read_adapter import db_health, _choose_table, _max_created_at, _pg, DB_READ_STALE_SEC
 
 # Optional: Sheets + Telegram are best-effort only
 try:
@@ -47,11 +59,32 @@ def _env_bool(name: str, default: str = "1") -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
-DB_PARITY_ENABLED = _env_bool("DB_PARITY_ENABLED", "1")
-DB_PARITY_NOTIFY  = _env_bool("DB_PARITY_NOTIFY", "1")
-DB_PARITY_LOG_POLICY = _env_bool("DB_PARITY_LOG_POLICY", "1")
-DB_PARITY_WINDOW_H = int(os.getenv("DB_PARITY_WINDOW_H", "24") or "24")
-DB_PARITY_MAX_ROWS = int(os.getenv("DB_PARITY_MAX_ROWS", "5000") or "5000")
+def _safe_int(v: Any, default: int) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _load_cfg() -> dict:
+    raw = os.getenv("DB_READ_JSON", "") or ""
+    if not raw.strip():
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+_CFG = _load_cfg()
+_PAR = _CFG.get("parity") if isinstance(_CFG.get("parity"), dict) else None
+
+DB_PARITY_ENABLED = bool(_PAR.get("enabled")) if _PAR is not None else _env_bool("DB_PARITY_ENABLED", "1")
+DB_PARITY_NOTIFY  = bool(_PAR.get("notify", True)) if _PAR is not None else _env_bool("DB_PARITY_NOTIFY", "1")
+DB_PARITY_LOG_POLICY = bool(_PAR.get("log_policy", True)) if _PAR is not None else _env_bool("DB_PARITY_LOG_POLICY", "1")
+DB_PARITY_WINDOW_H = _safe_int(_PAR.get("window_h", 24), 24) if _PAR is not None else _safe_int(os.getenv("DB_PARITY_WINDOW_H", "24"), 24)
+DB_PARITY_MAX_ROWS = _safe_int(_PAR.get("max_rows", 5000), 5000) if _PAR is not None else _safe_int(os.getenv("DB_PARITY_MAX_ROWS", "5000"), 5000)
 
 
 def _utcnow() -> datetime:
@@ -93,8 +126,11 @@ def _mirror_count_for_tab(tab: str, since_dt: datetime) -> Optional[int]:
 
 
 def run_db_parity_validator() -> dict:
+    """
+    Returns a dict report. Safe: never raises.
+    """
     if not DB_PARITY_ENABLED:
-        return {"ok": True, "skipped": True, "reason": "DB_PARITY_ENABLED=0"}
+        return {"ok": True, "skipped": True, "reason": "DB parity disabled"}
 
     now = _utcnow()
     since = now - timedelta(hours=DB_PARITY_WINDOW_H)
@@ -107,7 +143,7 @@ def run_db_parity_validator() -> dict:
         "ok": True,
     }
 
-    stale_cut = int(os.getenv("DB_READ_STALE_SEC", "900") or "900")
+    stale_cut = DB_READ_STALE_SEC  # keep aligned with adapter default / cfg
 
     def add_stream(name: str, table: Optional[str], mirror_tab: Optional[str] = None):
         if not table:
@@ -136,9 +172,12 @@ def run_db_parity_validator() -> dict:
     # Soft parity: if mirror exists and is dramatically smaller than DB in window, warn.
     rec = report["streams"].get("receipts") or {}
     if rec.get("mirror_window") is not None and rec.get("n_window"):
-        if rec["mirror_window"] < int(0.4 * rec["n_window"]):
-            rec["warn"] = (rec.get("warn") or "") + "|mirror_low"
-            report["ok"] = False
+        try:
+            if rec["mirror_window"] < int(0.4 * rec["n_window"]):
+                rec["warn"] = (rec.get("warn") or "") + "|mirror_low"
+                report["ok"] = False
+        except Exception:
+            pass
 
     _emit(report)
     return report
