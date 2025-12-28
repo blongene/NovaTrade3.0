@@ -85,6 +85,12 @@ def get_env_str(name: str, default: Optional[str] = None) -> Optional[str]:
         return default
     return str(val)
 
+def env_enabled(name: str, default=False):
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
+
 def get_sheet_client():
     """
     Return a gspread client using the service account JSON from env.
