@@ -13,7 +13,7 @@ from utils import (
 )
 
 TAB = os.getenv("SCOUT_DECISIONS_TAB", "Scout Decisions")
-ENABLED = os.getenv("SCOUT_DECISIONS_ADVISORY_ENABLED", "0").lower() in {"1","true","yes","on"}
+ENABLED = os.getenv("SCOUT_DECISIONS_ADVISORY_ENABLED", "1").lower() in {"1","true","yes","on"}
 MAX_ROWS = int(os.getenv("SCOUT_DECISIONS_MAX_ROWS", "25"))
 TTL_SEC  = int(os.getenv("SCOUT_DECISIONS_TTL_SEC", "21600"))  # 6h dedupe
 
