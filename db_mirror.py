@@ -39,6 +39,7 @@ except Exception:  # pragma: no cover
     psycopg2 = None  # type: ignore
     psycopg2_extras = None  # type: ignore
 
+DB_MIRROR_ENABLED = env_enabled("DB_MIRROR_ENABLED", False)
 
 DEFAULT_TABS = [
     "Policy_Log",
@@ -69,6 +70,11 @@ def enabled() -> bool:
         and bool(_db_url())
     )
 
+def env_enabled(name: str, default=False):
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
 
 def allowed_tabs() -> set[str]:
     raw = os.getenv("DB_MIRROR_TABS", "").strip()
