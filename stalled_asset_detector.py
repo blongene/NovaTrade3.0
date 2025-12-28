@@ -56,6 +56,7 @@ STALL_DETECT_DAYS       = int(os.getenv("STALL_DETECT_DAYS", "7"))
 STALL_ORPHAN_DAYS       = int(os.getenv("STALL_ORPHAN_DAYS", "30"))
 STALL_MIN_BALANCE       = float(os.getenv("STALL_MIN_BALANCE", "0.000001"))
 STALL_MIN_STABLE_BAL    = float(os.getenv("STALL_MIN_STABLE_BALANCE", "5.0"))
+STALL_IGNORE_ASSETS    = {x.strip().upper() for x in os.getenv('STALL_DETECTOR_IGNORE_ASSETS', 'USD,USDC,USDT').split(',') if x and x.strip()}
 STALL_STABLE_DAYS       = int(os.getenv("STALL_STABLE_DAYS", "3"))
 
 STABLE_SYMBOLS = {"USDC", "USDT", "USD", "USDP", "DAI"}
@@ -157,61 +158,57 @@ def _extract_base_from_symbol(symbol: str) -> str:
 # ==== Data loaders ====
 
 def load_wallet_balances(sh) -> List[Dict[str, Any]]:
-    """
-    From Wallet_Monitor:
-        Timestamp | Venue | Asset | Free | Locked | Quote
+    """Load balances from Wallet_Monitor, returning *latest* row per (Venue, Asset).
+
+    Wallet_Monitor is append-only. As it grows, iterating every historical row causes the
+    stalled detector to emit duplicate anomalies. We collapse to the newest record per
+    (venue, asset) key before classification.
     """
     try:
-        ws = _get_ws(sh, WALLET_MONITOR_WS)
-    except gspread.WorksheetNotFound:
-        warn(f"Worksheet {WALLET_MONITOR_WS} not found; no balances to scan")
-        return []
+        ws = _get_ws(sh, WALLET_MONITOR_TAB)
+        rows = ws.get_all_records()
 
-    rows = ws.get_all_values()
-    if not rows:
-        return []
+        balances: List[Dict[str, Any]] = []
+        for r in rows:
+            r = _normalize_record(r)
+            venue = (r.get("Venue") or "").strip().upper()
+            asset = (r.get("Asset") or "").strip().upper()
+            if not venue or not asset:
+                continue
 
-    header = rows[0]
-    hix = {h.strip(): i for i, h in enumerate(header) if h}
+            ts_raw = r.get("Timestamp") or r.get("timestamp") or r.get("TS") or r.get("ts")
+            ts = _parse_ts(ts_raw) or 0
 
-    needed = ["Timestamp", "Venue", "Asset", "Free", "Locked"]
-    for col in needed:
-        if col not in hix:
-            warn(f"{WALLET_MONITOR_WS}: missing column '{col}', skipping")
-            return []
+            free = _safe_float(r.get("Free"))
+            locked = _safe_float(r.get("Locked"))
+            total = free + locked
+            if total <= 0:
+                continue
 
-    out = []
-    for row in rows[1:]:
-        def g(col: str) -> str:
-            idx = hix.get(col)
-            if idx is None or idx >= len(row):
-                return ""
-            return str(row[idx]).strip()
-
-        ts = g("Timestamp")
-        venue = g("Venue")
-        asset = g("Asset")
-        free = _safe_float(g("Free"))
-        locked = _safe_float(g("Locked"))
-
-        if not asset or not venue:
-            continue
-
-        total = free + locked
-        if total <= 0:
-            continue
-
-        out.append(
-            {
-                "timestamp": ts,
-                "venue": venue.upper(),
-                "asset": asset.upper(),
+            balances.append({
+                "venue": venue,
+                "asset": asset,
                 "free": free,
                 "locked": locked,
                 "total": total,
-            }
-        )
-    return out
+                "timestamp": ts,
+                "class": (r.get("Class") or r.get("class") or "").strip().upper(),
+                "agent": (r.get("Agent") or r.get("agent") or "").strip(),
+            })
+
+        latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for b in balances:
+            k = (b["venue"], b["asset"])
+            prev = latest.get(k)
+            if (prev is None) or (b.get("timestamp", 0) >= prev.get("timestamp", 0)):
+                latest[k] = b
+
+        out = list(latest.values())
+        out.sort(key=lambda x: (x.get("venue", ""), x.get("asset", "")))
+        return out
+    except Exception as e:
+        logger.exception("[stalled_asset_detector] failed to load wallet balances: %s", e)
+        return []
 
 
 def load_last_trades(sh) -> Dict[Tuple[str, str], datetime]:
@@ -398,6 +395,10 @@ def classify_balances(
 
     for b in balances:
         asset = b["asset"]
+        # Common quote currencies are expected to have no trade history; skip by default.
+        if asset in STALL_IGNORE_ASSETS:
+            continue
+
         venue = b["venue"]
         total = float(b.get("total", 0.0))
 
