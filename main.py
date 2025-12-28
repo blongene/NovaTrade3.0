@@ -255,6 +255,14 @@ def _set_schedules():
     _schedule("Scout Decisions (Advisory)",    "scout_decisions_advisory",  "run_scout_decisions_advisory",  every=int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN","60")), unit="minutes")
     _schedule("Sentiment Log (Advisory)",      "sentiment_log_advisory",    "run_sentiment_log_advisory",    every=int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN","60")), unit="minutes")
 
+    # Phase 22B — DB parity validator (safe: never blocks)
+    try:
+        from db_parity_validator import run_db_parity_validator
+        schedule.every(6).hours.do(run_db_parity_validator)
+        print("🧪 Scheduled DB parity validator every 6 hours", flush=True)
+    except Exception as e:
+        print(f"DB parity validator not scheduled: {e}", flush=True)
+
 def _kick_once_and_threads():
     # Background scheduler loop
     def _scheduler_loop():
