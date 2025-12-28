@@ -21,6 +21,13 @@ from utils import (
     BACKOFF_BASE_S, BACKOFF_MAX_S, BACKOFF_JIT_S
 )
 
+# Phase 22A: optional Postgres shadow-write mirror for append-only tabs.
+# Best-effort only: it must never break Sheets writes.
+try:
+    from db_mirror import mirror_append
+except Exception:
+    mirror_append = None  # type: ignore
+
 # -----------------------------------------------------------------------------
 # Backoff helper mirrors utils semantics but stays local to wrappers.
 # -----------------------------------------------------------------------------
@@ -97,6 +104,7 @@ def _patch() -> None:
     _orig_update          = Worksheet.update
     _orig_batch_update    = Worksheet.batch_update
     _orig_append_row      = Worksheet.append_row
+    _orig_append_rows     = getattr(Worksheet, "append_rows", None)
 
     # ---- READS ----
     @functools.wraps(_orig_get)
@@ -140,7 +148,32 @@ def _patch() -> None:
 
     @functools.wraps(_orig_append_row)
     def _guard_append_row(self: Worksheet, values: Any, *args: Any, **kwargs: Any):
-        return _with_backoff("append_row", _orig_append_row, self, values, *args, **kwargs)
+        res = _with_backoff("append_row", _orig_append_row, self, values, *args, **kwargs)
+        # Phase 22A: best-effort DB shadow-write.
+        try:
+            if mirror_append is not None:
+                title = getattr(self, "title", None) or "?"
+                mirror_append(title, [values])
+        except Exception:
+            # Absolutely never break Sheets writes.
+            pass
+        return res
+
+    if _orig_append_rows is not None:
+        @functools.wraps(_orig_append_rows)
+        def _guard_append_rows(self: Worksheet, values: Any, *args: Any, **kwargs: Any):
+            """Guard + backoff for Worksheet.append_rows, plus optional DB mirror.
+
+            values is typically a list of rows (list[list[Any]]).
+            """
+            res = _with_backoff("append_rows", _orig_append_rows, self, values, *args, **kwargs)
+            if mirror_append is not None:
+                try:
+                    tab = getattr(self, "title", "")
+                    mirror_append(tab, values)
+                except Exception:
+                    pass
+            return res
 
     # Apply patches
     Worksheet.get             = _guard_get             # type: ignore[assignment]
@@ -149,6 +182,8 @@ def _patch() -> None:
     Worksheet.update          = _guard_update          # type: ignore[assignment]
     Worksheet.batch_update    = _guard_batch_update    # type: ignore[assignment]
     Worksheet.append_row      = _guard_append_row      # type: ignore[assignment]
+    if _orig_append_rows is not None:
+        Worksheet.append_rows = _guard_append_rows     # type: ignore[assignment]
     Worksheet._nova_guard_patched = True
 
     info("gspread_guard: Worksheet methods patched (budget + backoff)")
