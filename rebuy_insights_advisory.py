@@ -16,7 +16,7 @@ from utils import (
 TAB = os.getenv("REBUY_INSIGHTS_TAB", "Rebuy_Insights")
 
 # Defaults intentionally conservative
-ENABLED = os.getenv("REBUY_INSIGHTS_ADVISORY_ENABLED", "0").lower() in {"1","true","yes","on"}
+ENABLED = os.getenv("REBUY_INSIGHTS_ADVISORY_ENABLED", "1").lower() in {"1","true","yes","on"}
 MAX_ROWS = int(os.getenv("REBUY_INSIGHTS_MAX_ROWS", "25"))
 THRESH_RATIO = float(os.getenv("REBUY_UNDERSIZED_THRESH_PCT", "0.5"))  # current < 50% of target
 TTL_SEC = int(os.getenv("REBUY_INSIGHTS_TTL_SEC", "3600"))  # de-dupe per token within TTL
