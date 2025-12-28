@@ -14,7 +14,7 @@ from utils import (
 )
 
 TAB = os.getenv("SENTIMENT_LOG_TAB", "Sentiment_Log")
-ENABLED = os.getenv("SENTIMENT_LOG_ADVISORY_ENABLED", "0").lower() in {"1","true","yes","on"}
+ENABLED = os.getenv("SENTIMENT_LOG_ADVISORY_ENABLED", "1").lower() in {"1","true","yes","on"}
 MAX_ROWS = int(os.getenv("SENTIMENT_LOG_MAX_ROWS", "20"))
 MIN_MENTIONS = float(os.getenv("SENTIMENT_LOG_MIN_MENTIONS", "1"))
 TTL_SEC = int(os.getenv("SENTIMENT_LOG_TTL_SEC", "21600"))  # 6h per token
