@@ -1,45 +1,41 @@
 # db_read_adapter.py
 """
-Phase 22B — DB Read Adapter (Postgres-first, Sheets-fallback)
+Phase 22B — DB Read Adapter (DB_READ_JSON edition)
 
-Purpose
--------
-Provide a safe, cache-backed read helper that prefers Postgres when available,
-but NEVER breaks NovaTrade when Postgres is unavailable or stale.
+Drop-in goals
+-------------
+- Prefer Postgres for reads when enabled & fresh.
+- ALWAYS fall back to Google Sheets safely (never break NovaTrade).
+- Keep behavior transparent, configurable, and bounded (max rows / stale age).
 
-Design rules (NovaTrade canon):
-- Sheets remain the visible control plane and must continue working.
-- Postgres read path is *advisory* until parity is proven.
-- Any DB exception MUST degrade to Sheets, quietly.
+Configuration (single env var)
+------------------------------
+DB_READ_JSON (optional)
+Example:
+DB_READ_JSON={
+  "enabled": 1,
+  "prefer_db": 1,
+  "ttl_s": 120,
+  "max_rows": 2000,
+  "stale_sec": 900
+}
 
-Environment
------------
-DB_URL or DATABASE_URL:
-  Postgres connection string.
+Back-compat (optional)
+----------------------
+If DB_READ_JSON is not set, legacy env vars are still honored:
+DB_READ_ENABLED, DB_READ_PREFER, DB_READ_TTL_S, DB_READ_MAX_ROWS, DB_READ_STALE_SEC
 
-DB_READ_ENABLED (default: 1):
-  Set to 0 to force Sheets reads.
-
-DB_READ_PREFER (default: 1):
-  If 0, always read Sheets (still keeps DB health metrics).
-
-DB_READ_TTL_S (default: 120):
-  In-process cache TTL for DB query results.
-
-DB_READ_MAX_ROWS (default: 2000):
-  Upper bound for rows returned from DB for parity / dashboards.
-
-DB_READ_STALE_SEC (default: 900):
-  If the freshest DB row is older than this, prefer Sheets.
+DB connection string:
+DB_URL or DATABASE_URL
 
 Notes
 -----
-This adapter is intentionally generic:
-- It can read from:
-    - 7C outbox tables: commands, receipts
-    - Phase-19 backbone tables: nova_commands, nova_receipts, nova_telemetry
-    - Sheet mirror events: sheet_mirror_events (tab/payload ledger)
-- Callers provide a *logical* name and we auto-detect the best physical table.
+- This adapter is intentionally generic and table-flexible:
+    logical_stream "commands"  -> commands / nova_commands
+    logical_stream "receipts"  -> receipts / nova_receipts
+    logical_stream "telemetry" -> nova_telemetry
+    logical_stream "sheet_mirror" -> sheet_mirror_events
+- Any DB error → silent fallback to Sheets.
 """
 
 from __future__ import annotations
@@ -49,13 +45,13 @@ import json
 import time
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
 
 try:
     import psycopg2  # type: ignore
     import psycopg2.extras  # type: ignore
 except Exception:
-    psycopg2 = None
+    psycopg2 = None  # type: ignore
 
 
 # ----------------- config -----------------
@@ -65,11 +61,32 @@ def _env_bool(name: str, default: str = "1") -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
-DB_READ_ENABLED = _env_bool("DB_READ_ENABLED", "1")
-DB_READ_PREFER  = _env_bool("DB_READ_PREFER", "1")
-DB_READ_TTL_S   = int(os.getenv("DB_READ_TTL_S", "120") or "120")
-DB_READ_MAX_ROWS = int(os.getenv("DB_READ_MAX_ROWS", "2000") or "2000")
-DB_READ_STALE_SEC = int(os.getenv("DB_READ_STALE_SEC", "900") or "900")
+def _safe_int(v: Any, default: int) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _load_db_read_json() -> Dict[str, Any]:
+    raw = os.getenv("DB_READ_JSON", "") or ""
+    if not raw.strip():
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+_CFG = _load_db_read_json()
+
+# Prefer DB_READ_JSON, but keep legacy envs as fallback.
+DB_READ_ENABLED = bool(_CFG.get("enabled")) if _CFG else _env_bool("DB_READ_ENABLED", "1")
+DB_READ_PREFER  = bool(_CFG.get("prefer_db", True)) if _CFG else _env_bool("DB_READ_PREFER", "1")
+DB_READ_TTL_S   = _safe_int(_CFG.get("ttl_s", 120), 120) if _CFG else _safe_int(os.getenv("DB_READ_TTL_S", "120"), 120)
+DB_READ_MAX_ROWS = _safe_int(_CFG.get("max_rows", 2000), 2000) if _CFG else _safe_int(os.getenv("DB_READ_MAX_ROWS", "2000"), 2000)
+DB_READ_STALE_SEC = _safe_int(_CFG.get("stale_sec", 900), 900) if _CFG else _safe_int(os.getenv("DB_READ_STALE_SEC", "900"), 900)
 
 _DB_URL = os.getenv("DB_URL") or os.getenv("DATABASE_URL") or ""
 
@@ -145,7 +162,7 @@ class PgClient:
         if not c:
             return []
         try:
-            cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)  # type: ignore
             cur.execute(sql, args)
             rows = cur.fetchall()
             return [dict(r) for r in rows]
@@ -210,10 +227,9 @@ def _choose_table(logical: str) -> Optional[str]:
     if logical == "telemetry":
         if _table_exists("nova_telemetry"):
             return "nova_telemetry"
-        # If only mirror exists, callers can use logical "sheet_mirror"
         return None
 
-    if logical == "sheet_mirror":
+    if logical in ("sheet_mirror", "sheet_mirror_events"):
         if _table_exists("sheet_mirror_events"):
             return "sheet_mirror_events"
         return None
@@ -229,60 +245,84 @@ def _choose_table(logical: str) -> Optional[str]:
 
 def db_health() -> dict:
     h = _pg.health()
-    return {"enabled": DB_READ_ENABLED, "prefer": DB_READ_PREFER, **h.__dict__}
+    return {
+        "enabled": DB_READ_ENABLED,
+        "prefer": DB_READ_PREFER,
+        "ttl_s": DB_READ_TTL_S,
+        "max_rows": DB_READ_MAX_ROWS,
+        "stale_sec": DB_READ_STALE_SEC,
+        **h.__dict__,
+    }
 
 
 def get_records_prefer_db(
     sheet_tab: str,
     logical_stream: str,
-    ttl_s: int | None = None,
+    ttl_s: Optional[int] = None,
     *,
-    sheets_fallback_fn=None,
+    sheets_fallback_fn: Optional[Callable[..., List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Returns rows as list[dict].
 
-    - Prefer DB if:
-        * DB_READ_ENABLED and DB_READ_PREFER
-        * table exists
-        * and freshness within DB_READ_STALE_SEC
-    - Otherwise return Sheets via sheets_fallback_fn (required),
-      typically utils.get_all_records_cached(tab, ttl_s)
+    Prefer DB if:
+      - DB_READ_ENABLED and DB_READ_PREFER
+      - table exists
+      - newest DB row age <= DB_READ_STALE_SEC
 
-    Note: This is designed to mirror utils.get_all_records_cached shape (dict rows).
+    Otherwise returns Sheets via sheets_fallback_fn (required),
+    typically: utils.get_all_records_cached(tab, ttl_s=ttl_s)
+
+    Hard rule: ANY DB issue -> Sheets fallback.
     """
-    ttl_s = DB_READ_TTL_S if ttl_s is None else int(ttl_s)
+    ttl_s = DB_READ_TTL_S if ttl_s is None else _safe_int(ttl_s, DB_READ_TTL_S)
 
     if sheets_fallback_fn is None:
         raise ValueError("sheets_fallback_fn is required (e.g., utils.get_all_records_cached)")
 
     # Sheets forced
-    if not DB_READ_ENABLED or not DB_READ_PREFER:
-        return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
+    if (not DB_READ_ENABLED) or (not DB_READ_PREFER):
+        try:
+            return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)  # type: ignore
+        except TypeError:
+            # Some call sites may use (tab, ttl_s) positional style
+            return sheets_fallback_fn(sheet_tab, ttl_s)  # type: ignore
 
     table = _choose_table(logical_stream)
     if not table:
-        return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
+        try:
+            return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)  # type: ignore
+        except TypeError:
+            return sheets_fallback_fn(sheet_tab, ttl_s)  # type: ignore
 
     cache_key = f"db::{table}::{ttl_s}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    # freshness check
-    max_ts = _max_created_at(table)
-    if max_ts is not None:
-        age = time.time() - max_ts
-        if age > DB_READ_STALE_SEC:
-            return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
+    try:
+        max_ts = _max_created_at(table)
+        if max_ts is not None:
+            age = time.time() - max_ts
+            if age > DB_READ_STALE_SEC:
+                try:
+                    return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)  # type: ignore
+                except TypeError:
+                    return sheets_fallback_fn(sheet_tab, ttl_s)  # type: ignore
 
-    rows: List[Dict[str, Any]] = _fetch_table_rows(table, limit=DB_READ_MAX_ROWS)
-    if rows:
-        _cache_set(cache_key, rows, ttl_s)
-        return rows
+        rows: List[Dict[str, Any]] = _fetch_table_rows(table, limit=DB_READ_MAX_ROWS)
+        if rows:
+            _cache_set(cache_key, rows, ttl_s)
+            return rows
+    except Exception:
+        # hard fail-safe, never leak exception
+        pass
 
     # no data -> fallback
-    return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
+    try:
+        return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)  # type: ignore
+    except TypeError:
+        return sheets_fallback_fn(sheet_tab, ttl_s)  # type: ignore
 
 
 def _fetch_table_rows(table: str, limit: int = 2000) -> List[Dict[str, Any]]:
@@ -301,8 +341,7 @@ def _fetch_table_rows(table: str, limit: int = 2000) -> List[Dict[str, Any]]:
         return _pg.query(sql, (limit,))
 
     if table == "receipts":
-        # schema varies across builds; select only known-safe columns
-        # receipts may include receipt jsonb or raw payload; try both.
+        # schema varies across builds; select only known-safe columns; degrade if cols missing.
         rows = _pg.query(
             """
             select id, created_at, agent_id,
@@ -315,12 +354,12 @@ def _fetch_table_rows(table: str, limit: int = 2000) -> List[Dict[str, Any]]:
             """,
             (limit,),
         )
-        # some schemas don't have those cols -> fallback to minimal
         if rows:
             return rows
+        # fallback to nova_receipts minimal
         return _pg.query(
             """
-            select id, created_at, agent_id, cmd_id, payload, ok
+            select id, created_at, agent_id, cmd_id, ok, status, venue, symbol, base, quote, notional_usd, payload
             from nova_receipts
             order by id desc
             limit %s
@@ -372,5 +411,4 @@ def _fetch_table_rows(table: str, limit: int = 2000) -> List[Dict[str, Any]]:
             (limit,),
         )
 
-    # direct generic
     return _pg.query(f"select * from {table} order by 1 desc limit %s", (limit,))
