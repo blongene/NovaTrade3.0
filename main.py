@@ -31,6 +31,31 @@ except Exception as e:
     print(f"[BOOT] FATAL: utils import failed: {e}")
     raise
 
+
+# --- Phase 22A Advisory JSON (optional; env-fallback) --------------------------
+def _phase22a_json_cfg() -> dict:
+    raw = (os.getenv("PHASE22A_ADVISORY_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+_PHASE22A_CFG = _phase22a_json_cfg()
+
+def _phase22a_interval_min(default: int = 60) -> int:
+    try:
+        v = _PHASE22A_CFG.get("interval_min")
+        if v is not None:
+            return int(v)
+    except Exception:
+        pass
+    try:
+        return int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN", str(default)))
+    except Exception:
+        return default
+
 # --- Telegram webhook / Flask (optional) -------------------------------------
 RUN_WEBHOOK_IN_MAIN = (os.getenv("RUN_WEBHOOK_IN_MAIN", "0").strip().lower() in {"1","true","yes"})
 _telegram_app = None
@@ -251,9 +276,9 @@ def _set_schedules():
     _schedule("Council Drift Detector", "council_drift_detector", "run_council_drift_detector", every=30, unit="minutes")
 
     # --- Phase 22A — Advisory Writers (opt-in; advisory-only; no execution) ---
-    _schedule("Rebuy Insights (Advisory)",      "rebuy_insights_advisory",   "run_rebuy_insights_advisory",   every=int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN","60")), unit="minutes")
-    _schedule("Scout Decisions (Advisory)",    "scout_decisions_advisory",  "run_scout_decisions_advisory",  every=int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN","60")), unit="minutes")
-    _schedule("Sentiment Log (Advisory)",      "sentiment_log_advisory",    "run_sentiment_log_advisory",    every=int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN","60")), unit="minutes")
+    _schedule("Rebuy Insights (Advisory)",      "rebuy_insights_advisory",   "run_rebuy_insights_advisory",   every=_phase22a_interval_min(60), unit="minutes")
+    _schedule("Scout Decisions (Advisory)",    "scout_decisions_advisory",  "run_scout_decisions_advisory",  every=_phase22a_interval_min(60), unit="minutes")
+    _schedule("Sentiment Log (Advisory)",      "sentiment_log_advisory",    "run_sentiment_log_advisory",    every=_phase22a_interval_min(60), unit="minutes")
 
     # Phase 22B — DB parity validator (safe: never blocks)
     try:
