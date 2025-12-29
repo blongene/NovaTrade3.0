@@ -9,10 +9,17 @@ from utils import (
     send_telegram_message_dedup as _send_dedup_raw,
     tg_should_send as _tg_should_send_raw,
     get_all_records_cached,
+    get_all_records_cached_dbaware,
     get_value_cached,
     detect_stalled_tokens,
     warn, info, str_or_empty
 )
+
+# Phase 22B: DB-aware reads (safe fallback to Sheets)
+try:
+    _get_all_records_dbaware = get_all_records_cached_dbaware
+except Exception:
+    _get_all_records_dbaware = None
 
 # Env toggles
 ENABLED = (os.getenv("TELEGRAM_SUMMARIES_ENABLED", "1").lower() in ("1", "true", "yes"))
@@ -95,6 +102,8 @@ def _get_telemetry_snapshot():
 
 def _try_get(ws_name, ttl_s=120):
     try:
+        if _get_all_records_dbaware:
+            return _get_all_records_dbaware(ws_name, ttl_s=ttl_s, logical_stream=f\"sheet_mirror:{ws_name}\")
         return get_all_records_cached(ws_name, ttl_s=ttl_s)
     except Exception as e:
         warn(f"telegram_summaries: {ws_name} read failed: {e}")
