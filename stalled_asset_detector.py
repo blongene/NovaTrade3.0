@@ -25,11 +25,9 @@ only print a short summary and exit.
 from __future__ import annotations
 import os
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Dict, Tuple, List, Any
-import logging
-
-logger = logging.getLogger(__name__)
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -40,6 +38,13 @@ try:
 except Exception:  # pragma: no cover
     def send_telegram_message_dedup(*a, **k) -> bool:
         return False
+
+
+# Module logger
+logger = logging.getLogger(__name__)
+
+# Sheet tab names
+WALLET_MONITOR_TAB = os.getenv("WALLET_MONITOR_TAB", "Wallet_Monitor")
 
 try:
     from utils import warn  # type: ignore
