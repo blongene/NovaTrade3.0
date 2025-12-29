@@ -24,6 +24,8 @@ import time
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+import logging
+logger = logging.getLogger(__name__)
 
 try:
     import psycopg2  # type: ignore
@@ -244,29 +246,54 @@ def get_records_prefer_db(
         raise ValueError("sheets_fallback_fn is required (e.g., utils.get_all_records_cached)")
 
     if not DB_READ_ENABLED or not DB_READ_PREFER:
+        logger.info("🟡 DB READ FALLBACK [%s] reason=disabled", logical_stream)
         return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
 
     base_logical, tab = _parse_logical(logical_stream)
     table = _choose_table(base_logical)
     if not table:
+        logger.info("🟡 DB READ FALLBACK [%s] reason=no_table_mapping", logical_stream)
         return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
 
     cache_key = f"db::{table}::{tab or ''}::{ttl_s}"
     cached = _cache_get(cache_key)
     if cached is not None:
+        logger.info("🟢 DB READ HIT [%s] source=cache rows=%s", logical_stream, len(cached))
         return cached
-
+    
     max_ts = _max_created_at(table, tab=tab)
     if max_ts is not None:
         age = time.time() - max_ts
         if age > DB_READ_STALE_SEC:
+            logger.info(
+                "🟡 DB READ FALLBACK [%s] reason=stale age=%.1fs stale_sec=%s table=%s tab=%s",
+                logical_stream, age, DB_READ_STALE_SEC, table, tab
+            )
             return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
+        else:
+            logger.info(
+                "ℹ️ DB READ CANDIDATE [%s] freshness_ok age=%.1fs table=%s tab=%s",
+                logical_stream, age, table, tab
+            )
+    else:
+        logger.info(
+            "ℹ️ DB READ CANDIDATE [%s] no_created_at table=%s tab=%s",
+            logical_stream, table, tab
+        )
 
     rows: List[Dict[str, Any]] = _fetch_table_rows(table, limit=DB_READ_MAX_ROWS, tab=tab)
     if rows:
         _cache_set(cache_key, rows, ttl_s)
+        logger.info(
+            "🟢 DB READ HIT [%s] source=db rows=%s table=%s tab=%s",
+            logical_stream, len(rows), table, tab
+        )
         return rows
-
+    
+    logger.info(
+        "🟡 DB READ FALLBACK [%s] reason=empty_result table=%s tab=%s",
+        logical_stream, table, tab
+    )
     return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
 
 # ----------------- table fetchers -----------------
