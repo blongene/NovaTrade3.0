@@ -103,7 +103,11 @@ def _get_telemetry_snapshot():
 def _try_get(ws_name, ttl_s=120):
     try:
         if _get_all_records_dbaware:
-            return _get_all_records_dbaware(ws_name, ttl_s=ttl_s, logical_stream=f\"sheet_mirror:{ws_name}\")
+            return _get_all_records_dbaware(
+                ws_name,
+                ttl_s=ttl_s,
+                logical_stream=f"sheet_mirror:{ws_name}",
+            )
         return get_all_records_cached(ws_name, ttl_s=ttl_s)
     except Exception as e:
         warn(f"telegram_summaries: {ws_name} read failed: {e}")
