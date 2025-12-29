@@ -899,3 +899,42 @@ def hmac_enqueue(intent: dict) -> dict:
         return {"ok": False, "reason": f"http_{resp.status_code}", "body": resp.text}
     except Exception as e:
         return {"ok": False, "reason": f"connection_error: {e}"}
+# ========= Phase 22B: DB-aware read helper (non-breaking, opt-in) =========
+def get_all_records_cached_dbaware(name: str, ttl_s: int | None = None, logical_stream: str | None = None):
+    """DB-first, Sheets-fallback record fetch.
+
+    - Backward-safe: if logical_stream is None, this behaves exactly like get_all_records_cached().
+    - If logical_stream is provided and DB_READ_JSON enables DB reads, we attempt a DB read first.
+    - Any DB error or stale DB data falls back to Sheets (get_all_records_cached).
+
+    logical_stream examples (Bus DB mirror):
+      - "telemetry"
+      - "receipts"
+      - "commands"
+      - "sheet_mirror" (if you mirror arbitrary sheet tabs into DB)
+    """
+    # Preserve original behavior unless caller opts in
+    if not logical_stream:
+        return get_all_records_cached(name, ttl_s=ttl_s)
+
+    try:
+        from db_read_adapter import get_records_prefer_db as _get_records_prefer_db
+    except Exception:
+        # Adapter not present (or import error) -> Sheets primary
+        return get_all_records_cached(name, ttl_s=ttl_s)
+
+    # The adapter expects a fallback callable shaped like (sheet_tab, ttl_s)->rows
+    def _fallback(sheet_tab: str, ttl: int):
+        return get_all_records_cached(sheet_tab, ttl_s=ttl)
+
+    ttl = DEFAULT_ROWS_TTL_S if ttl_s is None else ttl_s
+    try:
+        return _get_records_prefer_db(
+            sheet_tab=name,
+            logical_stream=logical_stream,
+            ttl_s=ttl,
+            sheets_fallback_fn=_fallback,
+        )
+    except Exception:
+        # Hard fail-safe
+        return get_all_records_cached(name, ttl_s=ttl_s)
