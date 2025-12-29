@@ -31,31 +31,6 @@ except Exception as e:
     print(f"[BOOT] FATAL: utils import failed: {e}")
     raise
 
-
-# --- Phase 22A Advisory JSON (optional; env-fallback) --------------------------
-def _phase22a_json_cfg() -> dict:
-    raw = (os.getenv("PHASE22A_ADVISORY_JSON") or "").strip()
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {}
-
-_PHASE22A_CFG = _phase22a_json_cfg()
-
-def _phase22a_interval_min(default: int = 60) -> int:
-    try:
-        v = _PHASE22A_CFG.get("interval_min")
-        if v is not None:
-            return int(v)
-    except Exception:
-        pass
-    try:
-        return int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN", str(default)))
-    except Exception:
-        return default
-
 # --- Telegram webhook / Flask (optional) -------------------------------------
 RUN_WEBHOOK_IN_MAIN = (os.getenv("RUN_WEBHOOK_IN_MAIN", "0").strip().lower() in {"1","true","yes"})
 _telegram_app = None
@@ -238,55 +213,85 @@ def _boot_serialize_first_minute():
     _safe_call("Milestone Alerts (Days Held)", "rotation_signal_engine",     "run_milestone_alerts");           _sleep_jitter()
     _safe_call("Policy Bias Builder",          "policy_bias_engine",         "run_policy_bias_builder");        _sleep_jitter()
 
+def _phase22a_interval_min() -> int:
+    """Phase 22A advisory cadence. Uses PHASE22A_ADVISORY_JSON if present; falls back to PHASE22A_ADVISORY_EVERY_MIN env; default 60."""
+    try:
+        raw = (os.getenv("PHASE22A_ADVISORY_JSON") or "").strip()
+        if raw:
+            cfg = json.loads(raw)
+            v = cfg.get("interval_min")
+            if v is not None:
+                return int(v)
+    except Exception:
+        pass
+    try:
+        return int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN", "60") or "60")
+    except Exception:
+        return 60
+
 def _set_schedules():
-    # Frequent cadence
-    _schedule("Nova Trigger Watcher",          "nova_trigger_watcher",       "check_nova_trigger",       every=2, unit="minutes")
-    _schedule("Rotation Log Updater",          "rotation_log_updater",       "run_rotation_log_updater", every=60, unit="minutes")
-    _schedule("Rebalance Scanner",             "rebalance_scanner",          "run_rebalance_scanner",    every=60, unit="minutes")
-    # Keep legacy wrapper scheduled if other modules rely on it; the enhancer now does the heavy lifting
-    _schedule("Rotation Memory",               "rotation_memory",            "run_rotation_memory",     every=60, unit="minutes")
-    _schedule("Sentiment Radar",               "sentiment_radar",            "run_sentiment_radar",     every=6,  unit="hours")
-    _schedule("Memory-Aware Rebuy Scan",       "rebuy_memory_engine",        "run_memory_rebuy_scan",   every=3,  unit="hours")
-    _schedule("Sentiment Summary",             "sentiment_summary",          "run_sentiment_summary",   every=3,  unit="hours")
-    _schedule("Stalled Autotrader (Shadow)",     "stalled_autotrader",         "run_stalled_autotrader_shadow",    every=6,  unit="hours")
-              
-    # Daily (spread to avoid spikes)
-    _schedule("Health Summary",                "health_summary",             "run_health_summary",          when="13:00")
-    _schedule("Daily Summary",                 "daily_summary",              "daily_phase5_summary",        when="13:05")
-    _schedule("ROI Threshold Validator",       "roi_threshold_validator",    "run_roi_threshold_validator", when="01:00")
-    _schedule("Rebuy Weight Calculator",       "rebuy_weight_calculator",    "run_rebuy_weight_calculator", when="01:10")
-    _schedule("Memory Score Sync",             "memory_score_sync",          "run_memory_score_sync",       when="01:15")
-    _schedule("Top Token Summary",             "top_token_summary",          "run_top_token_summary",       when="01:30")
-    _schedule("Vault ROI Tracker",             "vault_roi_tracker",          "run_vault_roi_tracker",       when="02:00")
-    _schedule("Vault Rotation Scanner",        "vault_rotation_scanner",     "run_vault_rotation_scanner",  when="09:15")
-    _schedule("Vault Rotation Executor",       "vault_rotation_executor",    "run_vault_rotation_executor", when="09:25")
-    _schedule("Policy Bias Builder",           "policy_bias_engine",         "run_policy_bias_builder",     when="01:20") 
-    _schedule("Rebuy ROI Tracker",             "rebuy_roi_tracker",          "run_rebuy_roi_tracker",       when="12:45")
-    _schedule("Sentiment Alerts",              "sentiment_alerts",           "run_sentiment_alerts",        when="13:00")
+    # Frequent cadence / watchers
+    _schedule("Nova Trigger Watcher",          "nova_trigger_watcher",       "check_nova_trigger",            every=2,  unit="minutes")
+    _schedule("Planner→Log Sync",             "planner_to_log_sync",         "run_planner_to_log_sync",       every=30, unit="minutes")
+    _schedule("Council Drift Detector",       "council_drift_detector",      "run_council_drift_detector",    every=30, unit="minutes")
+    _schedule("Milestone Alerts",             "milestone_alerts",            "run_milestone_alerts",          every=1,  unit="hours")
 
-    # --- Phase 9 added schedules ---
-    _schedule("Planner→Log Sync",              "rotation_executor",          "sync_confirmed_to_rotation_log", every=30, unit="minutes")
-    _schedule("Rotation Memory Weighted",      "rotation_feedback_enhancer", "run_rotation_feedback_enhancer", every=6,  unit="hours")
-    _schedule("Milestone Alerts",              "rotation_signal_engine",     "run_milestone_alerts",           every=1,  unit="hours")
-    _schedule("Wallet Monitor",                "wallet_monitor",             "run_wallet_monitor",             every=15, unit="minutes")
-    _schedule("Telemetry Mirror",              "telemetry_mirror",           "run_telemetry_mirror",           every=15, unit="minutes")
-    _schedule("Unified Snapshot",              "unified_snapshot",           "run_unified_snapshot",           every=15, unit="minutes")
-      
-    # --- Phase 21.6 — Council Drift Detector (opt-in) ---
-    _schedule("Council Drift Detector", "council_drift_detector", "run_council_drift_detector", every=30, unit="minutes")
+    # Rotations / memory
+    _schedule("Rebalance Scanner",            "rebalance_scanner",           "run_rebalance_scanner",         every=60, unit="minutes")
+    _schedule("Rotation Memory",              "rotation_memory",             "run_rotation_memory",           every=60, unit="minutes")
+    _schedule("Rotation Memory (Weighted)",   "rotation_memory_weighted",    "run_rotation_memory_weighted",  every=6,  unit="hours")
+    _schedule("Rotation Stats Sync",          "rotation_stats_sync",         "run_rotation_stats_sync",       every=60, unit="minutes")
+    _schedule("Memory Weight Sync",           "memory_weight_sync",          "run_memory_weight_sync",        every=60, unit="minutes")
+    _schedule("Total Memory Score",           "total_memory_score",          "run_total_memory_score",        every=60, unit="minutes")
 
-    # --- Phase 22A — Advisory Writers (opt-in; advisory-only; no execution) ---
-    _schedule("Rebuy Insights (Advisory)",      "rebuy_insights_advisory",   "run_rebuy_insights_advisory",   every=_phase22a_interval_min(60), unit="minutes")
-    _schedule("Scout Decisions (Advisory)",    "scout_decisions_advisory",  "run_scout_decisions_advisory",  every=_phase22a_interval_min(60), unit="minutes")
-    _schedule("Sentiment Log (Advisory)",      "sentiment_log_advisory",    "run_sentiment_log_advisory",    every=_phase22a_interval_min(60), unit="minutes")
+    # Rebuy engines
+    _schedule("Undersized Rebuy",             "undersized_rebuy",            "run_undersized_rebuy_engine",   every=60, unit="minutes")
+    _schedule("Memory-Aware Rebuy",           "memory_aware_rebuy",          "run_memory_aware_rebuy_engine", every=60, unit="minutes")
+    _schedule("Rebuy Weight Calculator",      "rebuy_weight_calculator",     "run_rebuy_weight_calculator",   every=60, unit="minutes")
+    _schedule("Rebuy ROI Tracker",            "rebuy_roi_tracker",           "run_rebuy_roi_tracker",         when="12:45")
+    _schedule("Rebuy Insights (Advisory)",    "rebuy_insights_advisory",     "run_rebuy_insights_advisory",   every=_phase22a_interval_min(), unit="minutes")
 
-    # Phase 22B — DB parity validator (safe: never blocks)
+    # Scout / advisory
+    _schedule("Scout Decisions (Advisory)",   "scout_decisions_advisory",    "run_scout_decisions_advisory",  every=_phase22a_interval_min(), unit="minutes")
+    _schedule("Sentiment Log (Advisory)",     "sentiment_log_advisory",      "run_sentiment_log_advisory",    every=_phase22a_interval_min(), unit="minutes")
+
+    # Wallet + telemetry
+    _schedule("Wallet Monitor",               "wallet_monitor",              "run_wallet_monitor",            every=15, unit="minutes")
+    _schedule("Telemetry Mirror",             "telemetry_mirror",            "run_telemetry_mirror",          every=15, unit="minutes")
+    _schedule("Unified Snapshot",             "unified_snapshot",            "run_unified_snapshot",          every=15, unit="minutes")
+    _schedule("Daily Telemetry Digest",       "telemetry_digest",            "run_daily_telemetry_digest",    when="13:10")
+
+    # Vault suite
+    _schedule("Vault ROI Tracker",            "vault_roi_tracker",           "run_vault_roi_tracker",         when="02:00")
+    _schedule("Vault Rotation Scanner",       "vault_rotation_scanner",      "run_vault_rotation_scanner",    when="09:15")
+    _schedule("Vault Rotation Executor",      "vault_rotation_executor",     "run_vault_rotation_executor",   when="09:25")
+    _schedule("Vault Intelligence",           "vault_intelligence",          "run_vault_intelligence",        every=60, unit="minutes")
+    _schedule("Vault Review Alerts",          "vault_review_alerts",         "run_vault_review_alerts",       every=60, unit="minutes")
+    _schedule("Unlock Horizon Alerts",        "unlock_horizon_alerts",       "run_unlock_horizon_alerts",     every=60, unit="minutes")
+
+    # Sentiment / alerts
+    _schedule("Sentiment Radar",              "sentiment_radar",             "run_sentiment_radar",           every=6,  unit="hours")
+    _schedule("Sentiment Alerts",             "sentiment_alerts",            "run_sentiment_alerts",          when="13:00")
+    _schedule("Policy Bias Builder",          "policy_bias_engine",          "run_policy_bias_builder",       when="01:20")
+
+    # Reporting
+    _schedule("Health Summary",               "health_summary",              "run_health_summary",            when="13:00")
+    _schedule("Daily Summary",                "daily_summary",               "daily_phase5_summary",          when="13:05")
+    _schedule("Telegram Summaries",           "telegram_summaries",          "run_telegram_summaries",        every=60, unit="minutes")
+
+    # Stalled safety
+    _schedule("Stalled Asset Detector",       "stalled_asset_detector",      "run_stalled_asset_detector",    every=60, unit="minutes")
+    _schedule("Stalled Autotrader (Shadow)",  "stalled_autotrader",          "run_stalled_autotrader_shadow", every=6, unit="hours")
+
+    # DB parity (Phase 22B)
     try:
         from db_parity_validator import run_db_parity_validator
         schedule.every(6).hours.do(run_db_parity_validator)
         print("🧪 Scheduled DB parity validator every 6 hours", flush=True)
     except Exception as e:
         print(f"DB parity validator not scheduled: {e}", flush=True)
+
+
 
 def _kick_once_and_threads():
     # Background scheduler loop
