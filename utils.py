@@ -528,6 +528,108 @@ _cached_rows: dict[str, tuple[float, Any]] = {}
 _values_cache: dict[str, tuple[float, Any]] = {}
 _cache_lock = threading.Lock()
 
+# ========= Phase 22B Capstone: Sheet Mirror READ shadow-write (best-effort) =========
+# Goal: populate Postgres sheet_mirror_events from existing Sheets READS so the
+# DB_READ adapter can produce 🟢 DB READ HIT for sheet_mirror:<TAB>.
+#
+# Rules:
+# - Must never block or fail the main loop.
+# - Must never add extra Sheets calls.
+# - DB is advisory; Sheets remain primary.
+#
+# Control:
+# - Uses DB_READ_JSON if present (mirror_reads defaults to 1 when enabled).
+# - Alternatively supports DB_MIRROR_READS_ENABLED=1 as an override.
+try:
+    from db_mirror import mirror_rows as _db_mirror_rows  # type: ignore
+except Exception:
+    _db_mirror_rows = None  # type: ignore
+
+_mirror_q = []
+_mirror_lock = threading.Lock()
+_mirror_cv = threading.Condition(_mirror_lock)
+_mirror_started = False
+
+def _load_db_read_json_cfg() -> dict:
+    raw = (os.getenv("DB_READ_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+def _mirror_reads_enabled() -> bool:
+    # Hard override (optional)
+    if str(os.getenv("DB_MIRROR_READS_ENABLED", "")).strip().lower() in ("1","true","yes","on"):
+        return True
+
+    cfg = _load_db_read_json_cfg()
+    if not isinstance(cfg, dict):
+        return False
+
+    # Enabled gate
+    enabled = bool(cfg.get("enabled", 0))
+    if not enabled:
+        return False
+
+    # mirror_reads defaults to 1 when enabled (capstone behavior)
+    return bool(cfg.get("mirror_reads", 1))
+
+def _mirror_reads_max_rows() -> int:
+    cfg = _load_db_read_json_cfg()
+    try:
+        v = int(cfg.get("mirror_max_rows", 1000))
+        return max(10, min(5000, v))
+    except Exception:
+        return 1000
+
+def _mirror_worker():
+    while True:
+        with _mirror_cv:
+            while not _mirror_q:
+                _mirror_cv.wait(timeout=5.0)
+            item = _mirror_q.pop(0)
+        try:
+            tab, rows = item
+            if _db_mirror_rows is not None:
+                _db_mirror_rows(tab, rows)
+        except Exception:
+            # Never raise; mirrors are advisory-only.
+            pass
+
+def _ensure_mirror_worker():
+    global _mirror_started
+    with _mirror_lock:
+        if _mirror_started:
+            return
+        t = threading.Thread(target=_mirror_worker, name="sheet_mirror_worker", daemon=True)
+        t.start()
+        _mirror_started = True
+
+def _mirror_rows_async(tab: str, rows: Any) -> None:
+    # rows should be list[dict] from ws.get_all_records
+    if not rows or _db_mirror_rows is None:
+        return
+    if not _mirror_reads_enabled():
+        return
+
+    try:
+        max_rows = _mirror_reads_max_rows()
+        if isinstance(rows, list) and len(rows) > max_rows:
+            rows = rows[:max_rows]
+    except Exception:
+        pass
+
+    try:
+        _ensure_mirror_worker()
+        with _mirror_cv:
+            _mirror_q.append((tab, rows))
+            _mirror_cv.notify()
+    except Exception:
+        pass
+
+
 def clear_sheet_caches():
     with _cache_lock:
         _cached_ws.clear()
@@ -581,6 +683,8 @@ def get_all_records_cached(name: str, ttl_s: int | None = None):
             _cached_rows.pop(key, None)
     ws = get_ws_cached(name, ttl_s=ttl_s)
     rows = _ws_get_all_records(ws)
+    # Phase 22B: shadow-write read rows into Postgres sheet_mirror_events (best-effort)
+    _mirror_rows_async(name, rows)
     with _cache_lock:
         _cached_rows[key] = (time.time()+ttl_s, rows)
     return rows
@@ -899,42 +1003,3 @@ def hmac_enqueue(intent: dict) -> dict:
         return {"ok": False, "reason": f"http_{resp.status_code}", "body": resp.text}
     except Exception as e:
         return {"ok": False, "reason": f"connection_error: {e}"}
-# ========= Phase 22B: DB-aware read helper (non-breaking, opt-in) =========
-def get_all_records_cached_dbaware(name: str, ttl_s: int | None = None, logical_stream: str | None = None):
-    """DB-first, Sheets-fallback record fetch.
-
-    - Backward-safe: if logical_stream is None, this behaves exactly like get_all_records_cached().
-    - If logical_stream is provided and DB_READ_JSON enables DB reads, we attempt a DB read first.
-    - Any DB error or stale DB data falls back to Sheets (get_all_records_cached).
-
-    logical_stream examples (Bus DB mirror):
-      - "telemetry"
-      - "receipts"
-      - "commands"
-      - "sheet_mirror" (if you mirror arbitrary sheet tabs into DB)
-    """
-    # Preserve original behavior unless caller opts in
-    if not logical_stream:
-        return get_all_records_cached(name, ttl_s=ttl_s)
-
-    try:
-        from db_read_adapter import get_records_prefer_db as _get_records_prefer_db
-    except Exception:
-        # Adapter not present (or import error) -> Sheets primary
-        return get_all_records_cached(name, ttl_s=ttl_s)
-
-    # The adapter expects a fallback callable shaped like (sheet_tab, ttl_s)->rows
-    def _fallback(sheet_tab: str, ttl: int):
-        return get_all_records_cached(sheet_tab, ttl_s=ttl)
-
-    ttl = DEFAULT_ROWS_TTL_S if ttl_s is None else ttl_s
-    try:
-        return _get_records_prefer_db(
-            sheet_tab=name,
-            logical_stream=logical_stream,
-            ttl_s=ttl,
-            sheets_fallback_fn=_fallback,
-        )
-    except Exception:
-        # Hard fail-safe
-        return get_all_records_cached(name, ttl_s=ttl_s)
