@@ -1,19 +1,20 @@
-# rebuy_roi_tracker.py — NT3.0 Render (429-safe, batch-only)
+# rebuy_roi_tracker.py — NT3.0 Render (429-safe, batch-only) — Phase 22B DB-aware
 # Aggregates per-token "rebuy" performance from Rotation_Log and writes
 # Rebuy Count / Win% / Avg ROI% into Rotation_Stats in a single batch.
 
 import os, time, random
+from typing import Any, Dict, List, Optional
+
 from utils import (
     get_values_cached, get_ws, ws_batch_update, with_sheet_backoff,
     str_or_empty, to_float,
 )
 
-# Optional DB-aware reader (Phase 22B): DB-first, Sheets-fallback
+# Optional DB-aware reader (Sheets fallback is always available)
 try:
-    from utils import get_all_records_cached_dbaware as _get_all_records_dbaware  # type: ignore
+    from utils import get_all_records_cached_dbaware  # type: ignore
 except Exception:
-    _get_all_records_dbaware = None
-
+    get_all_records_cached_dbaware = None  # type: ignore
 
 # ---------------- Env config (override in Render) ----------------
 LOG_TAB          = os.getenv("REBUY_LOG_TAB", "Rotation_Log")
@@ -21,215 +22,220 @@ STATS_TAB        = os.getenv("ROT_STATS_TAB", "Rotation_Stats")
 
 # Source columns (Rotation_Log)
 LOG_TOKEN_COL    = os.getenv("REBUY_LOG_TOKEN_COL", "Token")
-LOG_ROI_COLS     = [s.strip() for s in os.getenv("REBUY_LOG_ROI_COLS", "ROI %,ROI").split(",")]
-LOG_DECISION_COL = os.getenv("REBUY_LOG_DECISION_COL", "Decision")
+LOG_DEC_COL      = os.getenv("REBUY_LOG_DEC_COL", "Decision")
 LOG_STATUS_COL   = os.getenv("REBUY_LOG_STATUS_COL", "Status")
+# ROI column candidates (Rotation_Log)
+LOG_ROI_COLS     = [c.strip() for c in os.getenv("REBUY_LOG_ROI_COLS", "Rebuy ROI%,ROI%,ROI").split(",") if c.strip()]
 
-# Which rows count as a "rebuy" record?
-# We accept any row whose 'Decision' contains one of these tokens (case-insensitive),
-# or whose 'Status' contains one of these tokens.
-REBUY_DECISION_TOKENS = [s.strip().upper() for s in os.getenv("REBUY_DECISION_TOKENS", "REBUY,BUYBACK").split(",")]
-REBUY_STATUS_TOKENS   = [s.strip().upper() for s in os.getenv("REBUY_STATUS_TOKENS", "REBUY").split(",")]
-
-# Destination columns (Rotation_Stats) — created if missing
+# Destination columns (Rotation_Stats)
 STATS_TOKEN_COL  = os.getenv("ROT_STATS_TOKEN_COL", "Token")
 STATS_REBUY_CT   = os.getenv("ROT_STATS_REBUY_CT_COL", "Rebuy Count")
 STATS_REBUY_WIN  = os.getenv("ROT_STATS_REBUY_WIN_COL", "Rebuy Win%")
 STATS_REBUY_AVG  = os.getenv("ROT_STATS_REBUY_AVG_COL", "Rebuy Avg ROI%")
 
-# Behavior
-TTL_LOG_S        = int(os.getenv("REBUY_TTL_LOG_SEC",  "300"))
-TTL_STATS_S      = int(os.getenv("REBUY_TTL_STATS_SEC","300"))
-JIT_MIN_S        = float(os.getenv("REBUY_JITTER_MIN_S","0.35"))
-JIT_MAX_S        = float(os.getenv("REBUY_JITTER_MAX_S","1.1"))
-MAX_WRITES       = int(os.getenv("REBUY_MAX_WRITES",   "800"))
+# Performance / safety
+TTL_LOG_S        = int(os.getenv("REBUY_ROI_TTL_LOG_S", "1800"))      # 30 min
+TTL_STATS_S      = int(os.getenv("REBUY_ROI_TTL_STATS_S", "600"))     # 10 min
+MAX_WRITES       = int(os.getenv("REBUY_ROI_MAX_WRITES", "250"))      # cap per run
+JITTER_S         = float(os.getenv("REBUY_ROI_JITTER_S", "2.0"))      # jitter to spread load
 
-# -----------------------------------------------------------------
 
 def _col_letter(n: int) -> str:
+    """1-indexed column number -> Excel letter (A, B, ..., AA)."""
     s = ""
-    while n:
-        n, r = divmod(n-1, 26)
-        s = chr(65+r) + s
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
     return s
 
-def _hmap(header):
-    return {str_or_empty(h): i for i, h in enumerate(header)}
 
-def _pick_first_index(header, names):
+def _hmap(header: List[Any]) -> Dict[str, int]:
+    """Header list -> {name: index} with stripped string keys."""
+    out: Dict[str, int] = {}
+    for i, h in enumerate(header or []):
+        k = str(h).strip()
+        if k and k not in out:
+            out[k] = i
+    return out
+
+
+def _pick_first_index(h: Dict[str, int], names: List[str]) -> Optional[int]:
     for n in names:
-        i = header.get(n)
-        if i is not None:
-            return i
+        if n in h:
+            return h[n]
     return None
 
-def _is_rebuy(dec_str: str, status_str: str) -> bool:
-    d = str_or_empty(dec_str).upper()
-    s = str_or_empty(status_str).upper()
-    if any(tok and tok in d for tok in REBUY_DECISION_TOKENS):
+
+def _is_rebuy(decision: str, status: str) -> bool:
+    d = (decision or "").strip().upper()
+    s = (status or "").strip().upper()
+    # conservative: count rows that look like rebuy decisions, regardless of fill state
+    # (your existing system treats these as "rebuy" performance lines)
+    if "REBUY" in d:
         return True
-    if any(tok and tok in s for tok in REBUY_STATUS_TOKENS):
+    if "REBUY" in s:
         return True
     return False
 
-def _get_rotation_log_mode_rows():
-    """Return ("dict", rows) from DB mirror if available, else ("values", rows) from Sheets."""
-    if _get_all_records_dbaware:
+
+def _ensure_col(header: List[Any], h: Dict[str, int], header_writes: List[Dict[str, Any]], name: str) -> int:
+    """Ensure column exists in header; stage header write if added."""
+    if name in h:
+        return h[name]
+    header.append(name)
+    idx = len(header) - 1
+    h[name] = idx
+    header_writes.append({"range": f"{_col_letter(idx+1)}1", "values": [[name]]})
+    return idx
+
+
+def _load_rotation_log_rows() -> List[Dict[str, Any]]:
+    """
+    Prefer DB mirror for Rotation_Log if available; otherwise use Sheets values.
+    Returns normalized list[dict] for easier processing.
+    """
+    # DB-aware path (expects list[dict] already)
+    if get_all_records_cached_dbaware:
         try:
-            rows = _get_all_records_dbaware(
-                LOG_TAB,
-                ttl_s=TTL_LOG_S,
-                logical_stream=f"sheet_mirror:{LOG_TAB}",
-            ) or []
-            if rows and isinstance(rows[0], dict):
-                return "dict", rows
+            rows = get_all_records_cached_dbaware(LOG_TAB, ttl_s=TTL_LOG_S, logical_stream=f"sheet_mirror:{LOG_TAB}")
+            if isinstance(rows, list) and (not rows or isinstance(rows[0], dict)):
+                return rows or []
         except Exception:
             pass
+
+    # Sheets fallback: values -> dicts using header
     vals = get_values_cached(LOG_TAB, ttl_s=TTL_LOG_S) or []
-    return "values", vals
+    if not vals or not vals[0]:
+        return []
+    header = [str(x).strip() for x in vals[0]]
+    out: List[Dict[str, Any]] = []
+    for r in vals[1:]:
+        d: Dict[str, Any] = {}
+        for i, k in enumerate(header):
+            if not k:
+                continue
+            d[k] = r[i] if i < len(r) else ""
+        out.append(d)
+    return out
 
-@with_sheet_backoff
-def run_rebuy_roi_tracker():
+
+def run_rebuy_roi_tracker() -> None:
+    # jitter to avoid synchronized bursts across jobs
+    if JITTER_S > 0:
+        time.sleep(random.random() * JITTER_S)
+
     print("🔁 Syncing Rebuy ROI → Rotation_Stats...")
-    time.sleep(random.uniform(JIT_MIN_S, JIT_MAX_S))
 
-    
-# -------- ONE cached read of Rotation_Log (DB-aware preferred)
-mode, log_rows = _get_rotation_log_mode_rows()
-
-agg = {}  # TOKEN -> {"cnt": int, "win": int, "sum": float}
-
-if mode == "values":
-    log_vals = log_rows
-    if not log_vals or not log_vals[0]:
-        print(f"ℹ️ {LOG_TAB} empty; nothing to aggregate.")
+    log_rows = _load_rotation_log_rows()
+    if not log_rows:
+        print(f"ℹ️ {LOG_TAB} empty; skipping.")
         return
-    lh = _hmap(log_vals[0])
-    li_token   = lh.get(LOG_TOKEN_COL)
-    li_dec     = lh.get(LOG_DECISION_COL)
-    li_status  = lh.get(LOG_STATUS_COL)
-    li_roi     = _pick_first_index(lh, LOG_ROI_COLS)
 
-    miss = [n for n,i in [(LOG_TOKEN_COL,li_token),(LOG_DECISION_COL,li_dec),(LOG_STATUS_COL,li_status)] if i is None]
-    if li_roi is None:
+    # Validate required columns exist in log rows
+    # (since dicts may be missing keys for some rows, we check presence in any row)
+    def _has_any_key(k: str) -> bool:
+        return any((k in r and str(r.get(k, "")).strip() != "") for r in log_rows)
+
+    miss = []
+    if not _has_any_key(LOG_TOKEN_COL): miss.append(LOG_TOKEN_COL)
+    if not _has_any_key(LOG_DEC_COL):   miss.append(LOG_DEC_COL)
+    if not _has_any_key(LOG_STATUS_COL): miss.append(LOG_STATUS_COL)
+    roi_key = None
+    for c in LOG_ROI_COLS:
+        if _has_any_key(c):
+            roi_key = c
+            break
+    if roi_key is None:
         miss.append(f"one of {LOG_ROI_COLS}")
+
     if miss:
         print(f"⚠️ {LOG_TAB} missing columns: {', '.join(miss)}; skipping.")
         return
 
-    for row in log_vals[1:]:
-        token = str_or_empty(row[li_token] if (li_token is not None and li_token < len(row)) else "").upper()
+    # Aggregate per token: sum ROI, count, win count
+    agg: Dict[str, Dict[str, float]] = {}
+    agg_cnt: Dict[str, int] = {}
+    agg_win: Dict[str, int] = {}
+
+    for r in log_rows:
+        token = str_or_empty(r.get(LOG_TOKEN_COL, "")).upper()
         if not token:
             continue
-        decision = str_or_empty(row[li_dec] if (li_dec is not None and li_dec < len(row)) else "").upper()
-        status   = str_or_empty(row[li_status] if (li_status is not None and li_status < len(row)) else "").upper()
-
-        if not _is_rebuy_row(decision, status):
+        dec = str_or_empty(r.get(LOG_DEC_COL, ""))
+        st  = str_or_empty(r.get(LOG_STATUS_COL, ""))
+        if not _is_rebuy(dec, st):
             continue
 
-        roi = to_float(row[li_roi] if (li_roi is not None and li_roi < len(row)) else None)
+        roi = to_float(r.get(roi_key, ""), default=None)
         if roi is None:
             continue
 
-        d = agg.setdefault(token, {"cnt": 0, "win": 0, "sum": 0.0})
-        d["cnt"] += 1
-        d["sum"] += float(roi)
-        if roi > 0:
-            d["win"] += 1
+        agg[token] = agg.get(token, {"sum": 0.0})
+        agg[token]["sum"] += float(roi)
+        agg_cnt[token] = agg_cnt.get(token, 0) + 1
+        if float(roi) > 0:
+            agg_win[token] = agg_win.get(token, 0) + 1
 
-else:
-    # DB mirror rows arrive as list[dict] keyed by column headers
-    log_dicts = log_rows
-    if not log_dicts:
-        print(f"ℹ️ {LOG_TAB} empty; nothing to aggregate.")
+    if not agg_cnt:
+        print("ℹ️ No rebuy rows to aggregate.")
         return
-
-    for r in log_dicts:
-        if not isinstance(r, dict):
-            continue
-        token = str_or_empty(r.get(LOG_TOKEN_COL)).upper()
-        if not token:
-            continue
-        decision = str_or_empty(r.get(LOG_DECISION_COL)).upper()
-        status   = str_or_empty(r.get(LOG_STATUS_COL)).upper()
-
-        if not _is_rebuy_row(decision, status):
-            continue
-
-        roi = None
-        for col in LOG_ROI_COLS:
-            if col in r:
-                roi = to_float(r.get(col))
-                if roi is not None:
-                    break
-        if roi is None:
-            continue
-
-        d = agg.setdefault(token, {"cnt": 0, "win": 0, "sum": 0.0})
-        d["cnt"] += 1
-        d["sum"] += float(roi)
-        if roi > 0:
-            d["win"] += 1
-
-if not agg:
-    print("ℹ️ No rebuy rows to aggregate.")
-    return
 
     # -------- ONE cached read of Rotation_Stats
     stats_vals = get_values_cached(STATS_TAB, ttl_s=TTL_STATS_S) or []
     if not stats_vals or not stats_vals[0]:
         print(f"ℹ️ {STATS_TAB} empty; skipping.")
         return
-    sh = _hmap(stats_vals[0])
-    si_token = sh.get(STATS_TOKEN_COL)
 
-    # Ensure destination columns exist (header-only write later)
-    header_writes = []
-    def ensure_col(name):
-        nonlocal stats_vals, sh, header_writes
-        if name in sh:
-            return sh[name]
-        stats_vals[0].append(name)
-        idx = len(stats_vals[0]) - 1
-        sh[name] = idx
-        header_writes.append({"range": f"{_col_letter(idx+1)}1", "values": [[name]]})
-        return idx
+    header = stats_vals[0]
+    h = _hmap(header)
 
-    si_ct  = ensure_col(STATS_REBUY_CT)
-    si_win = ensure_col(STATS_REBUY_WIN)
-    si_avg = ensure_col(STATS_REBUY_AVG)
+    si_token = h.get(STATS_TOKEN_COL)
+    if si_token is None:
+        print(f"⚠️ {STATS_TAB} missing required column: {STATS_TOKEN_COL}; skipping.")
+        return
 
-    # Compute row diffs (no per-row .update_cell)
-    writes, touched = [], 0
+    header_writes: List[Dict[str, Any]] = []
+    si_ct  = _ensure_col(header, h, header_writes, STATS_REBUY_CT)
+    si_win = _ensure_col(header, h, header_writes, STATS_REBUY_WIN)
+    si_avg = _ensure_col(header, h, header_writes, STATS_REBUY_AVG)
+
+    # Compute row diffs (no per-row update_cell)
+    writes: List[Dict[str, Any]] = []
+    touched = 0
+
     for r_idx, row in enumerate(stats_vals[1:], start=2):
-        token = str_or_empty(row[si_token] if (si_token is not None and si_token < len(row)) else "").upper()
-        if not token or token not in agg:
+        token = str_or_empty(row[si_token] if si_token < len(row) else "").upper()
+        if not token or token not in agg_cnt:
             continue
-        cnt = agg[token]["cnt"]
-        if cnt == 0:
+
+        cnt = int(agg_cnt[token])
+        if cnt <= 0:
             continue
-        avg = agg[token]["sum"] / cnt
-        winp = 100.0 * agg[token]["win"] / cnt
+        avg = float(agg[token]["sum"]) / cnt
+        winp = 100.0 * float(agg_win.get(token, 0)) / cnt
 
-        # Existing values (to avoid needless writes)
-        cur_ct  = str_or_empty(row[si_ct]  if si_ct  < len(row) else "")
-        cur_win = str_or_empty(row[si_win] if si_win < len(row) else "")
-        cur_avg = str_or_empty(row[si_avg] if si_avg < len(row) else "")
+        # existing values
+        cur_ct  = to_float(row[si_ct]  if si_ct  < len(row) else "", default=None)
+        cur_win = to_float(row[si_win] if si_win < len(row) else "", default=None)
+        cur_avg = to_float(row[si_avg] if si_avg < len(row) else "", default=None)
 
-        new_ct  = str(cnt)
-        new_win = f"{winp:.1f}"
-        new_avg = f"{avg:.2f}"
+        # only write if changed meaningfully
+        def _need(cur, new) -> bool:
+            if cur is None:
+                return True
+            try:
+                return abs(float(cur) - float(new)) > 1e-9
+            except Exception:
+                return True
 
-        def _need(a, b): return (a or "") != (b or "")
-
-        if _need(cur_ct, new_ct):
-            writes.append({"range": f"{_col_letter(si_ct+1)}{r_idx}",  "values": [[new_ct]]})
+        if _need(cur_ct, cnt):
+            writes.append({"range": f"{_col_letter(si_ct+1)}{r_idx}", "values": [[cnt]]})
             touched += 1
-        if _need(cur_win, new_win):
-            writes.append({"range": f"{_col_letter(si_win+1)}{r_idx}", "values": [[new_win]]})
+        if _need(cur_win, winp):
+            writes.append({"range": f"{_col_letter(si_win+1)}{r_idx}", "values": [[round(winp, 4)]]})
             touched += 1
-        if _need(cur_avg, new_avg):
-            writes.append({"range": f"{_col_letter(si_avg+1)}{r_idx}", "values": [[new_avg]]})
+        if _need(cur_avg, avg):
+            writes.append({"range": f"{_col_letter(si_avg+1)}{r_idx}", "values": [[round(avg, 6)]]})
             touched += 1
 
         if touched >= MAX_WRITES:
@@ -241,8 +247,10 @@ if not agg:
 
     # Single batched write
     ws = get_ws(STATS_TAB)
-    payload = []
-    if header_writes: payload.extend(header_writes)
-    if writes:        payload.extend(writes)
+    payload: List[Dict[str, Any]] = []
+    if header_writes:
+        payload.extend(header_writes)
+    if writes:
+        payload.extend(writes)
     ws_batch_update(ws, payload)
     print(f"✅ Rebuy ROI tracker: wrote {touched} cell(s){' + header' if header_writes else ''}.")
