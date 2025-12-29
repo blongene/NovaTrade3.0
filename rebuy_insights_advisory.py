@@ -1,8 +1,30 @@
 # rebuy_insights_advisory.py — Phase 22A (advisory only)
 # Writes "would rebuy" candidate insights to Rebuy_Insights WITHOUT enqueuing trades.
 
-import os, time
+import os, time, json
 from typing import Any, Dict, List, Tuple
+
+
+# --- Phase 22A Advisory JSON (optional; JSON-first, env-fallback) -------------
+def _phase22a_json_cfg() -> dict:
+    raw = (os.getenv("PHASE22A_ADVISORY_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+_PHASE22A_CFG = _phase22a_json_cfg()
+
+def _cfg_get(path: str, default=None):
+    cur = _PHASE22A_CFG
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(part)
+    return default if cur is None else cur
+
 
 from utils import (
     get_records_cached,
@@ -13,13 +35,13 @@ from utils import (
     warn,
 )
 
-TAB = os.getenv("REBUY_INSIGHTS_TAB", "Rebuy_Insights")
+TAB = str(_cfg_get("rebuy_insights.tab", os.getenv("REBUY_INSIGHTS_TAB", "Rebuy_Insights")))
 
 # Defaults intentionally conservative
-ENABLED = os.getenv("REBUY_INSIGHTS_ADVISORY_ENABLED", "1").lower() in {"1","true","yes","on"}
-MAX_ROWS = int(os.getenv("REBUY_INSIGHTS_MAX_ROWS", "25"))
+ENABLED = str(_cfg_get("rebuy_insights.enabled", os.getenv("REBUY_INSIGHTS_ADVISORY_ENABLED", "1"))).lower() in {"1","true","yes","on"}
+MAX_ROWS = int(_cfg_get("rebuy_insights.max_rows", os.getenv("REBUY_INSIGHTS_MAX_ROWS", "25")))
 THRESH_RATIO = float(os.getenv("REBUY_UNDERSIZED_THRESH_PCT", "0.5"))  # current < 50% of target
-TTL_SEC = int(os.getenv("REBUY_INSIGHTS_TTL_SEC", "3600"))  # de-dupe per token within TTL
+TTL_SEC = int(_cfg_get("rebuy_insights.ttl_sec", os.getenv("REBUY_INSIGHTS_TTL_SEC", "3600")))
 
 
 def _now_utc() -> str:
