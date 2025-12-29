@@ -118,6 +118,51 @@ def _safe_float(x: Any) -> float:
     except Exception:
         return 0.0
 
+def _normalize_record(r: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize Wallet_Monitor rows into a predictable schema so downstream logic
+    (Venue/Asset/Timestamp/Free/Locked/etc.) never breaks.
+
+    Wallet_Monitor source rows may have:
+      - different key casing
+      - leading/trailing spaces in headers
+      - missing keys
+    This function never raises.
+    """
+    if not isinstance(r, dict):
+        return {}
+
+    # Normalize keys (strip whitespace, keep original values)
+    rr: Dict[str, Any] = {}
+    for k, v in r.items():
+        if k is None:
+            continue
+        kk = str(k).strip()
+        if not kk:
+            continue
+        rr[kk] = v
+
+    # Provide canonical keys expected by the detector
+    # Wallet_Monitor usually uses these exact headers:
+    # Timestamp | Agent | Venue | Asset | Free | Locked | Class | Snapshot
+    out: Dict[str, Any] = {}
+
+    # Timestamp (allow a few variants)
+    out["Timestamp"] = rr.get("Timestamp") or rr.get("timestamp") or rr.get("TS") or rr.get("ts") or ""
+
+    # Venue / Asset
+    out["Venue"] = rr.get("Venue") or rr.get("venue") or ""
+    out["Asset"] = rr.get("Asset") or rr.get("asset") or ""
+
+    # Balances
+    out["Free"] = rr.get("Free") if "Free" in rr else rr.get("free", 0)
+    out["Locked"] = rr.get("Locked") if "Locked" in rr else rr.get("locked", 0)
+
+    # Optional context columns
+    out["Class"] = rr.get("Class") or rr.get("class") or ""
+    out["Agent"] = rr.get("Agent") or rr.get("agent") or ""
+
+    return out
 
 def _parse_ts(s: str) -> datetime | None:
     """
