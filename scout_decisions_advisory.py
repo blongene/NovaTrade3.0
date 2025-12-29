@@ -1,8 +1,30 @@
 # scout_decisions_advisory.py — Phase 22A (advisory only)
 # Emits SHADOW scout decisions to "Scout Decisions" without triggering planner imports.
 
-import os, time
+import os, time, json
 from typing import Any, Dict, List, Set
+
+
+# --- Phase 22A Advisory JSON (optional; JSON-first, env-fallback) -------------
+def _phase22a_json_cfg() -> dict:
+    raw = (os.getenv("PHASE22A_ADVISORY_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+_PHASE22A_CFG = _phase22a_json_cfg()
+
+def _cfg_get(path: str, default=None):
+    cur = _PHASE22A_CFG
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(part)
+    return default if cur is None else cur
+
 
 from utils import (
     get_records_cached,
@@ -12,10 +34,10 @@ from utils import (
     warn,
 )
 
-TAB = os.getenv("SCOUT_DECISIONS_TAB", "Scout Decisions")
-ENABLED = os.getenv("SCOUT_DECISIONS_ADVISORY_ENABLED", "1").lower() in {"1","true","yes","on"}
-MAX_ROWS = int(os.getenv("SCOUT_DECISIONS_MAX_ROWS", "25"))
-TTL_SEC  = int(os.getenv("SCOUT_DECISIONS_TTL_SEC", "21600"))  # 6h dedupe
+TAB = str(_cfg_get("scout_decisions.tab", os.getenv("SCOUT_DECISIONS_TAB", "Scout Decisions")))
+ENABLED = str(_cfg_get("scout_decisions.enabled", os.getenv("SCOUT_DECISIONS_ADVISORY_ENABLED", "1"))).lower() in {"1","true","yes","on"}
+MAX_ROWS = int(_cfg_get("scout_decisions.max_rows", os.getenv("SCOUT_DECISIONS_MAX_ROWS", "25")))
+TTL_SEC = int(_cfg_get("scout_decisions.ttl_sec", os.getenv("SCOUT_DECISIONS_TTL_SEC", "21600")))
 
 def _now_utc() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
