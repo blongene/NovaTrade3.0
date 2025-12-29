@@ -27,6 +27,9 @@ import os
 import json
 from datetime import datetime, timezone
 from typing import Dict, Tuple, List, Any
+import logging
+
+logger = logging.getLogger(__name__)
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
