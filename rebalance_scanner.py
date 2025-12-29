@@ -2,7 +2,8 @@
 import os, time, random
 from utils import (
     get_ws_cached, get_values_cached, ws_batch_update,
-    str_or_empty, invalidate_tab, warn
+    str_or_empty, invalidate_tab, warn,
+    get_all_records_cached_dbaware
 )
 
 SRC_TAB="Rotation_Stats"
@@ -34,10 +35,16 @@ def _to_float(v,default=None):
 def run_rebalance_scanner():
     try:
         time.sleep(random.uniform(JIT_MIN,JIT_MAX))
-        stats_vals=get_values_cached(SRC_TAB,ttl_s=TTL_READ_S)
+        # Phase 22B (DB-aware): pull Rotation_Stats via DB mirror when available.
+        # Falls back to Sheets automatically.
+        stats = get_all_records_cached_dbaware(
+            SRC_TAB,
+            ttl_s=TTL_READ_S,
+            logical_stream=f"sheet_mirror:{SRC_TAB}",
+        )
         planner_vals=get_values_cached(DST_TAB,ttl_s=TTL_READ_S)
-        if not stats_vals: return
-        stats=_values_to_records(stats_vals)
+        if not stats:
+            return
         plan_hdr=planner_vals[0] if planner_vals else []
         changed=False
         for h in PLAN_HEADERS:
