@@ -20,6 +20,7 @@ import os
 from datetime import datetime
 from utils import (
     get_ws_cached, ws_update, ws_batch_update,
+    get_all_records_cached_dbaware,
     str_or_empty, with_sheet_backoff
 )
 
@@ -82,7 +83,7 @@ def _sync_memory_tags():
         return
 
     # Read once
-    vault_rows = _get_all_records(vault_ws)
+    vault_rows = get_all_records_cached_dbaware("Token_Vault", ttl_s=120, logical_stream="sheet_mirror:Token_Vault")
     stats_vals = _get_all_values(stats_ws)
     if not stats_vals:
         print("⚠️ Rotation_Stats is empty; nothing to tag.")
@@ -128,12 +129,12 @@ def _build_vault_intelligence():
     """Phase 5: generate Vault Intelligence metrics sheet."""
     # Inputs
     try:
-        rotation_log = _get_all_records(_get_ws("Rotation_Log"))
+        rotation_log = get_all_records_cached_dbaware("Rotation_Log", ttl_s=120, logical_stream="sheet_mirror:Rotation_Log")
     except Exception:
         rotation_log = []
 
     try:
-        claim_records = _get_all_records(_get_ws("Claim_Tracker"))
+        claim_records = get_all_records_cached_dbaware("Claim_Tracker", ttl_s=120, logical_stream="sheet_mirror:Claim_Tracker")
         claim_tracker = {r.get("Token","").strip().upper(): r for r in claim_records}
     except Exception:
         claim_tracker = {}
