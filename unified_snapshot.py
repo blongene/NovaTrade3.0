@@ -29,6 +29,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 from utils import with_sheet_backoff
 from utils import get_ws_cached, info, warn
+from utils import get_all_records_cached_dbaware
 
 UNIFIED_SNAPSHOT_SRC_WS = os.getenv("UNIFIED_SNAPSHOT_SRC_WS", "Wallet_Monitor")
 UNIFIED_SNAPSHOT_WS = os.getenv("UNIFIED_SNAPSHOT_WS", "Unified_Snapshot")
@@ -176,11 +177,25 @@ def run_unified_snapshot() -> None:
         warn(f"unified_snapshot: failed to open source worksheet '{UNIFIED_SNAPSHOT_SRC_WS}': {e}")
         return
 
+    # Phase 22B: Prefer DB-backed sheet_mirror for Wallet_Monitor when available.
+    # If DB has no mirror for this tab (or DB unavailable), we fall back to the sheet read below.
+    rows = []
     try:
-        rows = src_ws.get_all_records()
+        rows = get_all_records_cached_dbaware(
+            UNIFIED_SNAPSHOT_SRC_WS,
+            ttl_s=120,
+            logical_stream=f"sheet_mirror:{UNIFIED_SNAPSHOT_SRC_WS}",
+        ) or []
     except Exception as e:
-        warn(f"unified_snapshot: get_all_records() failed for '{UNIFIED_SNAPSHOT_SRC_WS}': {e}")
-        return
+        warn(f"unified_snapshot: DB-aware read failed (will fall back to Sheets): {e}")
+        rows = []
+
+    if not rows:
+        try:
+            rows = src_ws.get_all_records()
+        except Exception as e:
+            warn(f"unified_snapshot: get_all_records() failed for '{UNIFIED_SNAPSHOT_SRC_WS}': {e}")
+            return
 
     info(f"unified_snapshot: Wallet_Monitor get_all_records -> {len(rows)} rows")
     if rows:
