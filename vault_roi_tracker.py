@@ -1,12 +1,29 @@
-# vault_roi_tracker.py — NT3.0 Render Phase-1 polish
-# Reads a vault positions tab once (cached), computes/records a daily snapshot
-# in Vault_ROI_Tracker with ONE batch write. Tiny jitter + backoff.
+# vault_roi_tracker.py — NT3.0 (Phase 22B DB-aware, Sheets-primary)
+# Reads a vault positions tab (DB-first via sheet_mirror, Sheets-fallback),
+# computes/records a daily snapshot into Vault_ROI_Tracker with ONE batch write.
+# Tiny jitter + backoff. Safe and idempotent-ish (appends one row per token per run).
 
-import os, time, random
+from __future__ import annotations
+
+import os
+import time
+import random
+from typing import Any, Dict, List, Optional, Tuple
+
 from utils import (
-    get_values_cached, get_ws, ws_batch_update, with_sheet_backoff,
-    str_or_empty, to_float
+    get_values_cached,
+    get_ws,
+    ws_batch_update,
+    with_sheet_backoff,
+    str_or_empty,
+    to_float,
 )
+
+# Optional (Phase 22B): DB-aware reader with Sheets fallback
+try:
+    from utils import get_all_records_cached_dbaware as _get_all_records_dbaware  # type: ignore
+except Exception:
+    _get_all_records_dbaware = None  # type: ignore
 
 SRC_TAB   = os.getenv("VAULT_SRC_TAB", "Vaults")             # positions source
 SNAP_TAB  = os.getenv("VAULT_SNAPSHOT_TAB", "Vault_ROI_Tracker")
@@ -22,18 +39,72 @@ COL_ROI      = os.getenv("VAULT_COL_ROI",   "ROI %")
 COL_USD      = os.getenv("VAULT_COL_USD",   "Value (USD)")
 COL_STATUS   = os.getenv("VAULT_COL_STATUS","Status")  # optional
 
+def _read_src_as_values(ttl_s: int) -> List[List[Any]]:
+    """
+    Read SRC_TAB as a 2D values array.
+    DB-aware path uses dict rows (from sheet_mirror) and converts to values to preserve
+    existing column-based logic. Always falls back to Sheets values.
+    """
+    if _get_all_records_dbaware:
+        try:
+            # DB-first if available, Sheets-fallback inside utils
+            rows = _get_all_records_dbaware(
+                SRC_TAB,
+                ttl_s=ttl_s,
+                logical_stream=f"sheet_mirror:{SRC_TAB}",
+            )
+            if rows:
+                # Convert list[dict] -> values matrix using header from keys union (stable)
+                # Preserve typical sheet column order when possible by using known columns first.
+                preferred = [COL_TOKEN, COL_ROI, COL_USD, COL_STATUS]
+                keys = []
+                seen = set()
+                for k in preferred:
+                    if any(k in r for r in rows):
+                        keys.append(k); seen.add(k)
+                # Add any additional keys in first-row order
+                for k in (list(rows[0].keys()) if isinstance(rows[0], dict) else []):
+                    if k not in seen:
+                        keys.append(k); seen.add(k)
+                header = keys
+                vals = [header]
+                for r in rows:
+                    vals.append([r.get(k, "") for k in header])
+                return vals
+        except Exception:
+            # silent fallback below
+            pass
+
+    return get_values_cached(SRC_TAB, ttl_s=ttl_s) or []
+
+def _next_append_row(ws) -> int:
+    """
+    Find the next empty row in column A (cheap and reliable).
+    Uses backoff wrapper via ws.col_values in our utils patching.
+    """
+    try:
+        col_a = ws.col_values(1) or []
+    except Exception:
+        # Worst case: append near the top; Sheets will still accept it
+        return 2
+    # Trim trailing empties
+    i = len(col_a)
+    while i > 0 and not str(col_a[i-1]).strip():
+        i -= 1
+    return max(2, i + 1)
+
 @with_sheet_backoff
 def run_vault_roi_tracker():
     print("📈 Running Vault ROI Tracker…")
     time.sleep(random.uniform(JIT_MIN_S, JIT_MAX_S))
 
-    vals = get_values_cached(SRC_TAB, ttl_s=TTL_READ_S) or []
+    vals = _read_src_as_values(TTL_READ_S) or []
     if not vals:
         print(f"ℹ️ {SRC_TAB} empty; skipping snapshot.")
         return
 
-    header = vals[0]
-    h = {h:i for i,h in enumerate(header)}
+    header = vals[0] or []
+    h = {str_or_empty(c): i for i, c in enumerate(header)}
     need = [COL_TOKEN, COL_ROI, COL_USD]
     miss = [c for c in need if c not in h]
     if miss:
@@ -43,9 +114,8 @@ def run_vault_roi_tracker():
     tok_i, roi_i, usd_i = h[COL_TOKEN], h[COL_ROI], h[COL_USD]
     status_i = h.get(COL_STATUS)
 
-    # Build snapshot rows in memory (no per-row writes)
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    rows = []
+    rows: List[List[Any]] = []
     for r in vals[1:]:
         token = str_or_empty(r[tok_i] if tok_i < len(r) else "").upper()
         if not token:
@@ -61,9 +131,8 @@ def run_vault_roi_tracker():
         print("✅ Vault ROI Tracker: nothing to write.")
         return
 
-    # One batched append (single API call)
     ws = get_ws(SNAP_TAB)
-    # Append by giving a starting A1 at the next empty row via batch_update
-    payload = [{"range": f"A{ws.row_count+1}", "values": rows[:MAX_WRITES]}]
+    start_row = _next_append_row(ws)
+    payload = [{"range": f"A{start_row}", "values": rows[:MAX_WRITES]}]
     ws_batch_update(ws, payload)
     print(f"✅ Vault ROI Tracker: wrote {min(len(rows), MAX_WRITES)} snapshot row(s).")
