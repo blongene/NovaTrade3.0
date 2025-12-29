@@ -8,6 +8,13 @@ from utils import (
     str_or_empty, to_float,
 )
 
+# Optional DB-aware reader (Phase 22B): DB-first, Sheets-fallback
+try:
+    from utils import get_all_records_cached_dbaware as _get_all_records_dbaware  # type: ignore
+except Exception:
+    _get_all_records_dbaware = None
+
+
 # ---------------- Env config (override in Render) ----------------
 LOG_TAB          = os.getenv("REBUY_LOG_TAB", "Rotation_Log")
 STATS_TAB        = os.getenv("ROT_STATS_TAB", "Rotation_Stats")
@@ -65,13 +72,35 @@ def _is_rebuy(dec_str: str, status_str: str) -> bool:
         return True
     return False
 
+def _get_rotation_log_mode_rows():
+    """Return ("dict", rows) from DB mirror if available, else ("values", rows) from Sheets."""
+    if _get_all_records_dbaware:
+        try:
+            rows = _get_all_records_dbaware(
+                LOG_TAB,
+                ttl_s=TTL_LOG_S,
+                logical_stream=f"sheet_mirror:{LOG_TAB}",
+            ) or []
+            if rows and isinstance(rows[0], dict):
+                return "dict", rows
+        except Exception:
+            pass
+    vals = get_values_cached(LOG_TAB, ttl_s=TTL_LOG_S) or []
+    return "values", vals
+
 @with_sheet_backoff
 def run_rebuy_roi_tracker():
     print("🔁 Syncing Rebuy ROI → Rotation_Stats...")
     time.sleep(random.uniform(JIT_MIN_S, JIT_MAX_S))
 
-    # -------- ONE cached read of Rotation_Log
-    log_vals = get_values_cached(LOG_TAB, ttl_s=TTL_LOG_S) or []
+    
+# -------- ONE cached read of Rotation_Log (DB-aware preferred)
+mode, log_rows = _get_rotation_log_mode_rows()
+
+agg = {}  # TOKEN -> {"cnt": int, "win": int, "sum": float}
+
+if mode == "values":
+    log_vals = log_rows
     if not log_vals or not log_vals[0]:
         print(f"ℹ️ {LOG_TAB} empty; nothing to aggregate.")
         return
@@ -88,28 +117,63 @@ def run_rebuy_roi_tracker():
         print(f"⚠️ {LOG_TAB} missing columns: {', '.join(miss)}; skipping.")
         return
 
-    # Aggregate per token
-    agg = {}  # token -> dict(sum, count, wins)
     for row in log_vals[1:]:
-        token = str_or_empty(row[li_token] if li_token < len(row) else "").upper()
+        token = str_or_empty(row[li_token] if (li_token is not None and li_token < len(row)) else "").upper()
         if not token:
             continue
-        dec = row[li_dec] if (li_dec is not None and li_dec < len(row)) else ""
-        st  = row[li_status] if (li_status is not None and li_status < len(row)) else ""
-        if not _is_rebuy(dec, st):
+        decision = str_or_empty(row[li_dec] if (li_dec is not None and li_dec < len(row)) else "").upper()
+        status   = str_or_empty(row[li_status] if (li_status is not None and li_status < len(row)) else "").upper()
+
+        if not _is_rebuy_row(decision, status):
             continue
-        roi = to_float(row[li_roi] if li_roi < len(row) else "", default=None)
+
+        roi = to_float(row[li_roi] if (li_roi is not None and li_roi < len(row)) else None)
         if roi is None:
             continue
-        d = agg.setdefault(token, {"sum":0.0, "cnt":0, "win":0})
-        d["sum"] += roi
+
+        d = agg.setdefault(token, {"cnt": 0, "win": 0, "sum": 0.0})
         d["cnt"] += 1
+        d["sum"] += float(roi)
         if roi > 0:
             d["win"] += 1
 
-    if not agg:
-        print("ℹ️ No rebuy rows to aggregate.")
+else:
+    # DB mirror rows arrive as list[dict] keyed by column headers
+    log_dicts = log_rows
+    if not log_dicts:
+        print(f"ℹ️ {LOG_TAB} empty; nothing to aggregate.")
         return
+
+    for r in log_dicts:
+        if not isinstance(r, dict):
+            continue
+        token = str_or_empty(r.get(LOG_TOKEN_COL)).upper()
+        if not token:
+            continue
+        decision = str_or_empty(r.get(LOG_DECISION_COL)).upper()
+        status   = str_or_empty(r.get(LOG_STATUS_COL)).upper()
+
+        if not _is_rebuy_row(decision, status):
+            continue
+
+        roi = None
+        for col in LOG_ROI_COLS:
+            if col in r:
+                roi = to_float(r.get(col))
+                if roi is not None:
+                    break
+        if roi is None:
+            continue
+
+        d = agg.setdefault(token, {"cnt": 0, "win": 0, "sum": 0.0})
+        d["cnt"] += 1
+        d["sum"] += float(roi)
+        if roi > 0:
+            d["win"] += 1
+
+if not agg:
+    print("ℹ️ No rebuy rows to aggregate.")
+    return
 
     # -------- ONE cached read of Rotation_Stats
     stats_vals = get_values_cached(STATS_TAB, ttl_s=TTL_STATS_S) or []
