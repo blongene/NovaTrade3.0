@@ -12,6 +12,11 @@ CRITICAL FIX (Dec 2025):
   causing column shift:
     Free=Amount, Locked="QUOTE", Class=<compact fragment>, Snapshot=""
 - This drop-in version detects the header and writes the correct format.
+
+PHASE 22B FIX (Dec 29, 2025):
+- Some telemetry payloads arriving at /api/telemetry/last do NOT include `by_venue`.
+  They may include a compact snapshot string (e.g. "BINANCEUS:USD=...,USDT=...; COINBASE:...").
+  This version reconstructs `by_venue` from that string so Wallet_Monitor writes don't get skipped.
 """
 
 from __future__ import annotations
@@ -123,15 +128,12 @@ def _ensure_wallet_monitor_header(ws) -> List[str]:
         _clear_and_seed_header(ws, canonical_8)
         return canonical_8
 
-    # Normalize for matching
     norm = [h.strip() for h in header if h is not None]
     if norm == canonical_8:
         return canonical_8
     if norm == canonical_7:
         return canonical_7
 
-    # If it contains these required columns, we’ll respect it,
-    # but we will choose how to write by checking which fields exist.
     return norm
 
 
@@ -176,14 +178,75 @@ def _format_compact_fragment(by_venue: Dict[str, Dict[str, float]]) -> str:
     return "; ".join(parts)
 
 
+def _parse_snapshot_string(s: str) -> Dict[str, Dict[str, float]]:
+    """
+    Parse compact snapshot strings like:
+      'BINANCEUS:USD=9.77,USDT=159.253; COINBASE:USD=8.01,USDC=41.6,USDT=58.3; KRAKEN:USDT=130.69'
+    into:
+      { "BINANCEUS": {"USD": 9.77, "USDT": 159.253}, ... }
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    if not s:
+        return out
+    parts = [p.strip() for p in str(s).split(";") if p.strip()]
+    for part in parts:
+        if ":" not in part:
+            continue
+        venue, rest = part.split(":", 1)
+        venue = venue.strip().upper()
+        if not venue:
+            continue
+        balances: Dict[str, float] = {}
+        for kv in [x.strip() for x in rest.split(",") if x.strip()]:
+            if "=" not in kv:
+                continue
+            a, v = kv.split("=", 1)
+            a = a.strip().upper()
+            try:
+                balances[a] = float(v.strip())
+            except Exception:
+                continue
+        if balances:
+            out[venue] = balances
+    return out
+
+
+def _get_by_venue(data: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    """
+    Return a usable by_venue dict.
+    If telemetry lacks by_venue, try to reconstruct from compact snapshot fields.
+    """
+    by_venue = data.get("by_venue")
+    if isinstance(by_venue, dict) and by_venue:
+        return by_venue
+
+    # Try common alternate fields that may carry the compact snapshot
+    snap = (
+        data.get("snapshot")
+        or data.get("Snapshot")
+        or data.get("class")
+        or data.get("Class")
+        or data.get("compact")
+        or data.get("balances_compact")
+        or ""
+    )
+
+    parsed = _parse_snapshot_string(str(snap))
+    if parsed:
+        info(f"telemetry_mirror: rebuilt by_venue from snapshot string (venues={list(parsed.keys())})")
+        return parsed
+
+    return {}
+
+
 # ---------------- Safety gating ----------------
 def _telemetry_ok_for_sheet(data: Dict[str, Any]) -> bool:
     if not isinstance(data, dict):
         warn("telemetry_mirror: telemetry data is not a dict; skipping Wallet_Monitor write.")
         return False
 
-    by_venue = data.get("by_venue") or {}
-    if not isinstance(by_venue, dict) or not by_venue:
+    by_venue = _get_by_venue(data)
+    if not by_venue:
         warn("telemetry_mirror: telemetry missing by_venue; skipping Wallet_Monitor write.")
         return False
 
@@ -278,8 +341,8 @@ def _write_wallet_monitor_rows(data: Dict[str, Any]) -> None:
         warn("telemetry_mirror: SHEET_URL not set; cannot mirror telemetry.")
         return
 
-    by_venue = data.get("by_venue") or {}
-    if not isinstance(by_venue, dict):
+    by_venue = _get_by_venue(data)
+    if not by_venue:
         warn("telemetry_mirror: telemetry has no by_venue; nothing to mirror.")
         return
 
@@ -303,9 +366,6 @@ def _write_wallet_monitor_rows(data: Dict[str, Any]) -> None:
     ws = _open_wallet_monitor_ws()
     header = _ensure_wallet_monitor_header(ws)
 
-    # Determine schema write mode:
-    # - If header contains Free/Locked -> write 8-column format
-    # - Else if header contains Amount -> write 7-column format
     header_set = {h.strip() for h in header}
 
     use_8 = ("Free" in header_set and "Locked" in header_set and "Snapshot" in header_set)
@@ -315,15 +375,10 @@ def _write_wallet_monitor_rows(data: Dict[str, Any]) -> None:
     for venue, asset, qty in rows:
         klass = _classify_asset(asset)
         if use_8:
-            # Timestamp | Agent | Venue | Asset | Free | Locked | Class | Snapshot
             out_rows.append([now_str, agent, venue, asset, qty, 0.0, klass, snapshot_frag])
         elif use_7:
-            # Timestamp | Agent | Venue | Asset | Amount | Class | Snapshot
             out_rows.append([now_str, agent, venue, asset, qty, klass, snapshot_frag])
         else:
-            # Unknown header. Fail-safe: write the 8-column canonical if header is close-ish,
-            # otherwise fall back to 7 to avoid breaking append_rows.
-            # We choose by expected length if header has >= 8.
             if len(header) >= 8:
                 out_rows.append([now_str, agent, venue, asset, qty, 0.0, klass, snapshot_frag])
             else:
