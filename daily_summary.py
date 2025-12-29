@@ -9,20 +9,8 @@
 # • Optional Bus outbox snapshot if BASE_URL is provided
 # • Clean HTML escaping + consistent timeouts
 
-import os
-import time
-import json
-import math
-import hashlib
-
-
-# Phase 22B: DB-aware reads (DB-first, Sheets-fallback)
-try:
-    from utils import get_all_records_cached_dbaware as _get_all_records_cached_dbaware
-except Exception:
-    _get_all_records_cached_dbaware = None
-import pathlib
-from datetime import datetime, timedelta, timezone
+\1
+TTL_READ_S = int(os.getenv('TTL_READ_S','120') or '120')
 
 from zoneinfo import ZoneInfo
 import requests
@@ -58,22 +46,6 @@ DEDUP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ---- Helpers / utilities ----------------------------------------------------
-
-
-def _dbaware_get_records(ws_name: str, ttl_s: int):
-    """Best-effort DB-first records for a sheet tab via sheet_mirror:<TAB>.
-    Returns list[dict] on success, or None to indicate caller should use Sheets/gspread path.
-    This function NEVER raises.
-    """
-    try:
-        if _get_all_records_cached_dbaware is None:
-            return None
-        rows = _get_all_records_cached_dbaware(ws_name, ttl_s=ttl_s, logical_stream=f"sheet_mirror:{ws_name}")
-        if isinstance(rows, list):
-            return rows
-        return None
-    except Exception:
-        return None
 
 
 def _to_bool(v) -> bool:
@@ -206,14 +178,11 @@ def _latest_wallet_snapshot(sheet):
     summary_line example:
         'COINBASE: 2 tokens, ~19.30 stable; BINANCEUS: 1 tokens, ~17.47 stable'
     """
-    # Phase 22B: prefer DB mirror for Wallet_Monitor when available
-    rows = _dbaware_get_records(WALLET_MONITOR_WS, ttl_s=TTL_READ_S)
-    if rows is None:
-        try:
-            ws = _retry(sheet.worksheet, WALLET_MONITOR_WS)
-            rows = _retry(ws.get_all_records)
-        except Exception:
-            return None
+    try:
+        ws = _retry(sheet.worksheet, WALLET_MONITOR_WS)
+        rows = _retry(ws.get_all_records)
+    except Exception:
+        return None
 
     if not rows:
         return None
@@ -313,14 +282,11 @@ def daily_phase5_summary():
     den = 0
     reasons = {}
 
-    # Phase 22B: prefer DB mirror for Policy_Log when available
-    pl = _dbaware_get_records(POLICY_LOG_WS, ttl_s=TTL_READ_S)
-    if pl is None:
-        try:
-            pl_ws = _retry(sh.worksheet, POLICY_LOG_WS)
-            pl = _retry(pl_ws.get_all_records)
-        except Exception:
-            pl = []
+    try:
+        pl_ws = _retry(sh.worksheet, POLICY_LOG_WS)
+        pl = _retry(pl_ws.get_all_records)
+    except Exception:
+        pl = []
 
     now_utc = datetime.now(timezone.utc)
     since = now_utc - timedelta(hours=24)
