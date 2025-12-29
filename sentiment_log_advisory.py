@@ -1,8 +1,30 @@
 # sentiment_log_advisory.py — Phase 22A (advisory only)
 # Writes sparse breadcrumbs + notable sentiment observations to Sentiment_Log.
 
-import os, time, math
+import os, time, json, math
 from typing import Any, Dict, List, Tuple
+
+
+# --- Phase 22A Advisory JSON (optional; JSON-first, env-fallback) -------------
+def _phase22a_json_cfg() -> dict:
+    raw = (os.getenv("PHASE22A_ADVISORY_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+_PHASE22A_CFG = _phase22a_json_cfg()
+
+def _cfg_get(path: str, default=None):
+    cur = _PHASE22A_CFG
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(part)
+    return default if cur is None else cur
+
 
 from utils import (
     get_records_cached,
@@ -13,11 +35,11 @@ from utils import (
     warn,
 )
 
-TAB = os.getenv("SENTIMENT_LOG_TAB", "Sentiment_Log")
-ENABLED = os.getenv("SENTIMENT_LOG_ADVISORY_ENABLED", "1").lower() in {"1","true","yes","on"}
-MAX_ROWS = int(os.getenv("SENTIMENT_LOG_MAX_ROWS", "20"))
-MIN_MENTIONS = float(os.getenv("SENTIMENT_LOG_MIN_MENTIONS", "1"))
-TTL_SEC = int(os.getenv("SENTIMENT_LOG_TTL_SEC", "21600"))  # 6h per token
+TAB = str(_cfg_get("sentiment_log.tab", os.getenv("SENTIMENT_LOG_TAB", "Sentiment_Log")))
+ENABLED = str(_cfg_get("sentiment_log.enabled", os.getenv("SENTIMENT_LOG_ADVISORY_ENABLED", "1"))).lower() in {"1","true","yes","on"}
+MAX_ROWS = int(_cfg_get("sentiment_log.max_rows", os.getenv("SENTIMENT_LOG_MAX_ROWS", "20")))
+MIN_MENTIONS = float(_cfg_get("sentiment_log.min_mentions", os.getenv("SENTIMENT_LOG_MIN_MENTIONS", "1")))
+TTL_SEC = int(_cfg_get("sentiment_log.ttl_sec", os.getenv("SENTIMENT_LOG_TTL_SEC", "21600")))
 
 def _now_utc() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
