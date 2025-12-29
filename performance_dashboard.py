@@ -21,6 +21,12 @@ VAULT_INTEL_WS = os.getenv("VAULT_INTELLIGENCE_WS", "Vault_Intelligence")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Phase 22B: optional DB-first reads (Sheets fallback)
+try:
+    from utils import get_all_records_cached_dbaware as _get_all_records_cached_dbaware
+except Exception:
+    _get_all_records_cached_dbaware = None
+
 # -------- Sheet helpers --------
 def _open_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -28,7 +34,20 @@ def _open_sheet():
     client = gspread.authorize(creds)
     return client.open_by_url(SHEET_URL)
 
-def _get(ws_name):
+def _get(ws_name, ttl_s=120):
+    """
+    Phase 22B: try DB mirror first via utils.get_all_records_cached_dbaware.
+    Falls back to direct gspread reads on any failure.
+    
+    If the DB mirror does not contain this tab yet, the helper will also fall back to Sheets.
+    """
+    try:
+        if _get_all_records_cached_dbaware is not None:
+            # Use sheet-mirror stream naming so the adapter can optionally reconstruct from DB events
+            return _get_all_records_cached_dbaware(ws_name, ttl_s=ttl_s, logical_stream=f"sheet_mirror:{ws_name}")
+    except Exception:
+        pass
+
     try:
         return _open_sheet().worksheet(ws_name).get_all_records()
     except Exception:
