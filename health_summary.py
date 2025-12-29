@@ -4,10 +4,20 @@ import sqlite3
 import time
 from datetime import datetime, timedelta
 from utils import send_telegram_message, is_cold_boot
-from db_backbone import outbox_stats
+try:
+    from db_backbone import outbox_stats
+except Exception:
+    outbox_stats = None
 
 DB = os.getenv("BUS_TELEMETRY_DB", "bus_telemetry.db")
 
+def _safe__safe_outbox_stats(*args, **kwargs):
+    if outbox_stats is None:
+        return {"available": False}
+    try:
+        return _safe_outbox_stats(*args, **kwargs)
+    except Exception:
+        return {"available": False}
 def _conn():
     return sqlite3.connect(DB, isolation_level=None, timeout=10)
 
@@ -42,7 +52,7 @@ def run_health_summary():
         f"Mode: `{mode}`\n"
     )
 
-    stats = outbox_stats() or {}
+    stats = _safe_outbox_stats() or {}
     q = stats.get("queued", "?")
     l = stats.get("leased", "?")
     d = stats.get("done", "?")
