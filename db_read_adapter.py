@@ -1,55 +1,41 @@
 # db_read_adapter.py
 """
-Phase 22B — DB Read Adapter (Postgres-first, Sheets-fallback)
+Phase 22B — DB Read Adapter (DB_READ_JSON edition, Sheet Mirror aware)
 
-Purpose
--------
-Provide a safe, cache-backed read helper that prefers Postgres when available,
-but NEVER breaks NovaTrade when Postgres is unavailable or stale.
+What this does
+--------------
+- Prefer Postgres reads when enabled & fresh.
+- ALWAYS fall back to Google Sheets safely (never break NovaTrade).
+- Supports logical streams:
+    - commands / receipts / telemetry
+    - sheet_mirror
+    - sheet_mirror:<TAB_NAME>  -> returns reconstructed row dicts (most recent first)
 
-Design rules (NovaTrade canon):
-- Sheets remain the visible control plane and must continue working.
-- Postgres read path is *advisory* until parity is proven.
-- Any DB exception MUST degrade to Sheets, quietly.
+Design rules (canon)
+-------------------
+- Sheets remain primary.
+- DB reads are advisory until parity is proven.
+- Any DB failure must degrade silently to Sheets.
 
-Environment
------------
-DB_URL or DATABASE_URL:
-  Postgres connection string.
+Configuration
+-------------
+Single JSON env var (preferred):
+  DB_READ_JSON={"enabled":1,"prefer_db":1,"ttl_s":120,"stale_sec":900,"max_rows":5000,"notify":1,...}
 
-DB_READ_ENABLED (default: 1):
-  Set to 0 to force Sheets reads.
-
-DB_READ_PREFER (default: 1):
-  If 0, always read Sheets (still keeps DB health metrics).
-
-DB_READ_TTL_S (default: 120):
-  In-process cache TTL for DB query results.
-
-DB_READ_MAX_ROWS (default: 2000):
-  Upper bound for rows returned from DB for parity / dashboards.
-
-DB_READ_STALE_SEC (default: 900):
-  If the freshest DB row is older than this, prefer Sheets.
-
-Notes
------
-This adapter is intentionally generic:
-- It can read from:
-    - 7C outbox tables: commands, receipts
-    - Phase-19 backbone tables: nova_commands, nova_receipts, nova_telemetry
-    - Sheet mirror events: sheet_mirror_events (tab/payload ledger)
-- Callers provide a *logical* name and we auto-detect the best physical table.
+DB url:
+  DB_URL or DATABASE_URL
 """
 
 from __future__ import annotations
 
-import os
 import json
-import time
+import logging
+import os
 import threading
-from dataclasses import dataclass
+import time
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     import psycopg2  # type: ignore
@@ -58,180 +44,276 @@ except Exception:
     psycopg2 = None
 
 
-# ----------------- config -----------------
+# ----------------- config helpers -----------------
 
-def _env_bool(name: str, default: str = "1") -> bool:
+def _env_bool(name: str, default: str = "0") -> bool:
     v = os.getenv(name, default)
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
-DB_READ_ENABLED = _env_bool("DB_READ_ENABLED", "1")
-DB_READ_PREFER  = _env_bool("DB_READ_PREFER", "1")
-DB_READ_TTL_S   = int(os.getenv("DB_READ_TTL_S", "120") or "120")
-DB_READ_MAX_ROWS = int(os.getenv("DB_READ_MAX_ROWS", "2000") or "2000")
-DB_READ_STALE_SEC = int(os.getenv("DB_READ_STALE_SEC", "900") or "900")
+def _load_db_read_json() -> Dict[str, Any]:
+    raw = os.getenv("DB_READ_JSON", "") or ""
+    raw = raw.strip()
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+_CFG = _load_db_read_json()
+
+
+def _cfg_get(key: str, default=None):
+    # simple top-level getter (we keep it basic on purpose)
+    v = _CFG.get(key) if isinstance(_CFG, dict) else None
+    return default if v is None else v
+
+
+DB_READ_ENABLED = bool(_cfg_get("enabled", _env_bool("DB_READ_ENABLED", "0")))
+DB_READ_PREFER  = bool(_cfg_get("prefer_db", _env_bool("DB_READ_PREFER", "1")))
+DB_READ_TTL_S   = int(_cfg_get("ttl_s", os.getenv("DB_READ_TTL_S", "120") or "120"))
+DB_READ_MAX_ROWS = int(_cfg_get("max_rows", os.getenv("DB_READ_MAX_ROWS", "2000") or "2000"))
+DB_READ_STALE_SEC = int(_cfg_get("stale_sec", os.getenv("DB_READ_STALE_SEC", "900") or "900"))
 
 _DB_URL = os.getenv("DB_URL") or os.getenv("DATABASE_URL") or ""
 
 
-# ----------------- internal cache -----------------
+# ----------------- tiny TTL cache -----------------
 
-_cache_lock = threading.Lock()
-_cache: Dict[str, Tuple[float, Any]] = {}  # key -> (expires_at, value)
+_CACHE: Dict[str, Tuple[float, Any]] = {}
+_CACHE_LOCK = threading.Lock()
 
 
-def _cache_get(key: str) -> Optional[Any]:
-    with _cache_lock:
-        item = _cache.get(key)
+def _cache_get(key: str):
+    now = time.time()
+    with _CACHE_LOCK:
+        item = _CACHE.get(key)
         if not item:
             return None
         exp, val = item
-        if time.time() < exp:
-            return val
-        _cache.pop(key, None)
-        return None
+        if exp <= now:
+            _CACHE.pop(key, None)
+            return None
+        return val
 
 
-def _cache_set(key: str, val: Any, ttl_s: int) -> None:
-    with _cache_lock:
-        _cache[key] = (time.time() + ttl_s, val)
+def _cache_set(key: str, val: Any, ttl_s: int):
+    exp = time.time() + max(1, int(ttl_s))
+    with _CACHE_LOCK:
+        _CACHE[key] = (exp, val)
 
 
-# ----------------- PG client -----------------
+# ----------------- postgres wrapper -----------------
 
-@dataclass
-class PgHealth:
-    ok: bool
-    url_set: bool
-    driver_ok: bool
-    last_err: Optional[str] = None
-
-
-class PgClient:
-    def __init__(self) -> None:
+class _PG:
+    def __init__(self):
         self._conn = None
         self._lock = threading.Lock()
-        self._last_err: Optional[str] = None
-
-    def health(self) -> PgHealth:
-        return PgHealth(
-            ok=bool(self._conn) and self._last_err is None,
-            url_set=bool(_DB_URL),
-            driver_ok=psycopg2 is not None,
-            last_err=self._last_err,
-        )
 
     def _connect(self):
-        if not (_DB_URL and psycopg2):
+        if psycopg2 is None:
+            return None
+        if not _DB_URL:
             return None
         try:
-            c = psycopg2.connect(_DB_URL)
-            c.autocommit = True
-            return c
-        except Exception as e:
-            self._last_err = f"{type(e).__name__}: {e}"
+            return psycopg2.connect(_DB_URL)
+        except Exception:
             return None
 
-    def conn(self):
-        if not DB_READ_ENABLED:
-            return None
+    def _get_conn(self):
         with self._lock:
             if self._conn is None:
                 self._conn = self._connect()
             return self._conn
 
-    def query(self, sql: str, args: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
-        c = self.conn()
-        if not c:
+    def query(self, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        if conn is None:
             return []
         try:
-            cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(sql, args)
-            rows = cur.fetchall()
-            return [dict(r) for r in rows]
-        except Exception as e:
-            self._last_err = f"{type(e).__name__}: {e}"
-            # degrade by resetting connection to allow recovery next call
-            with self._lock:
-                try:
-                    if self._conn:
-                        self._conn.close()
-                except Exception:
-                    pass
-                self._conn = None
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                return [dict(r) for r in rows] if rows else []
+        except Exception:
+            # advisory-only: never throw
             return []
 
+    def scalar(self, sql: str, params: Tuple[Any, ...] = ()) -> Any:
+        rows = self.query(sql, params)
+        if not rows:
+            return None
+        # first col of first row
+        return list(rows[0].values())[0]
 
-_pg = PgClient()
+
+_pg = _PG()
 
 
-# ----------------- table detection -----------------
-
-def _table_exists(table: str) -> bool:
-    rows = _pg.query(
-        "select 1 as ok from information_schema.tables where table_schema='public' and table_name=%s limit 1",
-        (table,),
+def _table_exists(name: str) -> bool:
+    if not name:
+        return False
+    # safe parameterization
+    return bool(
+        _pg.scalar(
+            "select 1 from information_schema.tables where table_schema='public' and table_name=%s limit 1",
+            (name,),
+        )
     )
-    return bool(rows)
 
 
-def _max_created_at(table: str, created_col: str = "created_at") -> Optional[float]:
-    rows = _pg.query(f"select extract(epoch from max({created_col})) as ts from {table}")
-    if not rows:
+def _parse_logical(logical_stream: str) -> Tuple[str, Optional[str]]:
+    """
+    Supports:
+      sheet_mirror
+      sheet_mirror:<TAB>
+    """
+    s = (logical_stream or "").strip()
+    if ":" in s:
+        base, tab = s.split(":", 1)
+        return base.strip().lower(), tab.strip()
+    return s.strip().lower(), None
+
+
+def _max_created_at(table: str, tab: Optional[str] = None) -> Optional[float]:
+    if not table:
         return None
-    ts = rows[0].get("ts")
     try:
+        if tab and table == "sheet_mirror_events":
+            sql = "select extract(epoch from max(created_at)) as ts from sheet_mirror_events where tab=%s"
+            rows = _pg.query(sql, (tab,))
+        else:
+            sql = f"select extract(epoch from max(created_at)) as ts from {table}"
+            rows = _pg.query(sql)
+        if not rows:
+            return None
+        ts = rows[0].get("ts")
         return float(ts) if ts is not None else None
     except Exception:
         return None
 
 
-def _choose_table(logical: str) -> Optional[str]:
-    """
-    Map a logical stream to the best physical table.
-    """
-    logical = (logical or "").strip().lower()
+def _choose_table(base_logical: str) -> Optional[str]:
+    base_logical = (base_logical or "").strip().lower()
 
-    # 7C outbox schema (preferred for command bus)
-    if logical == "commands":
+    if base_logical == "commands":
         if _table_exists("commands"):
             return "commands"
         if _table_exists("nova_commands"):
             return "nova_commands"
         return None
 
-    if logical == "receipts":
+    if base_logical == "receipts":
         if _table_exists("receipts"):
             return "receipts"
         if _table_exists("nova_receipts"):
             return "nova_receipts"
         return None
 
-    if logical == "telemetry":
+    if base_logical == "telemetry":
         if _table_exists("nova_telemetry"):
             return "nova_telemetry"
-        # If only mirror exists, callers can use logical "sheet_mirror"
         return None
 
-    if logical == "sheet_mirror":
-        # Prefer canonical mirror-events table, but tolerate older/alternate names.
-        for cand in ("sheet_mirror_events", "nova_sheet_mirror_events", "sheet_mirror", "nova_sheet_mirror"):
-            if _table_exists(cand):
-                return cand
+    if base_logical == "sheet_mirror":
+        if _table_exists("sheet_mirror_events"):
+            return "sheet_mirror_events"
         return None
 
     # allow direct table name
-    if logical and _table_exists(logical):
-        return logical
+    if base_logical and _table_exists(base_logical):
+        return base_logical
 
     return None
 
 
+def _fetch_table_rows(table: str, limit: int = 2000, tab: Optional[str] = None) -> List[Dict[str, Any]]:
+    limit = max(1, int(limit))
+
+    if table == "sheet_mirror_events":
+        if tab:
+            return _pg.query(
+                """
+                select created_at, tab, row_hash, payload
+                from sheet_mirror_events
+                where tab=%s
+                order by created_at desc
+                limit %s
+                """,
+                (tab, limit),
+            )
+        return _pg.query(
+            """
+            select created_at, tab, row_hash, payload
+            from sheet_mirror_events
+            order by created_at desc
+            limit %s
+            """,
+            (limit,),
+        )
+
+    # generic fallthrough (safe-ish)
+    try:
+        return _pg.query(f"select * from {table} order by 1 desc limit %s", (limit,))
+    except Exception:
+        return []
+
+
+def _reconstruct_sheet_rows(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert sheet_mirror_events payloads into row dicts.
+    db_mirror writes payloads like:
+      {"type":"sheet_row","tab":"Wallet_Monitor","row":{...}}
+      {"type":"append","tab":"Trade_Log","row":{...}}
+    """
+    out: List[Dict[str, Any]] = []
+    for ev in events:
+        payload = ev.get("payload")
+        if payload is None:
+            continue
+        # psycopg2 may return dict for JSONB; but handle strings too
+        try:
+            if isinstance(payload, str):
+                payload_obj = json.loads(payload)
+            else:
+                payload_obj = payload
+        except Exception:
+            continue
+
+        if isinstance(payload_obj, dict):
+            row = payload_obj.get("row")
+            if isinstance(row, dict):
+                out.append(row)
+                continue
+            # allow payload itself to be row-like
+            # (useful if future mirror schema changes)
+            if "type" not in payload_obj and "tab" not in payload_obj:
+                out.append(payload_obj)
+                continue
+        # ignore unknown shapes
+    return out
+
+
 # ----------------- public API -----------------
 
-def db_health() -> dict:
-    h = _pg.health()
-    return {"enabled": DB_READ_ENABLED, "prefer": DB_READ_PREFER, **h.__dict__}
+def db_health() -> Dict[str, Any]:
+    return {
+        "enabled": bool(DB_READ_ENABLED),
+        "prefer_db": bool(DB_READ_PREFER),
+        "has_driver": psycopg2 is not None,
+        "db_url": bool(_DB_URL),
+        "tables": {
+            "sheet_mirror_events": _table_exists("sheet_mirror_events"),
+            "nova_telemetry": _table_exists("nova_telemetry"),
+            "nova_receipts": _table_exists("nova_receipts"),
+            "nova_commands": _table_exists("nova_commands"),
+            "commands": _table_exists("commands"),
+            "receipts": _table_exists("receipts"),
+        },
+    }
 
 
 def get_records_prefer_db(
@@ -248,131 +330,57 @@ def get_records_prefer_db(
         * DB_READ_ENABLED and DB_READ_PREFER
         * table exists
         * and freshness within DB_READ_STALE_SEC
-    - Otherwise return Sheets via sheets_fallback_fn (required),
-      typically utils.get_all_records_cached(tab, ttl_s)
+    - Otherwise: Sheets fallback (required)
 
-    Note: This is designed to mirror utils.get_all_records_cached shape (dict rows).
+    Special:
+      logical_stream="sheet_mirror:<TAB>" returns reconstructed sheet row dicts.
     """
     ttl_s = DB_READ_TTL_S if ttl_s is None else int(ttl_s)
 
     if sheets_fallback_fn is None:
         raise ValueError("sheets_fallback_fn is required (e.g., utils.get_all_records_cached)")
 
-    # Sheets forced
     if not DB_READ_ENABLED or not DB_READ_PREFER:
         return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
 
-    table = _choose_table(logical_stream)
+    base, tab = _parse_logical(logical_stream)
+    table = _choose_table(base)
     if not table:
         return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
 
-    cache_key = f"db::{table}::{ttl_s}"
+    cache_key = f"db::{table}::{tab or ''}::{ttl_s}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    # freshness check
-    max_ts = _max_created_at(table)
+    max_ts = _max_created_at(table, tab=tab if table == "sheet_mirror_events" else None)
     if max_ts is not None:
         age = time.time() - max_ts
         if age > DB_READ_STALE_SEC:
             return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
 
-    rows: List[Dict[str, Any]] = _fetch_table_rows(table, limit=DB_READ_MAX_ROWS)
-    if rows:
-        _cache_set(cache_key, rows, ttl_s)
-        return rows
+    events = _fetch_table_rows(table, limit=DB_READ_MAX_ROWS, tab=tab if table == "sheet_mirror_events" else None)
+    if not events:
+        return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
 
-    # no data -> fallback
-    return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
-
-
-def _fetch_table_rows(table: str, limit: int = 2000) -> List[Dict[str, Any]]:
-    """
-    Returns a normalized list[dict] per table type.
-    """
-    limit = max(1, int(limit))
-
-    if table == "commands":
-        sql = """
-          select id, created_at, agent_id, intent, intent_hash, status, leased_by, lease_expires_at, attempts, dedup_ttl_seconds
-          from commands
-          order by id desc
-          limit %s
-        """
-        return _pg.query(sql, (limit,))
-
-    if table == "receipts":
-        # schema varies across builds; select only known-safe columns
-        # receipts may include receipt jsonb or raw payload; try both.
-        rows = _pg.query(
-            """
-            select id, created_at, agent_id,
-                   cmd_id,
-                   coalesce(receipt, raw_payload, payload)::jsonb as payload,
-                   ok, status, venue, symbol, base, quote, notional_usd
-            from receipts
-            order by id desc
-            limit %s
-            """,
-            (limit,),
-        )
-        # some schemas don't have those cols -> fallback to minimal
+    # sheet_mirror:<TAB> => reconstruct to row dicts
+    if base == "sheet_mirror" and tab:
+        rows = _reconstruct_sheet_rows(events)
         if rows:
+            _cache_set(cache_key, rows, ttl_s)
             return rows
-        return _pg.query(
-            """
-            select id, created_at, agent_id, cmd_id, payload, ok
-            from nova_receipts
-            order by id desc
-            limit %s
-            """,
-            (limit,),
-        )
+        return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
 
-    if table == "nova_commands":
-        return _pg.query(
-            """
-            select id, created_at, agent_id, payload
-            from nova_commands
-            order by id desc
-            limit %s
-            """,
-            (limit,),
-        )
+    # raw table read
+    _cache_set(cache_key, events, ttl_s)
+    return events
 
-    if table == "nova_receipts":
-        return _pg.query(
-            """
-            select id, created_at, agent_id, cmd_id, ok, status, venue, symbol, base, quote, notional_usd, payload
-            from nova_receipts
-            order by id desc
-            limit %s
-            """,
-            (limit,),
-        )
 
-    if table == "nova_telemetry":
-        return _pg.query(
-            """
-            select id, created_at, agent_id, kind, payload
-            from nova_telemetry
-            order by id desc
-            limit %s
-            """,
-            (limit,),
-        )
-
-    if table == "sheet_mirror_events":
-        return _pg.query(
-            """
-            select id, created_at, tab, row_hash, payload
-            from sheet_mirror_events
-            order by id desc
-            limit %s
-            """,
-            (limit,),
-        )
-
-    # direct generic
-    return _pg.query(f"select * from {table} order by 1 desc limit %s", (limit,))
+# convenience export expected by some patches
+def get_sheet_mirror_rows(tab: str, *, ttl_s: int = 120, sheets_fallback_fn=None) -> List[Dict[str, Any]]:
+    return get_records_prefer_db(
+        sheet_tab=tab,
+        logical_stream=f"sheet_mirror:{tab}",
+        ttl_s=ttl_s,
+        sheets_fallback_fn=sheets_fallback_fn or (lambda sheet_tab, ttl_s=120: []),
+    )
