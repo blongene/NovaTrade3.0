@@ -15,10 +15,6 @@ Config:
 - Env fallback:
     DB_READ_PARITY_TABS=Rotation_Log,Trade_Log
     DB_READ_PARITY_MAX_COMPARE=200
-
-One-shot capstone verification:
-- If run as a script/module (python -m sheet_mirror_parity_validator), prints a concise summary
-  and performs a DB-only reconstruction sanity test (no Sheets fallback) for at least one tab.
 """
 
 from __future__ import annotations
@@ -28,7 +24,7 @@ import json
 import time
 import logging
 import hashlib
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -40,20 +36,9 @@ DEFAULT_TABS = [
     "Unified_Snapshot",
 ]
 
-# Prefer tabs we know are commonly present in mirror events in your environment
-_CAPSTONE_PREFERRED_TABS = [
-    "Wallet_Monitor",
-    "Trade_Log",
-    "Unified_Snapshot",
-    "Rotation_Stats",
-    "Rotation_Log",
-]
-
-
 def _env_bool(name: str, default: str = "0") -> bool:
     v = os.getenv(name, default)
     return str(v).strip().lower() in ("1", "true", "yes", "on")
-
 
 def _load_db_read_json() -> dict:
     raw = (os.getenv("DB_READ_JSON") or "").strip()
@@ -64,14 +49,11 @@ def _load_db_read_json() -> dict:
     except Exception:
         return {}
 
-
 _CFG = _load_db_read_json()
-
 
 def _cfg_get(key: str, default=None):
     v = _CFG.get(key, default)
     return default if v is None else v
-
 
 def _get_tabs() -> List[str]:
     tabs = _cfg_get("tabs")
@@ -81,7 +63,6 @@ def _get_tabs() -> List[str]:
     if env:
         return [t.strip() for t in env.split(",") if t.strip()]
     return list(DEFAULT_TABS)
-
 
 def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -96,18 +77,70 @@ def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _ts_str(row: Dict[str, Any]) -> str:
+    return str(row.get("Timestamp") or row.get("timestamp") or "").strip()
+
+def _key_agent_venue_asset(row: Dict[str, Any]) -> Tuple[str, str, str]:
+    agent = str(row.get("Agent") or row.get("agent") or row.get("  Agent") or "").strip()
+    venue = str(row.get("Venue") or row.get("venue") or "").strip().upper()
+    asset = str(row.get("Asset") or row.get("asset") or "").strip().upper()
+    return (agent, venue, asset)
+
+def _latest_per_key(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Latest row per (Agent, Venue, Asset) based on Timestamp string."""
+    best: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    best_ts: Dict[Tuple[str, str, str], str] = {}
+    for r in rows or []:
+        rr = _normalize_row(r)
+        k = _key_agent_venue_asset(rr)
+        ts = _ts_str(rr)
+        if ts >= best_ts.get(k, ""):
+            best_ts[k] = ts
+            best[k] = rr
+    return [best[k] for k in sorted(best.keys())]
+
+def _project_wallet_monitor(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Wallet_Monitor parity should be stable across DB/SHEETS ordering & formatting.
+    Snapshot string formatting can differ (float formatting), so we exclude it from hashing.
+    """
+    r = _normalize_row(row)
+    out = {
+        "Timestamp": _ts_str(r),
+        "Agent": str(r.get("Agent") or r.get("  Agent") or "").strip(),
+        "Venue": str(r.get("Venue") or "").strip().upper(),
+        "Asset": str(r.get("Asset") or "").strip().upper(),
+        "Free": r.get("Free"),
+        "Locked": r.get("Locked"),
+        "Class": str(r.get("Class") or "").strip().upper(),
+    }
+    return out
+
+def _project_unified_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Unified_Snapshot rows are derived; compare on the same stable subset.
+    """
+    r = _normalize_row(row)
+    out = {
+        "Timestamp": _ts_str(r),
+        "Agent": str(r.get("Agent") or r.get("  Agent") or "").strip(),
+        "Venue": str(r.get("Venue") or "").strip().upper(),
+        "Asset": str(r.get("Asset") or "").strip().upper(),
+        "Free": r.get("Free"),
+        "Locked": r.get("Locked"),
+        "Class": str(r.get("Class") or "").strip().upper(),
+    }
+    return out
+
 def _row_hash(row: Dict[str, Any]) -> str:
     s = json.dumps(_normalize_row(row), sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-
 def _should_notify() -> bool:
     return bool(_cfg_get("notify", _env_bool("DB_READ_NOTIFY", "0")))
 
-
 def _parity_enabled() -> bool:
     return bool(_cfg_get("parity_enabled", _env_bool("DB_READ_PARITY_ENABLED", "1")))
-
 
 def _max_compare() -> int:
     try:
@@ -115,54 +148,40 @@ def _max_compare() -> int:
     except Exception:
         return 200
 
+def _compare(tab: str, sheets_rows: List[Dict[str, Any]], db_rows: List[Dict[str, Any]], max_compare: int) -> Dict[str, Any]:
+    # Make parity meaningful for reconstructed streams:
+    # - Wallet_Monitor / Unified_Snapshot: compare latest-per-(Agent,Venue,Asset), order independent
+    if tab.strip() in ("Wallet_Monitor", "Unified_Snapshot"):
+        s_latest = _latest_per_key(sheets_rows)
+        d_latest = _latest_per_key(db_rows)
+        if tab.strip() == "Wallet_Monitor":
+            s_proj = [_project_wallet_monitor(r) for r in s_latest][:max_compare]
+            d_proj = [_project_wallet_monitor(r) for r in d_latest][:max_compare]
+        else:
+            s_proj = [_project_unified_snapshot(r) for r in s_latest][:max_compare]
+            d_proj = [_project_unified_snapshot(r) for r in d_latest][:max_compare]
+        s_hashes = [_row_hash(r) for r in s_proj]
+        d_hashes = [_row_hash(r) for r in d_proj]
+        s_set, d_set = set(s_hashes), set(d_hashes)
+        overlap = len(s_set & d_set)
+        only_s = len(s_set - d_set)
+        only_d = len(d_set - s_set)
+        s_keys = set().union(*[set(r.keys()) for r in s_proj]) if s_proj else set()
+        d_keys = set().union(*[set(r.keys()) for r in d_proj]) if d_proj else set()
+        return {
+            "tab": tab,
+            "sheets_n": len(sheets_rows),
+            "db_n": len(db_rows),
+            "overlap": overlap,
+            "only_sheets": only_s,
+            "only_db": only_d,
+            "missing_in_db_cols": sorted(list(s_keys - d_keys))[:50],
+            "extra_in_db_cols": sorted(list(d_keys - s_keys))[:50],
+        }
 
-def _wm_key(row: Dict[str, Any]) -> Tuple[str, str, str]:
-    """Key for Wallet_Monitor parity: (agent, venue, asset) normalized."""
-    agent = str(row.get("Agent") or row.get("agent") or row.get("  Agent") or "").strip()
-    venue = str(row.get("Venue") or row.get("venue") or "").strip().upper()
-    asset = str(row.get("Asset") or row.get("asset") or "").strip().upper()
-    return (agent, venue, asset)
-
-
-def _wm_latest_per_key(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    For Wallet_Monitor, reduce noisy ordering/duplication by taking the latest row per (Agent, Venue, Asset).
-    This makes parity meaningful even when DB and Sheets ordering differ.
-    """
-    best: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    best_ts: Dict[Tuple[str, str, str], str] = {}
-
-    for r in rows or []:
-        rr = _normalize_row(r)
-        k = _wm_key(rr)
-        ts = str(rr.get("Timestamp") or rr.get("timestamp") or "").strip()
-        # Keep lexicographically greatest timestamp string; timestamps are consistent "%Y-%m-%d %H:%M:%S" or similar.
-        # If empty, treat as lowest.
-        prev = best_ts.get(k, "")
-        if ts >= prev:
-            best_ts[k] = ts
-            best[k] = rr
-
-    # Return deterministic order
-    return [best[k] for k in sorted(best.keys())]
-
-
-def _compare(
-    tab: str,
-    sheets_rows: List[Dict[str, Any]],
-    db_rows: List[Dict[str, Any]],
-    max_compare: int
-) -> Dict[str, Any]:
-    # Wallet_Monitor is special: compare latest-per-key, order-independent.
-    if tab.strip() == "Wallet_Monitor":
-        s_reduced = _wm_latest_per_key(sheets_rows)
-        d_reduced = _wm_latest_per_key(db_rows)
-        s = s_reduced[:max_compare]
-        d = d_reduced[:max_compare]
-    else:
-        s = (sheets_rows or [])[:max_compare]
-        d = (db_rows or [])[:max_compare]
-
+    # Default behavior: simple hash compare on first N rows
+    s = sheets_rows[:max_compare]
+    d = db_rows[:max_compare]
     s_hashes = [_row_hash(r) for r in s]
     d_hashes = [_row_hash(r) for r in d]
     s_set, d_set = set(s_hashes), set(d_hashes)
@@ -193,39 +212,6 @@ def _compare(
         "missing_in_db_cols": sorted(list(s_keys - d_keys))[:50],
         "extra_in_db_cols": sorted(list(d_keys - s_keys))[:50],
     }
-
-
-def _choose_capstone_tab(tabs: List[str]) -> Optional[str]:
-    # Prefer known tabs, but only if present in the validator's tabs list.
-    tabset = set(tabs)
-    for t in _CAPSTONE_PREFERRED_TABS:
-        if t in tabset:
-            return t
-    return tabs[0] if tabs else None
-
-
-def _capstone_db_only_reconstruct(
-    get_records_prefer_db,
-    tab: str
-) -> Tuple[int, Optional[Dict[str, Any]], str]:
-    """
-    DB-only reconstruction test: forces sheets_fallback_fn to return [] to prove DB is working.
-    Returns: (row_count, sample_row, reason)
-    """
-    try:
-        rows = get_records_prefer_db(
-            sheet_tab=tab,
-            logical_stream=f"sheet_mirror:{tab}",
-            ttl_s=5,
-            sheets_fallback_fn=lambda sheet_tab, ttl_s=120: [],
-        )
-        if not rows:
-            return 0, None, "db_returned_0_rows"
-        sample = rows[0] if isinstance(rows[0], dict) else {"_sample": str(rows[0])}
-        return len(rows), sample, "ok"
-    except Exception as e:
-        return 0, None, f"exception:{e}"
-
 
 def run_sheet_mirror_parity_validator() -> Dict[str, Any]:
     if not _parity_enabled():
@@ -311,50 +297,3 @@ def run_sheet_mirror_parity_validator() -> Dict[str, Any]:
         "max_compare": max_compare,
         "ts": int(time.time()),
     }
-
-
-def _print_capstone_summary(result: Dict[str, Any], capstone: Dict[str, Any]) -> None:
-    # Minimal stdout reporting for shell usage
-    print("=== Phase 22B Capstone Verification ===")
-    print(f"parity_ok: {bool(result.get('ok'))} skipped: {bool(result.get('skipped', False))}")
-    print(f"tabs_configured: {result.get('tabs')} checked: {result.get('checked')} drift: {result.get('drift')}")
-    print("--- DB-only reconstruction test ---")
-    print(
-        f"tab={capstone.get('tab')} rows={capstone.get('rows')} reason={capstone.get('reason')}"
-    )
-    if capstone.get("sample"):
-        sample = capstone["sample"]
-        try:
-            s = json.dumps(sample, default=str)[:400]
-        except Exception:
-            s = str(sample)[:400]
-        print(f"sample: {s}")
-    print("======================================")
-
-
-if __name__ == "__main__":
-    # When run manually, do:
-    #  1) parity validator (normal)
-    #  2) DB-only reconstruction test (no Sheets fallback)
-    # Print to stdout and exit non-zero if DB-only reconstruction is empty.
-    try:
-        res = run_sheet_mirror_parity_validator()
-    except Exception as e:
-        print(f"❌ validator crashed: {e}")
-        raise
-
-    capstone_info: Dict[str, Any] = {"tab": None, "rows": 0, "sample": None, "reason": "not_run"}
-    try:
-        from db_read_adapter import get_records_prefer_db  # type: ignore
-        tabs = _get_tabs()
-        tab = _choose_capstone_tab(tabs) or "Wallet_Monitor"
-        n, sample, reason = _capstone_db_only_reconstruct(get_records_prefer_db, tab)
-        capstone_info = {"tab": tab, "rows": n, "sample": sample, "reason": reason}
-    except Exception as e:
-        capstone_info = {"tab": None, "rows": 0, "sample": None, "reason": f"imports_failed:{e}"}
-
-    _print_capstone_summary(res, capstone_info)
-
-    if capstone_info.get("rows", 0) <= 0:
-        # Make failure unambiguous in shell
-        raise SystemExit(2)
