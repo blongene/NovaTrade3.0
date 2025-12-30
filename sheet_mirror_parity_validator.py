@@ -116,14 +116,53 @@ def _max_compare() -> int:
         return 200
 
 
+def _wm_key(row: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Key for Wallet_Monitor parity: (agent, venue, asset) normalized."""
+    agent = str(row.get("Agent") or row.get("agent") or row.get("  Agent") or "").strip()
+    venue = str(row.get("Venue") or row.get("venue") or "").strip().upper()
+    asset = str(row.get("Asset") or row.get("asset") or "").strip().upper()
+    return (agent, venue, asset)
+
+
+def _wm_latest_per_key(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    For Wallet_Monitor, reduce noisy ordering/duplication by taking the latest row per (Agent, Venue, Asset).
+    This makes parity meaningful even when DB and Sheets ordering differ.
+    """
+    best: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    best_ts: Dict[Tuple[str, str, str], str] = {}
+
+    for r in rows or []:
+        rr = _normalize_row(r)
+        k = _wm_key(rr)
+        ts = str(rr.get("Timestamp") or rr.get("timestamp") or "").strip()
+        # Keep lexicographically greatest timestamp string; timestamps are consistent "%Y-%m-%d %H:%M:%S" or similar.
+        # If empty, treat as lowest.
+        prev = best_ts.get(k, "")
+        if ts >= prev:
+            best_ts[k] = ts
+            best[k] = rr
+
+    # Return deterministic order
+    return [best[k] for k in sorted(best.keys())]
+
+
 def _compare(
     tab: str,
     sheets_rows: List[Dict[str, Any]],
     db_rows: List[Dict[str, Any]],
     max_compare: int
 ) -> Dict[str, Any]:
-    s = sheets_rows[:max_compare]
-    d = db_rows[:max_compare]
+    # Wallet_Monitor is special: compare latest-per-key, order-independent.
+    if tab.strip() == "Wallet_Monitor":
+        s_reduced = _wm_latest_per_key(sheets_rows)
+        d_reduced = _wm_latest_per_key(db_rows)
+        s = s_reduced[:max_compare]
+        d = d_reduced[:max_compare]
+    else:
+        s = (sheets_rows or [])[:max_compare]
+        d = (db_rows or [])[:max_compare]
+
     s_hashes = [_row_hash(r) for r in s]
     d_hashes = [_row_hash(r) for r in d]
     s_set, d_set = set(s_hashes), set(d_hashes)
