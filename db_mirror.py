@@ -242,10 +242,10 @@ _MIRROR = _Mirror()
 # ----------------- public helpers -----------------
 
 def mirror_append(tab: str, rows: List[Any]) -> None:
-    _MIRROR.mirror_append(tab, rows, source="read")
+    _MIRROR.mirror_append(tab, rows)
 
 def mirror_rows(tab: str, rows: List[Any]) -> None:
-    _MIRROR.mirror_rows(tab, rows, source="read")
+    _MIRROR.mirror_rows(tab, rows)
     # ---- observability: log once per tab per boot ----
     try:
         global _LOGGED_TABS
