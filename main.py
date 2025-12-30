@@ -9,6 +9,7 @@ from flask import Blueprint, request, jsonify
 from policy_bias_engine import run_policy_bias_builder
 from telegram_summaries import run_telegram_summaries
 from stalled_autotrader import run_stalled_autotrader_shadow
+from sheet_mirror_parity_validator import run_sheet_mirror_parity_validator
 
 # Enable asynchronous Sheets gateway flusher
 try:
@@ -282,6 +283,7 @@ def _set_schedules():
     # Stalled safety
     _schedule("Stalled Asset Detector",       "stalled_asset_detector",      "run_stalled_asset_detector",    every=60, unit="minutes")
     _schedule("Stalled Autotrader (Shadow)",  "stalled_autotrader",          "run_stalled_autotrader_shadow", every=6, unit="hours")
+    _schedule("Sheet Mirror Parity Validator", "sheet_mirror_parity_validator", "run_sheet_mirror_parity_validator", every=6, units="hours")
 
     # DB parity (Phase 22B)
     try:
