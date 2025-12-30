@@ -273,3 +273,10 @@ def run_telemetry_digest() -> None:
 
 if __name__ == "__main__":
     run_telemetry_digest()
+
+
+# ---- scheduler compatibility ----
+
+def run_daily_telemetry_digest():
+    """Compatibility alias expected by some schedulers."""
+    return run_telemetry_digest()
