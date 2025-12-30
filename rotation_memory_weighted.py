@@ -1,13 +1,13 @@
 """
-rotation_memory_weighted.py — compatibility shim
+rotation_memory_weighted.py — compatibility shim (Phase 22B)
 
-Your scheduler/main occasionally imports rotation_memory_weighted.
-Some repos only ship rotation_memory.py (run_rotation_memory).
+Scheduler expects:
+  rotation_memory_weighted.run_rotation_memory_weighted()
 
-This shim keeps the system operational and removes "Import skipped" warnings.
+Legacy module:
+  rotation_memory.run_rotation_memory()
 """
 from __future__ import annotations
-
 import logging
 logger = logging.getLogger(__name__)
 
@@ -16,5 +16,5 @@ def run_rotation_memory_weighted():
         from rotation_memory import run_rotation_memory  # type: ignore
         return run_rotation_memory()
     except Exception as e:
-        logger.warning("rotation_memory_weighted: unable to run rotation_memory fallback: %s", e)
+        logger.warning("rotation_memory_weighted: fallback failed: %s", e)
         return None
