@@ -1003,3 +1003,28 @@ def hmac_enqueue(intent: dict) -> dict:
         return {"ok": False, "reason": f"http_{resp.status_code}", "body": resp.text}
     except Exception as e:
         return {"ok": False, "reason": f"connection_error: {e}"}
+
+
+# ---------------- Phase 22B DB-aware read helper ----------------
+# Several Phase 22B modules import this symbol from utils.
+# It is a thin wrapper around db_read_adapter.get_records_prefer_db (DB-first, Sheets-fallback).
+try:
+    from db_read_adapter import get_records_prefer_db as _get_records_prefer_db  # type: ignore
+except Exception:
+    _get_records_prefer_db = None  # type: ignore
+
+
+def get_all_records_cached_dbaware(ws_name: str, ttl_s: int = 120, *, logical_stream: str | None = None):
+    """Return list[dict] from DB mirror if enabled/healthy; otherwise fall back to Sheets cached read.
+
+    This preserves backwards compatibility with Phase 22B modules that call:
+        get_all_records_cached_dbaware("Rotation_Log", ttl_s=..., logical_stream="sheet_mirror:Rotation_Log")
+    """
+    ls = logical_stream or f"sheet_mirror:{ws_name}"
+    if _get_records_prefer_db:
+        try:
+            return _get_records_prefer_db(ws_name, ls, ttl_s=ttl_s, sheets_fallback_fn=get_all_records_cached)
+        except Exception:
+            return get_all_records_cached(ws_name, ttl_s=ttl_s)
+    return get_all_records_cached(ws_name, ttl_s=ttl_s)
+
