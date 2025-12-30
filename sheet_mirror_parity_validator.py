@@ -15,6 +15,10 @@ Config:
 - Env fallback:
     DB_READ_PARITY_TABS=Rotation_Log,Trade_Log
     DB_READ_PARITY_MAX_COMPARE=200
+
+One-shot capstone verification:
+- If run as a script/module (python -m sheet_mirror_parity_validator), prints a concise summary
+  and performs a DB-only reconstruction sanity test (no Sheets fallback) for at least one tab.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import json
 import time
 import logging
 import hashlib
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +40,20 @@ DEFAULT_TABS = [
     "Unified_Snapshot",
 ]
 
+# Prefer tabs we know are commonly present in mirror events in your environment
+_CAPSTONE_PREFERRED_TABS = [
+    "Wallet_Monitor",
+    "Trade_Log",
+    "Unified_Snapshot",
+    "Rotation_Stats",
+    "Rotation_Log",
+]
+
+
 def _env_bool(name: str, default: str = "0") -> bool:
     v = os.getenv(name, default)
     return str(v).strip().lower() in ("1", "true", "yes", "on")
+
 
 def _load_db_read_json() -> dict:
     raw = (os.getenv("DB_READ_JSON") or "").strip()
@@ -49,11 +64,14 @@ def _load_db_read_json() -> dict:
     except Exception:
         return {}
 
+
 _CFG = _load_db_read_json()
+
 
 def _cfg_get(key: str, default=None):
     v = _CFG.get(key, default)
     return default if v is None else v
+
 
 def _get_tabs() -> List[str]:
     tabs = _cfg_get("tabs")
@@ -63,6 +81,7 @@ def _get_tabs() -> List[str]:
     if env:
         return [t.strip() for t in env.split(",") if t.strip()]
     return list(DEFAULT_TABS)
+
 
 def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -76,15 +95,19 @@ def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
             out[kk] = v
     return out
 
+
 def _row_hash(row: Dict[str, Any]) -> str:
     s = json.dumps(_normalize_row(row), sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+
 def _should_notify() -> bool:
     return bool(_cfg_get("notify", _env_bool("DB_READ_NOTIFY", "0")))
 
+
 def _parity_enabled() -> bool:
     return bool(_cfg_get("parity_enabled", _env_bool("DB_READ_PARITY_ENABLED", "1")))
+
 
 def _max_compare() -> int:
     try:
@@ -92,7 +115,13 @@ def _max_compare() -> int:
     except Exception:
         return 200
 
-def _compare(tab: str, sheets_rows: List[Dict[str, Any]], db_rows: List[Dict[str, Any]], max_compare: int) -> Dict[str, Any]:
+
+def _compare(
+    tab: str,
+    sheets_rows: List[Dict[str, Any]],
+    db_rows: List[Dict[str, Any]],
+    max_compare: int
+) -> Dict[str, Any]:
     s = sheets_rows[:max_compare]
     d = db_rows[:max_compare]
     s_hashes = [_row_hash(r) for r in s]
@@ -125,6 +154,39 @@ def _compare(tab: str, sheets_rows: List[Dict[str, Any]], db_rows: List[Dict[str
         "missing_in_db_cols": sorted(list(s_keys - d_keys))[:50],
         "extra_in_db_cols": sorted(list(d_keys - s_keys))[:50],
     }
+
+
+def _choose_capstone_tab(tabs: List[str]) -> Optional[str]:
+    # Prefer known tabs, but only if present in the validator's tabs list.
+    tabset = set(tabs)
+    for t in _CAPSTONE_PREFERRED_TABS:
+        if t in tabset:
+            return t
+    return tabs[0] if tabs else None
+
+
+def _capstone_db_only_reconstruct(
+    get_records_prefer_db,
+    tab: str
+) -> Tuple[int, Optional[Dict[str, Any]], str]:
+    """
+    DB-only reconstruction test: forces sheets_fallback_fn to return [] to prove DB is working.
+    Returns: (row_count, sample_row, reason)
+    """
+    try:
+        rows = get_records_prefer_db(
+            sheet_tab=tab,
+            logical_stream=f"sheet_mirror:{tab}",
+            ttl_s=5,
+            sheets_fallback_fn=lambda sheet_tab, ttl_s=120: [],
+        )
+        if not rows:
+            return 0, None, "db_returned_0_rows"
+        sample = rows[0] if isinstance(rows[0], dict) else {"_sample": str(rows[0])}
+        return len(rows), sample, "ok"
+    except Exception as e:
+        return 0, None, f"exception:{e}"
+
 
 def run_sheet_mirror_parity_validator() -> Dict[str, Any]:
     if not _parity_enabled():
@@ -210,3 +272,50 @@ def run_sheet_mirror_parity_validator() -> Dict[str, Any]:
         "max_compare": max_compare,
         "ts": int(time.time()),
     }
+
+
+def _print_capstone_summary(result: Dict[str, Any], capstone: Dict[str, Any]) -> None:
+    # Minimal stdout reporting for shell usage
+    print("=== Phase 22B Capstone Verification ===")
+    print(f"parity_ok: {bool(result.get('ok'))} skipped: {bool(result.get('skipped', False))}")
+    print(f"tabs_configured: {result.get('tabs')} checked: {result.get('checked')} drift: {result.get('drift')}")
+    print("--- DB-only reconstruction test ---")
+    print(
+        f"tab={capstone.get('tab')} rows={capstone.get('rows')} reason={capstone.get('reason')}"
+    )
+    if capstone.get("sample"):
+        sample = capstone["sample"]
+        try:
+            s = json.dumps(sample, default=str)[:400]
+        except Exception:
+            s = str(sample)[:400]
+        print(f"sample: {s}")
+    print("======================================")
+
+
+if __name__ == "__main__":
+    # When run manually, do:
+    #  1) parity validator (normal)
+    #  2) DB-only reconstruction test (no Sheets fallback)
+    # Print to stdout and exit non-zero if DB-only reconstruction is empty.
+    try:
+        res = run_sheet_mirror_parity_validator()
+    except Exception as e:
+        print(f"❌ validator crashed: {e}")
+        raise
+
+    capstone_info: Dict[str, Any] = {"tab": None, "rows": 0, "sample": None, "reason": "not_run"}
+    try:
+        from db_read_adapter import get_records_prefer_db  # type: ignore
+        tabs = _get_tabs()
+        tab = _choose_capstone_tab(tabs) or "Wallet_Monitor"
+        n, sample, reason = _capstone_db_only_reconstruct(get_records_prefer_db, tab)
+        capstone_info = {"tab": tab, "rows": n, "sample": sample, "reason": reason}
+    except Exception as e:
+        capstone_info = {"tab": None, "rows": 0, "sample": None, "reason": f"imports_failed:{e}"}
+
+    _print_capstone_summary(res, capstone_info)
+
+    if capstone_info.get("rows", 0) <= 0:
+        # Make failure unambiguous in shell
+        raise SystemExit(2)
