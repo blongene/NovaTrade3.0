@@ -283,7 +283,7 @@ def _set_schedules():
     # Stalled safety
     _schedule("Stalled Asset Detector",       "stalled_asset_detector",      "run_stalled_asset_detector",    every=60, unit="minutes")
     _schedule("Stalled Autotrader (Shadow)",  "stalled_autotrader",          "run_stalled_autotrader_shadow", every=6, unit="hours")
-    _schedule("Sheet Mirror Parity Validator", "sheet_mirror_parity_validator", "run_sheet_mirror_parity_validator", every=6, units="hours")
+    _schedule("Sheet Mirror Parity Validator", "sheet_mirror_parity_validator", "run_sheet_mirror_parity_validator", every=6, unit="hours")
 
     # DB parity (Phase 22B)
     try:
