@@ -1,282 +1,299 @@
-#!/usr/bin/env python3
-# telemetry_digest.py — Phase 9D/18 bridge
-#
-# Pulls /api/telemetry/last (local) and:
-#   1. Writes a heartbeat row to NovaHeartbeat.
-#   2. Sends a tiny Telegram digest of per-venue stable balances.
-#
+# sheet_mirror_parity_validator.py
+"""
+Phase 22B — Module 9: Sheet Mirror Parity Validator
+
+Validates that DB mirror reconstruction (sheet_mirror_events) matches Google Sheets reads.
+Sheets remain primary; DB reads are advisory until parity is proven.
+
+Config:
+- DB_READ_JSON:
+    enabled: 1/0
+    parity_enabled: 1/0
+    notify: 1/0
+    max_rows: cap for DB reads
+    tabs: optional list override
+- Env fallback:
+    DB_READ_PARITY_TABS=Rotation_Log,Trade_Log
+    DB_READ_PARITY_MAX_COMPARE=200
+"""
+
+from __future__ import annotations
+
 import os
-from datetime import datetime, timezone
-from typing import Any, Dict, Tuple
+import json
+import time
+import logging
+import hashlib
+from typing import Any, Dict, List
 
-HEARTBEAT_WS = os.getenv("HEARTBEAT_WS", "NovaHeartbeat")
-HEARTBEAT_ALERT_MIN = int(os.getenv("HEARTBEAT_ALERT_MIN", "90"))  # minutes
-SHEET_URL = os.getenv("SHEET_URL", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+logger = logging.getLogger(__name__)
 
-# Optional one-shot housekeeping (can safely run on every boot)
-HEARTBEAT_TRIM_TAIL_ON_BOOT = os.getenv("HEARTBEAT_TRIM_TAIL_ON_BOOT", "1") in (
-    "1",
-    "true",
-    "True",
-)
+DEFAULT_TABS = [
+    "Rotation_Log",
+    "Rotation_Stats",
+    "Trade_Log",
+    "Wallet_Monitor",
+    "Unified_Snapshot",
+]
 
-STABLES = {"USD", "USDT", "USDC"}
+def _env_bool(name: str, default: str = "0") -> bool:
+    v = os.getenv(name, default)
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
-try:
-    from utils import (
-        get_gspread_client,
-        send_telegram_message_dedup,
-        warn,
-        info,
-    )
-except Exception:
-    # Very defensive fallbacks for tooling environments
-    def warn(msg: str) -> None:  # type: ignore
-        print("[WARN]", msg)
-
-    def info(msg: str) -> None:  # type: ignore
-        print("[INFO]", msg)
-
-    def get_gspread_client():  # type: ignore
-        raise RuntimeError("get_gspread_client unavailable")
-
-    def send_telegram_message_dedup(  # type: ignore
-        message: str, key: str, ttl_min: int = 15
-    ) -> None:
-        if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            return
-        print("[TG]", key, message)
-
-
-def _http_get(url: str) -> Dict[str, Any]:
-    import requests
-
-    try:
-        resp = requests.get(url, timeout=5)
-    except Exception as e:
-        warn(f"telemetry_digest: GET {url} failed: {e}")
+def _load_db_read_json() -> dict:
+    raw = (os.getenv("DB_READ_JSON") or "").strip()
+    if not raw:
         return {}
-
-    if resp.status_code != 200:
-        warn(f"telemetry_digest: {url} -> HTTP {resp.status_code}")
-        return {}
-
     try:
-        return resp.json()
-    except Exception as e:
-        warn(f"telemetry_digest: invalid JSON from {url}: {e}")
-        return {}
-
-
-def _open_or_create_worksheet(sh, name: str, headers) -> Any:
-    """Return a worksheet with a correct header row."""
-    try:
-        ws = sh.worksheet(name)
+        return json.loads(raw)
     except Exception:
-        ws = sh.add_worksheet(
-            title=name, rows=2000, cols=max(8, len(headers) + 2)
-        )
+        return {}
 
-    try:
-        first = ws.row_values(1)
-        if [h.strip() for h in first] != headers:
-            ws.update("1:1", [headers], value_input_option="USER_ENTERED")
-    except Exception:
-        ws.update("1:1", [headers], value_input_option="USER_ENTERED")
-    return ws
+_CFG = _load_db_read_json()
 
+def _cfg_get(key: str, default=None):
+    v = _CFG.get(key, default)
+    return default if v is None else v
 
-def _trim_tail(ws, key_col: int = 1) -> None:
-    """
-    Remove trailing empty rows after the last non-empty in key_col (default A).
+def _get_tabs() -> List[str]:
+    tabs = _cfg_get("tabs")
+    if isinstance(tabs, list) and tabs:
+        return [str(x).strip() for x in tabs if str(x).strip()]
+    env = (os.getenv("DB_READ_PARITY_TABS") or "").strip()
+    if env:
+        return [t.strip() for t in env.split(",") if t.strip()]
+    return list(DEFAULT_TABS)
 
-    This is designed to be safe and idempotent: if there is no trailing
-    empty region, it becomes a fast no-op.
-    """
-    try:
-        # All values in the key column (e.g., "Timestamp")
-        col_vals = ws.col_values(key_col)
-    except Exception as e:
-        warn(f"telemetry_digest: failed to read column {key_col}: {e!r}")
-        return
-
-    if not col_vals:
-        # Entire column empty; nothing to trim.
-        return
-
-    # Find index of last non-empty cell (1-based)
-    last = len(col_vals)
-    while last > 0 and not str(col_vals[last - 1]).strip():
-        last -= 1
-
-    if last == 0:
-        # No non-empty rows; nothing to do.
-        return
-
-    total = ws.row_count
-
-    # No gap after last data row => nothing to delete.
-    if total <= last:
-        return
-
-    start = last + 1
-    end = total
-
-    if start > end:
-        return
-
-    try:
-        ws.delete_rows(start, end)
-        warn(
-            f"telemetry_digest: trimmed tail rows {start}..{end} "
-            f"(row_count={total}, last_data_row={last})"
-        )
-    except Exception as e:
-        warn(f"telemetry_digest: trim tail failed: {e!r}")
-
-
-def _compute_stable_digest(
-    by_venue: Dict[str, Dict[str, float]]
-) -> Tuple[str, Dict[str, float]]:
-    """
-    Return:
-        digest_str, per_venue_totals
-
-    per_venue_totals[VENUE] = sum of USD+USDT+USDC balances for that venue.
-    """
-    totals: Dict[str, float] = {}
-    for venue, assets in by_venue.items():
-        if not isinstance(assets, dict):
+def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (row or {}).items():
+        kk = str(k).strip()
+        if not kk:
             continue
-        acc = 0.0
-        for sym, qty in assets.items():
-            try:
-                qf = float(qty or 0.0)
-            except Exception:
-                continue
-            if sym.upper() not in STABLES:
-                continue
-            acc += qf
-        if acc > 0:
-            totals[str(venue).upper()] = acc
-
-    if not totals:
-        return "no stable balances reported", totals
-
-    parts = [f"{v}={amt:.2f}" for v, amt in sorted(totals.items())]
-    return ", ".join(parts) + " (USD+USDT+USDC)", totals
+        if isinstance(v, float):
+            out[kk] = round(v, 10)
+        else:
+            out[kk] = v
+    return out
 
 
-def _send_tg(msg: str, key: str) -> None:
-    if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+def _ts_str(row: Dict[str, Any]) -> str:
+    return str(row.get("Timestamp") or row.get("timestamp") or "").strip()
+
+def _key_agent_venue_asset(row: Dict[str, Any]) -> Tuple[str, str, str]:
+    agent = str(row.get("Agent") or row.get("agent") or row.get("  Agent") or "").strip()
+    venue = str(row.get("Venue") or row.get("venue") or "").strip().upper()
+    asset = str(row.get("Asset") or row.get("asset") or "").strip().upper()
+    return (agent, venue, asset)
+
+def _latest_per_key(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Latest row per (Agent, Venue, Asset) based on Timestamp string."""
+    best: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    best_ts: Dict[Tuple[str, str, str], str] = {}
+    for r in rows or []:
+        rr = _normalize_row(r)
+        k = _key_agent_venue_asset(rr)
+        ts = _ts_str(rr)
+        if ts >= best_ts.get(k, ""):
+            best_ts[k] = ts
+            best[k] = rr
+    return [best[k] for k in sorted(best.keys())]
+
+def _project_wallet_monitor(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Wallet_Monitor parity should be stable across DB/SHEETS ordering & formatting.
+    Snapshot string formatting can differ (float formatting), so we exclude it from hashing.
+    """
+    r = _normalize_row(row)
+    out = {
+        "Timestamp": _ts_str(r),
+        "Agent": str(r.get("Agent") or r.get("  Agent") or "").strip(),
+        "Venue": str(r.get("Venue") or "").strip().upper(),
+        "Asset": str(r.get("Asset") or "").strip().upper(),
+        "Free": r.get("Free"),
+        "Locked": r.get("Locked"),
+        "Class": str(r.get("Class") or "").strip().upper(),
+    }
+    return out
+
+def _project_unified_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Unified_Snapshot rows are derived; compare on the same stable subset.
+    """
+    r = _normalize_row(row)
+    out = {
+        "Timestamp": _ts_str(r),
+        "Agent": str(r.get("Agent") or r.get("  Agent") or "").strip(),
+        "Venue": str(r.get("Venue") or "").strip().upper(),
+        "Asset": str(r.get("Asset") or "").strip().upper(),
+        "Free": r.get("Free"),
+        "Locked": r.get("Locked"),
+        "Class": str(r.get("Class") or "").strip().upper(),
+    }
+    return out
+
+def _row_hash(row: Dict[str, Any]) -> str:
+    s = json.dumps(_normalize_row(row), sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _should_notify() -> bool:
+    return bool(_cfg_get("notify", _env_bool("DB_READ_NOTIFY", "0")))
+
+def _parity_enabled() -> bool:
+    return bool(_cfg_get("parity_enabled", _env_bool("DB_READ_PARITY_ENABLED", "1")))
+
+def _max_compare() -> int:
     try:
-        send_telegram_message_dedup(msg, key=key)
-    except Exception as e:
-        warn(f"telemetry_digest: telegram send failed: {e}")
-
-
-def run_telemetry_digest() -> None:
-    if not SHEET_URL:
-        warn("SHEET_URL missing; abort.")
-        return
-
-    # 1) Pull telemetry snapshot from local Bus
-    port = os.getenv("PORT", "10000")
-    url = f"http://127.0.0.1:{port}/api/telemetry/last"
-    j = _http_get(url) or {}
-
-    age_sec = j.get("age_sec")
-    data = j.get("data") or {}
-    if not isinstance(data, dict):
-        warn("telemetry_digest: /api/telemetry/last returned no data")
-        return
-
-    agent = (
-        data.get("agent_id")
-        or data.get("agent")
-        or j.get("agent_id")
-        or j.get("agent")
-        or ""
-    )
-
-    by_venue = data.get("by_venue") or {}
-    if not isinstance(by_venue, dict):
-        by_venue = {}
-
-    # Compute human-readable stable digest
-    digest_str, per_venue = _compute_stable_digest(by_venue)
-
-    # 2) Append heartbeat row
-    try:
-        gc = get_gspread_client()
-        sh = gc.open_by_url(SHEET_URL)
-        headers = [
-            "Timestamp",
-            "Agent",
-            "Age_sec",
-            "Age_min",
-            "Digest",
-            "PerVenue_JSON",
-        ]
-        ws = _open_or_create_worksheet(sh, HEARTBEAT_WS, headers)
-
-        if HEARTBEAT_TRIM_TAIL_ON_BOOT:
-            _trim_tail(ws, key_col=1)
-
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
-
-        age_min = None
-        if isinstance(age_sec, (int, float)):
-            age_min = age_sec / 60.0
-
-        row = [
-            ts_str,
-            str(agent or ""),
-            age_sec if age_sec is not None else "",
-            f"{age_min:.1f}" if age_min is not None else "",
-            digest_str,
-            str(per_venue),
-        ]
-        ws.append_row(row, value_input_option="USER_ENTERED")
-        info(f"telemetry_digest: wrote heartbeat row for agent={agent}")
-    except Exception as e:
-        warn(f"heartbeat write failed: {e}")
-
-    # 3) Alert if stale
-    try:
-        if isinstance(age_sec, (int, float)):
-            age_min = age_sec / 60.0
-            if age_min > HEARTBEAT_ALERT_MIN:
-                _send_tg(
-                    f"⚠️ Edge heartbeat stale: {int(age_min)} min "
-                    f"(>{HEARTBEAT_ALERT_MIN} min)",
-                    key=f"hb:{int(age_min)}",
-                )
+        return int(os.getenv("DB_READ_PARITY_MAX_COMPARE") or "200")
     except Exception:
-        pass
+        return 200
 
-    # 4) Send a small daily telemetry digest to Telegram
+def _compare(tab: str, sheets_rows: List[Dict[str, Any]], db_rows: List[Dict[str, Any]], max_compare: int) -> Dict[str, Any]:
+    # Make parity meaningful for reconstructed streams:
+    # - Wallet_Monitor / Unified_Snapshot: compare latest-per-(Agent,Venue,Asset), order independent
+    if tab.strip() in ("Wallet_Monitor", "Unified_Snapshot"):
+        s_latest = _latest_per_key(sheets_rows)
+        d_latest = _latest_per_key(db_rows)
+        if tab.strip() == "Wallet_Monitor":
+            s_proj = [_project_wallet_monitor(r) for r in s_latest][:max_compare]
+            d_proj = [_project_wallet_monitor(r) for r in d_latest][:max_compare]
+        else:
+            s_proj = [_project_unified_snapshot(r) for r in s_latest][:max_compare]
+            d_proj = [_project_unified_snapshot(r) for r in d_latest][:max_compare]
+        s_hashes = [_row_hash(r) for r in s_proj]
+        d_hashes = [_row_hash(r) for r in d_proj]
+        s_set, d_set = set(s_hashes), set(d_hashes)
+        overlap = len(s_set & d_set)
+        only_s = len(s_set - d_set)
+        only_d = len(d_set - s_set)
+        s_keys = set().union(*[set(r.keys()) for r in s_proj]) if s_proj else set()
+        d_keys = set().union(*[set(r.keys()) for r in d_proj]) if d_proj else set()
+        return {
+            "tab": tab,
+            "sheets_n": len(sheets_rows),
+            "db_n": len(db_rows),
+            "overlap": overlap,
+            "only_sheets": only_s,
+            "only_db": only_d,
+            "missing_in_db_cols": sorted(list(s_keys - d_keys))[:50],
+            "extra_in_db_cols": sorted(list(d_keys - s_keys))[:50],
+        }
+
+    # Default behavior: simple hash compare on first N rows
+    s = sheets_rows[:max_compare]
+    d = db_rows[:max_compare]
+    s_hashes = [_row_hash(r) for r in s]
+    d_hashes = [_row_hash(r) for r in d]
+    s_set, d_set = set(s_hashes), set(d_hashes)
+
+    overlap = len(s_set & d_set)
+    only_s = len(s_set - d_set)
+    only_d = len(d_set - s_set)
+
+    def key_union(rows):
+        u = set()
+        for r in rows:
+            for k in (r or {}).keys():
+                kk = str(k).strip()
+                if kk:
+                    u.add(kk)
+        return u
+
+    s_keys = key_union(s)
+    d_keys = key_union(d)
+
+    return {
+        "tab": tab,
+        "sheets_n": len(sheets_rows),
+        "db_n": len(db_rows),
+        "overlap": overlap,
+        "only_sheets": only_s,
+        "only_db": only_d,
+        "missing_in_db_cols": sorted(list(s_keys - d_keys))[:50],
+        "extra_in_db_cols": sorted(list(d_keys - s_keys))[:50],
+    }
+
+def run_sheet_mirror_parity_validator() -> Dict[str, Any]:
+    if not _parity_enabled():
+        logger.info("sheet_mirror_parity_validator: parity disabled; skipping.")
+        return {"ok": True, "skipped": True}
+
     try:
-        if per_venue:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            _send_tg(
-                f"📊 Telemetry digest {today}: {digest_str}",
-                key=f"tel_digest:{today}",
-            )
+        import utils  # type: ignore
+        from db_read_adapter import get_records_prefer_db  # type: ignore
     except Exception as e:
-        warn(f"telemetry_digest: digest telegram failed: {e}")
+        logger.warning("sheet_mirror_parity_validator: imports failed; skipping: %s", e)
+        return {"ok": False, "skipped": True, "reason": "imports_failed"}
 
+    tabs = _get_tabs()
+    max_compare = _max_compare()
 
-if __name__ == "__main__":
-    run_telemetry_digest()
+    results: List[Dict[str, Any]] = []
+    drift: List[Dict[str, Any]] = []
 
+    for tab in tabs:
+        try:
+            sheets_rows = utils.get_all_records_cached(tab, ttl_s=120)
+        except Exception as e:
+            logger.warning("sheet_mirror_parity_validator: sheets read failed tab=%s err=%s", tab, e)
+            continue
 
-# ---- scheduler compatibility ----
+        try:
+            db_rows = get_records_prefer_db(
+                sheet_tab=tab,
+                logical_stream=f"sheet_mirror:{tab}",
+                ttl_s=120,
+                sheets_fallback_fn=utils.get_all_records_cached,
+            )
+        except Exception as e:
+            logger.warning("sheet_mirror_parity_validator: db read failed tab=%s err=%s", tab, e)
+            db_rows = []
 
-def run_daily_telemetry_digest():
-    """Compatibility alias expected by some schedulers."""
-    return run_telemetry_digest()
+        r = _compare(tab, sheets_rows, db_rows, max_compare=max_compare)
+        results.append(r)
+
+        count_gap = abs(int(r["sheets_n"]) - int(r["db_n"]))
+        col_drift = bool(r["missing_in_db_cols"] or r["extra_in_db_cols"])
+        overlap_min = max(1, int(min(len(sheets_rows), len(db_rows), max_compare) * 0.8))
+        overlap_ok = r["overlap"] >= overlap_min
+
+        if count_gap > 5 or (not overlap_ok) or col_drift:
+            drift.append(r)
+
+        logger.info(
+            "sheet_mirror_parity: tab=%s sheets=%s db=%s overlap=%s only_s=%s only_d=%s",
+            tab, r["sheets_n"], r["db_n"], r["overlap"], r["only_sheets"], r["only_db"]
+        )
+
+    if drift:
+        for r in drift[:10]:
+            logger.warning(
+                "sheet_mirror_parity_drift: tab=%s sheets=%s db=%s overlap=%s only_s=%s only_d=%s missing_cols=%s extra_cols=%s",
+                r["tab"], r["sheets_n"], r["db_n"], r["overlap"], r["only_sheets"], r["only_db"],
+                ",".join(r["missing_in_db_cols"][:10]) if r["missing_in_db_cols"] else "",
+                ",".join(r["extra_in_db_cols"][:10]) if r["extra_in_db_cols"] else "",
+            )
+
+        if _should_notify():
+            try:
+                msg_lines = ["⚠️ DB parity drift detected (sheet_mirror):"]
+                for r in drift[:8]:
+                    msg_lines.append(f"• {r['tab']}: sheets={r['sheets_n']} db={r['db_n']} overlap={r['overlap']}")
+                msg = "\n".join(msg_lines)
+                try:
+                    from telegram_notify import send_telegram_message  # type: ignore
+                    send_telegram_message(msg)
+                except Exception:
+                    if hasattr(utils, "send_telegram_message"):
+                        utils.send_telegram_message(msg)  # type: ignore
+            except Exception as e:
+                logger.warning("sheet_mirror_parity_validator: notify failed: %s", e)
+
+    return {
+        "ok": True,
+        "tabs": len(tabs),
+        "checked": len(results),
+        "drift": len(drift),
+        "max_compare": max_compare,
+        "ts": int(time.time()),
+    }
