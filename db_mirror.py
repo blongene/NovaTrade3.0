@@ -52,6 +52,9 @@ try:
 except Exception:  # pragma: no cover
     psycopg2 = None  # type: ignore
 
+# One-time per-boot observability
+_LOGGED_TABS: set[str] = set()
+
 # ----------------- helpers -----------------
 
 def _truthy(v: str | None) -> bool:
@@ -239,7 +242,19 @@ _MIRROR = _Mirror()
 # ----------------- public helpers -----------------
 
 def mirror_append(tab: str, rows: List[Any]) -> None:
-    _MIRROR.mirror_append(tab, rows)
+    _MIRROR.mirror_append(tab, rows, source="read")
 
 def mirror_rows(tab: str, rows: List[Any]) -> None:
-    _MIRROR.mirror_rows(tab, rows)
+    _MIRROR.mirror_rows(tab, rows, source="read")
+    # ---- observability: log once per tab per boot ----
+    try:
+        global _LOGGED_TABS
+        if tab not in _LOGGED_TABS:
+            _LOGGED_TABS.add(tab)
+            logger.info(
+                "🪞 sheet_mirror_events: mirrored rows tab=%s n=%s",
+                tab,
+                len(rows),
+            )
+    except Exception:
+        pass
