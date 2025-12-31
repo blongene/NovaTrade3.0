@@ -107,20 +107,6 @@ def _ensure_schema() -> None:
             );
             """
         )
-# Phase 24B: Idempotency — prevent duplicate receipts for the same (agent_id, cmd_id).
-# This allows safe retries of receipt ACKs without growing duplicates.
-try:
-    cur.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS nova_receipts_agent_cmd_uniq
-        ON nova_receipts (agent_id, cmd_id)
-        WHERE cmd_id IS NOT NULL;
-        """
-    )
-except Exception:
-    # Ignore schema/index issues; DB is best-effort and must never break the Bus.
-    pass
-
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS nova_telemetry (
@@ -132,6 +118,16 @@ except Exception:
             );
             """
         )
+        # Phase 24B: Idempotency — prevent duplicate receipts for the same (agent_id, cmd_id).
+        # Safe retries: /receipts/ack may be called multiple times.
+        try:
+            cur.execute(
+                "ALTER TABLE nova_receipts ADD CONSTRAINT nova_receipts_agent_cmd_uniq UNIQUE (agent_id, cmd_id);"
+            )
+        except Exception:
+            # Constraint may already exist; ignore. DB schema must never break the Bus.
+            pass
+
         _schema_initialized = True
     except Exception as e:
         print(f"[db_backbone] Failed to ensure schema: {e}")
