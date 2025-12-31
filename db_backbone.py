@@ -107,7 +107,6 @@ def _ensure_schema() -> None:
             );
             """
         )
-        
 # Phase 24B: Idempotency — prevent duplicate receipts for the same (agent_id, cmd_id).
 # This allows safe retries of receipt ACKs without growing duplicates.
 try:
@@ -122,7 +121,7 @@ except Exception:
     # Ignore schema/index issues; DB is best-effort and must never break the Bus.
     pass
 
-cur.execute(
+        cur.execute(
             """
             CREATE TABLE IF NOT EXISTS nova_telemetry (
                 id          BIGSERIAL PRIMARY KEY,
