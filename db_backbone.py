@@ -107,7 +107,22 @@ def _ensure_schema() -> None:
             );
             """
         )
-        cur.execute(
+        
+# Phase 24B: Idempotency — prevent duplicate receipts for the same (agent_id, cmd_id).
+# This allows safe retries of receipt ACKs without growing duplicates.
+try:
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS nova_receipts_agent_cmd_uniq
+        ON nova_receipts (agent_id, cmd_id)
+        WHERE cmd_id IS NOT NULL;
+        """
+    )
+except Exception:
+    # Ignore schema/index issues; DB is best-effort and must never break the Bus.
+    pass
+
+cur.execute(
             """
             CREATE TABLE IF NOT EXISTS nova_telemetry (
                 id          BIGSERIAL PRIMARY KEY,
@@ -207,6 +222,7 @@ def record_receipt(
                  venue, symbol, base, quote, notional_usd, payload)
             VALUES (%s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (agent_id, cmd_id) DO NOTHING
             """,
             (
                 agent_id,
