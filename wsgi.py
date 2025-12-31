@@ -907,12 +907,20 @@ def cmd_pull():
     agent = (body.get("agent_id") or "edge").strip()
     n     = int(body.get("limit") or 5)
 
+    from edge_authority import evaluate_agent, lease_block_response
+    
+    trusted, reason, age = evaluate_agent(agent)
+    if not trusted:
+        return jsonify(lease_block_response(agent))
+    
     if _cloud_hold_active():
         # Cloud hold stops dispatch; keep response 200 to avoid noisy retry loops.
         return jsonify({"ok": True, "commands": [], "lease_seconds": OUTBOX_LEASE_SECONDS, "hold": True, "reason": _cloud_hold_reason()})
 
     out = store.lease(agent, n)
-    return jsonify({"ok": True, "commands": out, "lease_seconds": OUTBOX_LEASE_SECONDS})
+    resp = lease_block_response(agent)
+    resp["lease_seconds"] = OUTBOX_LEASE_SECONDS
+    return jsonify(resp)
 
 def append_trade_log_safe(cmd_id, agent_id, receipt, status: str, ok_val: bool):
     """
