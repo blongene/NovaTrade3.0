@@ -78,6 +78,22 @@ DB_READ_TTL_S   = int(_cfg_get("ttl_s", os.getenv("DB_READ_TTL_S", "120") or "12
 DB_READ_MAX_ROWS = int(_cfg_get("max_rows", os.getenv("DB_READ_MAX_ROWS", "2000") or "2000"))
 DB_READ_STALE_SEC = int(_cfg_get("stale_sec", os.getenv("DB_READ_STALE_SEC", "900") or "900"))
 
+
+# Phase 23 — Module 12: selective DB-first (Sheets remain primary)
+# If DB_READ_JSON includes `prefer_db_tabs` (non-empty), then DB-first is only used for those sheet tabs
+# when reading `logical_stream='sheet_mirror:<TAB>'` via get_all_records_cached_dbaware.
+def _as_str_list(v):
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        return [str(x) for x in v if str(x).strip()]
+    # allow comma-separated string
+    if isinstance(v, str):
+        return [s.strip() for s in v.split(',') if s.strip()]
+    return [str(v)]
+
+DB_READ_PREFER_TABS = {s.strip().lower() for s in _as_str_list(_cfg_get('prefer_db_tabs', [])) if s.strip()}
+
 _DB_URL = os.getenv("DB_URL") or os.getenv("DATABASE_URL") or ""
 
 
@@ -340,10 +356,24 @@ def get_records_prefer_db(
     if sheets_fallback_fn is None:
         raise ValueError("sheets_fallback_fn is required (e.g., utils.get_all_records_cached)")
 
-    if not DB_READ_ENABLED or not DB_READ_PREFER:
+    if not DB_READ_ENABLED:
         return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
 
     base, tab = _parse_logical(logical_stream)
+
+    # DB-native streams should remain DB-first when enabled
+    db_native = base in ('commands', 'receipts', 'telemetry')
+
+    # For sheet_mirror:<TAB> reads, allowlist DB-first if prefer_db_tabs is provided
+    if base == 'sheet_mirror' and DB_READ_PREFER_TABS:
+        if (sheet_tab or '').strip().lower() not in DB_READ_PREFER_TABS:
+            return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
+
+    # Global preference gate (kept for backwards compatibility)
+    if not DB_READ_PREFER and not db_native:
+        return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
+
+    # continue DB path
     table = _choose_table(base)
     if not table:
         return sheets_fallback_fn(sheet_tab, ttl_s=ttl_s)
