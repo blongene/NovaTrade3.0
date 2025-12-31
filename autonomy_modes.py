@@ -79,7 +79,7 @@ def get_autonomy_state() -> Dict[str, Any]:
         edge_mode = "unknown"
 
     holds = {
-        "cloud": _bool_env("CLOUD_HOLD", False),
+        "cloud": (_bool_env("CLOUD_HOLD", False) or _dbread_cloud_hold()),
         "edge": _bool_env("EDGE_HOLD", False),
         "nova": _bool_env("NOVA_KILL", False),
     }
