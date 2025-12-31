@@ -52,6 +52,13 @@ except Exception:  # pragma: no cover
     def warn(msg: str) -> None:
         print(f"[stalled_asset_detector] WARN: {msg}")
 
+
+# Phase 23 — Module 12: DB-first reads (selective, safe fallback)
+try:
+    from utils import get_all_records_cached_dbaware  # type: ignore
+except Exception:  # pragma: no cover
+    get_all_records_cached_dbaware = None  # type: ignore
+
 # ==== Config ====
 
 SHEET_URL = os.getenv("SHEET_URL")
@@ -218,8 +225,15 @@ def load_wallet_balances(sh) -> List[Dict[str, Any]]:
     (venue, asset) key before classification.
     """
     try:
-        ws = _get_ws(sh, WALLET_MONITOR_TAB)
-        rows = ws.get_all_records()
+        rows = []
+        if get_all_records_cached_dbaware:
+            try:
+                rows = get_all_records_cached_dbaware(WALLET_MONITOR_WS, ttl_s=120, logical_stream=f"sheet_mirror:{WALLET_MONITOR_WS}")
+            except Exception:
+                rows = []
+        if not rows:
+            ws = _get_ws(sh, WALLET_MONITOR_TAB)
+            rows = ws.get_all_records()
 
         balances: List[Dict[str, Any]] = []
         for r in rows:
@@ -276,6 +290,34 @@ def load_last_trades(sh) -> Dict[Tuple[str, str], datetime]:
     except gspread.WorksheetNotFound:
         warn(f"Worksheet {TRADE_LOG_WS} not found; treating as no trade history")
         return {}
+
+
+    # Prefer DB-mirror reconstruction when available (reduces Sheets load).
+    if get_all_records_cached_dbaware:
+        try:
+            dict_rows = get_all_records_cached_dbaware(TRADE_LOG_WS, ttl_s=120, logical_stream=f"sheet_mirror:{TRADE_LOG_WS}")
+        except Exception:
+            dict_rows = []
+        if dict_rows:
+            last: Dict[Tuple[str, str], datetime] = {}
+            for rec in dict_rows:
+                rec = _normalize_record(rec)
+                ts_str = (rec.get('Timestamp') or rec.get('timestamp') or rec.get('Time') or rec.get('time') or '').strip()
+                venue = (rec.get('Venue') or rec.get('venue') or '').strip().upper()
+                symbol = (rec.get('Symbol') or rec.get('symbol') or rec.get('Market') or rec.get('market') or '').strip()
+                if not (ts_str and venue and symbol):
+                    continue
+                ts = _parse_ts(ts_str)
+                if ts is None:
+                    continue
+                base = _extract_base_from_symbol(symbol)
+                if not base:
+                    continue
+                key = (venue, base)
+                prev = last.get(key)
+                if prev is None or ts > prev:
+                    last[key] = ts
+            return last
 
     rows = ws.get_all_values()
     if not rows:
