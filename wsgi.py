@@ -152,6 +152,13 @@ def _require_json():
 # ========== Kill switches & Policy flags ==========
 CLOUD_HOLD     = _env_true("CLOUD_HOLD")
 NOVA_KILL      = _env_true("NOVA_KILL")
+try:
+    from kill_switches import cloud_hold_active as _cloud_hold_active, cloud_hold_reason as _cloud_hold_reason
+except Exception:  # ultra-safe fallback
+    def _cloud_hold_active():
+        return bool(NOVA_KILL or CLOUD_HOLD)
+    def _cloud_hold_reason():
+        return "NOVA_KILL" if NOVA_KILL else ("CLOUD_HOLD" if CLOUD_HOLD else "")
 ENABLE_POLICY  = _env_true("ENABLE_POLICY")
 POLICY_ENFORCE = _env_true("POLICY_ENFORCE")
 POLICY_PATH    = os.getenv("POLICY_PATH","policy.yaml")
@@ -642,8 +649,8 @@ def intent_enqueue():
     if REQUIRE_HMAC_OPS and not ok:
         return jsonify(ok=False, error="invalid_signature"), 401
 
-    if NOVA_KILL or CLOUD_HOLD:
-        return jsonify(ok=False, error="bus_killed"), 503
+    if _cloud_hold_active():
+        return jsonify(ok=False, error="bus_killed", reason=_cloud_hold_reason()), 503
 
     # minimal schema
     req = ["agent_target","symbol","side","amount"]
@@ -899,6 +906,10 @@ def cmd_pull():
 
     agent = (body.get("agent_id") or "edge").strip()
     n     = int(body.get("limit") or 5)
+
+    if _cloud_hold_active():
+        # Cloud hold stops dispatch; keep response 200 to avoid noisy retry loops.
+        return jsonify({"ok": True, "commands": [], "lease_seconds": OUTBOX_LEASE_SECONDS, "hold": True, "reason": _cloud_hold_reason()})
 
     out = store.lease(agent, n)
     return jsonify({"ok": True, "commands": out, "lease_seconds": OUTBOX_LEASE_SECONDS})
