@@ -221,6 +221,10 @@ def run_sheet_mirror_parity_validator() -> Dict[str, Any]:
     try:
         import utils  # type: ignore
         from db_read_adapter import get_records_prefer_db  # type: ignore
+        try:
+            from parity_auto_heal import maybe_auto_heal as _maybe_auto_heal  # type: ignore
+        except Exception:
+            _maybe_auto_heal = None
     except Exception as e:
         logger.warning("sheet_mirror_parity_validator: imports failed; skipping: %s", e)
         return {"ok": False, "skipped": True, "reason": "imports_failed"}
@@ -259,6 +263,12 @@ def run_sheet_mirror_parity_validator() -> Dict[str, Any]:
 
         if count_gap > 5 or (not overlap_ok) or col_drift:
             drift.append(r)
+            # Phase 23 — Module 11 (OFF by default): one-shot parity auto-heal
+            if _maybe_auto_heal is not None:
+                try:
+                    _maybe_auto_heal(tab=tab, sheets_rows=sheets_rows, drift_record=r)
+                except Exception:
+                    pass
 
         logger.info(
             "sheet_mirror_parity: tab=%s sheets=%s db=%s overlap=%s only_s=%s only_d=%s",
