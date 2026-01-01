@@ -1288,6 +1288,12 @@ def _start_daily():
     log.info("Daily report scheduled for %02d:%02d UTC", DAILY_UTC_HOUR, DAILY_UTC_MIN)
 _start_daily()
 
+try:
+    from phase25_decision_only import start_phase25_background_loop
+    start_phase25_background_loop()
+except Exception:
+    pass
+
 # --- Sheets helpers ---------------------------------------------------------
 def _get_gspread():
     import gspread
