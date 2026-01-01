@@ -14,7 +14,6 @@ def _venue_symbol_remap(base: str, quote: str, venue: str):
 
 
 # router.py — Phase 7C + Phase 10 Predictive Bias (fixed symbol parsing)
-from __future__ import annotations
 import os, re, time
 from typing import Dict, Any, Tuple, Optional
 
