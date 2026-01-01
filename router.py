@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 # --- Optional venue alias normalization ---
 _KRAKEN_BASE_ALIASES = {"BTC": "XBT"}
