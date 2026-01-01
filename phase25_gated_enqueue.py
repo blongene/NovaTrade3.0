@@ -32,7 +32,7 @@ Config (DB_READ_JSON.phase25)
     "approve": 0,                      # flip to 1 for a window, then back to 0
     "allow_types": ["SCAN"],           # allowed plan item types
     "notify": 1,
-    "agent_id": "edge-primary,edge-nl1"
+    "agent_id": "edge-primary"
   }
 }
 
@@ -42,7 +42,8 @@ Notes
 """
 
 from __future__ import annotations
-
+import hashlib
+import hmac
 import json
 import os
 import threading
@@ -283,52 +284,173 @@ def _run_planner_once() -> Optional[Dict[str, Any]]:
         return None
 
 
+def _bus_base_url() -> str:
+    """
+    Base URL used ONLY for HTTP fallbacks.
+    For in-process enqueue, we don't need it.
+    """
+    return (
+        os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("BASE_URL")
+        or os.getenv("CLOUD_BASE_URL")
+        or os.getenv("BUS_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+
+
+def _hmac_sha256_hex(secret: str, body_bytes: bytes) -> str:
+    return hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+
+
+def _signed_post_json(url: str, payload: Dict[str, Any], secret_env: str, header_name: str) -> Optional[Dict[str, Any]]:
+    """
+    POST JSON with stable bytes and an HMAC signature header.
+    Returns JSON dict on success, else None.
+    """
+    secret = (os.getenv(secret_env) or "").strip()
+    if not secret:
+        return None
+
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    sig = _hmac_sha256_hex(secret, body)
+
+    headers = {
+        "Content-Type": "application/json",
+        header_name: sig,
+        # extra belt-and-suspenders (harmless if ignored)
+        "X-OUTBOX-SIGNATURE": sig,
+    }
+
+    try:
+        import requests  # local import to avoid hard dependency at import-time
+        r = requests.post(url, data=body, headers=headers, timeout=10)
+        if r.status_code >= 400:
+            return None
+        try:
+            return r.json()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _http_outbox_enqueue(commands: List[Dict[str, Any]], agent: str) -> List[str]:
+    """
+    Best-effort HTTP enqueue fallback.
+    Tries common endpoints + payload shapes.
+    Returns list of cmd_ids enqueued.
+    """
+    base = _bus_base_url()
+    if not base:
+        return []
+
+    # Ensure cmd_ids exist
+    for c in commands:
+        cmd_id = c.get("cmd_id") or c.get("command_id")
+        if not cmd_id:
+            cmd_id = os.urandom(8).hex()
+            c["cmd_id"] = cmd_id
+
+    # Try a few likely endpoints + payload shapes.
+    tries: List[tuple[str, Dict[str, Any], str]] = [
+        ("/api/outbox/enqueue", {"agent_id": agent, "commands": commands}, "X-OUTBOX-SIGN"),
+        ("/api/outbox/enqueue", {"agent": agent, "commands": commands}, "X-OUTBOX-SIGN"),
+        ("/api/outbox/enqueue", {"agent_id": agent, "items": commands}, "X-OUTBOX-SIGN"),
+        ("/api/commands/enqueue", {"agent_id": agent, "commands": commands}, "X-OUTBOX-SIGN"),
+        ("/api/outbox/push", {"agent_id": agent, "commands": commands}, "X-OUTBOX-SIGN"),
+    ]
+
+    for path, payload, header in tries:
+        url = base + path
+        out = _signed_post_json(url, payload, secret_env="OUTBOX_SECRET", header_name=header)
+        if not isinstance(out, dict):
+            continue
+
+        # Accept multiple response formats
+        for key in ("enqueued", "cmd_ids", "ids", "commands", "items"):
+            val = out.get(key)
+            if isinstance(val, list) and val:
+                ids: List[str] = []
+                for x in val:
+                    if isinstance(x, str):
+                        ids.append(x)
+                    elif isinstance(x, dict):
+                        cid = x.get("cmd_id") or x.get("command_id") or x.get("id")
+                        if cid:
+                            ids.append(str(cid))
+                if ids:
+                    return ids
+
+        # Some endpoints just return {"ok":true}
+        if out.get("ok") is True:
+            return [str(c.get("cmd_id") or "") for c in commands if c.get("cmd_id")]
+
+    return []
+
+
 def _outbox_enqueue(commands: List[Dict[str, Any]], agent: str) -> List[str]:
     """
     Best-effort enqueue to outbox.
-    Supports multiple internal implementations without breaking.
+    1) Try to discover in-process outbox/command store and enqueue directly.
+    2) Fallback to signed HTTP enqueue using OUTBOX_SECRET.
     Returns list of enqueued cmd_ids.
     """
     ids: List[str] = []
 
-    # Prefer a dedicated outbox store if present
+    # ---- (1) in-process store discovery (expanded) ----
     store = None
     for mod, attr in [
+        ("api_commands", "store"),
+        ("api_commands", "command_store"),
+        ("api_commands", "COMMAND_STORE"),
         ("command_outbox", "store"),
         ("outbox_store", "store"),
         ("outbox", "store"),
+        ("wsgi", "store"),
     ]:
         try:
             m = __import__(mod, fromlist=[attr])
-            store = getattr(m, attr, None)
-            if store:
+            cand = getattr(m, attr, None)
+            if cand:
+                store = cand
                 break
         except Exception:
             continue
 
-    # Many codebases expose store.lease / store.enqueue / store.put
     if store:
         for c in commands:
             try:
-                # normalize command_id
                 cmd_id = c.get("cmd_id") or c.get("command_id") or ""
                 if not cmd_id:
                     cmd_id = os.urandom(8).hex()
                     c["cmd_id"] = cmd_id
-                # try common methods
+
+                # Try multiple method signatures defensively
                 if hasattr(store, "enqueue"):
-                    store.enqueue(agent, c)
+                    try:
+                        store.enqueue(agent, c)
+                    except TypeError:
+                        store.enqueue(c)
                 elif hasattr(store, "put"):
-                    store.put(agent, c)
+                    try:
+                        store.put(agent, c)
+                    except TypeError:
+                        store.put(c)
+                elif hasattr(store, "add"):
+                    store.add(c)
+                elif hasattr(store, "insert"):
+                    store.insert(c)
                 else:
-                    # unknown store interface
                     raise RuntimeError("unknown outbox store interface")
+
                 ids.append(cmd_id)
             except Exception:
                 continue
-        return ids
 
-    # Fallback: if there's a function enqueue_command(payload) style
+        if ids:
+            return ids
+
+    # ---- (2) function-style fallback (kept) ----
     for fn_name in ("enqueue_command", "enqueue_outbox", "outbox_enqueue"):
         try:
             m = __import__("db_backbone", fromlist=[fn_name])
@@ -342,12 +464,18 @@ def _outbox_enqueue(commands: List[Dict[str, Any]], agent: str) -> List[str]:
                         ids.append(cmd_id)
                     except Exception:
                         pass
-                return ids
+                if ids:
+                    return ids
         except Exception:
             continue
 
+    # ---- (3) signed HTTP fallback using OUTBOX_SECRET ----
+    http_ids = _http_outbox_enqueue(commands, agent)
+    if http_ids:
+        return http_ids
+
     # No outbox available
-    return ids
+    return []
 
 
 def _plan_to_commands(plan: Dict[str, Any], agent: str) -> List[Dict[str, Any]]:
