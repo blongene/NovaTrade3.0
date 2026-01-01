@@ -1294,6 +1294,12 @@ try:
 except Exception:
     pass
 
+try:
+    from phase25_planning_only import start_phase25b_background_loop
+    start_phase25b_background_loop()
+except Exception:
+    pass
+
 # --- Sheets helpers ---------------------------------------------------------
 def _get_gspread():
     import gspread
