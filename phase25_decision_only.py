@@ -146,7 +146,6 @@ def _read_hot_path(tab: str, limit: int = 200) -> Dict[str, Any]:
         rows = get_records_prefer_db(
             tab,
             f"sheet_mirror:{tab}",
-            ttl_s=None,
             sheets_fallback_fn=lambda: get_records_cached(tab),
         )
         if not rows:
