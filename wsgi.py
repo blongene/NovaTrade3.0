@@ -888,41 +888,77 @@ def add_server_timing_header(response):
     response.headers["Server-Timing"] = f"app;dur={delta:.2f}"
     return response
            
+
 # Edge pulls leased commands
 @flask_app.post("/api/commands/pull")
 def cmd_pull():
-    # Robust verify
+    # Robust verify (expects HMAC under X-OUTBOX-SIGN using OUTBOX_SECRET)
     ok, body, provided, expected = _verify_hmac_json("OUTBOX_SECRET", "X-OUTBOX-SIGN")
     if not ok:
+        log.error("cmd_pull: invalid HMAC provided=%s expected=%s", provided, expected)
         return (
-            jsonify({
-                "ok": False,
-                "error": "invalid_signature",
-                "provided": provided,
-                "expected": expected
-            }), 
-            401
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "invalid_signature",
+                    "provided": provided,
+                    "expected": expected,
+                }
+            ),
+            401,
         )
 
-    agent = (body.get("agent_id") or "edge").strip()
-    n     = int(body.get("limit") or 5)
+    agent = (body.get("agent_id") or body.get("agent") or body.get("agent_target") or "edge").strip()
+    try:
+        n = int(body.get("limit") or body.get("max_items") or body.get("n") or 5)
+    except Exception:
+        n = 5
+    n = max(1, min(n, 25))
 
-    from edge_authority import evaluate_agent, lease_block_response
-    
+    # Phase 24C+ trust boundary
     trusted, reason, age = evaluate_agent(agent)
-    if not trusted:
-        return jsonify(lease_block_response(agent))
-    
+
+    # If cloud hold is active, stop dispatch (keep 200 to avoid retry storms)
     if _cloud_hold_active():
-        # Cloud hold stops dispatch; keep response 200 to avoid noisy retry loops.
-        return jsonify({"ok": True, "commands": [], "lease_seconds": OUTBOX_LEASE_SECONDS, "hold": True, "reason": _cloud_hold_reason()})
+        return jsonify(
+            {
+                "ok": True,
+                "commands": [],
+                "lease_seconds": OUTBOX_LEASE_SECONDS,
+                "hold": True,
+                "reason": _cloud_hold_reason(),
+                "agent_id": agent,
+                "age_sec": age,
+            }
+        )
 
-    out = store.lease(agent, n)
-    resp = lease_block_response(agent)
-    resp["lease_seconds"] = OUTBOX_LEASE_SECONDS
-    return jsonify(resp)
+    # If edge authority is enabled and agent is not trusted, do not dispatch.
+    if not trusted:
+        resp = lease_block_response(agent)
+        resp["lease_seconds"] = OUTBOX_LEASE_SECONDS
+        return jsonify(resp)
 
-def append_trade_log_safe(cmd_id, agent_id, receipt, status: str, ok_val: bool):
+    # Lease commands for this agent
+    try:
+        out = store.lease(agent, n) or []
+    except Exception as e:
+        log.exception("cmd_pull: lease error agent=%s", agent)
+        return jsonify({"ok": False, "error": f"lease_error: {e}"}), 500
+
+    return jsonify(
+        {
+            "ok": True,
+            "commands": out,
+            "lease_seconds": OUTBOX_LEASE_SECONDS,
+            "hold": False,
+            "reason": reason,
+            "agent_id": agent,
+            "age_sec": age,
+        }
+    )
+
+
+def append_trade_log_safe(cmd_id, agent_id, receipt, status: str, ok_val: bool):(cmd_id, agent_id, receipt, status: str, ok_val: bool):
     """
     Best-effort logging of edge receipts into Trade_Log.
 
