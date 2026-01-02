@@ -958,7 +958,7 @@ def cmd_pull():
     )
 
 
-def append_trade_log_safe(cmd_id, agent_id, receipt, status: str, ok_val: bool):(cmd_id, agent_id, receipt, status: str, ok_val: bool):
+def append_trade_log_safe(cmd_id, agent_id, receipt, status: str, ok_val: bool):
     """
     Best-effort logging of edge receipts into Trade_Log.
 
