@@ -135,11 +135,16 @@ def evaluate_agent(agent_id: str) -> Tuple[bool, str, Optional[int]]:
 
 
 def lease_block_response(agent_id: str) -> Dict[str, Any]:
+    """Standard response shape for /api/commands/pull when dispatch is blocked.
+
+    NOTE: If the agent is trusted, this function returns hold=False. This makes the
+    helper safe even if called in a success path by mistake.
+    """
     trusted, reason, age = evaluate_agent(agent_id)
     return {
         "ok": True,
         "commands": [],
-        "hold": True,
+        "hold": (not trusted),
         "reason": reason,
         "agent_id": agent_id,
         "age_sec": age,
