@@ -71,13 +71,13 @@ class PGStore:
                        attempts=attempts+1
                  where id in (
                    select id from commands
-                    where status='queued'
+                    where status='queued' and agent_id=%s
                     order by id asc
                     limit %s
                     for update skip locked
                  )
                 returning id, intent
-            """, (agent_id, exp, limit))
+            """, (agent_id, exp, agent_id, limit))
             rows = cur.fetchall() or []
             return [{"id": r["id"], "intent": r["intent"]} for r in rows]
 
