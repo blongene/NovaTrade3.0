@@ -13,6 +13,7 @@ from sheets_bp import SHEETS_ROUTES, start_background_flusher
 from telemetry_routes import bp_telemetry
 from autonomy_modes import get_autonomy_state
 from ops_api import bp as ops_bp
+from edge_authority import evaluate_agent, lease_block_response
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
