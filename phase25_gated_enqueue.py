@@ -479,36 +479,74 @@ def _outbox_enqueue(commands: List[Dict[str, Any]], agent: str) -> List[str]:
 
 
 def _plan_to_commands(plan: Dict[str, Any], agent: str) -> List[Dict[str, Any]]:
+    """
+    Convert a Phase 25B plan into Outbox intents.
+
+    Supported plan items (if enabled/approved):
+    - TRADE: becomes an Edge trade intent (venue/symbol/side/amount_usd/mode)
+    - SCAN + ROTATION_SCAN: legacy safe no-op-ish command (kept for backward compat)
+
+    NOTE: Enqueue is still gated by enqueue_enabled(), approval flags, and caps.
+    """
     allowed = set(allow_types())
     proposed = plan.get("proposed") or []
     if not isinstance(proposed, list):
         return []
     cmds: List[Dict[str, Any]] = []
+
+    plan_id = str(plan.get("plan_id") or plan.get("id") or "").strip() or "plan"
+    force_mode = str(_cfg("phase25.force_mode", "") or "").strip().lower() or None
+
     for idx, item in enumerate(proposed):
         if not isinstance(item, dict):
             continue
         typ = str(item.get("type") or "").strip().upper()
         if typ not in allowed:
             continue
-        # Build a minimal command payload the Edge understands (generic intent)
-        # We keep it ultra-safe: ROTATION_SCAN only.
+
+        if typ == "TRADE":
+            token = str(item.get("token") or "").strip().upper()
+            venue = str(item.get("venue") or "").strip().upper()
+            quote = str(item.get("quote") or "").strip().upper()
+            action = str(item.get("action") or "").strip().upper()
+            side = "BUY" if action not in ("SELL", "BUY") else action
+            amt = item.get("amount_usd")
+            try:
+                amt_f = float(amt) if amt is not None else 0.0
+            except Exception:
+                amt_f = 0.0
+            if not token or not venue or not quote or amt_f <= 0:
+                continue
+
+            mode = force_mode or str(item.get("mode") or "dryrun").strip().lower()
+            intent = {
+                "venue": venue,
+                "symbol": f"{token}/{quote}",
+                "side": side,
+                "amount_usd": amt_f,
+                "mode": mode,
+                "source": "phase25",
+                "policy_id": plan_id,
+                "client_id": f"phase25-{plan_id}-{idx}-{venue}-{token}-{quote}-{side.lower()}",
+            }
+            cmds.append(intent)
+            continue
+
+        # Legacy: SCAN/ROTATION_SCAN (kept ultra-safe)
         action = str(item.get("action") or "").strip().upper()
         if action != "ROTATION_SCAN":
             continue
-
-        plan_id = str(plan.get("plan_id") or "")
-        cmd_id = f"p25c_{plan_id}_{idx}"
-
         cmds.append({
-            "cmd_id": cmd_id,
-            "agent_id": agent,
-            "type": "SCAN",
-            "action": "ROTATION_SCAN",
-            "mode": os.getenv("EDGE_MODE") or "",  # optional hint; edge still uses its own env
-            "source": "phase25_gated_enqueue",
-            "plan_id": plan_id,
-            "item_index": idx,
+            "venue": "BUS",  # not executed as trade
+            "symbol": "ROTATION_SCAN",
+            "side": "BUY",
+            "amount_usd": 0.0,
+            "mode": "dryrun",
+            "source": "phase25",
+            "policy_id": plan_id,
+            "client_id": f"phase25-{plan_id}-{idx}-rotation-scan",
         })
+
     return cmds
 
 
