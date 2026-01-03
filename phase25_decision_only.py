@@ -158,6 +158,11 @@ def _read_hot_path(tab: str, limit: int = 200) -> Dict[str, Any]:
 
 
 def build_decision() -> Dict[str, Any]:
+    """
+    Phase 25A decision record builder.
+
+    Goal: produce *human-readable*, low-noise "would do" records without enqueueing or writing to Sheets.
+    """
     agent = _get_agent_id()
     auth = _edge_authority(agent)
     cloud_hold = _cloud_hold_active()
@@ -165,22 +170,44 @@ def build_decision() -> Dict[str, Any]:
     wallet = _read_hot_path("Wallet_Monitor", limit=200)
     trades = _read_hot_path("Trade_Log", limit=200)
 
+    # Vault Intelligence signals (read-only)
+    signals = []
+    sig_err = None
+    try:
+        from phase25_vault_signals import compute_vault_signals  # type: ignore
+
+        signals, sig_err = compute_vault_signals(max_items=25)
+    except Exception as e:
+        sig_err = f"{e.__class__.__name__}:{e}"
+
     # Decision framing (Phase 25A: NO COMMANDS)
     ok = (not cloud_hold) and auth.get("trusted", False)
-    recommendation = "NOOP" if ok else "HOLD"
+
+    # Recommendation is informational, not an action.
+    if not ok:
+        recommendation = "HOLD"
+    else:
+        if any(s.get("type") == "SELL_CANDIDATE" for s in signals):
+            recommendation = "WOULD_SELL"
+        elif any(s.get("type") == "REBUY_CANDIDATE" for s in signals):
+            recommendation = "WOULD_REBUY"
+        else:
+            recommendation = "NOOP"
 
     reasons = []
     if cloud_hold:
         reasons.append("CLOUD_HOLD=1")
     if not auth.get("trusted", False):
-        reasons.append(f"EDGE_AUTH:{auth.get('reason')}")
-    if "error" in wallet:
-        reasons.append("WALLET_READ_ERROR")
-    if "error" in trades:
-        reasons.append("TRADELOG_READ_ERROR")
+        reasons.append("EDGE_AUTHORITY=untrusted")
+    if sig_err:
+        reasons.append(f"signals_error={sig_err}")
 
-    if not reasons:
-        reasons.append("phase25A_decision_only")
+    # Lightweight summary for human scanning (kept short)
+    summary = {
+        "sell": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="SELL_CANDIDATE"][:5],
+        "rebuy": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="REBUY_CANDIDATE"][:5],
+        "watch": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="WATCH"][:5],
+    }
 
     decision_id = os.urandom(8).hex()
 
@@ -193,6 +220,8 @@ def build_decision() -> Dict[str, Any]:
         "agent_id": agent,
         "recommendation": recommendation,
         "reasons": reasons,
+        "summary": summary,
+        "signals": signals,  # full list (still small)
         "inputs": {
             "edge_authority": auth,
             "cloud_hold": cloud_hold,
