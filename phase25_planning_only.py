@@ -35,6 +35,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List
+from utils import str_or_empty, safe_float  # type: ignore
 
 
 _LOG_ONCE = set()
@@ -119,65 +120,166 @@ def _safe_json(obj: Any) -> str:
 
 
 def _derive_simple_plan(decision: Dict[str, Any]) -> Dict[str, Any]:
-    # Heuristic plan builder. Conservative by default.
+    """
+    Convert a Phase 25A decision record into a Phase 25B "plan object".
+
+    IMPORTANT:
+    - This creates *proposed* intents only.
+    - It does not enqueue anything (Phase25C handles that, and is OFF by default).
+    """
     decision_id = decision.get("decision_id") or ""
     agent_id = decision.get("agent_id") or ""
     ok = bool(decision.get("ok"))
     rec = (decision.get("recommendation") or "HOLD").upper()
     reasons = decision.get("reasons") or []
+    signals = decision.get("signals") or []
 
-    # Extract a couple inputs (best-effort)
-    inputs = decision.get("inputs") or {}
-    wallet = inputs.get("wallet_monitor") or {}
-    last_wallet = wallet.get("last") or {}
-    free = None
-    asset = None
-    try:
-        free = float(last_wallet.get("Free")) if last_wallet.get("Free") is not None else None
-        asset = str(last_wallet.get("Asset") or "")
-    except Exception:
-        pass
+    ts = _now_ts()
+    plan_id = os.urandom(8).hex()
 
-    proposed: List[Dict[str, Any]] = []
+    proposed = []
     mode = "planning_only"
 
-    if not ok or rec == "HOLD":
+    if (not ok) or (rec == "HOLD"):
         proposed = []
         mode = "hold"
     else:
-        # Conservative default: produce a "SCAN" intent only, not a trade.
+        # Conservative sizing caps (env override)
+        max_trade_usd = float(os.getenv("PHASE25_MAX_TRADE_USD", os.getenv("POLICY_CANARY_MAX_USD", "25")))
+        prefer_venues = (os.getenv("ROUTER_ALLOWED", "COINBASE,BINANCEUS,KRAKEN").split(",") if os.getenv("ROUTER_ALLOWED") else ["COINBASE","BINANCEUS","KRAKEN"])
+        prefer_venues = [v.strip().upper() for v in prefer_venues if v.strip()]
+
+        # Best-effort prefer quote map from policy_engine (if available)
+        prefer_quotes = {}
+        try:
+            from policy_engine import PolicyEngine  # type: ignore
+            pe = PolicyEngine()
+            prefer_quotes = (pe.cfg.get("prefer_quotes") or {})
+        except Exception:
+            prefer_quotes = {}
+
+        # Build a quick position USD map from Vaults (read-only)
+        pos_usd = {}
+        try:
+            from phase25_vault_signals import VAULT_TAB, _read_records_prefer_db  # type: ignore
+            for r in _read_records_prefer_db(VAULT_TAB) or []:
+                tok = str_or_empty(r.get("Token") or r.get("token") or r.get("Asset")).upper()
+                if not tok:
+                    continue
+                v = safe_float(r.get("USD Value") or r.get("usd_value") or r.get("Value_USD") or r.get("Value"))
+                if v is None:
+                    continue
+                pos_usd[tok] = float(v)
+        except Exception:
+            pass
+
+        def _pick_venue_quote(token: str) -> tuple[str, str]:
+            venue = prefer_venues[0] if prefer_venues else "BINANCEUS"
+            quote = (prefer_quotes.get(venue) or os.getenv("DEFAULT_QUOTE") or "USDT").upper()
+            return venue, quote
+
+        # Translate signals -> proposed TRADE intents (still evaluated by policy/guard)
+        # Order: SELL first, then REBUY. Cap count.
+        ordered = []
+        for s in signals:
+            if not isinstance(s, dict):
+                continue
+            typ = (s.get("type") or "").upper()
+            if typ in ("SELL_CANDIDATE","REBUY_CANDIDATE"):
+                ordered.append(s)
+        # stable sort
+        ordered.sort(key=lambda s: (0 if (s.get("type") or "").upper()=="SELL_CANDIDATE" else 1, -float(s.get("confidence") or 0.0)))
+
+        for s in ordered:
+            typ = (s.get("type") or "").upper()
+            token = (s.get("token") or "").upper()
+            if not token:
+                continue
+
+            venue, quote = _pick_venue_quote(token)
+            action = "SELL" if typ=="SELL_CANDIDATE" else "BUY"
+            # sizing: sell up to position usd; rebuy up to cap
+            amt = max_trade_usd
+            if action == "SELL":
+                amt = min(max_trade_usd, float(pos_usd.get(token) or max_trade_usd))
+
+            item = {
+                "type": "TRADE",
+                "action": action,
+                "token": token,
+                "venue": venue,
+                "quote": quote,
+                "amount_usd": float(max(0.0, amt)),
+                "mode": "dryrun",
+                "reason": "phase25B_plan",
+                "decision_id": decision_id,
+            }
+            proposed.append(item)
+
+            # Keep it small; Phase25C has additional caps too.
+            if len(proposed) >= int(os.getenv("PHASE25_PLAN_MAX_ITEMS", "3")):
+                break
+
+        # Always include a low-risk BALANCE_SNAPSHOT (helps validate budgets)
         proposed.append({
-            "type": "SCAN",
-            "action": "ROTATION_SCAN",
+            "type": "BALANCE_SNAPSHOT",
+            "action": "BALANCE_SNAPSHOT",
             "agent_id": agent_id,
-            "reason": "phase25B_planning_only"
+            "reason": "phase25B_plan"
         })
 
-        # Optional gentle heuristic: if we see a USD/USDT free balance, suggest a small *candidate* buy,
-        # but keep amount_usd=0 unless explicitly enabled later in Phase 25C.
-        if free is not None and free > 25 and asset in {"USD", "USDT", "USDC"}:
-            proposed.append({
-                "type": "TRADE_CANDIDATE",
-                "action": "BUY",
-                "venue": "",
-                "symbol": "",
-                "amount_usd": 0,
-                "reason": f"found_free_{asset}>{free:.2f}_candidate_only"
-            })
+    # Evaluate each proposed item through guard + policy (for explanations)
+    evaluated = []
+    for it in proposed:
+        if not isinstance(it, dict):
+            continue
+        typ = str(it.get("type") or "").upper()
+        if typ != "TRADE":
+            evaluated.append(it)
+            continue
 
-    plan_id = os.urandom(8).hex()
+        legacy_intent = {
+            "token": (it.get("token") or "").upper(),
+            "action": (it.get("action") or "BUY").upper(),
+            "amount_usd": it.get("amount_usd"),
+            "venue": (it.get("venue") or "").upper(),
+            "quote": (it.get("quote") or "").upper(),
+            "source": "phase25_plan",
+            "id": f"p25-{plan_id}",
+        }
+
+        guard = None
+        pol = None
+        try:
+            from trade_guard import guard_trade_intent  # type: ignore
+            guard = guard_trade_intent(legacy_intent)
+        except Exception as e:
+            guard = {"ok": False, "status": "error", "reason": f"guard_error:{e.__class__.__name__}:{e}"}
+
+        try:
+            from policy_engine import PolicyEngine  # type: ignore
+            pe = PolicyEngine()
+            ok2, reason2, patched2 = pe.validate(legacy_intent, None)
+            pol = {"ok": bool(ok2), "reason": str(reason2), "patched": patched2 or {}}
+        except Exception as e:
+            pol = {"ok": False, "reason": f"policy_error:{e.__class__.__name__}:{e}", "patched": {}}
+
+        it2 = dict(it)
+        it2["guard"] = guard
+        it2["policy"] = pol
+        evaluated.append(it2)
+
     return {
-        "ok": True,
+        "ok": bool(ok),
         "plan_id": plan_id,
-        "ts": _now_ts(),
+        "ts": ts,
         "phase": "25B",
         "mode": mode,
-        "enqueue": False,
-        "decision_id": decision_id,
         "agent_id": agent_id,
-        "summary": rec,
+        "decision_id": decision_id,
+        "recommendation": rec,
         "reasons": reasons,
-        "proposed": proposed,
+        "proposed": evaluated,
     }
 
 
