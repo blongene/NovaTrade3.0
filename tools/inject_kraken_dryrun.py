@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Inject a single Kraken dryrun trade command into the NovaTrade Bus outbox.
+Inject a single Kraken SELL command into the NovaTrade Bus outbox.
 """
-import argparse, hashlib, hmac, json, os, time
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import time
 from urllib import request as urlrequest
 
 def _hmac_sig(secret: str, body_bytes: bytes) -> str:
@@ -18,36 +24,43 @@ def _http_post(url: str, body: dict, secret: str | None, timeout: int = 20):
         raw = resp.read().decode("utf-8", errors="replace")
         return resp.status, raw
 
+def _print_resp(status: int, raw: str):
+    print(f"HTTP {status}")
+    try:
+        obj = json.loads(raw)
+        print(json.dumps(obj, indent=2, sort_keys=True))
+    except Exception:
+        print(raw)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", required=True)
     ap.add_argument("--secret", default=os.getenv("OUTBOX_SECRET"))
     ap.add_argument("--agent", required=True)
     ap.add_argument("--symbol", default="XBT/USDT")
-    ap.add_argument("--side", choices=["buy","sell"], default="buy")
-    ap.add_argument("--amount", type=float, default=5.0)
+    ap.add_argument("--amount-base", type=float, default=0.00005)
     ap.add_argument("--venue", default="KRAKEN")
     ap.add_argument("--client-order-id", default=None)
     ap.add_argument("--live", action="store_true")
     ap.add_argument("--timeout", type=int, default=20)
     args = ap.parse_args()
 
-    base = args.base_url.rstrip("/")
-    url = f"{base}/ops/enqueue"
+    base_url = args.base_url.rstrip("/")
+    url = f"{base_url}/ops/enqueue"
 
     now = int(time.time())
-    cid = args.client_order_id or f"dryrun-{args.venue.lower()}-{args.symbol.replace('/','-').lower()}-{args.side}-{int(args.amount*100)}-{now}"
+    cid = args.client_order_id or f"sell-kraken-{args.symbol.replace('/','-').lower()}-{int(args.amount_base*1e8)}-{now}"
 
     cmd = {
         "type": "trade",
         "venue": args.venue,
         "symbol": args.symbol,
-        "side": args.side,
-        "amount": args.amount,
-        "flags": ["quote"],
+        "side": "sell",
+        "amount_base": float(args.amount_base),
+        "flags": ["base"],
         "dry_run": (not args.live),
         "client_order_id": cid,
-        "idempotency_key": cid,
+        "idempotency_key": cid
     }
 
     body = {
@@ -57,17 +70,13 @@ def main():
         "agent_name": args.agent,
         "agentName": args.agent,
         "target_agent": args.agent,
+        "agent_target": args.agent,
         "command": cmd,
-        "meta": {"source": "inject_kraken_dryrun.py", "ts": now},
+        "meta": {"source": "inject_kraken_sell_base.py", "ts": now},
     }
 
     status, raw = _http_post(url, body, args.secret, timeout=args.timeout)
-    print(f"HTTP {status}")
-    try:
-        obj = json.loads(raw)
-        print(json.dumps(obj, indent=2, sort_keys=True))
-    except Exception:
-        print(raw)
+    _print_resp(status, raw)
 
 if __name__ == "__main__":
     main()
