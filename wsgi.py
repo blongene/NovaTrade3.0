@@ -63,6 +63,52 @@ def _queue_depth() -> dict:
 TRADE_LOGGED_CMDS = set()
 TRADE_LOG_STUB_WARNED = set()
 
+
+# ---------- Command context cache (for richer Trade_Log receipts) ----------
+# Some store backends (e.g., PGStore) do not expose store.get(cmd_id).
+# To avoid stub Trade_Log rows, we cache recent command dicts by id when:
+# - /ops/enqueue succeeds
+# - /api/commands/pull leases commands
+#
+# This cache is best-effort, bounded, and safe: it never blocks ACK.
+CMD_CTX_CACHE = {}
+CMD_CTX_CACHE_ORDER = []
+CMD_CTX_CACHE_MAX = int(os.getenv("CMD_CTX_CACHE_MAX", "500"))
+
+def _cache_cmd_ctx(cmd_id, cmd_obj):
+    try:
+        if cmd_id is None:
+            return
+        key = str(cmd_id)
+        if not isinstance(cmd_obj, dict):
+            return
+        # Keep only light context
+        slim = {
+            "id": cmd_obj.get("id", cmd_id),
+            "agent_id": cmd_obj.get("agent_id") or cmd_obj.get("agent") or cmd_obj.get("leased_by"),
+            "intent": cmd_obj.get("intent") or cmd_obj.get("payload") or cmd_obj.get("command") or {},
+            "payload": cmd_obj.get("payload") or cmd_obj.get("intent") or cmd_obj.get("command") or {},
+            "kind": cmd_obj.get("kind") or cmd_obj.get("type") or (cmd_obj.get("intent") or {}).get("type"),
+            "hash": cmd_obj.get("hash") or cmd_obj.get("intent_hash"),
+        }
+        CMD_CTX_CACHE[key] = slim
+        CMD_CTX_CACHE_ORDER.append(key)
+        # bound
+        while len(CMD_CTX_CACHE_ORDER) > CMD_CTX_CACHE_MAX:
+            old = CMD_CTX_CACHE_ORDER.pop(0)
+            CMD_CTX_CACHE.pop(old, None)
+    except Exception:
+        # never raise from cache path
+        return
+
+def _get_cached_cmd_ctx(cmd_id):
+    try:
+        if cmd_id is None:
+            return None
+        return CMD_CTX_CACHE.get(str(cmd_id))
+    except Exception:
+        return None
+
 # ========== Flags / helpers ==========
 def _env_true(k: str) -> bool:
     return os.environ.get(k, "").lower() in ("1","true","yes","on")
@@ -863,25 +909,20 @@ def ping_prevent_cold_start():
 
 @flask_app.post("/ops/enqueue")
 def ops_enqueue():
-    """
-    Enqueue a command intent into the Bus outbox.
+    """Enqueue a command into the outbox.
 
-    Backward/forward compatible payload shapes:
-      A) {"payload": {"agent_id":"edge-primary", "command": {...}}}
-      B) {"agent_id":"edge-primary", "command": {...}}
-      C) {"agent":"edge-primary", "venue":"BINANCEUS", ...}   (intent at top-level)
-      D) {"agent":"edge-primary", "intent": {...}}
-
-    We resolve agent_id from common aliases to avoid "agent=cloud" default misroutes.
+    Accepts multiple payload shapes for backwards compatibility:
+      - {"payload": {"agent_id": "...", "command": {...}}}
+      - {"agent_id": "...", "command": {...}}
+      - Aliases: agent, agentId, agent_name, agentName, target_agent
     """
     j = request.get_json(force=True) or {}
 
-    # Accept both wrapped and unwrapped formats
-    payload = j.get("payload") if isinstance(j.get("payload"), dict) else j
+    payload = j.get("payload")
     if not isinstance(payload, dict):
         payload = {}
 
-    # Resolve agent id using common aliases (historical compatibility)
+    # Resolve agent_id from common aliases (payload-first, then top-level)
     agent_id = (
         payload.get("agent_id")
         or payload.get("agent")
@@ -890,29 +931,33 @@ def ops_enqueue():
         or payload.get("agentName")
         or payload.get("target_agent")
         or payload.get("agent_target")
+        or j.get("agent_id")
+        or j.get("agent")
+        or j.get("agentId")
+        or j.get("agent_name")
+        or j.get("agentName")
+        or j.get("target_agent")
+        or j.get("agent_target")
         or "cloud"
     )
-    try:
-        agent_id = str(agent_id).strip() or "cloud"
-    except Exception:
-        agent_id = "cloud"
 
-    # Resolve the actual intent dict
-    intent = None
-    if isinstance(payload.get("command"), dict):
-        intent = payload.get("command")
-    elif isinstance(payload.get("intent"), dict):
-        intent = payload.get("intent")
-    else:
-        # If the payload itself looks like an intent, accept it directly.
-        intent = payload
-
-    # Ensure intent is always a dict
+    # Resolve intent/command (payload-first, then top-level)
+    intent = (
+        payload.get("command")
+        or payload.get("intent")
+        or payload.get("payload")
+        or j.get("command")
+        or j.get("intent")
+        or j.get("payload")
+        or {}
+    )
     if not isinstance(intent, dict):
-        return jsonify(ok=False, error="invalid_intent"), 422
+        intent = {"raw": intent}
 
     try:
         res = store.enqueue(agent_id, intent)
+        # Cache minimal context for Trade_Log correlation
+        _cache_cmd_ctx(res.get("id"), {"id": res.get("id"), "agent_id": agent_id, "intent": intent, "payload": intent, "hash": res.get("hash")})
         # Expect res like: {"ok": True, "id": ..., "status": "queued", "hash": "..."}
         log.info(
             "ops_enqueue: agent=%s ok=%s id=%s status=%s hash=%s",
@@ -923,6 +968,9 @@ def ops_enqueue():
             res.get("hash"),
         )
         return jsonify(res)
+    except Exception as e:
+        log.exception("ops_enqueue error")
+        return jsonify({"ok": False, "error": str(e)}), 500
     except Exception as e:
         log.exception("ops_enqueue failed for agent=%s: %s", agent_id, e)
         return jsonify(ok=False, error=str(e)), 500
@@ -1039,10 +1087,12 @@ def append_trade_log_safe(cmd_id, agent_id, receipt, status: str, ok_val: bool):
         gc_client = get_gspread_client()
 
         # Try to fetch the original command for richer context
-        command = None
-        if cid is not None:
+        command = _get_cached_cmd_ctx(cid)
+        if command is None and cid is not None:
+            # Some store backends do not implement .get(); try it only if present.
             try:
-                command = store.get(cid)
+                if hasattr(store, "get") and callable(getattr(store, "get")):
+                    command = store.get(cid)
             except Exception:
                 command = None
                 if cid not in TRADE_LOG_STUB_WARNED:
