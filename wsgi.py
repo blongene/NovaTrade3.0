@@ -863,12 +863,56 @@ def ping_prevent_cold_start():
 
 @flask_app.post("/ops/enqueue")
 def ops_enqueue():
+    """
+    Enqueue a command intent into the Bus outbox.
+
+    Backward/forward compatible payload shapes:
+      A) {"payload": {"agent_id":"edge-primary", "command": {...}}}
+      B) {"agent_id":"edge-primary", "command": {...}}
+      C) {"agent":"edge-primary", "venue":"BINANCEUS", ...}   (intent at top-level)
+      D) {"agent":"edge-primary", "intent": {...}}
+
+    We resolve agent_id from common aliases to avoid "agent=cloud" default misroutes.
+    """
     j = request.get_json(force=True) or {}
-    payload = j.get("payload") or {}
-    agent_id = (payload.get("agent_id") or "cloud")
+
+    # Accept both wrapped and unwrapped formats
+    payload = j.get("payload") if isinstance(j.get("payload"), dict) else j
+    if not isinstance(payload, dict):
+        payload = {}
+
+    # Resolve agent id using common aliases (historical compatibility)
+    agent_id = (
+        payload.get("agent_id")
+        or payload.get("agent")
+        or payload.get("agentId")
+        or payload.get("agent_name")
+        or payload.get("agentName")
+        or payload.get("target_agent")
+        or payload.get("agent_target")
+        or "cloud"
+    )
+    try:
+        agent_id = str(agent_id).strip() or "cloud"
+    except Exception:
+        agent_id = "cloud"
+
+    # Resolve the actual intent dict
+    intent = None
+    if isinstance(payload.get("command"), dict):
+        intent = payload.get("command")
+    elif isinstance(payload.get("intent"), dict):
+        intent = payload.get("intent")
+    else:
+        # If the payload itself looks like an intent, accept it directly.
+        intent = payload
+
+    # Ensure intent is always a dict
+    if not isinstance(intent, dict):
+        return jsonify(ok=False, error="invalid_intent"), 422
 
     try:
-        res = store.enqueue(agent_id, payload)
+        res = store.enqueue(agent_id, intent)
         # Expect res like: {"ok": True, "id": ..., "status": "queued", "hash": "..."}
         log.info(
             "ops_enqueue: agent=%s ok=%s id=%s status=%s hash=%s",
