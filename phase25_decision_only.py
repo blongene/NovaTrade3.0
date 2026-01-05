@@ -205,30 +205,33 @@ def _derive_blocked_by(reasons: Any, recommendation: str) -> list:
 
 def _derive_confidence(recommendation: str, blocked_by: list, auth: Dict[str, Any]) -> float:
     """
-    Very light, advisory-only confidence heuristic.
-    This does NOT grant authority; it only describes conviction of the recommendation.
+    Confidence represents conviction in a *directional action* (WOULD_*),
+    not system health or data freshness.
+
+    NOOP / HOLD intentionally remain LOW confidence.
     """
     try:
         rec = (recommendation or "").upper()
         trusted = bool((auth or {}).get("trusted"))
 
+        # Default: no conviction
         conf = 0.0
 
-        # If we have a WOULD_* signal, we have at least some directional intent
+        # Only directional recommendations earn confidence
         if rec in {"WOULD_SELL", "WOULD_REBUY"}:
-            conf += 0.4
+            conf += 0.5
 
-        # If nothing is blocking us (rare in Phase 25A), add confidence
-        if not blocked_by:
-            conf += 0.3
+            # Fewer blockers → more conviction
+            if not blocked_by:
+                conf += 0.3
 
-        # If edge authority is trusted, add confidence
-        if trusted:
-            conf += 0.3
+            # Trusted authority strengthens conviction
+            if trusted:
+                conf += 0.2
 
-        # HOLD/NOOP should generally stay low confidence (they are safe, not "convicted")
-        if rec in {"HOLD", "NOOP"}:
-            conf = min(conf, 0.4)
+        # NOOP / HOLD stay intentionally low
+        if rec in {"NOOP", "HOLD"}:
+            conf = 0.1 if trusted and not blocked_by else 0.0
 
         return round(min(max(conf, 0.0), 1.0), 2)
     except Exception:
