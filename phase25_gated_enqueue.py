@@ -94,6 +94,14 @@ def _cfg() -> Dict[str, Any]:
     return p if isinstance(p, dict) else {}
 
 
+def _cfg_get(key: str, default: Any = None) -> Any:
+    """Read a key from DB_READ_JSON.phase25 with a safe default."""
+    try:
+        return _cfg().get(key, default)
+    except Exception:
+        return default
+
+
 def enabled() -> bool:
     return _truthy(_cfg().get("enabled", 0))
 
@@ -495,7 +503,7 @@ def _plan_to_commands(plan: Dict[str, Any], agent: str) -> List[Dict[str, Any]]:
     cmds: List[Dict[str, Any]] = []
 
     plan_id = str(plan.get("plan_id") or plan.get("id") or "").strip() or "plan"
-    force_mode = str(_cfg("phase25.force_mode", "") or "").strip().lower() or None
+    force_mode = str(_cfg_get("force_mode", "") or "").strip().lower() or None
 
     for idx, item in enumerate(proposed):
         if not isinstance(item, dict):
@@ -529,6 +537,7 @@ def _plan_to_commands(plan: Dict[str, Any], agent: str) -> List[Dict[str, Any]]:
                 "policy_id": plan_id,
                 "client_id": f"phase25-{plan_id}-{idx}-{venue}-{token}-{quote}-{side.lower()}",
             }
+            intent["item_index"] = idx
             cmds.append(intent)
             continue
 
