@@ -2,57 +2,116 @@
 phase25_vault_signals.py — Phase 25A/B helpers (Bus)
 
 Purpose
-- Compute "Vault Intelligence" and "Rebuy/Rotation" signals WITHOUT writing to Sheets.
-- Designed for Phase 25 observation: decision records should be human-readable and low-noise.
+- Compute Vault + Rebuy signals WITHOUT writing to Sheets.
+- Phase 25-safe: low-noise, tolerant of missing tabs, idempotent outputs.
 
-Inputs (read-only; DB-first when available)
-- Vaults (or VAULT_SRC_TAB): current positions with ROI/Status fields (best case)
-- Vault_ROI_Tracker (optional): historical ROI snapshots (fallback for ROI + USD value)
-- Vault Intelligence (optional): tag memory + rebuy_ready (enables REBUY candidates)
-- Unified_Snapshot (optional): venue budgets / balances (fallback for quotes)
+Key upgrades (Jan 2026)
+1) Quote normalization: compute a GLOBAL stable-quote budget (USD/USDC/USDT/DAI) using Wallet_Monitor snapshot text.
+2) Signal memory: keep lightweight in-process counts/streaks (exposed to decision records as "memory").
+3) Alpha namespace (prep-only): optional ALPHA_WATCH signals from TrendTracker/Listings when enabled.
 
-Outputs
-- A list of signal dicts, each:
+Safety
+- No Sheet writes.
+- Any failure -> returns [] + error string (never raises).
+- Alpha is OFF by default and cannot influence Vault execution unless explicitly enabled via DB_READ_JSON.
+
+Expected Outputs
+Signal dicts, each:
   {
-    "type": "SELL_CANDIDATE" | "REBUY_CANDIDATE" | "WATCH",
+    "type": "SELL_CANDIDATE" | "REBUY_CANDIDATE" | "WATCH" | "ALPHA_WATCH",
     "token": "BTC",
     "confidence": 0.0-1.0,
     "reasons": [...],
     "facts": {...}   # lightweight numbers
   }
-
-Safety
-- No Sheet writes.
-- Any failure -> returns [] and an error string, never raises.
-
-Notes (Phase 25)
-- If VAULT_TAB is empty / missing, we still attempt to produce signals from ROI + Intel tabs.
-- We intentionally avoid creating "new buy ideas" unless explicitly tagged (rebuy_ready) OR
-  existing holdings show risk / rotation signals.
 """
 
 from __future__ import annotations
 
 import os
+import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import get_records_cached, str_or_empty, safe_float  # type: ignore
 
 
-def _tab(name: str, default: str) -> str:
-    v = (os.getenv(name, "") or "").strip()
+# -----------------------
+# Tabs / config helpers
+# -----------------------
+
+def _tab(env_name: str, default: str) -> str:
+    v = os.getenv(env_name, "").strip()
     return v or default
 
 
-# Primary sources (defaults are safe; can override with env)
-VAULT_TAB = _tab("VAULT_SRC_TAB", "Vaults")
-VAULT_INTEL_TAB = _tab("VAULT_INTELLIGENCE_WS", "Vault Intelligence")
+VAULT_TAB = _tab("VAULT_SRC_TAB", "Token_Vault")
+VAULT_INTEL_TAB = _tab("VAULT_INTEL_TAB", "Vault_Intelligence")
 VAULT_ROI_TAB = _tab("VAULT_ROI_TAB", "Vault_ROI_Tracker")
-UNIFIED_SNAPSHOT_TAB = _tab("UNIFIED_SNAPSHOT_TAB", "Unified_Snapshot")
+WALLET_MONITOR_TAB = _tab("WALLET_MONITOR_TAB", "Wallet_Monitor")
 
+ALPHA_TREND_TAB = _tab("ALPHA_TREND_TAB", "TrendTracker")
+ALPHA_LISTINGS_TAB = _tab("ALPHA_LISTINGS_TAB", "Listings")
+
+
+def _read_db_read_json() -> Dict[str, Any]:
+    """
+    Best-effort parse of DB_READ_JSON env var.
+    If missing/invalid -> {}.
+    """
+    raw = os.getenv("DB_READ_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        import json
+        return json.loads(raw) if isinstance(raw, str) else {}
+    except Exception:
+        return {}
+
+
+def _phase25_cfg() -> Dict[str, Any]:
+    return (_read_db_read_json() or {}).get("phase25") or {}
+
+
+def _alpha_cfg() -> Dict[str, Any]:
+    # alpha config is nested under phase25.alpha, default disabled
+    p = _phase25_cfg()
+    return p.get("alpha") or {}
+
+
+def _alpha_enabled() -> bool:
+    try:
+        return bool(int(_alpha_cfg().get("enabled", 0)))
+    except Exception:
+        return False
+
+
+def _min_total_quote_usd() -> float:
+    """
+    Conservative rebuy floor. Defaults to 25 USD if not specified.
+    Override via DB_READ_JSON.phase25.min_total_quote_usd or env MIN_TOTAL_QUOTE_USD.
+    """
+    env_v = os.getenv("MIN_TOTAL_QUOTE_USD", "").strip()
+    if env_v:
+        try:
+            return float(env_v)
+        except Exception:
+            pass
+    try:
+        return float(_phase25_cfg().get("min_total_quote_usd", 25.0))
+    except Exception:
+        return 25.0
+
+
+# -----------------------
+# DB-first reads (safe)
+# -----------------------
 
 def _read_records_prefer_db(tab: str) -> List[Dict[str, Any]]:
-    # DB-first adapter if present, otherwise Sheets cached.
+    """
+    DB-first adapter if present, otherwise Sheets cached.
+    Never raises; returns [] on failure.
+    """
     try:
         from db_read_adapter import get_records_prefer_db  # type: ignore
 
@@ -69,115 +128,338 @@ def _read_records_prefer_db(tab: str) -> List[Dict[str, Any]]:
             return []
 
 
-def _latest_by_token(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    From a time-series tab (e.g., Vault_ROI_Tracker), return latest row per token.
-    We iterate newest-last and keep the first row seen for each token.
-    """
-    out: Dict[str, Dict[str, Any]] = {}
-    for r in reversed(rows or []):
-        tok = str_or_empty(r.get("Token") or r.get("token") or r.get("Asset")).upper()
-        if not tok or tok in out:
-            continue
-        out[tok] = r
-    return out
+# -----------------------
+# ROI helpers
+# -----------------------
 
-
-def _parse_rebuy_ready(intel_rows: List[Dict[str, Any]]) -> Tuple[Dict[str, bool], Dict[str, str]]:
-    rebuy_ready: Dict[str, bool] = {}
-    memory_tags: Dict[str, str] = {}
-    for r in intel_rows or []:
-        tok = str_or_empty(r.get("Token") or r.get("token") or r.get("Asset")).upper()
+def _latest_roi_by_token(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Extract latest ROI by token from Vault_ROI_Tracker-like rows.
+    Tolerant to schema drift.
+    """
+    latest: Dict[str, Tuple[float, float]] = {}  # token -> (ts_epoch, roi)
+    for r in rows:
+        tok = str_or_empty(r.get("Token") or r.get("token") or r.get("Symbol") or r.get("symbol")).upper()
         if not tok:
             continue
-        rr = str_or_empty(r.get("rebuy_ready") or r.get("Rebuy Ready") or r.get("Rebuy") or r.get("RebuyReady")).upper()
-        if rr in ("TRUE", "YES", "1", "Y"):
-            rebuy_ready[tok] = True
-        tag = str_or_empty(r.get("Memory Tag") or r.get("memory_tag") or r.get("Tag") or r.get("Memory"))
-        if tag:
-            memory_tags[tok] = tag
-    return rebuy_ready, memory_tags
+        roi = safe_float(r.get("Vault ROI") or r.get("Vault_ROI") or r.get("roi") or r.get("ROI"))
+        if roi is None:
+            continue
+        ts = r.get("Date") or r.get("date") or r.get("Timestamp") or r.get("timestamp") or ""
+        ts_epoch = _safe_ts_epoch(ts)
+        cur = latest.get(tok)
+        if cur is None or ts_epoch >= cur[0]:
+            latest[tok] = (ts_epoch, float(roi))
+    return {k: v[1] for k, v in latest.items()}
 
 
-def _quote_budgets_from_unified(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+def _safe_ts_epoch(ts: Any) -> float:
+    if not ts:
+        return 0.0
+    s = str(ts).strip()
+    # very permissive; if parse fails, treat as 0
+    try:
+        # YYYY-MM-DD HH:MM:SS
+        import datetime
+        if len(s) >= 19 and s[4] == "-" and s[7] == "-":
+            dt = datetime.datetime.fromisoformat(s.replace("Z", ""))
+            return dt.timestamp()
+    except Exception:
+        pass
+    return 0.0
+
+
+# -----------------------
+# Quote aggregation (GLOBAL)
+# -----------------------
+
+_STABLE_QUOTES = {"USD", "USDC", "USDT", "DAI", "TUSD", "FDUSD"}
+
+
+def _extract_snapshot_text(row: Dict[str, Any]) -> str:
+    return str_or_empty(
+        row.get("Snapshot")
+        or row.get("snapshot")
+        or row.get("Balances")
+        or row.get("balances")
+        or ""
+    )
+
+
+def _parse_compact_snapshot_total(snapshot: str) -> float:
     """
-    Best-effort quote budgets. Unified_Snapshot varies; we look for rows Class=QUOTE.
-    Returns total USD-ish across venues (still approximate).
+    Parses strings like:
+      "BINANCEUS:USD=9.77,USDT=159.253; COINBASE:USD=8.01117,USDC=41.6153,USDT=58.3081"
+    Returns summed stable-quote total across venues.
     """
+    if not snapshot:
+        return 0.0
     total = 0.0
-    for r in rows or []:
+    # Find ASSET=NUMBER pairs
+    for asset, num in re.findall(r"([A-Za-z]{2,10})\s*=\s*([0-9]+(?:\.[0-9]+)?)", snapshot):
+        a = asset.strip().upper()
+        if a in _STABLE_QUOTES:
+            try:
+                total += float(num)
+            except Exception:
+                continue
+    return float(total)
+
+
+def _compute_total_quote_from_wallet_monitor(rows: List[Dict[str, Any]]) -> float:
+    """
+    Prefer parsing the compact snapshot string from the most recent Wallet_Monitor row.
+    Fallback: sum Free across recent rows with Class=QUOTE and stable assets.
+    """
+    if not rows:
+        return 0.0
+
+    # 1) Prefer snapshot parsing from newest non-empty snapshot
+    for r in reversed(rows[-25:]):
+        snap = _extract_snapshot_text(r)
+        if snap:
+            val = _parse_compact_snapshot_total(snap)
+            if val > 0:
+                return val
+
+    # 2) Fallback: sum free stable quotes in recent rows
+    total = 0.0
+    for r in rows[-200:]:
         cls = str_or_empty(r.get("Class") or r.get("class")).upper()
+        asset = str_or_empty(r.get("Asset") or r.get("asset")).upper()
         if cls != "QUOTE":
             continue
-        free = safe_float(r.get("Free") or r.get("free") or r.get("Amount") or r.get("Balance"))
-        if free is None:
+        if asset not in _STABLE_QUOTES:
             continue
-        total += float(free)
-    return {"total_quote": round(total, 6)}
+        f = safe_float(r.get("Free") or r.get("free"))
+        if f is None:
+            continue
+        total += float(f)
+    return float(total)
 
+
+def get_total_quote_usd() -> float:
+    """
+    Public helper: best-effort global quote total.
+    """
+    rows = _read_records_prefer_db(WALLET_MONITOR_TAB)
+    return _compute_total_quote_from_wallet_monitor(rows)
+
+
+# -----------------------
+# Signal memory (in-process)
+# -----------------------
+
+# NOTE: This is intentionally in-process only (no DB/Sheet writes) for Phase 25 safety.
+# It persists across cycles as long as the Bus process stays up (Render redeploy resets it).
+
+_SIGNAL_MEM: Dict[str, Any] = {
+    "watch": {},   # token -> {count, first_ts, last_ts, streak}
+    "rebuy": {},
+    "sell": {},
+    "alpha": {},
+    "last_seen": {},  # token -> ts
+}
+
+
+def _touch_bucket(bucket: str, token: str, ts: str) -> None:
+    b = _SIGNAL_MEM.setdefault(bucket, {})
+    rec = b.get(token) or {"count": 0, "first_ts": ts, "last_ts": ts, "streak": 0}
+    rec["count"] = int(rec.get("count", 0)) + 1
+    # streak increments if last_seen was also within recent window (very simple)
+    last_seen = str_or_empty(_SIGNAL_MEM.get("last_seen", {}).get(token))
+    if last_seen:
+        rec["streak"] = int(rec.get("streak", 0)) + 1
+    else:
+        rec["streak"] = 1
+    rec["last_ts"] = ts
+    if not rec.get("first_ts"):
+        rec["first_ts"] = ts
+    b[token] = rec
+    _SIGNAL_MEM.setdefault("last_seen", {})[token] = ts
+
+
+def update_signal_memory(signals: List[Dict[str, Any]], ts: str) -> Dict[str, Any]:
+    """
+    Update in-process memory based on current signals.
+    Returns a compact snapshot suitable for embedding in decision records.
+    """
+    # Clear last_seen each cycle (streak is per "consecutive sightings")
+    _SIGNAL_MEM["last_seen"] = {}
+
+    for s in signals or []:
+        typ = str_or_empty(s.get("type")).upper()
+        tok = str_or_empty(s.get("token")).upper()
+        if not tok or not typ:
+            continue
+        if typ == "WATCH":
+            _touch_bucket("watch", tok, ts)
+        elif typ == "REBUY_CANDIDATE":
+            _touch_bucket("rebuy", tok, ts)
+        elif typ == "SELL_CANDIDATE":
+            _touch_bucket("sell", tok, ts)
+        elif typ == "ALPHA_WATCH":
+            _touch_bucket("alpha", tok, ts)
+
+    # Return a compact summary (top tokens by count)
+    def top(bucket: str, n: int = 5) -> List[Dict[str, Any]]:
+        b = _SIGNAL_MEM.get(bucket) or {}
+        items = []
+        for tok, rec in b.items():
+            items.append({"token": tok, **rec})
+        items.sort(key=lambda x: (-int(x.get("count", 0)), x.get("token", "")))
+        return items[:n]
+
+    return {
+        "watch_top": top("watch", 8),
+        "rebuy_top": top("rebuy", 8),
+        "sell_top": top("sell", 8),
+        "alpha_top": top("alpha", 8),
+    }
+
+
+def get_signal_memory_snapshot() -> Dict[str, Any]:
+    """
+    Read-only snapshot (does not mutate).
+    """
+    return {
+        "watch": _SIGNAL_MEM.get("watch") or {},
+        "rebuy": _SIGNAL_MEM.get("rebuy") or {},
+        "sell": _SIGNAL_MEM.get("sell") or {},
+        "alpha": _SIGNAL_MEM.get("alpha") or {},
+    }
+
+
+# -----------------------
+# Alpha signals (prep-only)
+# -----------------------
+
+def _first_matching_key(row: Dict[str, Any], candidates: List[str]) -> Optional[str]:
+    keys = list(row.keys())
+    low = {str(k).strip().lower(): k for k in keys}
+    for c in candidates:
+        k = low.get(c.lower())
+        if k is not None:
+            return k
+    # fuzzy: contains
+    for c in candidates:
+        for lk, orig in low.items():
+            if c.lower() in lk:
+                return orig
+    return None
+
+
+def _compute_alpha_watch_signals(max_items: int = 10) -> List[Dict[str, Any]]:
+    """
+    Optional, low-confidence watchlist from Alpha tabs.
+    OFF by default.
+    """
+    trend_rows = _read_records_prefer_db(ALPHA_TREND_TAB)
+    list_rows = _read_records_prefer_db(ALPHA_LISTINGS_TAB)
+
+    out: List[Dict[str, Any]] = []
+
+    # TrendTracker: Token + Interest (Past 7 Days)
+    for r in trend_rows[-200:]:
+        tok_key = _first_matching_key(r, ["Token", "token", "Symbol", "symbol"])
+        if not tok_key:
+            continue
+        tok = str_or_empty(r.get(tok_key)).upper()
+        if not tok:
+            continue
+        interest_key = _first_matching_key(r, ["Interest (Past 7 Days)", "interest", "interest_7d"])
+        interest = safe_float(r.get(interest_key)) if interest_key else None
+        if interest is None:
+            continue
+        if float(interest) < 10.0:  # conservative default filter
+            continue
+        out.append({
+            "type": "ALPHA_WATCH",
+            "token": tok,
+            "confidence": 0.15,
+            "reasons": ["trend_spike"],
+            "facts": {"interest_7d": float(interest)},
+        })
+        if len(out) >= max_items:
+            break
+
+    # Listings: Symbol + Status
+    for r in list_rows[-200:]:
+        sym_key = _first_matching_key(r, ["Symbol", "symbol", "Ticker", "ticker"])
+        if not sym_key:
+            continue
+        tok = str_or_empty(r.get(sym_key)).upper()
+        if not tok:
+            continue
+        status_key = _first_matching_key(r, ["Status", "status"])
+        status = str_or_empty(r.get(status_key)) if status_key else ""
+        if status and status.upper() not in ("NEW", "WATCH", "TRACK", "LISTED"):
+            continue
+        out.append({
+            "type": "ALPHA_WATCH",
+            "token": tok,
+            "confidence": 0.10,
+            "reasons": ["new_listing_watch"],
+            "facts": {"status": status or "unknown"},
+        })
+        if len(out) >= max_items:
+            break
+
+    # Deduplicate by token (keep highest confidence)
+    best: Dict[str, Dict[str, Any]] = {}
+    for s in out:
+        tok = str_or_empty(s.get("token")).upper()
+        if not tok:
+            continue
+        cur = best.get(tok)
+        if cur is None or float(s.get("confidence") or 0.0) > float(cur.get("confidence") or 0.0):
+            best[tok] = s
+    dedup = list(best.values())
+    dedup.sort(key=lambda s: -float(s.get("confidence") or 0.0))
+    return dedup[:max_items]
+
+
+# -----------------------
+# Vault signals
+# -----------------------
 
 def compute_vault_signals(max_items: int = 25) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     Returns (signals, error). error is None if ok.
-    Designed to be resilient: missing tabs simply reduce signal richness.
     """
     try:
         vault_rows = _read_records_prefer_db(VAULT_TAB)
         intel_rows = _read_records_prefer_db(VAULT_INTEL_TAB)
         roi_rows = _read_records_prefer_db(VAULT_ROI_TAB)
-        unified_rows = _read_records_prefer_db(UNIFIED_SNAPSHOT_TAB)
 
-        rebuy_ready, memory_tags = _parse_rebuy_ready(intel_rows)
-        latest_roi_row = _latest_by_token(roi_rows)
-        quote_budget = _quote_budgets_from_unified(unified_rows)
+        latest_roi = _latest_roi_by_token(roi_rows)
+
+        # Build quick maps from Vault_Intelligence
+        rebuy_ready: Dict[str, bool] = {}
+        memory_tags: Dict[str, str] = {}
+        for r in intel_rows:
+            tok = str_or_empty(r.get("Token") or r.get("token")).upper()
+            if not tok:
+                continue
+            rr = str_or_empty(r.get("rebuy_ready") or r.get("Rebuy Ready") or r.get("Rebuy_Ready")).strip().upper()
+            rebuy_ready[tok] = rr in ("TRUE", "YES", "1", "Y")
+            mt = str_or_empty(r.get("memory_tag") or r.get("Memory Tag") or r.get("Memory_Tag"))
+            if mt:
+                memory_tags[tok] = mt
+
+        # Global quote budget (used to safely gate rebuys)
+        total_quote = get_total_quote_usd()
+        min_quote = _min_total_quote_usd()
+
+        # Thresholds (conservative defaults)
+        sell_roi_floor = float(os.getenv("SELL_ROI_FLOOR", "-12"))   # <= -12% -> sell candidate
+        watch_roi_floor = float(os.getenv("WATCH_ROI_FLOOR", "-6"))  # <= -6% -> watch
+        min_usd_to_care = float(os.getenv("MIN_USD_TO_CARE", "5"))   # ignore dust
 
         signals: List[Dict[str, Any]] = []
 
-        # Thresholds (safe defaults; override with env)
-        sell_roi_floor = float(os.getenv("PHASE25_SELL_ROI_FLOOR", "-15"))   # sell if ROI <= -15%
-        watch_roi_floor = float(os.getenv("PHASE25_WATCH_ROI_FLOOR", "-7"))  # watch if ROI <= -7%
-        min_usd_to_care = float(os.getenv("PHASE25_MIN_POSITION_USD", "10")) # ignore dust
-        rebuy_min_quote = float(os.getenv("PHASE25_REBUY_MIN_QUOTE", "25"))  # don't even suggest rebuy if quote is tiny
-
-        # Helper: build facts from the best info we have
-        def _facts_for(tok: str, vault_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-            facts: Dict[str, Any] = {}
-            if tok in memory_tags:
-                facts["memory_tag"] = memory_tags[tok]
-            if vault_row:
-                usd_val = safe_float(vault_row.get("USD Value") or vault_row.get("usd_value") or vault_row.get("Value_USD") or vault_row.get("Value"))
-                roi = safe_float(vault_row.get("ROI") or vault_row.get("roi"))
-                status = str_or_empty(vault_row.get("Status") or vault_row.get("status")).upper()
-                if usd_val is not None:
-                    facts["usd_value"] = float(usd_val)
-                if roi is not None:
-                    facts["roi"] = float(roi)
-                if status:
-                    facts["status"] = status
-                rc = str_or_empty(vault_row.get("RotationCandidate") or vault_row.get("Rotation Candidate") or vault_row.get("Rotate")).upper()
-                if rc:
-                    facts["rotation_candidate"] = rc
-            else:
-                # ROI fallback
-                rr = latest_roi_row.get(tok) or {}
-                roi = safe_float(rr.get("ROI") or rr.get("roi"))
-                usd_val = safe_float(rr.get("USD Value") or rr.get("usd_value") or rr.get("Value_USD") or rr.get("Value"))
-                status = str_or_empty(rr.get("Status") or rr.get("status")).upper()
-                if roi is not None:
-                    facts["roi"] = float(roi)
-                if usd_val is not None:
-                    facts["usd_value"] = float(usd_val)
-                if status:
-                    facts["status"] = status
-
-            # include quote context lightly (helpful for rebuy reasoning)
-            if quote_budget:
-                facts.update(quote_budget)
-            return facts
-
-        # --- Primary path: Vaults tab provides holdings + flags ---
-        for r in vault_rows or []:
-            tok = str_or_empty(r.get("Token") or r.get("token") or r.get("Asset")).upper()
+        for r in vault_rows:
+            tok = str_or_empty(r.get("Token") or r.get("token") or r.get("Symbol") or r.get("symbol")).upper()
             if not tok:
                 continue
 
@@ -187,101 +469,81 @@ def compute_vault_signals(max_items: int = 25) -> Tuple[List[Dict[str, Any]], Op
 
             roi = safe_float(r.get("ROI") or r.get("roi"))
             if roi is None:
-                # fallback ROI from tracker
-                roi = safe_float((latest_roi_row.get(tok) or {}).get("ROI") or (latest_roi_row.get(tok) or {}).get("roi"))
+                roi = latest_roi.get(tok)
 
             status = str_or_empty(r.get("Status") or r.get("status")).upper()
-            rotation_candidate = str_or_empty(r.get("RotationCandidate") or r.get("Rotation Candidate") or r.get("Rotate")).upper()
-            rotate_flag = rotation_candidate in ("TRUE", "YES", "1", "Y")
+            rotate_flag = str_or_empty(r.get("Rotation Candidate") or r.get("Rotate") or r.get("RotationCan...ate")).upper() in ("TRUE", "YES", "1", "Y")
 
-            reasons: List[str] = []
-            facts = _facts_for(tok, r)
+            facts: Dict[str, Any] = {"total_quote": float(total_quote)}
+            if usd_val is not None:
+                facts["usd_value"] = float(usd_val)
+            if roi is not None:
+                facts["roi"] = float(roi)
+            if status:
+                facts["status"] = status
+            if tok in memory_tags:
+                facts["memory_tag"] = memory_tags[tok]
 
-            # SELL candidate rules (only when we have a concrete reason)
-            if rotate_flag:
-                reasons.append("rotation_candidate=TRUE")
-            if roi is not None and float(roi) <= sell_roi_floor:
-                reasons.append(f"roi<= {sell_roi_floor}%")
-            if status in ("STALL", "STALLED", "DELIST", "RISK"):
-                reasons.append(f"status={status}")
-
-            if reasons:
-                conf = 0.55
+            # SELL candidate rules
+            if rotate_flag or (roi is not None and float(roi) <= sell_roi_floor):
+                reasons: List[str] = []
                 if rotate_flag:
-                    conf += 0.15
+                    reasons.append("rotation_candidate=TRUE")
                 if roi is not None and float(roi) <= sell_roi_floor:
-                    conf += 0.20
-                if status in ("DELIST", "RISK"):
-                    conf += 0.10
-                conf = max(0.0, min(1.0, conf))
+                    reasons.append(f"roi<= {sell_roi_floor}%")
+                signals.append({
+                    "type": "SELL_CANDIDATE",
+                    "token": tok,
+                    "confidence": 0.65,
+                    "reasons": reasons or ["policy_sell_floor"],
+                    "facts": facts,
+                })
 
-                signals.append({"type": "SELL_CANDIDATE", "token": tok, "confidence": conf, "reasons": reasons, "facts": facts})
-                continue
-
-            # WATCH: negative ROI but not full sell threshold
+            # WATCH on poor ROI
             if roi is not None and float(roi) <= watch_roi_floor:
-                signals.append({"type": "WATCH", "token": tok, "confidence": 0.40, "reasons": [f"roi<= {watch_roi_floor}%"], "facts": facts})
+                signals.append({
+                    "type": "WATCH",
+                    "token": tok,
+                    "confidence": 0.40,
+                    "reasons": [f"roi<= {watch_roi_floor}%"],
+                    "facts": facts,
+                })
 
-            # REBUY candidates: ONLY if explicitly tagged
+            # REBUY candidate only if explicitly tagged
             if rebuy_ready.get(tok):
-                # optional budget guard (avoid constant suggestions when no quote)
-                tq = safe_float(facts.get("total_quote"))
-                if tq is None or float(tq) >= rebuy_min_quote:
-                    signals.append({"type": "REBUY_CANDIDATE", "token": tok, "confidence": 0.55, "reasons": ["rebuy_ready=TRUE"], "facts": facts})
+                # Gate to WATCH if we do not have sufficient global quote
+                if float(total_quote) < float(min_quote):
+                    signals.append({
+                        "type": "WATCH",
+                        "token": tok,
+                        "confidence": 0.20,
+                        "reasons": [f"rebuy_ready=TRUE but total_quote<{float(min_quote):.1f}"],
+                        "facts": facts,
+                    })
                 else:
-                    signals.append({"type": "WATCH", "token": tok, "confidence": 0.20, "reasons": [f"rebuy_ready=TRUE but total_quote<{rebuy_min_quote}"], "facts": facts})
+                    signals.append({
+                        "type": "REBUY_CANDIDATE",
+                        "token": tok,
+                        "confidence": 0.55,
+                        "reasons": ["rebuy_ready=TRUE"],
+                        "facts": facts,
+                    })
 
             if len(signals) >= max_items:
                 break
 
-        # --- Fallback path: if Vaults is empty, build from ROI + Intel only ---
-        if not vault_rows:
-            # SELL/WATCH from ROI tracker if any
-            for tok, rr in (latest_roi_row or {}).items():
-                if not tok:
-                    continue
-                facts = _facts_for(tok, None)
-                usd_val = safe_float(facts.get("usd_value"))
-                if usd_val is not None and float(usd_val) < min_usd_to_care:
-                    continue
+        # Optional Alpha watch signals (prep-only)
+        if _alpha_enabled():
+            try:
+                alpha = _compute_alpha_watch_signals(max_items=10)
+                signals.extend(alpha)
+            except Exception:
+                # never fail vault signals due to alpha
+                pass
 
-                roi = safe_float(facts.get("roi"))
-                status = str_or_empty(facts.get("status")).upper()
-
-                reasons: List[str] = []
-                if roi is not None and float(roi) <= sell_roi_floor:
-                    reasons.append(f"roi<= {sell_roi_floor}%")
-                if status in ("STALL", "STALLED", "DELIST", "RISK"):
-                    reasons.append(f"status={status}")
-
-                if reasons:
-                    conf = 0.60
-                    if roi is not None and float(roi) <= sell_roi_floor:
-                        conf += 0.20
-                    if status in ("DELIST", "RISK"):
-                        conf += 0.10
-                    conf = max(0.0, min(1.0, conf))
-                    signals.append({"type": "SELL_CANDIDATE", "token": tok, "confidence": conf, "reasons": reasons, "facts": facts})
-                elif roi is not None and float(roi) <= watch_roi_floor:
-                    signals.append({"type": "WATCH", "token": tok, "confidence": 0.35, "reasons": [f"roi<= {watch_roi_floor}%"], "facts": facts})
-
-                if len(signals) >= max_items:
-                    break
-
-            # REBUY from Intel tags even if token not in vault rows
-            for tok, rr in (rebuy_ready or {}).items():
-                if not rr:
-                    continue
-                facts = _facts_for(tok, None)
-                tq = safe_float(facts.get("total_quote"))
-                if tq is None or float(tq) >= rebuy_min_quote:
-                    signals.append({"type": "REBUY_CANDIDATE", "token": tok, "confidence": 0.50, "reasons": ["rebuy_ready=TRUE (intel)"], "facts": facts})
-                else:
-                    signals.append({"type": "WATCH", "token": tok, "confidence": 0.20, "reasons": [f"rebuy_ready=TRUE but total_quote<{rebuy_min_quote}"], "facts": facts})
-
-        # Rank: SELL first, then REBUY, then WATCH
-        order = {"SELL_CANDIDATE": 0, "REBUY_CANDIDATE": 1, "WATCH": 2}
-        signals.sort(key=lambda s: (order.get(str(s.get("type")), 9), -float(s.get("confidence") or 0.0)))
+        # Rank: SELL first, then REBUY, then WATCH, then ALPHA_WATCH
+        order = {"SELL_CANDIDATE": 0, "REBUY_CANDIDATE": 1, "WATCH": 2, "ALPHA_WATCH": 3}
+        signals.sort(key=lambda s: (order.get(str_or_empty(s.get("type")).upper(), 9), -float(s.get("confidence") or 0.0)))
 
         return signals[:max_items], None
     except Exception as e:
