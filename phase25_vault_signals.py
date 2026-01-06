@@ -1,4 +1,5 @@
-"""phase25_vault_signals.py — Phase 25A/B helpers (Bus)
+"""
+phase25_vault_signals.py — Phase 25A/B helpers (Bus)
 
 Purpose
 - Compute Vault + Rebuy signals WITHOUT writing to Sheets.
@@ -6,7 +7,7 @@ Purpose
 
 Key upgrades (Jan 2026)
 1) Quote normalization: compute a GLOBAL stable-quote budget (USD/USDC/USDT/DAI)
-   using Wallet_Monitor snapshot compact text.
+   using Wallet_Monitor snapshot compact text (supports scientific notation like 1e-06).
 2) Signal memory: keep lightweight in-process counts/streaks (exposed to decision/plan).
 3) Alpha namespace (prep-only): optional ALPHA_WATCH signals from TrendTracker/Listings
    when enabled via DB_READ_JSON.
@@ -23,7 +24,7 @@ Signal dicts, each:
     "token": "BTC",
     "confidence": 0.0-1.0,
     "reasons": [...],
-    "facts": {...}
+    "facts": {...}   # lightweight numbers
   }
 """
 
@@ -42,17 +43,16 @@ from utils import get_records_cached, str_or_empty, safe_float  # type: ignore
 # Tabs / config helpers
 # -----------------------
 
-
 def _tab(env_name: str, default: str) -> str:
     v = (os.getenv(env_name) or "").strip()
     return v or default
 
 
-# Prefer the newer canonical names, but tolerate legacy.
+# Prefer canonical names, tolerate legacy where useful.
 VAULT_TAB = _tab("VAULT_SRC_TAB", "Token_Vault")
 
-# Some older deployments used a spaced name. Accept both.
 VAULT_INTEL_TAB = _tab("VAULT_INTEL_TAB", "Vault_Intelligence")
+# Some older sheets used a spaced tab name; accept both.
 VAULT_INTEL_TAB_LEGACY = _tab("VAULT_INTELLIGENCE_WS", "Vault Intelligence")
 
 VAULT_ROI_TAB = _tab("VAULT_ROI_TAB", "Vault_ROI_Tracker")
@@ -74,23 +74,43 @@ def _load_db_read_json() -> Dict[str, Any]:
 
 
 def _alpha_enabled() -> bool:
-    """Alpha is OFF by default. Enable only via DB_READ_JSON."""
+    """
+    Alpha is OFF by default.
+    Enable only via DB_READ_JSON:
+      - {"alpha": {"enabled": 1}}
+      - or {"phase25": {"alpha_enabled": 1}}
+    """
     cfg = _load_db_read_json()
-    # allow either top-level alpha.enabled or phase25.alpha_enabled
+
     alpha = cfg.get("alpha") or {}
-    if isinstance(alpha, dict) and str(alpha.get("enabled", "0")).strip() in ("1", "true", "TRUE", "yes", "YES"):
-        return True
+    if isinstance(alpha, dict):
+        v = str(alpha.get("enabled", "0")).strip().lower()
+        if v in ("1", "true", "yes", "y"):
+            return True
+
     p25 = cfg.get("phase25") or {}
-    if isinstance(p25, dict) and str(p25.get("alpha_enabled", "0")).strip() in ("1", "true", "TRUE", "yes", "YES"):
-        return True
+    if isinstance(p25, dict):
+        v = str(p25.get("alpha_enabled", "0")).strip().lower()
+        if v in ("1", "true", "yes", "y"):
+            return True
+
     return False
 
 
+# -----------------------
+# DB-first read helper
+# -----------------------
+
 def _read_records_prefer_db(tab: str) -> List[Dict[str, Any]]:
-    """DB-first adapter if present, otherwise Sheets cached."""
+    """
+    DB-first adapter if present, otherwise Sheets cached.
+
+    IMPORTANT: do NOT assume get_records_cached supports ttl_s (historic gotcha).
+    """
     try:
         from db_read_adapter import get_records_prefer_db  # type: ignore
 
+        # Some adapters accept extra args. We pass cache_key + sheets fallback explicitly.
         rows = get_records_prefer_db(
             tab,
             f"sheet_mirror:{tab}",
@@ -105,95 +125,132 @@ def _read_records_prefer_db(tab: str) -> List[Dict[str, Any]]:
 
 
 # -----------------------
-# Quote parsing (Snapshot)
+# Snapshot parsing (global quote)
 # -----------------------
 
+# Allows decimal + scientific notation (e.g., 1e-06), with optional sign.
+_PAIR_RE = re.compile(r"\b([A-Z0-9]{2,10})=([0-9eE+\-\.]+)\b")
 
-_SNAPSHOT_ASSET_RE = re.compile(r"\b([A-Z0-9]{2,10})=([0-9]+(?:\.[0-9]+)?)\b")
 
-
-def _parse_snapshot_total_quote(snapshot: str) -> float:
-    """Parse compact snapshot text and sum stable-quote amounts."""
+def _compute_total_quote_from_snapshot(snapshot: str) -> float:
     if not snapshot:
         return 0.0
-
-    stable = {"USD", "USDC", "USDT", "DAI"}
+    stables = {"USD", "USDC", "USDT", "DAI"}
     total = 0.0
-    for m in _SNAPSHOT_ASSET_RE.finditer(snapshot.upper()):
-        asset = m.group(1)
-        amt = safe_float(m.group(2))
+    for sym, val in _PAIR_RE.findall(snapshot.upper()):
+        if sym not in stables:
+            continue
+        amt = safe_float(val)
         if amt is None:
             continue
-        if asset in stable:
-            total += float(amt)
+        total += float(amt)
+    # NaN guard
+    if total != total:
+        return 0.0
     return float(total)
 
 
 def _get_total_quote_from_wallet_monitor() -> float:
-    """Read latest Wallet_Monitor row and compute total stable quote."""
     rows = _read_records_prefer_db(WALLET_MONITOR_TAB)
     if not rows:
         return 0.0
-    last = rows[-1] or {}
-    snap = str_or_empty(last.get("Snapshot") or last.get("snapshot") or last.get("SNAPSHOT"))
-    return _parse_snapshot_total_quote(snap)
+    # Search last 50 rows for a non-empty snapshot (robust to partial rows)
+    for r in reversed(rows[-50:]):
+        snap = str_or_empty(r.get("Snapshot") or r.get("snapshot") or r.get("SNAPSHOT"))
+        if snap:
+            return _compute_total_quote_from_snapshot(snap)
+    return 0.0
 
 
 # -----------------------
 # Signal memory (in-process)
 # -----------------------
 
-
 _MEM: Dict[str, Any] = {
     "since_ts": None,
-    "counts": {},      # token -> int
-    "streaks": {},     # token -> int
-    "last_seen": {},   # token -> ts
+    "updated_ts": None,
+    "counts": {},      # key -> int (e.g., "WATCH:BTC")
+    "streaks": {},     # key -> int consecutive buckets
+    "last_seen": {},   # key -> unix ts
+    "_cycle_key": {},  # key -> last cycle id
 }
 
 
-def update_signal_memory(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Update in-process memory from current signal set and return a compact snapshot."""
+def _cycle_id() -> int:
+    """
+    Bucket time to reduce streak flapping. Default aligns to Phase25A interval.
+    """
+    bucket_s = int(os.getenv("PHASE25_MEMORY_BUCKET_SEC", "1800"))
+    return int(int(time.time()) // max(bucket_s, 60))
+
+
+def _mem_touch(key: str) -> None:
     now = int(time.time())
     if _MEM.get("since_ts") is None:
         _MEM["since_ts"] = now
 
-    seen_tokens: List[str] = []
+    cid = _cycle_id()
+    counts = _MEM.setdefault("counts", {})
+    streaks = _MEM.setdefault("streaks", {})
+    last_seen = _MEM.setdefault("last_seen", {})
+    cycle_key = _MEM.setdefault("_cycle_key", {})
+
+    counts[key] = int(counts.get(key, 0)) + 1
+    last_seen[key] = now
+
+    prev = cycle_key.get(key)
+    if prev is not None and int(prev) == cid - 1:
+        streaks[key] = int(streaks.get(key, 0)) + 1
+    else:
+        streaks[key] = 1
+    cycle_key[key] = cid
+
+    _MEM["updated_ts"] = now
+
+
+def update_signal_memory(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Update memory from current signals and return a compact snapshot.
+    Keys are namespaced as TYPE:TOKEN.
+    """
     for s in signals or []:
         if not isinstance(s, dict):
             continue
+        typ = str_or_empty(s.get("type")).upper()
         tok = str_or_empty(s.get("token")).upper()
-        if not tok:
+        if not typ or not tok:
             continue
-        seen_tokens.append(tok)
-        _MEM["counts"][tok] = int(_MEM["counts"].get(tok, 0)) + 1
-        _MEM["last_seen"][tok] = now
+        _mem_touch(f"{typ}:{tok}")
 
-    # update streaks: increment if seen, else reset to 0
-    for tok in list(_MEM["streaks"].keys()):
-        if tok not in seen_tokens:
-            _MEM["streaks"][tok] = 0
-    for tok in seen_tokens:
-        _MEM["streaks"][tok] = int(_MEM["streaks"].get(tok, 0)) + 1
+    # Compact top 10 by counts
+    counts = dict(sorted((_MEM.get("counts") or {}).items(), key=lambda kv: kv[1], reverse=True)[:10])
+    streaks = dict(sorted((_MEM.get("streaks") or {}).items(), key=lambda kv: kv[1], reverse=True)[:10])
 
-    # return compact (top tokens only)
-    counts = dict(sorted(_MEM["counts"].items(), key=lambda kv: kv[1], reverse=True)[:10])
-    streaks = dict(sorted(_MEM["streaks"].items(), key=lambda kv: kv[1], reverse=True)[:10])
     return {
         "since_ts": _MEM.get("since_ts"),
+        "updated_ts": _MEM.get("updated_ts"),
         "counts": counts,
         "streaks": streaks,
     }
 
 
 def get_signal_memory() -> Dict[str, Any]:
-    return update_signal_memory([])
+    # Do not mutate on read (just return current snapshot)
+    counts = dict(_MEM.get("counts") or {})
+    streaks = dict(_MEM.get("streaks") or {})
+    last_seen = dict(_MEM.get("last_seen") or {})
+    return {
+        "since_ts": _MEM.get("since_ts"),
+        "updated_ts": _MEM.get("updated_ts"),
+        "counts": counts,
+        "streaks": streaks,
+        "last_seen": last_seen,
+    }
 
 
 # -----------------------
 # Vault signal logic
 # -----------------------
-
 
 def _latest_roi_by_token(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     out: Dict[str, float] = {}
@@ -201,7 +258,7 @@ def _latest_roi_by_token(rows: List[Dict[str, Any]]) -> Dict[str, float]:
         tok = str_or_empty(r.get("Token") or r.get("token")).upper()
         if not tok or tok in out:
             continue
-        roi = safe_float(r.get("ROI") or r.get("roi") or r.get("roi_pct"))
+        roi = safe_float(r.get("ROI") or r.get("roi") or r.get("roi_pct") or r.get("Vault ROI") or r.get("Vault_ROI"))
         if roi is None:
             continue
         out[tok] = float(roi)
@@ -212,7 +269,6 @@ def _read_intel_rows() -> List[Dict[str, Any]]:
     rows = _read_records_prefer_db(VAULT_INTEL_TAB)
     if rows:
         return rows
-    # tolerate legacy spaced tab name
     if VAULT_INTEL_TAB_LEGACY and VAULT_INTEL_TAB_LEGACY != VAULT_INTEL_TAB:
         return _read_records_prefer_db(VAULT_INTEL_TAB_LEGACY)
     return []
@@ -243,7 +299,7 @@ def _alpha_signals(max_items: int = 10) -> List[Dict[str, Any]]:
         if len(sigs) >= max_items:
             break
 
-    # Listings: Token + (optional) listing_date
+    # Listings: Token
     if len(sigs) < max_items:
         for r in _read_records_prefer_db(ALPHA_LISTINGS_TAB) or []:
             tok = str_or_empty(r.get("Token") or r.get("token") or r.get("Symbol") or r.get("Asset")).upper()
@@ -263,7 +319,9 @@ def _alpha_signals(max_items: int = 10) -> List[Dict[str, Any]]:
 
 
 def compute_vault_signals(max_items: int = 25) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Returns (signals, error). error is None if ok."""
+    """
+    Returns (signals, error). error is None if ok.
+    """
     try:
         vault_rows = _read_records_prefer_db(VAULT_TAB)
         intel_rows = _read_intel_rows()
@@ -369,7 +427,7 @@ def compute_vault_signals(max_items: int = 25) -> Tuple[List[Dict[str, Any]], Op
         for tok in sorted(rebuy_ready.keys()):
             if any(s.get("token") == tok and s.get("type") in ("SELL_CANDIDATE", "REBUY_CANDIDATE") for s in signals):
                 continue
-            facts = {"total_quote": total_quote}
+            facts = {"total_quote": total_quote, "min_total_quote": min_total_quote}
             if tok in latest_roi:
                 facts["roi"] = float(latest_roi[tok])
             if tok in memory_tags:
@@ -397,8 +455,7 @@ def compute_vault_signals(max_items: int = 25) -> Tuple[List[Dict[str, Any]], Op
 
         # 3) Optional alpha signals (prep-only)
         if len(signals) < max_items:
-            for s in _alpha_signals(max_items=max(0, max_items - len(signals))):
-                signals.append(s)
+            signals.extend(_alpha_signals(max_items=max(0, max_items - len(signals))))
 
         # Rank: SELL first, then REBUY, then WATCH, then ALPHA
         order = {"SELL_CANDIDATE": 0, "REBUY_CANDIDATE": 1, "WATCH": 2, "ALPHA_WATCH": 3}
