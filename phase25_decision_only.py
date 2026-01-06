@@ -30,12 +30,9 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-from utils import get_records_cached, str_or_empty, safe_float
 
 
 _LOG_ONCE = set()
-
-_LOCK = threading.Lock()  # protects cycle execution if scheduler overlaps
 
 
 def _log_once(msg: str) -> None:
@@ -211,6 +208,40 @@ def build_decision() -> Dict[str, Any]:
         "rebuy": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="REBUY_CANDIDATE"][:5],
         "watch": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="WATCH"][:5],
     }
+# --- Vault Decision Record v2 (additive-only fields; Phase 25 safe) ---
+# memory: lightweight continuity from vault signal module (in-process, resets on redeploy)
+memory: Dict[str, Any] = {}
+try:
+    from phase25_vault_signals import get_signal_memory  # type: ignore
+    memory = get_signal_memory()
+except Exception:
+    memory = {}
+
+# blocked_by: compact list of reasons preventing action (informational only)
+blocked_by: List[str] = []
+if cloud_hold:
+    blocked_by.append("CLOUD_HOLD")
+if not auth.get("trusted", False):
+    blocked_by.append("EDGE_AUTH_UNTRUSTED")
+if sig_err:
+    blocked_by.append("SIGNALS_ERROR")
+
+# confidence: conservative heuristic for human scanning (0..1)
+confidence = 0.1
+if ok and recommendation in ("WOULD_REBUY", "WOULD_SELL"):
+    confidence = 0.35
+if blocked_by:
+    confidence = 0.05
+
+signal_strength = "LOW"
+if confidence >= 0.6:
+    signal_strength = "HIGH"
+elif confidence >= 0.3:
+    signal_strength = "MEDIUM"
+
+counterfactuals: List[Dict[str, Any]] = []
+
+
 
     decision_id = os.urandom(8).hex()
 
@@ -225,6 +256,11 @@ def build_decision() -> Dict[str, Any]:
         "reasons": reasons,
         "summary": summary,
         "signals": signals,  # full list (still small)
+        "confidence": confidence,
+        "signal_strength": signal_strength,
+        "counterfactuals": counterfactuals,
+        "blocked_by": blocked_by,
+        "memory": memory,
         "inputs": {
             "edge_authority": auth,
             "cloud_hold": cloud_hold,
@@ -281,16 +317,13 @@ def notify_telegram(decision: Dict[str, Any]) -> None:
 
 
 def run_phase25_decision_cycle() -> Dict[str, Any]:
-    """Safe to call from scheduler. Returns the decision dict."""
     if not enabled():
         _log_once("Phase25A: disabled (set DB_READ_JSON.phase25.enabled=1 to enable)")
         return {"ok": False, "skipped": True, "reason": "disabled"}
-
-    with _LOCK:
-        decision = build_decision()
-        log_decision(decision)
-        notify_telegram(decision)
-        return decision
+    decision = build_decision()
+    log_decision(decision)
+    notify_telegram(decision)
+    return decision
 
 
 _thread_started = False
