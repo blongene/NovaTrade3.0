@@ -133,7 +133,7 @@ def _derive_simple_plan(decision: Dict[str, Any]) -> Dict[str, Any]:
     rec = (decision.get("recommendation") or "HOLD").upper()
     reasons = decision.get("reasons") or []
     signals = decision.get("signals") or []
-    memory = decision.get("memory") or {}
+    watch_signals = [s for s in signals if (s.get("type") or "").upper() in ("WATCH","ALPHA_WATCH")]
 
     ts = _now_ts()
     plan_id = os.urandom(8).hex()
@@ -221,26 +221,21 @@ def _derive_simple_plan(decision: Dict[str, Any]) -> Dict[str, Any]:
             if len(proposed) >= int(os.getenv("PHASE25_PLAN_MAX_ITEMS", "3")):
                 break
 
-        # Planning annotations (Phase 25-safe): add non-executable notes when WATCH signals exist.
-        # This helps you see "why we are waiting" without enabling any behavior.
-        watch = [s for s in signals if isinstance(s, dict) and str(s.get("type") or "").upper() in ("WATCH", "ALPHA_WATCH")]
-        if watch:
-            # keep it small / low noise
-            brief = []
-            for s in watch[:5]:
-                tok = str(s.get("token") or "").upper()
-                rs = s.get("reasons") or []
-                r0 = rs[0] if isinstance(rs, list) and rs else ""
-                brief.append(f"{tok}: {r0}".strip())
-
-            proposed.append({
-                "type": "PLAN_NOTE",
-                "action": "NOTE",
-                "agent_id": agent_id,
-                "reason": "phase25B_watch_notes",
-                "notes": "; ".join([b for b in brief if b])[:500],
-                "memory": memory if isinstance(memory, dict) else {},
-            })
+# If there are WATCH/ALPHA_WATCH signals, include a non-enqueueable NOTE for operator visibility.
+# Phase25C allow_types excludes NOTE, so this can never translate into an outbox intent.
+for s in watch_signals[:3]:
+    tok = (s.get("token") or "").upper()
+    rsn = (s.get("reasons") or [])[:3]
+    facts = s.get("facts") or {}
+    proposed.append({
+        "type": "NOTE",
+        "action": "NOTE",
+        "agent_id": agent_id,
+        "reason": "phase25B_watch_note",
+        "token": tok,
+        "note": f"WATCH: {tok} — " + "; ".join([str(x) for x in rsn if x]),
+        "facts": facts,
+    })
 
         # Always include a low-risk BALANCE_SNAPSHOT (helps validate budgets)
         proposed.append({
