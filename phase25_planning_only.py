@@ -228,6 +228,35 @@ def _derive_simple_plan(decision: Dict[str, Any]) -> Dict[str, Any]:
             "reason": "phase25B_plan"
         })
 
+        # Add low-noise planning annotations for WATCH signals (planning artifacts only; no enqueue)
+        try:
+            notes_added = 0
+            for s in signals:
+                if not isinstance(s, dict):
+                    continue
+                typ = str(s.get("type") or "").upper()
+                if typ not in ("WATCH", "ALPHA_WATCH"):
+                    continue
+                token = str(s.get("token") or "").upper()
+                if not token:
+                    continue
+                # Keep notes short; include the first reason only
+                rs = s.get("reasons") or []
+                r0 = (rs[0] if isinstance(rs, list) and rs else "") or ""
+                proposed.append({
+                    "type": "NOTE",
+                    "action": "NOTE",
+                    "agent_id": agent_id,
+                    "token": token,
+                    "note": f"{typ}: {r0}".strip(),
+                    "reason": "phase25B_watch_note",
+                })
+                notes_added += 1
+                if notes_added >= 5:
+                    break
+        except Exception:
+            pass
+
     # Evaluate each proposed item through guard + policy (for explanations)
     evaluated = []
     for it in proposed:
