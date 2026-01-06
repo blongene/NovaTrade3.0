@@ -32,7 +32,62 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 
+# -----------------------
+# Row selection helpers
+# -----------------------
+
+def _parse_ts_any(v: Any) -> Optional[float]:
+    """Parse a timestamp-ish value into epoch seconds (best-effort)."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        # already epoch-ish
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return None
+    # Common formats in NovaTrade:
+    # - "YYYY-MM-DD HH:MM:SS"
+    # - "YYYY-MM-DDTHH:MM:SS"
+    # - "YYYY-MM-DD" (date only)
+    s_norm = s.replace("T", " ")
+    try:
+        # handle date-only
+        if len(s_norm) == 10 and s_norm[4] == "-" and s_norm[7] == "-":
+            dt = datetime.datetime.strptime(s_norm, "%Y-%m-%d")
+        else:
+            # trim fractional seconds if present
+            if "." in s_norm:
+                s_norm = s_norm.split(".", 1)[0]
+            dt = datetime.datetime.strptime(s_norm, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def _pick_latest_row(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Pick the most recent row by Timestamp/ts/Date if possible; else fallback to last."""
+    if not rows:
+        return {}
+    best_row = None
+    best_ts = None
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        # common keys (Wallet_Monitor, Trade_Log, Unified_Snapshot)
+        for k in ("Timestamp", "ts", "TS", "timestamp", "Date", "date"):
+            if k in r:
+                t = _parse_ts_any(r.get(k))
+                if t is None:
+                    continue
+                if best_ts is None or t > best_ts:
+                    best_ts = t
+                    best_row = r
+                break
+    return best_row if best_row is not None else rows[-1]
 _LOG_ONCE = set()
+
+_LOCK = threading.Lock()  # protects cycle execution if scheduler overlaps
 
 
 def _log_once(msg: str) -> None:
@@ -151,7 +206,7 @@ def _read_hot_path(tab: str, limit: int = 200) -> Dict[str, Any]:
         if not rows:
             return {"tab": tab, "rows": 0}
         # keep it lightweight
-        sample = rows[-1]
+        sample = _pick_latest_row(rows)
         return {"tab": tab, "rows": len(rows), "last": sample}
     except Exception as e:
         return {"tab": tab, "error": f"{e.__class__.__name__}:{e}"}
@@ -208,40 +263,6 @@ def build_decision() -> Dict[str, Any]:
         "rebuy": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="REBUY_CANDIDATE"][:5],
         "watch": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="WATCH"][:5],
     }
-# --- Vault Decision Record v2 (additive-only fields; Phase 25 safe) ---
-# memory: lightweight continuity from vault signal module (in-process, resets on redeploy)
-memory: Dict[str, Any] = {}
-try:
-    from phase25_vault_signals import get_signal_memory  # type: ignore
-    memory = get_signal_memory()
-except Exception:
-    memory = {}
-
-# blocked_by: compact list of reasons preventing action (informational only)
-blocked_by: List[str] = []
-if cloud_hold:
-    blocked_by.append("CLOUD_HOLD")
-if not auth.get("trusted", False):
-    blocked_by.append("EDGE_AUTH_UNTRUSTED")
-if sig_err:
-    blocked_by.append("SIGNALS_ERROR")
-
-# confidence: conservative heuristic for human scanning (0..1)
-confidence = 0.1
-if ok and recommendation in ("WOULD_REBUY", "WOULD_SELL"):
-    confidence = 0.35
-if blocked_by:
-    confidence = 0.05
-
-signal_strength = "LOW"
-if confidence >= 0.6:
-    signal_strength = "HIGH"
-elif confidence >= 0.3:
-    signal_strength = "MEDIUM"
-
-counterfactuals: List[Dict[str, Any]] = []
-
-
 
     decision_id = os.urandom(8).hex()
 
@@ -256,11 +277,6 @@ counterfactuals: List[Dict[str, Any]] = []
         "reasons": reasons,
         "summary": summary,
         "signals": signals,  # full list (still small)
-        "confidence": confidence,
-        "signal_strength": signal_strength,
-        "counterfactuals": counterfactuals,
-        "blocked_by": blocked_by,
-        "memory": memory,
         "inputs": {
             "edge_authority": auth,
             "cloud_hold": cloud_hold,
@@ -317,13 +333,16 @@ def notify_telegram(decision: Dict[str, Any]) -> None:
 
 
 def run_phase25_decision_cycle() -> Dict[str, Any]:
+    """Safe to call from scheduler. Returns the decision dict."""
     if not enabled():
         _log_once("Phase25A: disabled (set DB_READ_JSON.phase25.enabled=1 to enable)")
         return {"ok": False, "skipped": True, "reason": "disabled"}
-    decision = build_decision()
-    log_decision(decision)
-    notify_telegram(decision)
-    return decision
+
+    with _LOCK:
+        decision = build_decision()
+        log_decision(decision)
+        notify_telegram(decision)
+        return decision
 
 
 _thread_started = False
