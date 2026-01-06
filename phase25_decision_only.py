@@ -29,10 +29,12 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 _LOG_ONCE = set()
+
+_LOCK = threading.Lock()  # protects cycle execution if scheduler overlaps
 
 
 def _log_once(msg: str) -> None:
@@ -41,7 +43,6 @@ def _log_once(msg: str) -> None:
     _LOG_ONCE.add(msg)
     try:
         import logging
-
         logging.getLogger("bus").info(msg)
     except Exception:
         print(msg)
@@ -133,7 +134,6 @@ def _cloud_hold_active() -> bool:
 def _edge_authority(agent_id: str) -> Dict[str, Any]:
     try:
         from edge_authority import evaluate_agent  # Phase 24C
-
         ok, reason, age = evaluate_agent(agent_id)
         return {"trusted": bool(ok), "reason": reason, "age_sec": age}
     except Exception as e:
@@ -145,8 +145,6 @@ def _read_hot_path(tab: str, limit: int = 200) -> Dict[str, Any]:
     try:
         from db_read_adapter import get_records_prefer_db  # Phase 22B/23/12
         from utils import get_records_cached  # Sheets fallback (cached)
-
-        # NOTE: limit is advisory; db_read_adapter may already cap by env.
         rows = get_records_prefer_db(
             tab,
             f"sheet_mirror:{tab}",
@@ -159,94 +157,6 @@ def _read_hot_path(tab: str, limit: int = 200) -> Dict[str, Any]:
         return {"tab": tab, "rows": len(rows), "last": sample}
     except Exception as e:
         return {"tab": tab, "error": f"{e.__class__.__name__}:{e}"}
-
-
-def _derive_blocked_by(reasons: Any, recommendation: str) -> list:
-    """Derive blocked_by tags from existing reasons/recommendation (additive-only, no new logic)."""
-    tags = set()
-    rs = reasons or []
-    try:
-        for r in rs:
-            s = str(r or "")
-            low = s.lower()
-
-            # Trust / authority
-            if "cloud_hold" in low:
-                tags.add("cloud_hold")
-            if "edge_authority" in low or "edge_auth" in low or "stale_telemetry" in low or "untrusted" in low:
-                tags.add("trust_stale")
-
-            # Data / reads
-            if "tradelog_read_error" in low or "trade_log" in low and "error" in low:
-                tags.add("trade_log_error")
-            if "wallet" in low and "error" in low:
-                tags.add("wallet_error")
-            if "signals_error" in low:
-                tags.add("signals_error")
-
-            # Policy-style keywords (if present)
-            if "min_notional" in low:
-                tags.add("min_notional")
-            if "cooldown" in low:
-                tags.add("cooldown")
-            if "insufficient" in low and "quote" in low:
-                tags.add("insufficient_quote")
-
-        # If we're HOLDing, it's always because something blocked the system
-        if str(recommendation or "").upper() == "HOLD":
-            if not tags:
-                tags.add("unknown_block")
-    except Exception:
-        # fail-closed: keep empty or minimal
-        pass
-
-    return sorted(tags)
-
-
-def _derive_confidence(recommendation: str, blocked_by: list, auth: Dict[str, Any]) -> float:
-    """
-    Confidence represents conviction in a *directional action* (WOULD_*),
-    not system health or data freshness.
-
-    NOOP / HOLD intentionally remain LOW confidence.
-    """
-    try:
-        rec = (recommendation or "").upper()
-        trusted = bool((auth or {}).get("trusted"))
-
-        # Default: no conviction
-        conf = 0.0
-
-        # Only directional recommendations earn confidence
-        if rec in {"WOULD_SELL", "WOULD_REBUY"}:
-            conf += 0.5
-
-            # Fewer blockers → more conviction
-            if not blocked_by:
-                conf += 0.3
-
-            # Trusted authority strengthens conviction
-            if trusted:
-                conf += 0.2
-
-        # NOOP / HOLD stay intentionally low
-        if rec in {"NOOP", "HOLD"}:
-            conf = 0.1 if trusted and not blocked_by else 0.0
-
-        return round(min(max(conf, 0.0), 1.0), 2)
-    except Exception:
-        return 0.0
-
-
-def _derive_signal_strength(confidence: float) -> str:
-    try:
-        if confidence >= 0.7:
-            return "HIGH"
-        if confidence >= 0.4:
-            return "MEDIUM"
-        return "LOW"
-    except Exception:
-        return "LOW"
 
 
 def build_decision() -> Dict[str, Any]:
@@ -296,57 +206,24 @@ def build_decision() -> Dict[str, Any]:
 
     # Lightweight summary for human scanning (kept short)
     summary = {
-        "sell": [
-            f'{s.get("token")} ({int(float(s.get("confidence") or 0) * 100)}%)'
-            for s in signals
-            if s.get("type") == "SELL_CANDIDATE"
-        ][:5],
-        "rebuy": [
-            f'{s.get("token")} ({int(float(s.get("confidence") or 0) * 100)}%)'
-            for s in signals
-            if s.get("type") == "REBUY_CANDIDATE"
-        ][:5],
-        "watch": [
-            f'{s.get("token")} ({int(float(s.get("confidence") or 0) * 100)}%)'
-            for s in signals
-            if s.get("type") == "WATCH"
-        ][:5],
+        "sell": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="SELL_CANDIDATE"][:5],
+        "rebuy": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="REBUY_CANDIDATE"][:5],
+        "watch": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="WATCH"][:5],
     }
 
     decision_id = os.urandom(8).hex()
-    ts = _now_ts()
-    mode = "decision_only" if decision_only() else "planning_only"
-
-    # --- Vault Decision Record v2 (additive-only fields) ---
-    blocked_by = _derive_blocked_by(reasons, recommendation)
-    confidence = _derive_confidence(recommendation, blocked_by, auth)
-    signal_strength = _derive_signal_strength(confidence)
-
-    # Keep counterfactuals empty by default (avoids spam); we can add later if desired.
-    counterfactuals = []
-
-    # memory is placeholder for future continuity (no dependency, no extra reads)
-    memory = {}
 
     return {
         "ok": bool(ok),
         "decision_id": decision_id,
-        "ts": ts,
+        "ts": _now_ts(),
         "phase": "25A",
-        "mode": mode,
+        "mode": "decision_only" if decision_only() else "planning_only",
         "agent_id": agent,
         "recommendation": recommendation,
         "reasons": reasons,
         "summary": summary,
         "signals": signals,  # full list (still small)
-
-        # v2 additions (safe, additive-only)
-        "confidence": confidence,
-        "signal_strength": signal_strength,
-        "counterfactuals": counterfactuals,
-        "blocked_by": blocked_by,
-        "memory": memory,
-
         "inputs": {
             "edge_authority": auth,
             "cloud_hold": cloud_hold,
@@ -403,13 +280,16 @@ def notify_telegram(decision: Dict[str, Any]) -> None:
 
 
 def run_phase25_decision_cycle() -> Dict[str, Any]:
+    """Safe to call from scheduler. Returns the decision dict."""
     if not enabled():
         _log_once("Phase25A: disabled (set DB_READ_JSON.phase25.enabled=1 to enable)")
         return {"ok": False, "skipped": True, "reason": "disabled"}
-    decision = build_decision()
-    log_decision(decision)
-    notify_telegram(decision)
-    return decision
+
+    with _LOCK:
+        decision = build_decision()
+        log_decision(decision)
+        notify_telegram(decision)
+        return decision
 
 
 _thread_started = False
