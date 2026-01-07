@@ -132,34 +132,68 @@ def _read_records_prefer_db(tab: str) -> List[Dict[str, Any]]:
 _PAIR_RE = re.compile(r"\b([A-Z0-9]{2,10})=([0-9eE+\-\.]+)\b")
 
 
-def _compute_total_quote_from_snapshot(snapshot: str) -> float:
+def _quote_breakdown_from_snapshot(snapshot: str) -> Dict[str, float]:
+    """
+    Return per-stable currency totals from a compact snapshot string.
+
+    Example snapshot:
+      "BINANCEUS:USD=9.77,USDT=159.253; COINBASE:USD=8.01,USDC=36.6,USDT=58.3; ..."
+    """
     if not snapshot:
-        return 0.0
+        return {}
     stables = {"USD", "USDC", "USDT", "DAI"}
-    total = 0.0
+    out: Dict[str, float] = {}
     for sym, val in _PAIR_RE.findall(snapshot.upper()):
         if sym not in stables:
             continue
         amt = safe_float(val)
         if amt is None:
             continue
-        total += float(amt)
+        out[sym] = float(out.get(sym, 0.0)) + float(amt)
     # NaN guard
-    if total != total:
+    for k, v in list(out.items()):
+        if v != v:
+            out[k] = 0.0
+    return out
+
+
+def _total_quote_from_breakdown(breakdown: Dict[str, float]) -> float:
+    if not breakdown:
         return 0.0
-    return float(total)
+    total = float(sum(float(v) for v in breakdown.values()))
+    return 0.0 if (total != total) else float(total)
 
 
-def _get_total_quote_from_wallet_monitor() -> float:
+def _get_quote_facts_from_wallet_monitor() -> Dict[str, Any]:
+    """
+    Best-effort: derive global quote totals from Wallet_Monitor snapshot.
+    Returns:
+      {
+        "total_quote": float,
+        "by_currency": {"USD":..., "USDC":..., ...},
+        "snapshot_ts": "YYYY-MM-DD HH:MM:SS" (if available)
+      }
+    """
     rows = _read_records_prefer_db(WALLET_MONITOR_TAB)
     if not rows:
-        return 0.0
+        return {"total_quote": 0.0, "by_currency": {}}
+
     # Search last 50 rows for a non-empty snapshot (robust to partial rows)
     for r in reversed(rows[-50:]):
+        if not isinstance(r, dict):
+            continue
         snap = str_or_empty(r.get("Snapshot") or r.get("snapshot") or r.get("SNAPSHOT"))
-        if snap:
-            return _compute_total_quote_from_snapshot(snap)
-    return 0.0
+        if not snap:
+            continue
+        breakdown = _quote_breakdown_from_snapshot(snap)
+        total = _total_quote_from_breakdown(breakdown)
+        out: Dict[str, Any] = {"total_quote": total, "by_currency": breakdown}
+        ts = str_or_empty(r.get("Timestamp") or r.get("timestamp") or r.get("ts") or r.get("TS"))
+        if ts:
+            out["snapshot_ts"] = ts
+        return out
+
+    return {"total_quote": 0.0, "by_currency": {}}
 
 
 # -----------------------
@@ -327,7 +361,8 @@ def compute_vault_signals(max_items: int = 25) -> Tuple[List[Dict[str, Any]], Op
         intel_rows = _read_intel_rows()
         roi_rows = _read_records_prefer_db(VAULT_ROI_TAB)
 
-        total_quote = _get_total_quote_from_wallet_monitor()
+        quote_facts = _get_quote_facts_from_wallet_monitor()
+        total_quote = float(quote_facts.get("total_quote", 0.0) or 0.0)
         latest_roi = _latest_roi_by_token(roi_rows)
 
         # Build quick intel maps
@@ -457,8 +492,34 @@ def compute_vault_signals(max_items: int = 25) -> Tuple[List[Dict[str, Any]], Op
         if len(signals) < max_items:
             signals.extend(_alpha_signals(max_items=max(0, max_items - len(signals))))
 
+        # 3.5) Observation breadcrumb: if no actionable signals yet, emit a single INFO signal
+        # derived from the Wallet_Monitor snapshot so we can verify quote aggregation is live.
+        if not signals:
+            try:
+                bcur = quote_facts.get("by_currency") if isinstance(quote_facts, dict) else {}
+                bcur = bcur if isinstance(bcur, dict) else {}
+                facts = {
+                    "total_quote": float(total_quote or 0.0),
+                    "by_currency": {k: float(v) for k, v in bcur.items()},
+                }
+                ts = quote_facts.get("snapshot_ts") if isinstance(quote_facts, dict) else None
+                if ts:
+                    facts["snapshot_ts"] = str(ts)
+                # Only emit if there's something to report (avoid pure noise)
+                if facts.get("total_quote", 0.0) > 0.0 or facts.get("by_currency"):
+                    signals.append({
+                        "type": "INFO",
+                        "token": "QUOTE",
+                        "confidence": 0.05,
+                        "reasons": ["quote_snapshot"],
+                        "facts": facts,
+                    })
+            except Exception:
+                pass
+
+
         # Rank: SELL first, then REBUY, then WATCH, then ALPHA
-        order = {"SELL_CANDIDATE": 0, "REBUY_CANDIDATE": 1, "WATCH": 2, "ALPHA_WATCH": 3}
+        order = {"SELL_CANDIDATE": 0, "REBUY_CANDIDATE": 1, "WATCH": 2, "INFO": 3, "ALPHA_WATCH": 4}
         signals.sort(key=lambda s: (order.get(str(s.get("type") or ""), 9), -float(s.get("confidence") or 0.0)))
 
         # Update memory (in-process) based on final signals
