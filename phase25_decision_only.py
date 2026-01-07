@@ -54,13 +54,13 @@ def _parse_ts_any(v: Any) -> Optional[float]:
     try:
         # handle date-only
         if len(s_norm) == 10 and s_norm[4] == "-" and s_norm[7] == "-":
-            dt = datetime.datetime.strptime(s_norm, "%Y-%m-%d")
+            dt = datetime.strptime(s_norm, "%Y-%m-%d")
         else:
             # trim fractional seconds if present
             if "." in s_norm:
                 s_norm = s_norm.split(".", 1)[0]
-            dt = datetime.datetime.strptime(s_norm, "%Y-%m-%d %H:%M:%S")
-        return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+            dt = datetime.strptime(s_norm, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc).timestamp()
     except Exception:
         return None
 
@@ -68,7 +68,7 @@ def _parse_ts_any(v: Any) -> Optional[float]:
 def _pick_latest_row(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Pick the most recent row by Timestamp/ts/Date if possible; else fallback to last."""
     if not rows:
-        return {}
+        out = {}
     best_row = None
     best_ts = None
     for r in rows:
@@ -284,6 +284,15 @@ def build_decision() -> Dict[str, Any]:
             "trade_log": trades,
         },
     }
+
+    # Low-noise diagnostics (only present when relevant)
+    if sig_err:
+        out["signals_error"] = str(sig_err)
+
+    # Always include a tiny meta breadcrumb for debugging
+    out["signals_meta"] = {"count": int(len(signals or [])), "has_error": bool(sig_err)}
+
+    return out
 
 
 def log_decision(decision: Dict[str, Any]) -> None:
