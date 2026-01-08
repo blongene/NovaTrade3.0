@@ -25,12 +25,49 @@ gateB AS (
   GROUP BY token
 ),
 
+/* Gate D: Policy blocks (real) */
+active_blocks AS (
+  SELECT
+    token,
+    block_code,
+    severity,
+    source,
+    details,
+    ts,
+    expires_at
+  FROM alpha_policy_blocks
+  WHERE cleared = 0
+    AND (expires_at IS NULL OR expires_at > NOW())
+),
+gateD AS (
+  SELECT
+    token,
+    CASE
+      -- Any BLOCK severity active => not clear
+      WHEN SUM((severity='BLOCK')::int) > 0 THEN 0
+      ELSE 1
+    END AS policy_clear,
+
+    -- Human-readable notes (codes + optional detail snippet)
+    STRING_AGG(
+      block_code ||
+      COALESCE(
+        CASE
+          WHEN details ? 'note' THEN '(' || (details->>'note') || ')'
+          ELSE ''
+        END, ''
+      ),
+      ', ' ORDER BY block_code
+    ) AS policy_note
+  FROM active_blocks
+  GROUP BY token
+),
+
 /* Aggregate memory metrics */
 m AS (
   SELECT
     token,
 
-    -- activity
     SUM((event='SEEN' AND ts >= NOW()-INTERVAL '24 hours')::int) AS seen_24h,
     SUM((event='SEEN' AND ts >= NOW()-INTERVAL '7 days')::int)   AS seen_7d,
     SUM((event='SEEN' AND ts >= NOW()-INTERVAL '30 days')::int)  AS seen_30d,
@@ -41,14 +78,12 @@ m AS (
       END
     ) AS distinct_seen_days_7d,
 
-    -- confirmations / watch / decay
     SUM((event='CONFIRMED' AND ts >= NOW()-INTERVAL '7 days')::int)  AS confirmed_7d,
     SUM((event='CONFIRMED' AND ts >= NOW()-INTERVAL '30 days')::int) AS confirmed_30d,
     SUM((event='PROMOTED_TO_WATCH' AND ts >= NOW()-INTERVAL '7 days')::int) AS watch_7d,
     SUM((event='EXPIRED' AND ts >= NOW()-INTERVAL '30 days')::int) AS expired_30d,
     SUM((event='DEMOTED' AND ts >= NOW()-INTERVAL '30 days')::int) AS demoted_30d,
 
-    -- timestamps
     MAX(CASE WHEN event='SEEN' THEN ts END) AS last_seen_ts,
     MAX(CASE WHEN event='CONFIRMED' THEN ts END) AS last_confirmed_ts,
     MAX(CASE WHEN event='PROMOTED_TO_WATCH' THEN ts END) AS last_watch_ts,
@@ -101,29 +136,30 @@ gates AS (
       THEN 1 ELSE 0
     END AS gate_A_memory_maturity,
 
-    /* Gate B: venue feasibility (REAL now) */
+    /* Gate B: venue feasibility (real) */
     COALESCE(gb.venue_feasible, 0) AS gate_B_venue_feasible,
     COALESCE(gb.venue_symbols, 'NONE')::text AS gate_B_note,
 
-    /* Gate C: data freshness (simple: has been seen within 7d) */
+    /* Gate C: freshness (simple: has been seen within 7d) */
     CASE
       WHEN b.last_seen_ts IS NOT NULL
        AND b.last_seen_ts >= NOW() - INTERVAL '7 days'
       THEN 1 ELSE 0
     END AS gate_C_fresh_enough,
 
-    /* Gate D: policy safety (still placeholder until we add policy-by-token blocks) */
-    0 AS gate_D_policy_clear,
-    'UNKNOWN'::text AS gate_D_note,
+    /* Gate D: policy safety (real) */
+    COALESCE(gd.policy_clear, 1) AS gate_D_policy_clear,
+    COALESCE(gd.policy_note, 'CLEAR')::text AS gate_D_note,
 
-    /* Gate E: capital discipline (preview-only; never enables execution here) */
+    /* Gate E: capital discipline (preview-only) */
     1 AS gate_E_capital_preview_ok,
 
-    /* Gate F: human sovereignty (always required) */
+    /* Gate F: human sovereignty */
     1 AS gate_F_human_required
 
   FROM base b
   LEFT JOIN gateB gb USING (token)
+  LEFT JOIN gateD gd USING (token)
 ),
 
 stage AS (
