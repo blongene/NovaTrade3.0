@@ -13,6 +13,14 @@ last_idea AS (
   FROM alpha_ideas
   ORDER BY token, ts DESC
 ),
+gateB AS (
+  SELECT
+    token,
+    MAX(CASE WHEN tradable=1 THEN 1 ELSE 0 END) AS venue_feasible,
+    STRING_AGG(venue || ':' || symbol, ', ' ORDER BY venue) AS venue_symbols
+  FROM alpha_symbol_map
+  GROUP BY token
+),
 m AS (
   SELECT
     token,
@@ -80,8 +88,8 @@ gates AS (
 
     -- Gate B: venue feasibility (placeholder until symbol mapping table exists)
     -- For now: treat as "UNKNOWN" unless you add a mapping table.
-    0 AS gate_B_venue_feasible,
-    'UNKNOWN'::text AS gate_B_note,
+    COALESCE(gb.venue_feasible, 0) AS gate_B_venue_feasible,
+    COALESCE(gb.venue_symbols, 'NONE')::text AS gate_B_note,
 
     -- Gate C: data freshness (based on last_seen age; adjust threshold as desired)
     CASE WHEN b.last_seen_ts IS NOT NULL AND b.last_seen_ts >= NOW() - INTERVAL '7 days'
@@ -147,3 +155,4 @@ ORDER BY
   seen_24h DESC,
   COALESCE(last_seen_ts, 'epoch'::timestamptz) DESC
 LIMIT 50;
+
