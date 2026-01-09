@@ -148,17 +148,17 @@ classified AS (
       WHEN r.gate_d_policy_clear  = 0 THEN 'WOULD_SKIP'
       WHEN r.gate_c_fresh_enough  = 0 THEN 'WOULD_WATCH'
       WHEN r.gate_a_memory_maturity = 0 THEN 'WOULD_WATCH'
-      WHEN r.gate_ready = 1 THEN 'WOULD_TRADE'
+      WHEN (r.gate_a_memory_maturity = 1 AND r.gate_b_venue_feasible = 1 AND r.gate_c_fresh_enough = 1 AND r.gate_d_policy_clear = 1) = 1 THEN 'WOULD_TRADE'
       ELSE 'WOULD_WATCH'
     END AS action,
 
     CASE
-      WHEN r.gate_ready = 1 THEN (SELECT default_trade_notional_usd FROM params)
+      WHEN (r.gate_a_memory_maturity = 1 AND r.gate_b_venue_feasible = 1 AND r.gate_c_fresh_enough = 1 AND r.gate_d_policy_clear = 1) = 1 THEN (SELECT default_trade_notional_usd FROM params)
       ELSE NULL
     END AS notional_usd,
 
     CASE
-      WHEN r.gate_ready = 1 THEN (SELECT default_trade_confidence FROM params)
+      WHEN (r.gate_a_memory_maturity = 1 AND r.gate_b_venue_feasible = 1 AND r.gate_c_fresh_enough = 1 AND r.gate_d_policy_clear = 1) = 1 THEN (SELECT default_trade_confidence FROM params)
       WHEN (r.gate_c_fresh_enough = 0 OR r.gate_a_memory_maturity = 0) THEN (SELECT default_watch_confidence FROM params)
       ELSE (SELECT default_watch_confidence FROM params)
     END AS confidence,
