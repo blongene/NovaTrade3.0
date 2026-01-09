@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-alpha_proposal_runner.py (Phase 26A, SQL-native, preview-only)
+alpha_proposal_runner.py — Phase 26A (v1.3.1 SQL-native, bulletproof)
 
-Design goals (per MSD50–52 + Phase 26 runway):
-- Python does NOT re-implement alpha logic.
-- Python only orchestrates the canonical SQL pipeline using psql.
-- SAFE DEFAULTS: does nothing unless explicitly enabled by env flags.
-- Never enqueues commands / never touches outbox / never executes trades.
+Why this exists:
+- Your Phase 26 logic already lives in canonical SQL files.
+- This runner should ONLY orchestrate those SQL files and never re-implement gates in Python.
+- It must be compatible with phase26a_smoketest.py, which imports:
+      from alpha_proposal_runner import run_alpha_proposal_runner
 
-What this runner does:
-1) Ensures alpha_tools.sql can be applied safely (preview_enabled forced to 0 in a temp copy).
-2) Runs alpha_proposal_generator.sql with preview_enabled=1 (only if enabled).
-3) Optionally runs alpha_polish.sql (non-destructive view/materialization polish).
+Safety:
+- Preview-only. Requires:
+    PREVIEW_ENABLED=1
+    ALPHA_PREVIEW_PROPOSALS_ENABLED=1
+- Never enqueues commands / never executes trades.
 
-This avoids the recurring redeploy loop caused by:
-- gate column type drift (int vs boolean)
-- CTE ordering changes (e.g., "norm" CTE)
-- column renames in alpha_readiness_v
+Execution model:
+1) Run sql/alpha_tools.sql in SAFE mode (force preview_enabled=0) to ensure helper objects exist.
+2) Run sql/alpha_proposal_generator.sql with preview_enabled=1 to generate preview proposals.
+3) Optionally run sql/alpha_polish.sql with preview_enabled=1.
 
-Because the SQL files are the source of truth, and psql handles their meta-commands (\set, \if).
+This file is intentionally self-contained and avoids shim hacks that can break imports.
 """
 
 from __future__ import annotations
@@ -28,197 +29,188 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from typing import Dict, Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Tuple
+
+ROOT = Path(__file__).resolve().parent
+SQL_DIR = ROOT / "sql"
+
+# SQL filenames (overrideable)
+TOOLS_SQL = os.getenv("ALPHA_TOOLS_SQL", "alpha_tools.sql")
+GEN_SQL = os.getenv("ALPHA_GENERATOR_SQL", "alpha_proposal_generator.sql")
+POLISH_SQL = os.getenv("ALPHA_POLISH_SQL", "alpha_polish.sql")
+
+POLISH_ENABLED = os.getenv("ALPHA_POLISH_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+
+# Safety gates
+PREVIEW_ENABLED = os.getenv("PREVIEW_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+ALPHA_ENABLED = os.getenv("ALPHA_PREVIEW_PROPOSALS_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+
+# psql binary name/path
+PSQL_BIN = os.getenv("PSQL_BIN", "psql")
+
+# Remove any existing \set preview_enabled ... lines from tools and force to 0
+_PREVIEW_SET_RE = re.compile(r"^\s*\\set\s+preview_enabled\s+.*$", re.IGNORECASE | re.MULTILINE)
 
 
-@dataclass(frozen=True)
-class AlphaRunnerConfig:
-    db_url: str
-    agent_id: str
-    preview_enabled: int
-    run_enabled: bool
-    apply_tools_if_missing: bool
-    run_polish: bool
-
-    # Optional knobs passed into SQL (if scripts support them)
-    default_trade_notional_usd: Optional[float] = None
-    default_trade_confidence: Optional[float] = None
-    default_watch_confidence: Optional[float] = None
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = (os.getenv(name) or "").strip().lower()
-    if not v:
-        return default
-    return v in ("1", "true", "t", "yes", "y", "on")
+def _log(level: str, msg: str) -> None:
+    print(f"[{_utc_now()}] {level.upper():5s} {msg}", flush=True)
 
 
-def _env_float(name: str) -> Optional[float]:
-    v = (os.getenv(name) or "").strip()
-    if not v:
-        return None
-    try:
-        return float(v)
-    except Exception:
-        return None
+@dataclass
+class RunResult:
+    ok: bool
+    returncode: int
+    stdout: str
+    stderr: str
 
 
-def _log(msg: str) -> None:
-    # Keep logs Render-friendly (single-line, timestamp handled by logger upstream)
-    print(msg, flush=True)
+def _run_cmd(cmd: list[str], env: Optional[dict] = None, cwd: Optional[Path] = None) -> RunResult:
+    proc = subprocess.run(
+        cmd,
+        env=env,
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+    )
+    return RunResult(
+        ok=(proc.returncode == 0),
+        returncode=proc.returncode,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+    )
 
 
-def _psql_cmd(db_url: str, sql_path: str, vars_map: Dict[str, str | int | float]) -> list[str]:
-    cmd = ["psql", db_url, "-v", "ON_ERROR_STOP=1", "-f", sql_path]
-    # Important: pass vars BEFORE -f is ok; psql uses them for :'var' and :var
-    # We'll add them after base but before -f for clarity (psql accepts anywhere).
-    cmd = ["psql", db_url, "-v", "ON_ERROR_STOP=1"]
-    for k, v in vars_map.items():
-        cmd += ["-v", f"{k}={v}"]
-    cmd += ["-f", sql_path]
-    return cmd
-
-
-def _run_psql(db_url: str, sql_path: str, vars_map: Dict[str, str | int | float]) -> None:
-    cmd = _psql_cmd(db_url, sql_path, vars_map)
-    _log(f"[alpha_runner] psql exec: {os.path.basename(sql_path)} (vars: {', '.join(sorted(vars_map.keys()))})")
-    # Capture output for debugging without spamming; show on failure
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        raise RuntimeError(
-            f"psql failed for {sql_path} (rc={proc.returncode}).\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        )
-
-
-def _safe_tools_temp_copy(original_path: str) -> str:
-    """
-    alpha_tools.sql historically had a line that could set preview_enabled=1.
-    Even if later fixed, we defensively force any '\\set preview_enabled <x>' to 0
-    in a TEMP copy, so running tools cannot insert proposals unintentionally.
-    """
-    with open(original_path, "r", encoding="utf-8", errors="ignore") as f:
-        txt = f.read()
-
-    # Force preview_enabled to 0 if hard-set anywhere
-    txt2 = re.sub(r"(?m)^\s*\\set\s+preview_enabled\s+\S+\s*$", r"\\set preview_enabled 0", txt)
-
-    fd, tmp_path = tempfile.mkstemp(prefix="alpha_tools_safe_", suffix=".sql")
-    os.close(fd)
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(txt2)
-    return tmp_path
-
-
-def _sql_path(name: str) -> str:
-    # Prefer repo-local sql/ folder; fall back to current directory
-    candidates = [
-        os.path.join(os.getcwd(), "sql", name),
-        os.path.join(os.getcwd(), name),
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    raise FileNotFoundError(f"Missing SQL file: {name}. Expected at: {candidates}")
-
-
-def load_config() -> AlphaRunnerConfig:
-    db_url = (os.getenv("DB_URL") or os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "").strip()
+def _require_db_url() -> str:
+    db_url = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
     if not db_url:
-        raise RuntimeError("Missing DB connection env. Set DB_URL or DATABASE_URL.")
-
-    # Global preview gate (match your conventions)
-    preview_global = _env_bool("PREVIEW_ENABLED", default=False)
-    preview_alpha = _env_bool("ALPHA_PREVIEW_PROPOSALS_ENABLED", default=False)
-
-    run_enabled = preview_global and preview_alpha
-
-    agent_id = (os.getenv("AGENT_ID") or os.getenv("ALPHA_AGENT_ID") or "edge-primary").strip()
-
-    cfg = AlphaRunnerConfig(
-        db_url=db_url,
-        agent_id=agent_id,
-        preview_enabled=1 if run_enabled else 0,
-        run_enabled=run_enabled,
-        apply_tools_if_missing=_env_bool("ALPHA_APPLY_TOOLS_IF_MISSING", default=True),
-        run_polish=_env_bool("ALPHA_RUN_POLISH", default=True),
-        default_trade_notional_usd=_env_float("ALPHA_DEFAULT_TRADE_NOTIONAL_USD"),
-        default_trade_confidence=_env_float("ALPHA_DEFAULT_TRADE_CONFIDENCE"),
-        default_watch_confidence=_env_float("ALPHA_DEFAULT_WATCH_CONFIDENCE"),
-    )
-    return cfg
+        raise RuntimeError("DB_URL/DATABASE_URL is not set (required for Phase 26A runner).")
+    return db_url
 
 
-def run_alpha_preview_proposals() -> None:
-    cfg = load_config()
+def _sql_path(name: str) -> Path:
+    p = SQL_DIR / name
+    if not p.exists():
+        raise FileNotFoundError(f"Missing SQL file: {p}")
+    return p
 
-    if not cfg.run_enabled:
-        _log("[alpha_runner] preview proposals disabled (set PREVIEW_ENABLED=1 and ALPHA_PREVIEW_PROPOSALS_ENABLED=1).")
-        return
 
-    # 1) Ensure tools are applied safely (creates alpha_readiness_v, alpha_proposals table, etc.)
-    tools_sql = _sql_path("alpha_tools.sql")
-    safe_tools = _safe_tools_temp_copy(tools_sql)
+def _patched_tools_sql(original: str) -> str:
+    """
+    Force preview_enabled=0 for alpha_tools.sql so it cannot accidentally generate preview rows.
+    """
+    stripped = re.sub(_PREVIEW_SET_RE, "", original)
+    return "\\set preview_enabled 0\n" + stripped
 
-    try:
-        # Always run tools in SAFE mode (preview_enabled=0) so no inserts happen from tools.
-        _run_psql(
-            cfg.db_url,
-            safe_tools,
-            {
-                "preview_enabled": 0,
-                "agent_id": cfg.agent_id,
-                # pass optional knobs if present; harmless if unused
-                **({ "default_trade_notional_usd": cfg.default_trade_notional_usd } if cfg.default_trade_notional_usd is not None else {}),
-                **({ "default_trade_confidence": cfg.default_trade_confidence } if cfg.default_trade_confidence is not None else {}),
-                **({ "default_watch_confidence": cfg.default_watch_confidence } if cfg.default_watch_confidence is not None else {}),
-            },
-        )
-    finally:
+
+def _write_temp_sql(contents: str) -> Path:
+    fd, path = tempfile.mkstemp(prefix="alpha_tools_safe_", suffix=".sql")
+    os.close(fd)
+    p = Path(path)
+    p.write_text(contents, encoding="utf-8")
+    return p
+
+
+def _parse_generated_count(text: str) -> int:
+    """
+    Best-effort parse from SQL output. Safe to return 0 if not detectable.
+    """
+    if not text:
+        return 0
+    for pat in (
+        re.compile(r"generated\D+(\d+)", re.IGNORECASE),
+        re.compile(r"wrote\D+(\d+)", re.IGNORECASE),
+        re.compile(r"inserted\D+(\d+)", re.IGNORECASE),
+    ):
+        m = pat.search(text)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    return 0
+
+
+def run_alpha_proposal_runner() -> Tuple[int, str]:
+    """
+    Public entrypoint (required by phase26a_smoketest.py).
+
+    Returns:
+      (count_generated, status_string)
+    """
+    if not (PREVIEW_ENABLED and ALPHA_ENABLED):
+        msg = "skipped (set PREVIEW_ENABLED=1 and ALPHA_PREVIEW_PROPOSALS_ENABLED=1)"
+        _log("INFO", f"alpha_proposal_runner {msg}")
+        return 0, msg
+
+    db_url = _require_db_url()
+
+    tools_path = _sql_path(TOOLS_SQL)
+    gen_path = _sql_path(GEN_SQL)
+    polish_path = None
+    if POLISH_ENABLED:
         try:
-            os.remove(safe_tools)
-        except Exception:
-            pass
+            polish_path = _sql_path(POLISH_SQL)
+        except FileNotFoundError:
+            polish_path = None  # optional
 
-    # 2) Generate proposals (this script is preview-gated internally and checks view/table presence)
-    gen_sql = _sql_path("alpha_proposal_generator.sql")
-    _run_psql(
-        cfg.db_url,
-        gen_sql,
-        {
-            "preview_enabled": cfg.preview_enabled,
-            "agent_id": cfg.agent_id,
-            # optional knobs
-            **({ "default_trade_notional_usd": cfg.default_trade_notional_usd } if cfg.default_trade_notional_usd is not None else {}),
-            **({ "default_trade_confidence": cfg.default_trade_confidence } if cfg.default_trade_confidence is not None else {}),
-            **({ "default_watch_confidence": cfg.default_watch_confidence } if cfg.default_watch_confidence is not None else {}),
-        },
-    )
+    env = os.environ.copy()
+    env["PGCONNECT_TIMEOUT"] = env.get("PGCONNECT_TIMEOUT", "10")
 
-    # 3) Optional polish (views / dashboards; should be safe + idempotent)
-    if cfg.run_polish:
-        polish_sql = _sql_path("alpha_polish.sql")
-        _run_psql(cfg.db_url, polish_sql, {"preview_enabled": cfg.preview_enabled, "agent_id": cfg.agent_id})
+    # 1) tools (safe preview=0)
+    tmp_tools = None
+    try:
+        tools_sql = tools_path.read_text(encoding="utf-8", errors="replace")
+        tmp_tools = _write_temp_sql(_patched_tools_sql(tools_sql))
+        _log("INFO", f"alpha_proposal_runner: tools (safe) -> {tools_path.name}")
+        res_tools = _run_cmd([PSQL_BIN, db_url, "-v", "ON_ERROR_STOP=1", "-f", str(tmp_tools)], env=env, cwd=ROOT)
+        if not res_tools.ok:
+            _log("ERROR", f"alpha_proposal_runner tools failed rc={res_tools.returncode}")
+            if res_tools.stderr.strip():
+                _log("ERROR", res_tools.stderr.strip())
+            return 0, f"tools_failed rc={res_tools.returncode}"
 
-    _log("[alpha_runner] Phase 26A preview proposals run complete.")
+        # 2) generator (preview_enabled=1)
+        _log("INFO", f"alpha_proposal_runner: generator -> {gen_path.name}")
+        res_gen = _run_cmd([PSQL_BIN, db_url, "-v", "ON_ERROR_STOP=1", "-v", "preview_enabled=1", "-f", str(gen_path)], env=env, cwd=ROOT)
+        if not res_gen.ok:
+            _log("ERROR", f"alpha_proposal_runner generator failed rc={res_gen.returncode}")
+            if res_gen.stderr.strip():
+                _log("ERROR", res_gen.stderr.strip())
+            return 0, f"generator_failed rc={res_gen.returncode}"
+
+        # 3) polish (optional)
+        if polish_path is not None:
+            _log("INFO", f"alpha_proposal_runner: polish -> {polish_path.name}")
+            res_polish = _run_cmd([PSQL_BIN, db_url, "-v", "ON_ERROR_STOP=1", "-v", "preview_enabled=1", "-f", str(polish_path)], env=env, cwd=ROOT)
+            if not res_polish.ok:
+                _log("ERROR", f"alpha_proposal_runner polish failed rc={res_polish.returncode}")
+                if res_polish.stderr.strip():
+                    _log("ERROR", res_polish.stderr.strip())
+                return 0, f"polish_failed rc={res_polish.returncode}"
+
+        combined = "\n".join([res_gen.stdout, res_gen.stderr]).strip()
+        count = _parse_generated_count(combined)
+        _log("INFO", f"alpha_proposal_runner: ok generated={count}")
+        return count, "ok"
+
+    finally:
+        if tmp_tools is not None:
+            try:
+                tmp_tools.unlink(missing_ok=True)  # py3.11+
+            except Exception:
+                pass
+
+
+def main() -> None:
+    count, status = run_alpha_proposal_runner()
+    _log("INFO", f"alpha_proposal_runner finished: status={status} count={count}")
 
 
 if __name__ == "__main__":
-    try:
-        run_alpha_preview_proposals()
-    except Exception as e:
-        _log(f"[alpha_runner] ERROR: {e}")
-        raise
-
-
-# -----------------------------------------------------------------------------
-# Compatibility shim (expected by phase26a_smoketest.py)
-# -----------------------------------------------------------------------------
-def run_alpha_proposal_runner():
-    """Compatibility shim. Calls main runner and returns (count, status)."""
-    try:
-        return run(), "ok"
-    except Exception as e:
-        _log("ERROR", f"alpha_proposal_runner failed: {e}")
-        return 0, f"error: {e}"
+    main()
