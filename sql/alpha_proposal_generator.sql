@@ -11,7 +11,7 @@
 \if :{?preview_enabled}
   \echo 'preview_enabled provided: ' :preview_enabled
 \else
-  \set preview_enabled 0
+  \set preview_enabled 1
   \echo 'preview_enabled defaulting to 0'
 \endif
 \set agent_id 'edge-primary'
