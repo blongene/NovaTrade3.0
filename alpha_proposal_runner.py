@@ -210,3 +210,15 @@ if __name__ == "__main__":
     except Exception as e:
         _log(f"[alpha_runner] ERROR: {e}")
         raise
+
+
+# -----------------------------------------------------------------------------
+# Compatibility shim (expected by phase26a_smoketest.py)
+# -----------------------------------------------------------------------------
+def run_alpha_proposal_runner():
+    """Compatibility shim. Calls main runner and returns (count, status)."""
+    try:
+        return run(), "ok"
+    except Exception as e:
+        _log("ERROR", f"alpha_proposal_runner failed: {e}")
+        return 0, f"error: {e}"
