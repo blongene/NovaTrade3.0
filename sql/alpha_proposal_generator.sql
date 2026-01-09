@@ -8,7 +8,12 @@
 -- ============================================================
 
 \set ON_ERROR_STOP on
-\set preview_enabled 0
+\if :{?preview_enabled}
+  \echo 'preview_enabled provided: ' :preview_enabled
+\else
+  \set preview_enabled 0
+  \echo 'preview_enabled defaulting to 0'
+\endif
 \set agent_id 'edge-primary'
 \set default_trade_notional_usd 25
 \set default_trade_confidence 0.10
