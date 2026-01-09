@@ -137,29 +137,29 @@ classified AS (
     r.*,
 
     ARRAY_REMOVE(ARRAY[
-      CASE WHEN r.gate_b_venue_feasible = 0 THEN 'NO_TRADABLE_VENUE' END,
-      CASE WHEN r.gate_d_policy_clear  = 0 THEN 'POLICY_BLOCK' END,
-      CASE WHEN r.gate_c_fresh_enough  = 0 THEN 'STALE' END,
-      CASE WHEN r.gate_a_memory_maturity = 0 THEN 'IMMATURE' END
+      CASE WHEN NOT COALESCE(r.gate_b_venue_feasible, FALSE) THEN 'NO_TRADABLE_VENUE' END,
+      CASE WHEN NOT COALESCE(r.gate_d_policy_clear, FALSE) THEN 'POLICY_BLOCK' END,
+      CASE WHEN NOT COALESCE(r.gate_c_fresh_enough, FALSE) THEN 'STALE' END,
+      CASE WHEN NOT COALESCE(r.gate_a_memory_maturity, FALSE) THEN 'IMMATURE' END
     ], NULL) AS blockers,
 
     CASE
-      WHEN r.gate_b_venue_feasible = 0 THEN 'WOULD_SKIP'
-      WHEN r.gate_d_policy_clear  = 0 THEN 'WOULD_SKIP'
-      WHEN r.gate_c_fresh_enough  = 0 THEN 'WOULD_WATCH'
-      WHEN r.gate_a_memory_maturity = 0 THEN 'WOULD_WATCH'
-      WHEN (r.gate_a_memory_maturity = 1 AND r.gate_b_venue_feasible = 1 AND r.gate_c_fresh_enough = 1 AND r.gate_d_policy_clear = 1) = 1 THEN 'WOULD_TRADE'
+      WHEN NOT COALESCE(r.gate_b_venue_feasible, FALSE) THEN 'WOULD_SKIP'
+      WHEN NOT COALESCE(r.gate_d_policy_clear, FALSE) THEN 'WOULD_SKIP'
+      WHEN NOT COALESCE(r.gate_c_fresh_enough, FALSE) THEN 'WOULD_WATCH'
+      WHEN NOT COALESCE(r.gate_a_memory_maturity, FALSE) THEN 'WOULD_WATCH'
+      WHEN (COALESCE(r.gate_a_memory_maturity, FALSE) AND COALESCE(r.gate_b_venue_feasible, FALSE) AND COALESCE(r.gate_c_fresh_enough, FALSE) AND COALESCE(r.gate_d_policy_clear, FALSE)) THEN 'WOULD_TRADE'
       ELSE 'WOULD_WATCH'
     END AS action,
 
     CASE
-      WHEN (r.gate_a_memory_maturity = 1 AND r.gate_b_venue_feasible = 1 AND r.gate_c_fresh_enough = 1 AND r.gate_d_policy_clear = 1) = 1 THEN (SELECT default_trade_notional_usd FROM params)
+      WHEN (COALESCE(r.gate_a_memory_maturity, FALSE) AND COALESCE(r.gate_b_venue_feasible, FALSE) AND COALESCE(r.gate_c_fresh_enough, FALSE) AND COALESCE(r.gate_d_policy_clear, FALSE)) THEN (SELECT default_trade_notional_usd FROM params)
       ELSE NULL
     END AS notional_usd,
 
     CASE
-      WHEN (r.gate_a_memory_maturity = 1 AND r.gate_b_venue_feasible = 1 AND r.gate_c_fresh_enough = 1 AND r.gate_d_policy_clear = 1) = 1 THEN (SELECT default_trade_confidence FROM params)
-      WHEN (r.gate_c_fresh_enough = 0 OR r.gate_a_memory_maturity = 0) THEN (SELECT default_watch_confidence FROM params)
+      WHEN (COALESCE(r.gate_a_memory_maturity, FALSE) AND COALESCE(r.gate_b_venue_feasible, FALSE) AND COALESCE(r.gate_c_fresh_enough, FALSE) AND COALESCE(r.gate_d_policy_clear, FALSE)) THEN (SELECT default_trade_confidence FROM params)
+      WHEN (NOT COALESCE(r.gate_c_fresh_enough, FALSE) OR NOT COALESCE(r.gate_a_memory_maturity, FALSE)) THEN (SELECT default_watch_confidence FROM params)
       ELSE (SELECT default_watch_confidence FROM params)
     END AS confidence,
 
@@ -167,10 +167,10 @@ classified AS (
       WITH blk AS (
         SELECT COALESCE(
           ARRAY_TO_JSON(ARRAY_REMOVE(ARRAY[
-            CASE WHEN r.gate_b_venue_feasible = 0 THEN 'NO_TRADABLE_VENUE' END,
-            CASE WHEN r.gate_d_policy_clear  = 0 THEN 'POLICY_BLOCK' END,
-            CASE WHEN r.gate_c_fresh_enough  = 0 THEN 'STALE' END,
-            CASE WHEN r.gate_a_memory_maturity = 0 THEN 'IMMATURE' END
+            CASE WHEN NOT COALESCE(r.gate_b_venue_feasible, FALSE) THEN 'NO_TRADABLE_VENUE' END,
+            CASE WHEN NOT COALESCE(r.gate_d_policy_clear, FALSE) THEN 'POLICY_BLOCK' END,
+            CASE WHEN NOT COALESCE(r.gate_c_fresh_enough, FALSE) THEN 'STALE' END,
+            CASE WHEN NOT COALESCE(r.gate_a_memory_maturity, FALSE) THEN 'IMMATURE' END
           ], NULL))::jsonb,
           '[]'::jsonb
         ) AS blockers
