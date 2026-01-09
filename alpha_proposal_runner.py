@@ -126,6 +126,7 @@ WITH params AS (
     %(default_trade_notional_usd)s::numeric AS default_trade_notional_usd,
     %(default_trade_confidence)s::numeric AS default_trade_confidence,
     %(default_watch_confidence)s::numeric AS default_watch_confidence,
+    %(confidence_cap)s::numeric AS confidence_cap,
     to_char((NOW() AT TIME ZONE 'UTC')::date,'YYYY-MM-DD')::text AS utc_day
 ),
 r AS (
@@ -162,28 +163,76 @@ classified AS (
       ELSE (SELECT default_watch_confidence FROM params)
     END AS confidence,
 
-    jsonb_build_object(
-      'utc_day', (SELECT utc_day FROM params),
-      'token', r.token,
-      'venue', r.venue,
-      'symbol', r.symbol,
-      'gates', jsonb_build_object(
-        'A', r.gate_a_memory_maturity,
-        'B', r.gate_b_venue_feasible,
-        'C', r.gate_c_fresh_enough,
-        'D', r.gate_d_policy_clear
-      ),
-      'gate_ready', r.gate_ready,
-      'blockers', COALESCE(ARRAY_TO_JSON(ARRAY_REMOVE(ARRAY[
-        CASE WHEN r.gate_b_venue_feasible = 0 THEN 'NO_TRADABLE_VENUE' END,
-        CASE WHEN r.gate_d_policy_clear  = 0 THEN 'POLICY_BLOCK' END,
-        CASE WHEN r.gate_c_fresh_enough  = 0 THEN 'STALE' END,
-        CASE WHEN r.gate_a_memory_maturity = 0 THEN 'IMMATURE' END
-      ], NULL))::jsonb, '[]'::jsonb),
-      'memory', jsonb_build_object(
-        'maturity_score', r.memory_maturity_score,
-        'last_signal_ts', r.last_signal_ts
+    (
+      WITH blk AS (
+        SELECT COALESCE(
+          ARRAY_TO_JSON(ARRAY_REMOVE(ARRAY[
+            CASE WHEN r.gate_b_venue_feasible = 0 THEN 'NO_TRADABLE_VENUE' END,
+            CASE WHEN r.gate_d_policy_clear  = 0 THEN 'POLICY_BLOCK' END,
+            CASE WHEN r.gate_c_fresh_enough  = 0 THEN 'STALE' END,
+            CASE WHEN r.gate_a_memory_maturity = 0 THEN 'IMMATURE' END
+          ], NULL))::jsonb,
+          '[]'::jsonb
+        ) AS blockers
       )
+      SELECT jsonb_build_object(
+        'schema', 'Alpha_Ideas.v1',
+        'idea_id', r.proposal_id,
+        'ts', to_char((NOW() AT TIME ZONE 'UTC'), 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'agent_id', r.agent_id,
+
+        'phase', '25',
+        'mode', 'observation_only',
+
+        'signal_type', 'ALPHA_IDEA',
+        'source', 'AlphaProposalGenerator',
+        'source_ref', (SELECT utc_day FROM params),
+
+        'token', r.token,
+        'see', NULL,
+        'venue_hint', NULLIF(r.venue,''),
+        'symbol_hint', NULLIF(r.symbol,''),
+
+        'novelty_reason', COALESCE(r.rationale,''),
+        'thesis', COALESCE(r.rationale,''),
+
+        'confidence', COALESCE(r.confidence, 0),
+        'confidence_cap', %(confidence_cap)s::numeric,
+        'signal_strength', CASE WHEN COALESCE(r.confidence,0) >= 0.15 THEN 'MEDIUM' ELSE 'LOW' END,
+
+        'execution_allowed', 0,
+        'blocked_by', (blk.blockers || '["alpha_execution_disabled"]'::jsonb),
+
+        'facts', jsonb_build_object(
+          'mentions_24h', 0,
+          'rank_delta_24h', 0,
+          'listing_signal', 0,
+          'sentiment_score', 0,
+          'liquidity_usd_est', 0
+        ),
+
+        'tags', jsonb_build_array('alpha','exploratory'),
+
+        'why', jsonb_build_object(
+          'decision', 'NOOP',
+          'because', jsonb_build_object(
+            'primary', 'alpha_observation_only',
+            'details', 'Phase 25: alpha produces ideas only; no execution.',
+            'blocked_by', (blk.blockers || '["alpha_execution_disabled"]'::jsonb)
+          ),
+          'to_change_this', jsonb_build_object(
+            'counterfactual',
+              CASE
+                WHEN r.action = 'WOULD_TRADE' THEN 'WOULD_TRADE if gate_ready=true AND execution_enabled=true'
+                WHEN r.action = 'WOULD_WATCH' THEN 'WOULD_WATCH if idea repeats >= 2 times in 24h AND data_fresh=true'
+                ELSE 'WOULD_SKIP unless gates improve'
+              END,
+            'min_conditions', jsonb_build_array('execution_enabled=true','gate_ready=true')
+          ),
+          'next_check', jsonb_build_object('type','SCHEDULED','when','next_cycle')
+        )
+      )
+      FROM blk
     ) AS payload,
 
     jsonb_build_object(
@@ -262,6 +311,7 @@ def run_alpha_proposal_runner() -> None:
         "default_trade_notional_usd": float(os.getenv("ALPHA_DEFAULT_TRADE_NOTIONAL_USD", "25")),
         "default_trade_confidence": float(os.getenv("ALPHA_DEFAULT_TRADE_CONFIDENCE", "0.10")),
         "default_watch_confidence": float(os.getenv("ALPHA_DEFAULT_WATCH_CONFIDENCE", "0.06")),
+        "confidence_cap": float(os.getenv("ALPHA_CONFIDENCE_CAP", "0.25")),
     }
 
     try:
