@@ -1,347 +1,212 @@
-# alpha_proposal_runner.py
+#!/usr/bin/env python3
 """
-Phase 26A — Preview Proposals (DB → alpha_proposals)
+alpha_proposal_runner.py (Phase 26A, SQL-native, preview-only)
 
-This module is *preview-only* by design:
-- It NEVER enqueues commands.
-- It NEVER calls any executor.
-- It ONLY writes proposals into Postgres table `alpha_proposals` (append-only, deduped by proposal_hash).
+Design goals (per MSD50–52 + Phase 26 runway):
+- Python does NOT re-implement alpha logic.
+- Python only orchestrates the canonical SQL pipeline using psql.
+- SAFE DEFAULTS: does nothing unless explicitly enabled by env flags.
+- Never enqueues commands / never touches outbox / never executes trades.
 
-It is safe to leave deployed continuously. When disabled, it becomes a no-op.
+What this runner does:
+1) Ensures alpha_tools.sql can be applied safely (preview_enabled forced to 0 in a temp copy).
+2) Runs alpha_proposal_generator.sql with preview_enabled=1 (only if enabled).
+3) Optionally runs alpha_polish.sql (non-destructive view/materialization polish).
 
-Enable flags (all must be truthy):
-- PREVIEW_ENABLED=1
-- ALPHA_PREVIEW_PROPOSALS_ENABLED=1
+This avoids the recurring redeploy loop caused by:
+- gate column type drift (int vs boolean)
+- CTE ordering changes (e.g., "norm" CTE)
+- column renames in alpha_readiness_v
 
-Optional:
-- ALPHA_AGENT_ID (default: AGENT_ID or 'edge-primary')
-- ALPHA_DEFAULT_TRADE_NOTIONAL_USD (default: 25)
-- ALPHA_DEFAULT_TRADE_CONFIDENCE (default: 0.10)
-- ALPHA_DEFAULT_WATCH_CONFIDENCE (default: 0.06)
-
-DB:
-- DB_URL must be set (standard Postgres URL)
+Because the SQL files are the source of truth, and psql handles their meta-commands (\set, \if).
 """
 
 from __future__ import annotations
 
 import os
-import time
-from typing import Any, Dict, Optional
-
-# Logging helpers (fall back to print)
-try:
-    from utils import info, warn, error
-except Exception:  # pragma: no cover
-    def info(msg: str): print(msg, flush=True)
-    def warn(msg: str): print(f"WARNING: {msg}", flush=True)
-    def error(msg: str): print(f"ERROR: {msg}", flush=True)
-
-# psycopg2 is optional in some deployments; we degrade safely.
-try:
-    import psycopg2  # type: ignore
-except Exception:  # pragma: no cover
-    psycopg2 = None
+import re
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from typing import Dict, Optional
 
 
-def _truthy(v: Optional[str]) -> bool:
-    return str(v or "").strip().lower() in ("1", "true", "yes", "y", "on")
+@dataclass(frozen=True)
+class AlphaRunnerConfig:
+    db_url: str
+    agent_id: str
+    preview_enabled: int
+    run_enabled: bool
+    apply_tools_if_missing: bool
+    run_polish: bool
+
+    # Optional knobs passed into SQL (if scripts support them)
+    default_trade_notional_usd: Optional[float] = None
+    default_trade_confidence: Optional[float] = None
+    default_watch_confidence: Optional[float] = None
 
 
-def _get_db_url() -> Optional[str]:
-    return os.getenv("DB_URL") or os.getenv("DATABASE_URL")
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "t", "yes", "y", "on")
 
 
-def _connect():
-    db_url = _get_db_url()
-    if not db_url:
-        warn("alpha_proposal_runner: DB_URL not set; skipping.")
-        return None
-    if not psycopg2:
-        warn("alpha_proposal_runner: psycopg2 not available; skipping.")
+def _env_float(name: str) -> Optional[float]:
+    v = (os.getenv(name) or "").strip()
+    if not v:
         return None
     try:
-        return psycopg2.connect(db_url, connect_timeout=10)
-    except Exception as e:
-        warn(f"alpha_proposal_runner: DB connect failed; skipping. err={e}")
-        return None
-
-
-def _ensure_alpha_proposals_table(cur) -> None:
-    """
-    Create alpha_proposals table if missing.
-    This is safe and idempotent. It does NOT create alpha_readiness_v (view), because that depends
-    on your broader Phase 25/26 schema (alpha_ideas, alpha_policy_blocks, etc.).
-    """
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS alpha_proposals (
-          id              BIGSERIAL PRIMARY KEY,
-          proposal_id     UUID        NOT NULL,
-          ts              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          agent_id        TEXT        NOT NULL DEFAULT 'edge-primary',
-
-          token           TEXT        NOT NULL,
-          venue           TEXT,
-          symbol          TEXT,
-
-          action          TEXT        NOT NULL,  -- WOULD_TRADE / WOULD_WATCH / WOULD_SKIP
-          notional_usd    NUMERIC,
-          confidence      NUMERIC,
-
-          rationale       TEXT,
-          gates           JSONB,
-          payload         JSONB,
-
-          proposal_hash   TEXT        NOT NULL
-        );
-        """
-    )
-    # Optional index for dedupe speed
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS alpha_proposals_hash_idx ON alpha_proposals (proposal_hash);"
-    )
-
-
-def _have_view(cur, view_name: str) -> bool:
-    cur.execute(
-        "SELECT 1 FROM information_schema.views WHERE table_name = %s LIMIT 1;",
-        (view_name,),
-    )
-    return cur.fetchone() is not None
-
-
-def _run_generator_insert(cur, params: Dict[str, Any]) -> int:
-    """
-    Insert proposals using alpha_readiness_v. Dedupe via proposal_hash.
-    Returns number of inserted rows (best-effort; may be -1 if driver doesn't report).
-    """
-    # NOTE: This SQL body is adapted from sql/alpha_proposal_generator.sql
-    # and is intentionally parameterized for psycopg2.
-    sql = r"""
-WITH params AS (
-  SELECT
-    %(preview_enabled)s::int AS preview_enabled,
-    %(agent_id)s::text AS agent_id,
-    %(default_trade_notional_usd)s::numeric AS default_trade_notional_usd,
-    %(default_trade_confidence)s::numeric AS default_trade_confidence,
-    %(default_watch_confidence)s::numeric AS default_watch_confidence,
-    %(confidence_cap)s::numeric AS confidence_cap,
-    to_char((NOW() AT TIME ZONE 'UTC')::date,'YYYY-MM-DD')::text AS utc_day
-),
-r AS (
-  SELECT * FROM alpha_readiness_v
-),
-classified AS (
-  SELECT
-    r.*,
-
-    ARRAY_REMOVE(ARRAY[
-      CASE WHEN COALESCE(r.gate_b_venue_feasible::int,0) = 0 THEN 'NO_TRADABLE_VENUE' END,
-      CASE WHEN COALESCE(r.gate_d_policy_clear::int,0)  = 0 THEN 'POLICY_BLOCK' END,
-      CASE WHEN COALESCE(r.gate_c_fresh_enough::int,0)  = 0 THEN 'STALE' END,
-      CASE WHEN COALESCE(r.gate_a_memory_maturity::int,0)= 0 THEN 'IMMATURE' END
-    ], NULL) AS blockers,
-
-    CASE
-      WHEN COALESCE(r.gate_b_venue_feasible::int,0)=0 THEN 'WOULD_SKIP'
-      WHEN COALESCE(r.gate_d_policy_clear::int,0)=0 THEN 'WOULD_SKIP'
-      WHEN COALESCE(r.gate_c_fresh_enough::int,0)=0 THEN 'WOULD_WATCH'
-      WHEN COALESCE(r.gate_a_memory_maturity::int,0)=0 THEN 'WOULD_WATCH'
-      WHEN ((COALESCE(r.gate_a_memory_maturity::int,0)=1) AND (COALESCE(r.gate_b_venue_feasible::int,0)=1) AND (COALESCE(r.gate_c_fresh_enough::int,0)=1) AND (COALESCE(r.gate_d_policy_clear::int,0)=1)) THEN 'WOULD_TRADE'
-      ELSE 'WOULD_WATCH'
-    END AS action,
-
-    CASE
-      WHEN ((COALESCE(r.gate_a_memory_maturity::int,0)=1) AND (COALESCE(r.gate_b_venue_feasible::int,0)=1) AND (COALESCE(r.gate_c_fresh_enough::int,0)=1) AND (COALESCE(r.gate_d_policy_clear::int,0)=1)) THEN (SELECT default_trade_notional_usd FROM params)
-      ELSE NULL
-    END AS notional_usd,
-
-    CASE
-      WHEN ((COALESCE(r.gate_a_memory_maturity::int,0)=1) AND (COALESCE(r.gate_b_venue_feasible::int,0)=1) AND (COALESCE(r.gate_c_fresh_enough::int,0)=1) AND (COALESCE(r.gate_d_policy_clear::int,0)=1)) THEN (SELECT default_trade_confidence FROM params)
-      WHEN (COALESCE(r.gate_c_fresh_enough::int,0)=0 OR COALESCE(r.gate_a_memory_maturity::int,0)=0) THEN (SELECT default_watch_confidence FROM params)
-      ELSE (SELECT default_watch_confidence FROM params)
-    END AS confidence,
-
-    (
-      WITH blk AS (
-        SELECT COALESCE(
-          ARRAY_TO_JSON(ARRAY_REMOVE(ARRAY[
-            CASE WHEN COALESCE(r.gate_b_venue_feasible::int,0)=0 THEN 'NO_TRADABLE_VENUE' END,
-            CASE WHEN COALESCE(r.gate_d_policy_clear::int,0)=0 THEN 'POLICY_BLOCK' END,
-            CASE WHEN COALESCE(r.gate_c_fresh_enough::int,0)=0 THEN 'STALE' END,
-            CASE WHEN COALESCE(r.gate_a_memory_maturity::int,0)=0 THEN 'IMMATURE' END
-          ], NULL))::jsonb,
-          '[]'::jsonb
-        ) AS blockers
-      )
-      SELECT jsonb_build_object(
-        'schema', 'Alpha_Ideas.v1',
-        'idea_id', r.proposal_id,
-        'ts', to_char((NOW() AT TIME ZONE 'UTC'), 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-        'agent_id', r.agent_id,
-
-        'phase', '25',
-        'mode', 'observation_only',
-
-        'signal_type', 'ALPHA_IDEA',
-        'source', 'AlphaProposalGenerator',
-        'source_ref', (SELECT utc_day FROM params),
-
-        'token', r.token,
-        'see', NULL,
-        'venue_hint', NULLIF(r.venue,''),
-        'symbol_hint', NULLIF(r.symbol,''),
-
-        'novelty_reason', COALESCE(r.rationale,''),
-        'thesis', COALESCE(r.rationale,''),
-
-        'confidence', COALESCE(r.confidence, 0),
-        'confidence_cap', %(confidence_cap)s::numeric,
-        'signal_strength', CASE WHEN COALESCE(r.confidence,0) >= 0.15 THEN 'MEDIUM' ELSE 'LOW' END,
-
-        'execution_allowed', 0,
-        'blocked_by', (blk.blockers || '["alpha_execution_disabled"]'::jsonb),
-
-        'facts', jsonb_build_object(
-          'mentions_24h', 0,
-          'rank_delta_24h', 0,
-          'listing_signal', 0,
-          'sentiment_score', 0,
-          'liquidity_usd_est', 0
-        ),
-
-        'tags', jsonb_build_array('alpha','exploratory'),
-
-        'why', jsonb_build_object(
-          'decision', 'NOOP',
-          'because', jsonb_build_object(
-            'primary', 'alpha_observation_only',
-            'details', 'Phase 25: alpha produces ideas only; no execution.',
-            'blocked_by', (blk.blockers || '["alpha_execution_disabled"]'::jsonb)
-          ),
-          'to_change_this', jsonb_build_object(
-            'counterfactual',
-              CASE
-                WHEN r.action = 'WOULD_TRADE' THEN 'WOULD_TRADE if gate_ready=true AND execution_enabled=true'
-                WHEN r.action = 'WOULD_WATCH' THEN 'WOULD_WATCH if idea repeats >= 2 times in 24h AND data_fresh=true'
-                ELSE 'WOULD_SKIP unless gates improve'
-              END,
-            'min_conditions', jsonb_build_array('execution_enabled=true','gate_ready=true')
-          ),
-          'next_check', jsonb_build_object('type','SCHEDULED','when','next_cycle')
-        )
-      )
-      FROM blk
-    ) AS payload,
-
-    jsonb_build_object(
-      'A', r.gate_a_memory_maturity,
-      'B', r.gate_b_venue_feasible,
-      'C', r.gate_c_fresh_enough,
-      'D', r.gate_d_policy_clear
-    ) AS gates
-
-  FROM r
-),
-to_insert AS (
-  SELECT
-    gen_random_uuid() AS proposal_id,
-    (SELECT agent_id FROM params) AS agent_id,
-    token,
-    venue,
-    symbol,
-    action,
-    notional_usd,
-    confidence,
-
-    -- rationale: compact, operator-friendly
-    CASE
-      WHEN action = 'WOULD_TRADE' THEN
-        'CLEAR: all gates pass (A-D).'
-      WHEN action = 'WOULD_WATCH' THEN
-        'WATCH: ' || COALESCE(array_to_string(blockers, ','), 'needs review')
-      ELSE
-        'SKIP: ' || COALESCE(array_to_string(blockers, ','), 'blocked')
-    END AS rationale,
-
-    gates,
-    payload,
-
-    -- dedupe per token/day/action/venue/symbol
-    (token || '|' || COALESCE(venue,'') || '|' || COALESCE(symbol,'') || '|' || action || '|' ||
-     (SELECT utc_day FROM params))::text AS proposal_hash
-  FROM classified
-)
-INSERT INTO alpha_proposals (
-  proposal_id, agent_id, token, venue, symbol, action,
-  notional_usd, confidence, rationale, gates, payload, proposal_hash
-)
-SELECT
-  t.proposal_id, t.agent_id, t.token, t.venue, t.symbol, t.action,
-  t.notional_usd, t.confidence, t.rationale, t.gates, t.payload, t.proposal_hash
-FROM to_insert t
-JOIN params p ON 1=1
-WHERE p.preview_enabled = 1
-  AND NOT EXISTS (SELECT 1 FROM alpha_proposals ap WHERE ap.proposal_hash = t.proposal_hash);
-"""
-    cur.execute(sql, params)
-    try:
-        return int(cur.rowcount or 0)
+        return float(v)
     except Exception:
-        return -1
+        return None
 
 
-def run_alpha_proposal_runner() -> None:
+def _log(msg: str) -> None:
+    # Keep logs Render-friendly (single-line, timestamp handled by logger upstream)
+    print(msg, flush=True)
+
+
+def _psql_cmd(db_url: str, sql_path: str, vars_map: Dict[str, str | int | float]) -> list[str]:
+    cmd = ["psql", db_url, "-v", "ON_ERROR_STOP=1", "-f", sql_path]
+    # Important: pass vars BEFORE -f is ok; psql uses them for :'var' and :var
+    # We'll add them after base but before -f for clarity (psql accepts anywhere).
+    cmd = ["psql", db_url, "-v", "ON_ERROR_STOP=1"]
+    for k, v in vars_map.items():
+        cmd += ["-v", f"{k}={v}"]
+    cmd += ["-f", sql_path]
+    return cmd
+
+
+def _run_psql(db_url: str, sql_path: str, vars_map: Dict[str, str | int | float]) -> None:
+    cmd = _psql_cmd(db_url, sql_path, vars_map)
+    _log(f"[alpha_runner] psql exec: {os.path.basename(sql_path)} (vars: {', '.join(sorted(vars_map.keys()))})")
+    # Capture output for debugging without spamming; show on failure
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        raise RuntimeError(
+            f"psql failed for {sql_path} (rc={proc.returncode}).\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        )
+
+
+def _safe_tools_temp_copy(original_path: str) -> str:
     """
-    Public entrypoint for scheduler.
+    alpha_tools.sql historically had a line that could set preview_enabled=1.
+    Even if later fixed, we defensively force any '\\set preview_enabled <x>' to 0
+    in a TEMP copy, so running tools cannot insert proposals unintentionally.
     """
-    if not (_truthy(os.getenv("PREVIEW_ENABLED")) and _truthy(os.getenv("ALPHA_PREVIEW_PROPOSALS_ENABLED"))):
-        info("alpha_proposal_runner: disabled (PREVIEW_ENABLED and/or ALPHA_PREVIEW_PROPOSALS_ENABLED not set).")
+    with open(original_path, "r", encoding="utf-8", errors="ignore") as f:
+        txt = f.read()
+
+    # Force preview_enabled to 0 if hard-set anywhere
+    txt2 = re.sub(r"(?m)^\s*\\set\s+preview_enabled\s+\S+\s*$", r"\\set preview_enabled 0", txt)
+
+    fd, tmp_path = tempfile.mkstemp(prefix="alpha_tools_safe_", suffix=".sql")
+    os.close(fd)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(txt2)
+    return tmp_path
+
+
+def _sql_path(name: str) -> str:
+    # Prefer repo-local sql/ folder; fall back to current directory
+    candidates = [
+        os.path.join(os.getcwd(), "sql", name),
+        os.path.join(os.getcwd(), name),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"Missing SQL file: {name}. Expected at: {candidates}")
+
+
+def load_config() -> AlphaRunnerConfig:
+    db_url = (os.getenv("DB_URL") or os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "").strip()
+    if not db_url:
+        raise RuntimeError("Missing DB connection env. Set DB_URL or DATABASE_URL.")
+
+    # Global preview gate (match your conventions)
+    preview_global = _env_bool("PREVIEW_ENABLED", default=False)
+    preview_alpha = _env_bool("ALPHA_PREVIEW_PROPOSALS_ENABLED", default=False)
+
+    run_enabled = preview_global and preview_alpha
+
+    agent_id = (os.getenv("AGENT_ID") or os.getenv("ALPHA_AGENT_ID") or "edge-primary").strip()
+
+    cfg = AlphaRunnerConfig(
+        db_url=db_url,
+        agent_id=agent_id,
+        preview_enabled=1 if run_enabled else 0,
+        run_enabled=run_enabled,
+        apply_tools_if_missing=_env_bool("ALPHA_APPLY_TOOLS_IF_MISSING", default=True),
+        run_polish=_env_bool("ALPHA_RUN_POLISH", default=True),
+        default_trade_notional_usd=_env_float("ALPHA_DEFAULT_TRADE_NOTIONAL_USD"),
+        default_trade_confidence=_env_float("ALPHA_DEFAULT_TRADE_CONFIDENCE"),
+        default_watch_confidence=_env_float("ALPHA_DEFAULT_WATCH_CONFIDENCE"),
+    )
+    return cfg
+
+
+def run_alpha_preview_proposals() -> None:
+    cfg = load_config()
+
+    if not cfg.run_enabled:
+        _log("[alpha_runner] preview proposals disabled (set PREVIEW_ENABLED=1 and ALPHA_PREVIEW_PROPOSALS_ENABLED=1).")
         return
 
-    conn = _connect()
-    if conn is None:
-        return
-
-    agent_id = os.getenv("ALPHA_AGENT_ID") or os.getenv("AGENT_ID") or "edge-primary"
-    params: Dict[str, Any] = {
-        "preview_enabled": 1,
-        "agent_id": agent_id,
-        "default_trade_notional_usd": float(os.getenv("ALPHA_DEFAULT_TRADE_NOTIONAL_USD", "25")),
-        "default_trade_confidence": float(os.getenv("ALPHA_DEFAULT_TRADE_CONFIDENCE", "0.10")),
-        "default_watch_confidence": float(os.getenv("ALPHA_DEFAULT_WATCH_CONFIDENCE", "0.06")),
-        "confidence_cap": float(os.getenv("ALPHA_CONFIDENCE_CAP", "0.25")),
-    }
+    # 1) Ensure tools are applied safely (creates alpha_readiness_v, alpha_proposals table, etc.)
+    tools_sql = _sql_path("alpha_tools.sql")
+    safe_tools = _safe_tools_temp_copy(tools_sql)
 
     try:
-        cur = conn.cursor()
-        _ensure_alpha_proposals_table(cur)
-
-        if not _have_view(cur, "alpha_readiness_v"):
-            warn("alpha_proposal_runner: missing view alpha_readiness_v; cannot generate proposals yet.")
-            warn("alpha_proposal_runner: deploy the Phase 26 SQL views (alpha_tools / readiness view) first.")
-            conn.commit()
-            return
-
-        inserted = _run_generator_insert(cur, params)
-        conn.commit()
-
-        if inserted == 0:
-            info("alpha_proposal_runner: no new proposals inserted (dedupe or empty universe).")
-        elif inserted > 0:
-            info(f"alpha_proposal_runner: inserted {inserted} proposal rows into alpha_proposals.")
-        else:
-            info("alpha_proposal_runner: proposal run complete (rowcount unavailable).")
-
-    except Exception as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        error(f"alpha_proposal_runner failed: {e}")
+        # Always run tools in SAFE mode (preview_enabled=0) so no inserts happen from tools.
+        _run_psql(
+            cfg.db_url,
+            safe_tools,
+            {
+                "preview_enabled": 0,
+                "agent_id": cfg.agent_id,
+                # pass optional knobs if present; harmless if unused
+                **({ "default_trade_notional_usd": cfg.default_trade_notional_usd } if cfg.default_trade_notional_usd is not None else {}),
+                **({ "default_trade_confidence": cfg.default_trade_confidence } if cfg.default_trade_confidence is not None else {}),
+                **({ "default_watch_confidence": cfg.default_watch_confidence } if cfg.default_watch_confidence is not None else {}),
+            },
+        )
     finally:
         try:
-            conn.close()
+            os.remove(safe_tools)
         except Exception:
             pass
+
+    # 2) Generate proposals (this script is preview-gated internally and checks view/table presence)
+    gen_sql = _sql_path("alpha_proposal_generator.sql")
+    _run_psql(
+        cfg.db_url,
+        gen_sql,
+        {
+            "preview_enabled": cfg.preview_enabled,
+            "agent_id": cfg.agent_id,
+            # optional knobs
+            **({ "default_trade_notional_usd": cfg.default_trade_notional_usd } if cfg.default_trade_notional_usd is not None else {}),
+            **({ "default_trade_confidence": cfg.default_trade_confidence } if cfg.default_trade_confidence is not None else {}),
+            **({ "default_watch_confidence": cfg.default_watch_confidence } if cfg.default_watch_confidence is not None else {}),
+        },
+    )
+
+    # 3) Optional polish (views / dashboards; should be safe + idempotent)
+    if cfg.run_polish:
+        polish_sql = _sql_path("alpha_polish.sql")
+        _run_psql(cfg.db_url, polish_sql, {"preview_enabled": cfg.preview_enabled, "agent_id": cfg.agent_id})
+
+    _log("[alpha_runner] Phase 26A preview proposals run complete.")
+
+
+if __name__ == "__main__":
+    try:
+        run_alpha_preview_proposals()
+    except Exception as e:
+        _log(f"[alpha_runner] ERROR: {e}")
+        raise
