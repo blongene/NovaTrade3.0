@@ -132,34 +132,43 @@ WITH params AS (
 r AS (
   SELECT * FROM alpha_readiness_v
 ),
+norm AS (
+  SELECT
+    n.*,
+    (lower(coalesce(r.gate_a_memory_maturity::text,'')) IN ('1','t','true','y','yes','on')) AS gate_a,
+    (lower(coalesce(r.gate_b_venue_feasible::text,'')) IN ('1','t','true','y','yes','on')) AS gate_b,
+    (lower(coalesce(r.gate_c_fresh_enough::text,'')) IN ('1','t','true','y','yes','on')) AS gate_c,
+    (lower(coalesce(r.gate_d_policy_clear::text,'')) IN ('1','t','true','y','yes','on')) AS gate_d
+  FROM norm n
+),
 classified AS (
   SELECT
-    r.*,
+    n.*,
 
     ARRAY_REMOVE(ARRAY[
-      CASE WHEN NOT COALESCE(r.gate_b_venue_feasible, FALSE) THEN 'NO_TRADABLE_VENUE' END,
-      CASE WHEN NOT COALESCE(r.gate_d_policy_clear, FALSE) THEN 'POLICY_BLOCK' END,
-      CASE WHEN NOT COALESCE(r.gate_c_fresh_enough, FALSE) THEN 'STALE' END,
-      CASE WHEN NOT COALESCE(r.gate_a_memory_maturity, FALSE) THEN 'IMMATURE' END
+      CASE WHEN NOT n.gate_b THEN 'NO_TRADABLE_VENUE' END,
+      CASE WHEN NOT n.gate_d THEN 'POLICY_BLOCK' END,
+      CASE WHEN NOT n.gate_c THEN 'STALE' END,
+      CASE WHEN NOT n.gate_a THEN 'IMMATURE' END
     ], NULL) AS blockers,
 
     CASE
-      WHEN NOT COALESCE(r.gate_b_venue_feasible, FALSE) THEN 'WOULD_SKIP'
-      WHEN NOT COALESCE(r.gate_d_policy_clear, FALSE) THEN 'WOULD_SKIP'
-      WHEN NOT COALESCE(r.gate_c_fresh_enough, FALSE) THEN 'WOULD_WATCH'
-      WHEN NOT COALESCE(r.gate_a_memory_maturity, FALSE) THEN 'WOULD_WATCH'
-      WHEN (COALESCE(r.gate_a_memory_maturity, FALSE) AND COALESCE(r.gate_b_venue_feasible, FALSE) AND COALESCE(r.gate_c_fresh_enough, FALSE) AND COALESCE(r.gate_d_policy_clear, FALSE)) THEN 'WOULD_TRADE'
+      WHEN NOT n.gate_b THEN 'WOULD_SKIP'
+      WHEN NOT n.gate_d THEN 'WOULD_SKIP'
+      WHEN NOT n.gate_c THEN 'WOULD_WATCH'
+      WHEN NOT n.gate_a THEN 'WOULD_WATCH'
+      WHEN (n.gate_a AND n.gate_b AND n.gate_c AND n.gate_d) THEN 'WOULD_TRADE'
       ELSE 'WOULD_WATCH'
     END AS action,
 
     CASE
-      WHEN (COALESCE(r.gate_a_memory_maturity, FALSE) AND COALESCE(r.gate_b_venue_feasible, FALSE) AND COALESCE(r.gate_c_fresh_enough, FALSE) AND COALESCE(r.gate_d_policy_clear, FALSE)) THEN (SELECT default_trade_notional_usd FROM params)
+      WHEN (n.gate_a AND n.gate_b AND n.gate_c AND n.gate_d) THEN (SELECT default_trade_notional_usd FROM params)
       ELSE NULL
     END AS notional_usd,
 
     CASE
-      WHEN (COALESCE(r.gate_a_memory_maturity, FALSE) AND COALESCE(r.gate_b_venue_feasible, FALSE) AND COALESCE(r.gate_c_fresh_enough, FALSE) AND COALESCE(r.gate_d_policy_clear, FALSE)) THEN (SELECT default_trade_confidence FROM params)
-      WHEN (NOT COALESCE(r.gate_c_fresh_enough, FALSE) OR NOT COALESCE(r.gate_a_memory_maturity, FALSE)) THEN (SELECT default_watch_confidence FROM params)
+      WHEN (n.gate_a AND n.gate_b AND n.gate_c AND n.gate_d) THEN (SELECT default_trade_confidence FROM params)
+      WHEN (NOT n.gate_c OR NOT n.gate_a) THEN (SELECT default_watch_confidence FROM params)
       ELSE (SELECT default_watch_confidence FROM params)
     END AS confidence,
 
@@ -167,19 +176,19 @@ classified AS (
       WITH blk AS (
         SELECT COALESCE(
           ARRAY_TO_JSON(ARRAY_REMOVE(ARRAY[
-            CASE WHEN NOT COALESCE(r.gate_b_venue_feasible, FALSE) THEN 'NO_TRADABLE_VENUE' END,
-            CASE WHEN NOT COALESCE(r.gate_d_policy_clear, FALSE) THEN 'POLICY_BLOCK' END,
-            CASE WHEN NOT COALESCE(r.gate_c_fresh_enough, FALSE) THEN 'STALE' END,
-            CASE WHEN NOT COALESCE(r.gate_a_memory_maturity, FALSE) THEN 'IMMATURE' END
+            CASE WHEN NOT n.gate_b THEN 'NO_TRADABLE_VENUE' END,
+            CASE WHEN NOT n.gate_d THEN 'POLICY_BLOCK' END,
+            CASE WHEN NOT n.gate_c THEN 'STALE' END,
+            CASE WHEN NOT n.gate_a THEN 'IMMATURE' END
           ], NULL))::jsonb,
           '[]'::jsonb
         ) AS blockers
       )
       SELECT jsonb_build_object(
         'schema', 'Alpha_Ideas.v1',
-        'idea_id', r.proposal_id,
+        'idea_id', gen_random_uuid(),
         'ts', to_char((NOW() AT TIME ZONE 'UTC'), 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-        'agent_id', r.agent_id,
+        'agent_id', (SELECT agent_id FROM params),
 
         'phase', '25',
         'mode', 'observation_only',
@@ -188,15 +197,15 @@ classified AS (
         'source', 'AlphaProposalGenerator',
         'source_ref', (SELECT utc_day FROM params),
 
-        'token', r.token,
+        'token', n.token,
         'see', NULL,
-        'venue_hint', NULLIF(r.venue,''),
-        'symbol_hint', NULLIF(r.symbol,''),
+        'venue_hint', NULLIF(n.venue,''),
+        'symbol_hint', NULLIF(n.symbol,''),
 
-        'novelty_reason', COALESCE(r.rationale,''),
-        'thesis', COALESCE(r.rationale,''),
+        'novelty_reason', COALESCE(n.rationale,''),
+        'thesis', COALESCE(n.rationale,''),
 
-        'confidence', COALESCE(r.confidence, 0),
+        'confidence', COALESCE(n.confidence, 0),
         'confidence_cap', %(confidence_cap)s::numeric,
         'signal_strength', CASE WHEN COALESCE(r.confidence,0) >= 0.15 THEN 'MEDIUM' ELSE 'LOW' END,
 
@@ -223,8 +232,8 @@ classified AS (
           'to_change_this', jsonb_build_object(
             'counterfactual',
               CASE
-                WHEN r.action = 'WOULD_TRADE' THEN 'WOULD_TRADE if gate_ready=true AND execution_enabled=true'
-                WHEN r.action = 'WOULD_WATCH' THEN 'WOULD_WATCH if idea repeats >= 2 times in 24h AND data_fresh=true'
+                WHEN n.action = 'WOULD_TRADE' THEN 'WOULD_TRADE if gate_ready=true AND execution_enabled=true'
+                WHEN n.action = 'WOULD_WATCH' THEN 'WOULD_WATCH if idea repeats >= 2 times in 24h AND data_fresh=true'
                 ELSE 'WOULD_SKIP unless gates improve'
               END,
             'min_conditions', jsonb_build_array('execution_enabled=true','gate_ready=true')
@@ -236,10 +245,14 @@ classified AS (
     ) AS payload,
 
     jsonb_build_object(
-      'A', r.gate_a_memory_maturity,
-      'B', r.gate_b_venue_feasible,
-      'C', r.gate_c_fresh_enough,
-      'D', r.gate_d_policy_clear
+      'A', n.gate_a,
+      'B', n.gate_b,
+      'C', n.gate_c,
+      'D', n.gate_d,
+      'A_raw', n.gate_a_memory_maturity,
+      'B_raw', n.gate_b_venue_feasible,
+      'C_raw', n.gate_c_fresh_enough,
+      'D_raw', n.gate_d_policy_clear
     ) AS gates
 
   FROM r
