@@ -142,49 +142,59 @@ def run_alpha_proposals_mirror() -> None:
             warn(f"alpha_proposals_mirror: sheet tab '{tab}' missing; creating.")
             ws = sheet.add_worksheet(title=tab, rows="500", cols="20")
 
-        header = [
-            "TimestampUTC",
-            "Proposal_ID",
-            "Token",
-            "Venue",
-            "Symbol",
-            "Action",
-            "Notional_USD",
-            "Confidence",
-            "Rationale",
-            "Gates_JSON",
-            "Payload_JSON",
-            "Proposal_Hash",
-        ]
+        header = ["ts", "idea_id", "agent_id", "token", "source", "source_ref", "venue_hint", "symbol_hint", "confidence", "confidence_cap", "signal_strength", "novelty_reason", "thesis", "blocked_by", "tags", "facts_json", "why_json", "record_json"]
 
         # Rebuild the tab for today's view (simple, robust)
         ws.clear()
         ws.append_row(header)
 
         if not rows:
-            ws.append_row([str(os.getenv("AGENT_ID") or "edge-primary"), "NO_ROWS_TODAY", "", "", "", "", "", "", "No proposals yet for UTC day.", "{}", "{}", ""])
+            ws.append_row(["", "", str(os.getenv("ALPHA_AGENT_ID") or os.getenv("AGENT_ID") or "edge-primary"), "", "", "", "", "", "", "", "", "No proposals yet for UTC day.", "", "", "[]", "[]", "{}", "{}", "{}"])
             info("alpha_proposals_mirror: no rows to mirror (UTC day).")
             return
 
+        # Replace-mode mirror (clears tab and writes today's snapshot)
+        try:
+            ws.clear()
+        except Exception:
+            pass
+        ws.append_row(header)
+
         values = []
         for r in rows:
-            values.append(
-                [
-                    r["ts_utc"],
-                    r["proposal_id"],
-                    r["token"],
-                    r["venue"],
-                    r["symbol"],
-                    r["action"],
-                    r["notional_usd"],
-                    r["confidence"],
-                    r["rationale"],
-                    r["gates_json"],
-                    r["payload_json"],
-                    r["proposal_hash"],
-                ]
-            )
+            rec = {}
+            try:
+                rec = json.loads(r.get("payload_json") or "{}")
+            except Exception:
+                rec = {}
 
+            facts = rec.get("facts") or {}
+            why = rec.get("why") or {}
+            blocked_by = rec.get("blocked_by") or []
+            tags = rec.get("tags") or []
+
+            values.append([
+                rec.get("ts") or r.get("ts_utc") or "",
+                rec.get("idea_id") or r.get("proposal_id") or "",
+                rec.get("agent_id") or str(os.getenv("ALPHA_AGENT_ID") or os.getenv("AGENT_ID") or "edge-primary"),
+                rec.get("token") or r.get("token") or "",
+                rec.get("source") or "",
+                rec.get("source_ref") or "",
+                rec.get("venue_hint") or r.get("venue") or "",
+                rec.get("symbol_hint") or r.get("symbol") or "",
+                str(rec.get("confidence") or r.get("confidence") or ""),
+                str(rec.get("confidence_cap") or ""),
+                rec.get("signal_strength") or "",
+                rec.get("novelty_reason") or r.get("rationale") or "",
+                rec.get("thesis") or "",
+                json.dumps(blocked_by, separators=(",",":")),
+                json.dumps(tags, separators=(",",":")),
+                json.dumps(facts, separators=(",",":")),
+                json.dumps(why, separators=(",",":")),
+                json.dumps(rec, separators=(",",":")),
+            ])
+
+        # batch append for quota safety
         # batch append for quota safety
         ws.append_rows(values, value_input_option="RAW")
         info(f"alpha_proposals_mirror: mirrored {len(values)} rows to sheet tab '{tab}'.")
