@@ -10,7 +10,7 @@
 -- ============================================================
 
 \set ON_ERROR_STOP on
-\set preview_enabled 0
+\set preview_enabled 1
 \set agent_id 'edge-primary'
 \set default_trade_notional_usd 25
 \set default_trade_confidence 0.10
