@@ -141,7 +141,12 @@ def run_alpha_proposal_runner() -> Tuple[int, str]:
     Public entrypoint (required by phase26a_smoketest.py).
 
     Returns:
-      (count_generated, status_string)
+      (generated_new, status_string)
+
+    Logging semantics:
+      - generated_new: how many *new* proposals were inserted this run (delta).
+      - proposals_today_total: how many proposals exist for the current UTC day (snapshot).
+        This should match what alpha_proposals_mirror publishes.
     """
     if not (PREVIEW_ENABLED and ALPHA_ENABLED):
         msg = "skipped (set PREVIEW_ENABLED=1 and ALPHA_PREVIEW_PROPOSALS_ENABLED=1)"
@@ -161,6 +166,26 @@ def run_alpha_proposal_runner() -> Tuple[int, str]:
 
     env = os.environ.copy()
     env["PGCONNECT_TIMEOUT"] = env.get("PGCONNECT_TIMEOUT", "10")
+
+    def _psql_scalar_int(sql: str) -> int:
+        """Run a scalar SQL via psql and parse an int from stdout."""
+        res = _run_cmd([PSQL_BIN, db_url, "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", sql], env=env, cwd=ROOT)
+        if not res.ok:
+            raise RuntimeError((res.stderr or res.stdout or "").strip() or "psql scalar query failed")
+        out = (res.stdout or "").strip()
+        try:
+            return int(out) if out else 0
+        except Exception:
+            return 0
+
+    # Snapshot size for today's UTC window (matches mirror's WHERE clause)
+    count_sql = "SELECT COUNT(*) FROM alpha_proposals WHERE (ts AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date;"
+    before_total = 0
+    try:
+        before_total = _psql_scalar_int(count_sql)
+    except Exception:
+        # If table doesn't exist yet, tools SQL will create it; treat as 0.
+        before_total = 0
 
     # 1) tools (safe preview=0)
     tmp_tools = None
@@ -194,10 +219,16 @@ def run_alpha_proposal_runner() -> Tuple[int, str]:
                     _log("ERROR", res_polish.stderr.strip())
                 return 0, f"polish_failed rc={res_polish.returncode}"
 
-        combined = "\n".join([res_gen.stdout, res_gen.stderr]).strip()
-        count = _parse_generated_count(combined)
-        _log("INFO", f"alpha_proposal_runner: ok generated={count}")
-        return count, "ok"
+        after_total = 0
+        try:
+            after_total = _psql_scalar_int(count_sql)
+        except Exception:
+            after_total = before_total
+
+        generated_new = max(0, after_total - before_total)
+
+        _log("INFO", f"alpha_proposal_runner: ok generated_new={generated_new} proposals_today_total={after_total}")
+        return generated_new, "ok"
 
     finally:
         if tmp_tools is not None:
