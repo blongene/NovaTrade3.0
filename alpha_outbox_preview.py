@@ -4,17 +4,22 @@ alpha_outbox_preview.py — Phase 26D-preview (safe enqueue)
 
 Enqueues DRYRUN commands into the Bus outbox from APPROVED alpha translations.
 
+Fixes:
+- Edge expects venue/symbol at *intent root*. We now set intent["venue"] and intent["symbol"].
+- WOULD_WATCH no longer uses order.place with HOLD/0 sizing. It enqueues a harmless "note" intent.
+
 Safety:
 - Requires PREVIEW_ENABLED=1
 - Requires ALPHA_EXECUTION_PREVIEW_ENABLED=1 (default on)
-- Always sets mode="dryrun" and dry_run=true
+- Always sets dry_run=true and mode="dryrun"
+- No live execution flags flipped
 
 Idempotency:
 - Uses translation row_hash as stable idempotency_key
 - Records alpha_command_previews(row_hash -> outbox_cmd_id) to prevent re-enqueue
 
 Sheets:
-- Optionally mirrors to Alpha_CommandPreviews tab (create tab first to avoid warnings)
+- Mirrors to Alpha_CommandPreviews tab (create tab first to avoid warnings)
 """
 
 from __future__ import annotations
@@ -45,7 +50,7 @@ def _safe_json(obj: Any) -> str:
 def _fetch_latest_approved_translations(cur, limit: int = 50) -> List[Dict[str, Any]]:
     """
     Pull latest translations that were made under an APPROVE decision.
-    NOTE: alpha_translations_latest_v does not include proposal_hash, so we derive it from command_preview.source.
+    alpha_translations_latest_v does not expose proposal_hash, so we derive it from command_preview.source.
     """
     cur.execute(
         """
@@ -76,13 +81,13 @@ def _fetch_latest_approved_translations(cur, limit: int = 50) -> List[Dict[str, 
                 "translation_id": str(r[0]),
                 "ts": r[1].isoformat() if r[1] else None,
                 "proposal_id": str(r[2]),
-                "proposal_hash": proposal_hash,  # derived
+                "proposal_hash": proposal_hash,
                 "approval_decision": r[3] or "",
                 "approval_actor": r[4] or "",
                 "approval_note": r[5] or "",
                 "agent_id": r[6] or AGENT_ID,
                 "token": r[7] or "",
-                "venue": r[8] or "",
+                "venue": (r[8] or "").upper(),
                 "symbol": r[9] or "",
                 "action": (r[10] or "").upper(),
                 "notional_usd": float(r[11] or 0),
@@ -103,6 +108,12 @@ def _already_enqueued(cur, row_hash: str) -> bool:
 
 
 def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build an intent compatible with Edge Agent expectations.
+
+    IMPORTANT: Edge expects venue/symbol at the *intent root*.
+    We still include them in payload for executor compatibility.
+    """
     action = (t.get("action") or "").upper()
     venue = (t.get("venue") or "").upper()
     symbol = t.get("symbol") or ""
@@ -110,31 +121,57 @@ def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
     notional = float(t.get("notional_usd") or 0)
     confidence = float(t.get("confidence") or 0)
 
-    side = "BUY" if action == "WOULD_TRADE" else "HOLD"
+    idem = f"alpha26d_preview:{t.get('row_hash')}"
 
+    meta = {
+        "phase": "26D-preview",
+        "translation_id": t.get("translation_id"),
+        "proposal_id": t.get("proposal_id"),
+        "proposal_hash": t.get("proposal_hash") or "",
+        "token": token,
+        "action": action,
+        "confidence": confidence,
+        "gates": t.get("gates") or {},
+        "rationale": t.get("rationale") or "",
+    }
+
+    # WOULD_WATCH -> harmless note intent (still fully traceable + ACKs cleanly)
+    if action == "WOULD_WATCH":
+        payload = {
+            "dry_run": True,
+            "mode": "dryrun",
+            "idempotency_key": idem,
+            "venue": venue,
+            "symbol": symbol,
+            "note": f"Alpha26D-preview WATCH note from translation {t.get('translation_id')} (proposal {t.get('proposal_id')})",
+            "meta": meta,
+        }
+        return {
+            "type": "note",
+            "venue": venue,     # root-level for Edge
+            "symbol": symbol,   # root-level for Edge
+            "payload": payload,
+        }
+
+    # WOULD_TRADE -> dryrun order.place (root-level venue/symbol + payload venue/symbol)
+    side = "BUY"  # default; your trade logic can refine later
     payload = {
         "venue": venue,
         "symbol": symbol,
         "side": side,
-        "amount_usd": notional if action == "WOULD_TRADE" else 0,
+        "amount_usd": max(notional, 1.0),  # ensure non-zero even if upstream is 0
         "dry_run": True,
         "mode": "dryrun",
-        "idempotency_key": f"alpha26d_preview:{t.get('row_hash')}",
-        "note": f"Alpha26D-preview from translation {t.get('translation_id')} (proposal {t.get('proposal_id')})",
-        "meta": {
-            "phase": "26D-preview",
-            "translation_id": t.get("translation_id"),
-            "proposal_id": t.get("proposal_id"),
-            "proposal_hash": t.get("proposal_hash") or "",
-            "token": token,
-            "action": action,
-            "confidence": confidence,
-            "gates": t.get("gates") or {},
-            "rationale": t.get("rationale") or "",
-        },
+        "idempotency_key": idem,
+        "note": f"Alpha26D-preview TRADE (dryrun) from translation {t.get('translation_id')} (proposal {t.get('proposal_id')})",
+        "meta": meta,
     }
-
-    return {"type": "order.place", "payload": payload}
+    return {
+        "type": "order.place",
+        "venue": venue,     # root-level for Edge
+        "symbol": symbol,   # root-level for Edge
+        "payload": payload,
+    }
 
 
 def _record_preview(cur, t: Dict[str, Any], outbox_cmd_id: int, intent: Dict[str, Any]) -> int:
