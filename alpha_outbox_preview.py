@@ -2,24 +2,10 @@
 """
 alpha_outbox_preview.py — Phase 26D-preview (safe enqueue)
 
-Enqueues DRYRUN commands into the Bus outbox from APPROVED alpha translations.
-
 Fixes:
-- Edge expects venue/symbol at *intent root*. We now set intent["venue"] and intent["symbol"].
-- WOULD_WATCH no longer uses order.place with HOLD/0 sizing. It enqueues a harmless "note" intent.
-
-Safety:
-- Requires PREVIEW_ENABLED=1
-- Requires ALPHA_EXECUTION_PREVIEW_ENABLED=1 (default on)
-- Always sets dry_run=true and mode="dryrun"
-- No live execution flags flipped
-
-Idempotency:
-- Uses translation row_hash as stable idempotency_key
-- Records alpha_command_previews(row_hash -> outbox_cmd_id) to prevent re-enqueue
-
-Sheets:
-- Mirrors to Alpha_CommandPreviews tab (create tab first to avoid warnings)
+- Edge expects venue/symbol at intent root -> now set intent["venue"], intent["symbol"]
+- WOULD_WATCH now enqueues type="note" instead of order.place with HOLD/0
+- Adds ALPHA26D_IDEM_PREFIX env var to bump idempotency when you want a fresh command row
 """
 
 from __future__ import annotations
@@ -39,6 +25,12 @@ EXEC_PREVIEW_ENABLED = os.getenv("ALPHA_EXECUTION_PREVIEW_ENABLED", "1").strip()
 
 AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
 
+# IMPORTANT: bump this when you want a new outbox command id (bypasses bus de-dupe safely)
+IDEM_PREFIX = os.getenv("ALPHA26D_IDEM_PREFIX", "alpha26d_preview").strip() or "alpha26d_preview"
+
+# Keep de-dupe for normal runs; you can override to 0 for debugging
+DEDUP_TTL = int(os.getenv("ALPHA26D_DEDUP_TTL_SECONDS", "3600"))
+
 
 def _safe_json(obj: Any) -> str:
     try:
@@ -48,10 +40,6 @@ def _safe_json(obj: Any) -> str:
 
 
 def _fetch_latest_approved_translations(cur, limit: int = 50) -> List[Dict[str, Any]]:
-    """
-    Pull latest translations that were made under an APPROVE decision.
-    alpha_translations_latest_v does not expose proposal_hash, so we derive it from command_preview.source.
-    """
     cur.execute(
         """
         SELECT
@@ -108,20 +96,15 @@ def _already_enqueued(cur, row_hash: str) -> bool:
 
 
 def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Build an intent compatible with Edge Agent expectations.
-
-    IMPORTANT: Edge expects venue/symbol at the *intent root*.
-    We still include them in payload for executor compatibility.
-    """
     action = (t.get("action") or "").upper()
     venue = (t.get("venue") or "").upper()
     symbol = t.get("symbol") or ""
     token = t.get("token") or ""
-    notional = float(t.get("notional_usd") or 0)
     confidence = float(t.get("confidence") or 0)
+    notional = float(t.get("notional_usd") or 0)
 
-    idem = f"alpha26d_preview:{t.get('row_hash')}"
+    row_hash = t.get("row_hash") or ""
+    idem = f"{IDEM_PREFIX}:{row_hash}"
 
     meta = {
         "phase": "26D-preview",
@@ -135,7 +118,7 @@ def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
         "rationale": t.get("rationale") or "",
     }
 
-    # WOULD_WATCH -> harmless note intent (still fully traceable + ACKs cleanly)
+    # WOULD_WATCH => NOTE (no exchange execution path, should ACK ok)
     if action == "WOULD_WATCH":
         payload = {
             "dry_run": True,
@@ -143,7 +126,7 @@ def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
             "idempotency_key": idem,
             "venue": venue,
             "symbol": symbol,
-            "note": f"Alpha26D-preview WATCH note from translation {t.get('translation_id')} (proposal {t.get('proposal_id')})",
+            "note": f"Alpha26D-preview NOTE (watch) from translation {t.get('translation_id')} (proposal {t.get('proposal_id')})",
             "meta": meta,
         }
         return {
@@ -153,17 +136,16 @@ def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
             "payload": payload,
         }
 
-    # WOULD_TRADE -> dryrun order.place (root-level venue/symbol + payload venue/symbol)
-    side = "BUY"  # default; your trade logic can refine later
+    # WOULD_TRADE => dryrun order.place with non-zero amount
     payload = {
         "venue": venue,
         "symbol": symbol,
-        "side": side,
-        "amount_usd": max(notional, 1.0),  # ensure non-zero even if upstream is 0
+        "side": "BUY",
+        "amount_usd": max(notional, 1.0),
         "dry_run": True,
         "mode": "dryrun",
         "idempotency_key": idem,
-        "note": f"Alpha26D-preview TRADE (dryrun) from translation {t.get('translation_id')} (proposal {t.get('proposal_id')})",
+        "note": f"Alpha26D-preview ORDER (dryrun) from translation {t.get('translation_id')} (proposal {t.get('proposal_id')})",
         "meta": meta,
     }
     return {
@@ -203,7 +185,7 @@ def _record_preview(cur, t: Dict[str, Any], outbox_cmd_id: int, intent: Dict[str
             "outbox_cmd_id": int(outbox_cmd_id),
             "intent_hash": ih,
             "intent": json.dumps(intent, separators=(",", ":"), sort_keys=True),
-            "note": f"enqueued dryrun preview cmd_id={outbox_cmd_id}",
+            "note": f"enqueued preview cmd_id={outbox_cmd_id} idem_prefix={IDEM_PREFIX}",
         },
     )
     return cur.rowcount or 0
@@ -254,7 +236,7 @@ def run_alpha_outbox_preview(limit: int = 50) -> Tuple[int, int, str]:
 
     conn = _get_conn()
     if conn is None:
-        warn("alpha_outbox_preview: no DB connection (DB_URL/psycopg2 missing?)")
+        warn("alpha_outbox_preview: no DB connection")
         return 0, 0, "no_db"
 
     store = get_store()
@@ -274,7 +256,7 @@ def run_alpha_outbox_preview(limit: int = 50) -> Tuple[int, int, str]:
                 continue
 
             intent = _build_outbox_intent(t)
-            res = store.enqueue(agent_id=AGENT_ID, intent=intent, dedup_ttl_seconds=3600)
+            res = store.enqueue(agent_id=AGENT_ID, intent=intent, dedup_ttl_seconds=DEDUP_TTL)
             cmd_id = int(res.get("id") or 0)
             if cmd_id <= 0:
                 continue
