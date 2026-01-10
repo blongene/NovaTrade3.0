@@ -43,10 +43,14 @@ def _safe_json(obj: Any) -> str:
 
 
 def _fetch_latest_approved_translations(cur, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Pull latest translations that were made under an APPROVE decision.
+    NOTE: alpha_translations_latest_v does not include proposal_hash, so we derive it from command_preview.source.
+    """
     cur.execute(
         """
         SELECT
-          t.translation_id, t.ts, t.proposal_id, t.proposal_hash,
+          t.translation_id, t.ts, t.proposal_id,
           t.approval_decision, t.approval_actor, t.approval_note,
           t.agent_id, t.token, t.venue, t.symbol, t.action,
           t.notional_usd, t.confidence, t.rationale,
@@ -61,28 +65,33 @@ def _fetch_latest_approved_translations(cur, limit: int = 50) -> List[Dict[str, 
     )
     rows = cur.fetchall() or []
     out: List[Dict[str, Any]] = []
+
     for r in rows:
+        command_preview = r[16] if isinstance(r[16], dict) else (r[16] or {})
+        src = (command_preview.get("source") or {}) if isinstance(command_preview, dict) else {}
+        proposal_hash = str(src.get("proposal_hash") or "")
+
         out.append(
             {
                 "translation_id": str(r[0]),
                 "ts": r[1].isoformat() if r[1] else None,
                 "proposal_id": str(r[2]),
-                "proposal_hash": r[3] or "",
-                "approval_decision": r[4] or "",
-                "approval_actor": r[5] or "",
-                "approval_note": r[6] or "",
-                "agent_id": r[7] or AGENT_ID,
-                "token": r[8] or "",
-                "venue": r[9] or "",
-                "symbol": r[10] or "",
-                "action": (r[11] or "").upper(),
-                "notional_usd": float(r[12] or 0),
-                "confidence": float(r[13] or 0),
-                "rationale": r[14] or "",
-                "gates": r[15] if isinstance(r[15], dict) else (r[15] or {}),
-                "payload": r[16] if isinstance(r[16], dict) else (r[16] or {}),
-                "command_preview": r[17] if isinstance(r[17], dict) else (r[17] or {}),
-                "row_hash": r[18] or "",
+                "proposal_hash": proposal_hash,  # derived
+                "approval_decision": r[3] or "",
+                "approval_actor": r[4] or "",
+                "approval_note": r[5] or "",
+                "agent_id": r[6] or AGENT_ID,
+                "token": r[7] or "",
+                "venue": r[8] or "",
+                "symbol": r[9] or "",
+                "action": (r[10] or "").upper(),
+                "notional_usd": float(r[11] or 0),
+                "confidence": float(r[12] or 0),
+                "rationale": r[13] or "",
+                "gates": r[14] if isinstance(r[14], dict) else (r[14] or {}),
+                "payload": r[15] if isinstance(r[15], dict) else (r[15] or {}),
+                "command_preview": command_preview,
+                "row_hash": r[17] or "",
             }
         )
     return out
@@ -101,7 +110,6 @@ def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
     notional = float(t.get("notional_usd") or 0)
     confidence = float(t.get("confidence") or 0)
 
-    # WOULD_WATCH becomes a harmless dryrun “note-shaped” command (still ACKs cleanly).
     side = "BUY" if action == "WOULD_TRADE" else "HOLD"
 
     payload = {
@@ -117,7 +125,7 @@ def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
             "phase": "26D-preview",
             "translation_id": t.get("translation_id"),
             "proposal_id": t.get("proposal_id"),
-            "proposal_hash": t.get("proposal_hash"),
+            "proposal_hash": t.get("proposal_hash") or "",
             "token": token,
             "action": action,
             "confidence": confidence,
@@ -126,7 +134,6 @@ def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
         },
     }
 
-    # Edge understands "type":"order.place" with payload.
     return {"type": "order.place", "payload": payload}
 
 
@@ -237,10 +244,7 @@ def run_alpha_outbox_preview(limit: int = 50) -> Tuple[int, int, str]:
 
             enq += _record_preview(cur, t, cmd_id, intent)
 
-        try:
-            conn.commit()
-        except Exception:
-            pass
+        conn.commit()
 
         try:
             mirrored = _mirror_sheet(conn)
