@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
-"""Phase 26E smoketest.
+"""
+phase26e_smoketest.py
 
-This smoketest:
-- Ensures the module imports
-- Runs a single pass of the outbox enqueuer (dry-run order.place)
-
-Run:
-  cd /opt/render/project/src
-  python phase26e_smoketest.py
-
-It should print a summary line.
+Applies Phase 26E SQL and runs the dryrun order.place outbox runner once.
 """
 
-from __future__ import annotations
+import os
+import subprocess
+from pathlib import Path
 
-import logging
+def main():
+    db_url = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DB_URL/DATABASE_URL missing")
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    root = Path(__file__).resolve().parent
+    sql = root / "sql" / "alpha_dryrun_orderplace.sql"
+    if not sql.exists():
+        raise RuntimeError(f"Missing {sql}")
 
+    subprocess.check_call(["psql", db_url, "-v", "ON_ERROR_STOP=1", "-f", str(sql)])
 
-def main() -> None:
     from alpha_outbox_orderplace_dryrun import run
-
-    res = run()
-    logging.info("phase26e_smoketest: %s", res)
-
+    run(limit=50)
 
 if __name__ == "__main__":
     main()
