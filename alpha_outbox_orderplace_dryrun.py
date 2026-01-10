@@ -1,316 +1,294 @@
 #!/usr/bin/env python3
-"""Phase 26E — enqueue dry-run BUY/SELL order.place intents.
+"""
+alpha_outbox_orderplace_dryrun.py — Phase 26E
 
-Reads Alpha translation previews and, when approved, enqueues a dry_run
-order.place intent into the Postgres Command Bus.
+Enqueue APPROVED alpha translations as dryrun order.place commands (BUY/SELL).
 
-Safety / intent semantics
-- Always sets payload.dry_run = True
-- BUY uses payload.amount_usd (quote sizing)
-- SELL uses payload.amount_base (fixed base sizing)
+Key behaviors:
+- Only enqueues when Gate A passes AND blockers are empty.
+- Only for actions: WOULD_TRADE, WOULD_BUY, WOULD_SELL
+- BUY uses amount_usd (quote sizing).
+- SELL uses fixed amount_base (base sizing).
+- Always dry_run=true + mode="dryrun"
+- Adds venue/symbol at intent root (Edge expectation).
+- Idempotent: one enqueue per translation_id (records to alpha_dryrun_orderplace_outbox).
 
-Config
-- ALPHA26E_AGENT_ID (default: edge-primary)
-- ALPHA26E_BUY_USD (default: 10)
-- ALPHA26E_SELL_BASE_DEFAULT (default: 1)
-- ALPHA26E_SELL_BASE_MAP (optional JSON, e.g. {"BTC":0.00005,"ETH":0.001})
-- ALPHA26E_SIDE_DEFAULT (default: BUY)
-- ALPHA26E_LIMIT (default: 10)
+Config (env):
+- PREVIEW_ENABLED=1                (required)
+- ALPHA_EXECUTION_PREVIEW_ENABLED=1 (required)
+- ALPHA26E_BUY_USD_DEFAULT=10
+- ALPHA26E_SELL_BASE_DEFAULT=1
+- ALPHA26E_SELL_BASE_MAP='{"BTC":0.00005,"ETH":0.001}'   (optional)
+- ALPHA26E_DEDUP_TTL_SECONDS=3600
 
-Dryrun order.place intent envelope (matches Edge expectations):
-{
-  "type": "order.place",
-  "venue": "COINBASE",
-  "symbol": "XYZ/USDC",
-  "payload": {
-     "venue": "COINBASE",
-     "symbol": "XYZ/USDC",
-     "side": "BUY"|"SELL",
-     "amount_usd": 10,
-     "amount_base": 0,
-     "dry_run": true,
-     "idempotency_key": "...",
-     "meta": {...}
-  }
-}
+Also supports ALPHA_CONFIG_JSON / ALPHA_CONFIG_PATH via alpha_config.py.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
-import psycopg2
+from bus_store_pg import get_store, _intent_hash
+from db_backbone import _get_conn
+from utils import info, warn, error
 
-from bus_store_pg import get_store
-from utils import log as _log
+from alpha_config import get_alpha_config, cfg_get
 
+AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+PREVIEW_ENABLED = os.getenv("PREVIEW_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+EXEC_PREVIEW_ENABLED = os.getenv("ALPHA_EXECUTION_PREVIEW_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+DEDUP_TTL = int(os.getenv("ALPHA26E_DEDUP_TTL_SECONDS", "3600") or "3600")
 
+DEFAULT_BUY_USD = float(os.getenv("ALPHA26E_BUY_USD_DEFAULT", "10") or "10")
+DEFAULT_SELL_BASE = float(os.getenv("ALPHA26E_SELL_BASE_DEFAULT", "1") or "1")
+SELL_BASE_MAP_RAW = os.getenv("ALPHA26E_SELL_BASE_MAP", "").strip()
 
-def _env_int(name: str, default: int) -> int:
+def _load_sell_base_map() -> Dict[str, float]:
+    if not SELL_BASE_MAP_RAW:
+        return {}
     try:
-        return int(os.getenv(name, str(default)).strip())
+        obj = json.loads(SELL_BASE_MAP_RAW)
+        if not isinstance(obj, dict):
+            return {}
+        out: Dict[str, float] = {}
+        for k, v in obj.items():
+            try:
+                out[str(k).upper()] = float(v)
+            except Exception:
+                continue
+        return out
     except Exception:
-        return default
+        return {}
+
+SELL_BASE_MAP = _load_sell_base_map()
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)).strip())
-    except Exception:
-        return default
-
-
-def _env_json(name: str) -> Optional[dict]:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return None
-    try:
-        v = json.loads(raw)
-        return v if isinstance(v, dict) else None
-    except Exception:
-        return None
-
-
-@dataclass
-class TranslationRow:
-    ts: datetime
-    translation_id: str
-    proposal_id: str
-    token: str
-    venue: str
-    symbol: str
-    action: str
-    confidence: float
-    approval_decision: str
-    approval_actor: str
-    approval_note: str
-    gates: Dict[str, Any]
-    rationale: str
-    proposal_hash: str
-
-
-def _stable_hash(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
-
-
-def _idempotency_key(prefix: str, row_hash: str) -> str:
-    return f"{prefix}:{row_hash}"
-
-
-def _sell_amount_base(token: str) -> float:
-    token_u = (token or "").upper().strip()
-    m = _env_json("ALPHA26E_SELL_BASE_MAP") or {}
-    if token_u in m:
-        try:
-            return float(m[token_u])
-        except Exception:
-            pass
-    # sensible defaults for big coins, otherwise 1.0 base
-    if token_u in {"BTC", "XBT"}:
-        return 0.00005
-    if token_u == "ETH":
-        return 0.001
-    return _env_float("ALPHA26E_SELL_BASE_DEFAULT", 1.0)
-
-
-def _choose_side(action: str) -> str:
-    # If upstream ever emits WOULD_BUY / WOULD_SELL we respect it.
-    a = (action or "").upper().strip()
-    if "SELL" in a:
-        return "SELL"
-    if "BUY" in a:
-        return "BUY"
-    return (os.getenv("ALPHA26E_SIDE_DEFAULT", "BUY").strip().upper() or "BUY")
-
-
-def _connect_db():
-    db_url = os.getenv("DB_URL")
-    if not db_url:
-        raise RuntimeError("DB_URL is required")
-    return psycopg2.connect(db_url)
-
-
-def _fetch_candidate_translations(limit: int) -> List[TranslationRow]:
-    # We rely on the Phase 26C view (alpha_translations_latest_v) for the latest translation per proposal.
-    # It should include the approval fields via joins, but we defensively compute what we need.
-    sql = """
-    WITH latest AS (
-      SELECT
-        t.translation_id,
-        t.ts,
-        t.proposal_id,
-        t.token,
-        t.venue,
-        t.symbol,
-        t.action,
-        t.confidence,
-        COALESCE(t.gates, '{}'::jsonb) AS gates,
-        COALESCE(t.rationale, '') AS rationale,
-        COALESCE(t.proposal_hash, '') AS proposal_hash,
-        COALESCE(t.approval_decision, '') AS approval_decision,
-        COALESCE(t.approval_actor, '') AS approval_actor,
-        COALESCE(t.approval_note, '') AS approval_note
-      FROM alpha_translations_latest_v t
+def _fetch_latest_approved_translations(cur, limit: int = 50) -> List[Dict[str, Any]]:
+    # Keep SQL conservative to avoid view drift; do JSON filtering in Python.
+    cur.execute(
+        """
+        SELECT
+          t.translation_id, t.ts, t.proposal_id,
+          t.approval_decision, t.approval_actor, t.approval_note,
+          t.agent_id, t.token, t.venue, t.symbol, t.action,
+          t.notional_usd, t.confidence, t.rationale,
+          t.gates, t.payload, t.command_preview,
+          t.row_hash
+        FROM alpha_translations_latest_v t
+        WHERE t.approval_decision = 'APPROVE'
+        ORDER BY t.ts DESC
+        LIMIT %s
+        """,
+        (int(limit),),
     )
-    SELECT *
-    FROM latest
-    WHERE approval_decision ILIKE 'APPROVE'
-    ORDER BY ts DESC
-    LIMIT %s;
-    """
-    rows: List[TranslationRow] = []
-    with _connect_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (limit,))
-            for (
-                translation_id,
-                ts,
-                proposal_id,
-                token,
-                venue,
-                symbol,
-                action,
-                confidence,
-                gates,
-                rationale,
-                proposal_hash,
-                approval_decision,
-                approval_actor,
-                approval_note,
-            ) in cur.fetchall():
-                # psycopg2 may give tz-aware timestamps; normalize
-                if isinstance(ts, datetime) and ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                rows.append(
-                    TranslationRow(
-                        ts=ts,
-                        translation_id=str(translation_id),
-                        proposal_id=str(proposal_id),
-                        token=str(token),
-                        venue=str(venue),
-                        symbol=str(symbol),
-                        action=str(action),
-                        confidence=float(confidence or 0),
-                        approval_decision=str(approval_decision),
-                        approval_actor=str(approval_actor),
-                        approval_note=str(approval_note),
-                        gates=dict(gates or {}),
-                        rationale=str(rationale),
-                        proposal_hash=str(proposal_hash),
-                    )
-                )
-    return rows
+    rows = cur.fetchall() or []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        gates = r[14] if isinstance(r[14], dict) else (r[14] or {})
+        payload = r[15] if isinstance(r[15], dict) else (r[15] or {})
+        cmd_prev = r[16] if isinstance(r[16], dict) else (r[16] or {})
+        out.append(
+            {
+                "translation_id": str(r[0]),
+                "ts": r[1].isoformat() if r[1] else None,
+                "proposal_id": str(r[2]),
+                "approval_actor": r[4] or "",
+                "approval_note": r[5] or "",
+                "agent_id": r[6] or AGENT_ID,
+                "token": (r[7] or "").upper(),
+                "venue": (r[8] or "").upper(),
+                "symbol": r[9] or "",
+                "action": (r[10] or "").upper(),
+                "notional_usd": float(r[11] or 0),
+                "confidence": float(r[12] or 0),
+                "rationale": r[13] or "",
+                "gates": gates,
+                "payload": payload,
+                "command_preview": cmd_prev,
+                "row_hash": r[17] or "",
+            }
+        )
+    return out
 
 
-def _already_enqueued(row_hash: str) -> bool:
-    # If we have already mirrored/enqueued this row_hash, don't enqueue again.
-    sql = "SELECT 1 FROM alpha_command_previews WHERE row_hash = %s LIMIT 1;"
-    with _connect_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (row_hash,))
-            return cur.fetchone() is not None
+def _gate_a_ok(gates: Dict[str, Any]) -> bool:
+    # Accept both "A":1 and "A":true styles
+    v = gates.get("A", 0)
+    if isinstance(v, bool):
+        return bool(v)
+    try:
+        return int(v) == 1
+    except Exception:
+        return False
 
 
-def _build_intent(row: TranslationRow, *, side: str, buy_usd: float, sell_base: float, id_prefix: str) -> Dict[str, Any]:
-    venue_u = (row.venue or "").upper().strip()
-    symbol = row.symbol.strip()
-    row_hash = hashlib.sha256(
-        f"{row.translation_id}|{venue_u}|{symbol}|{side}|{row.proposal_id}".encode("utf-8")
-    ).hexdigest()
+def _blockers_empty(gates: Dict[str, Any]) -> bool:
+    blockers = gates.get("blockers", [])
+    if blockers is None:
+        return True
+    if isinstance(blockers, list):
+        return len(blockers) == 0
+    # sometimes stored as stringified list
+    if isinstance(blockers, str):
+        s = blockers.strip()
+        if not s:
+            return True
+        # naive: treat any non-empty as blocked
+        return False
+    return False
+
+
+def _already_enqueued(cur, translation_id: str) -> bool:
+    cur.execute("SELECT 1 FROM alpha_dryrun_orderplace_outbox WHERE translation_id=%s LIMIT 1", (translation_id,))
+    return cur.fetchone() is not None
+
+
+def _build_intent(t: Dict[str, Any], buy_usd_default: float, sell_base_default: float) -> Dict[str, Any]:
+    token = t.get("token") or ""
+    venue = t.get("venue") or ""
+    symbol = t.get("symbol") or ""
+    action = t.get("action") or ""
+    notional = float(t.get("notional_usd") or 0)
+    confidence = float(t.get("confidence") or 0)
+
+    # Map action -> side
+    side = "SELL" if action == "WOULD_SELL" else "BUY"
 
     payload: Dict[str, Any] = {
-        "venue": venue_u,
+        "venue": venue,
         "symbol": symbol,
         "side": side,
         "dry_run": True,
-        "idempotency_key": _idempotency_key(id_prefix, row_hash),
-        # Sizing:
-        "amount_usd": float(buy_usd) if side == "BUY" else 0,
-        "amount_base": float(sell_base) if side == "SELL" else 0,
+        "mode": "dryrun",
+        "idempotency_key": f"alpha26e_dryrun:{t.get('translation_id')}",
+        "note": f"Phase26E dryrun order.place ({side}) from translation {t.get('translation_id')}",
         "meta": {
-            "phase": "26E-dryrun-order.place",
-            "translation_id": row.translation_id,
-            "proposal_id": row.proposal_id,
-            "proposal_hash": row.proposal_hash,
-            "token": row.token,
-            "action": row.action,
-            "confidence": row.confidence,
-            "gates": row.gates,
-            "rationale": row.rationale,
+            "phase": "26E",
+            "translation_id": t.get("translation_id"),
+            "proposal_id": t.get("proposal_id"),
+            "token": token,
+            "action": action,
+            "confidence": confidence,
+            "gates": t.get("gates") or {},
+            "rationale": t.get("rationale") or "",
             "approval": {
-                "decision": row.approval_decision,
-                "actor": row.approval_actor,
-                "note": row.approval_note,
-                "ts": row.ts.isoformat(),
+                "actor": t.get("approval_actor") or "",
+                "note": t.get("approval_note") or "",
             },
         },
     }
 
-    intent: Dict[str, Any] = {
+    if side == "BUY":
+        amt = notional if notional > 0 else buy_usd_default
+        payload["amount_usd"] = float(amt)
+    else:
+        base_amt = SELL_BASE_MAP.get(token.upper(), sell_base_default)
+        payload["amount_base"] = float(base_amt)
+
+    # IMPORTANT: venue/symbol at intent root for Edge
+    return {
         "type": "order.place",
-        "venue": venue_u,
+        "venue": venue,
         "symbol": symbol,
         "payload": payload,
     }
-    return {"row_hash": row_hash, "intent": intent}
 
 
-def run_alpha_outbox_orderplace_dryrun() -> Tuple[int, str]:
-    agent_id = os.getenv("ALPHA26E_AGENT_ID", "edge-primary").strip() or "edge-primary"
-    limit = _env_int("ALPHA26E_LIMIT", 10)
-    buy_usd = _env_float("ALPHA26E_BUY_USD", 10.0)
-    id_prefix = os.getenv("ALPHA26E_IDEM_PREFIX", "alpha26e_dryrun").strip() or "alpha26e_dryrun"
+def _record(cur, t: Dict[str, Any], cmd_id: int, intent: Dict[str, Any]) -> int:
+    ih = _intent_hash(intent)
+    side = str(intent.get("payload", {}).get("side", ""))
+    cur.execute(
+        """
+        INSERT INTO alpha_dryrun_orderplace_outbox(
+          translation_id, proposal_id,
+          token, venue, symbol, side,
+          cmd_id, intent_hash, intent, note
+        )
+        VALUES(
+          %(translation_id)s, %(proposal_id)s,
+          %(token)s, %(venue)s, %(symbol)s, %(side)s,
+          %(cmd_id)s, %(intent_hash)s, %(intent)s::jsonb, %(note)s
+        )
+        ON CONFLICT (translation_id) DO NOTHING
+        """,
+        {
+            "translation_id": t.get("translation_id"),
+            "proposal_id": t.get("proposal_id"),
+            "token": t.get("token") or "",
+            "venue": t.get("venue") or "",
+            "symbol": t.get("symbol") or "",
+            "side": side,
+            "cmd_id": int(cmd_id),
+            "intent_hash": ih,
+            "intent": json.dumps(intent, separators=(",", ":"), sort_keys=True),
+            "note": f"enqueued dryrun order.place cmd_id={cmd_id}",
+        },
+    )
+    return cur.rowcount or 0
 
-    processed = 0
-    enqueued_new = 0
+
+def run(limit: int = 50) -> Tuple[int, int, str]:
+    if not (PREVIEW_ENABLED and EXEC_PREVIEW_ENABLED):
+        msg = "skipped (set PREVIEW_ENABLED=1 and ALPHA_EXECUTION_PREVIEW_ENABLED=1)"
+        info(f"alpha_outbox_orderplace_dryrun: {msg}")
+        return 0, 0, msg
+
+    conn = _get_conn()
+    if conn is None:
+        warn("alpha_outbox_orderplace_dryrun: no DB connection")
+        return 0, 0, "no_db"
+
+    cfg = get_alpha_config()
+    buy_usd_default = float(cfg_get(cfg, "phase26.e.buy_usd_default", DEFAULT_BUY_USD))
+    sell_base_default = float(cfg_get(cfg, "phase26.e.sell_base_default", DEFAULT_SELL_BASE))
 
     store = get_store()
 
-    candidates = _fetch_candidate_translations(limit)
-    for row in candidates:
-        processed += 1
+    processed = 0
+    enq = 0
+    try:
+        cur = conn.cursor()
+        translations = _fetch_latest_approved_translations(cur, limit=limit)
+        processed = len(translations)
 
-        side = _choose_side(row.action)
-        sell_base = _sell_amount_base(row.token)
-
-        built = _build_intent(row, side=side, buy_usd=buy_usd, sell_base=sell_base, id_prefix=id_prefix)
-        row_hash = built["row_hash"]
-        intent = built["intent"]
-
-        # De-dupe:
-        try:
-            if _already_enqueued(row_hash):
+        for t in translations:
+            # eligibility
+            gates = t.get("gates") or {}
+            if not _gate_a_ok(gates):
                 continue
+            if not _blockers_empty(gates):
+                continue
+
+            action = (t.get("action") or "").upper()
+            if action not in ("WOULD_TRADE", "WOULD_BUY", "WOULD_SELL"):
+                continue
+
+            if _already_enqueued(cur, t.get("translation_id") or ""):
+                continue
+
+            intent = _build_intent(t, buy_usd_default, sell_base_default)
+            res = store.enqueue(agent_id=AGENT_ID, intent=intent, dedup_ttl_seconds=DEDUP_TTL)
+            cmd_id = int(res.get("id") or 0)
+            if cmd_id <= 0:
+                continue
+
+            enq += _record(cur, t, cmd_id, intent)
+
+        conn.commit()
+        info(f"alpha_outbox_orderplace_dryrun: processed={processed} enqueued_new={enq}")
+        return processed, enq, "ok"
+
+    except Exception as e:
+        try:
+            conn.rollback()
         except Exception:
-            # If alpha_command_previews isn't there yet, don't block enqueue.
             pass
-
-        # Enqueue to Postgres command bus.
-        cmd_id = store.enqueue(agent_id=agent_id, intent=intent)
-        enqueued_new += 1
-
-        _log(
-            "INFO",
-            f"alpha_outbox_orderplace_dryrun: enqueued cmd_id={cmd_id} agent_id={agent_id} {row.token} {row.venue} {row.symbol} side={side} dry_run=1",
-        )
-
-    return enqueued_new, "ok"
+        error(f"alpha_outbox_orderplace_dryrun failed: {e}")
+        return processed, enq, f"error:{e}"
 
 
 if __name__ == "__main__":
-    t0 = time.time()
-    try:
-        n, msg = run_alpha_outbox_orderplace_dryrun()
-        _log("INFO", f"alpha_outbox_orderplace_dryrun: enqueued_new={n} ({msg}) elapsed={time.time()-t0:.2f}s")
-    except Exception as e:
-        _log("ERROR", f"alpha_outbox_orderplace_dryrun failed: {e}")
-        raise
+    run()
