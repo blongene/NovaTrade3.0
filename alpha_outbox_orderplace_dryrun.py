@@ -1,23 +1,4 @@
 #!/usr/bin/env python3
-"""
-Phase 26E — Allow dryrun order.place BUY/SELL
-
-This module:
-- selects most-recent approved translation(s) from alpha_translations
-- constructs an intent of type "order.place" with payload sizing:
-    BUY  -> amount_usd = buy_max_usd
-    SELL -> amount_base = sell_base_amount
-- inserts into commands with a computed NOT-NULL intent_hash
-- records into alpha_dryrun_orderplace_outbox (unique per translation_id)
-
-Env:
-  DB_URL (required)
-  ALPHA_CONFIG_JSON (optional, JSON)
-  ALPHA26E_IDEM_PREFIX (optional; default: alpha26e_preview)
-  ALPHA26E_TEST_SIDE (optional; BUY or SELL; default BUY)
-  ALPHA26E_MAX_ROWS (optional; default 1)
-"""
-
 import os
 import json
 import time
@@ -29,276 +10,252 @@ import psycopg2
 import psycopg2.extras
 
 
-# ----------------------------
-# logging
-# ----------------------------
 LOG = logging.getLogger("alpha_outbox_orderplace_dryrun")
-_handler = logging.StreamHandler()
-_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s  %(message)s"))
-LOG.addHandler(_handler)
-LOG.setLevel(logging.INFO)
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="[%(asctime)s] %(levelname)s  %(message)s",
+)
+
+DEFAULT_AGENT_ID = os.getenv("ALPHA26E_AGENT_ID", "edge-primary")
 
 
-# ----------------------------
-# config helpers
-# ----------------------------
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _load_alpha_config() -> Dict[str, Any]:
+    """
+    Optional: Parse ALPHA_CONFIG_JSON for sizing + feature gates.
+    If missing/invalid, returns empty dict.
+    """
     raw = os.getenv("ALPHA_CONFIG_JSON", "").strip()
     if not raw:
         return {}
     try:
         return json.loads(raw)
     except Exception as e:
-        LOG.warning("ALPHA_CONFIG_JSON is not valid JSON; ignoring. err=%s", e)
+        LOG.warning("ALPHA_CONFIG_JSON invalid JSON (%s); ignoring", e)
         return {}
 
 
-def _get_cfg(cfg: Dict[str, Any], path: str, default: Any) -> Any:
+def _cfg_get(cfg: Dict[str, Any], path: Tuple[str, ...], default: Any) -> Any:
     cur: Any = cfg
-    for part in path.split("."):
-        if not isinstance(cur, dict) or part not in cur:
+    for p in path:
+        if not isinstance(cur, dict) or p not in cur:
             return default
-        cur = cur[part]
+        cur = cur[p]
     return cur
 
 
-# ----------------------------
-# hashing
-# ----------------------------
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def _build_intent_and_hash(
-    *,
-    translation_id: str,
-    proposal_id: str,
-    token: str,
-    venue: str,
-    symbol: str,
-    side: str,
-    cfg: Dict[str, Any],
-    idem_prefix: str,
-) -> Tuple[Dict[str, Any], str, str]:
+def _stable_intent_hash(intent: Dict[str, Any], include_idem: bool) -> str:
     """
-    Returns: (intent_json, intent_hash, idempotency_key)
+    Compute intent_hash for commands table. Must be deterministic.
+    If include_idem=True, includes idempotency_key so repeated tests won't dedupe.
     """
-    side_u = (side or "").upper().strip()
-    if side_u not in ("BUY", "SELL"):
-        side_u = "BUY"
-
-    buy_max_usd = float(_get_cfg(cfg, "phase26.dryrun.buy_max_usd", 10) or 0)
-    sell_base_amount = float(_get_cfg(cfg, "phase26.dryrun.sell_base_amount", 0.00005) or 0)
-
-    payload: Dict[str, Any] = {
-        "dry_run": True,
-        "venue": venue,
-        "symbol": symbol,
-        "token": token,
-        "side": side_u,
-        "meta": {
-            "phase": "26E",
-            "translation_id": translation_id,
-            "proposal_id": proposal_id,
-        },
+    obj = {
+        "type": intent.get("type"),
+        "payload": intent.get("payload", {}),
     }
-
-    # Sizing rules per your spec
-    if side_u == "BUY":
-        # must be > 0 or edge will reject
-        amount_usd = max(buy_max_usd, 0.0)
-        payload["amount_usd"] = amount_usd
-    else:
-        # SELL uses fixed base amount
-        amount_base = max(sell_base_amount, 0.0)
-        payload["amount_base"] = amount_base
-
-    # idempotency_key should be stable for same translation+prefix+side
-    stable_key_src = f"{idem_prefix}|{translation_id}|{side_u}|{venue}|{symbol}"
-    stable_key = _sha256_hex(stable_key_src)
-    idempotency_key = f"{idem_prefix}:{stable_key}"
-    payload["idempotency_key"] = idempotency_key
-
-    intent = {
-        "type": "order.place",
-        "venue": venue,
-        "symbol": symbol,
-        "payload": payload,
-    }
-
-    # intent_hash must be NOT NULL in commands.
-    # Use a deterministic hash of canonical fields.
-    # (Do NOT include timestamps.)
-    intent_hash_src = json.dumps(
-        {
-            "type": intent["type"],
-            "venue": venue,
-            "symbol": symbol,
-            "side": side_u,
-            "amount_usd": payload.get("amount_usd"),
-            "amount_base": payload.get("amount_base"),
-            "idempotency_key": idempotency_key,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    intent_hash = _sha256_hex(intent_hash_src)
-
-    return intent, intent_hash, idempotency_key
+    if include_idem:
+        obj["idempotency_key"] = (intent.get("payload") or {}).get("idempotency_key", "")
+    return _sha256_hex(json.dumps(obj, sort_keys=True, separators=(",", ":")))
 
 
-# ----------------------------
-# db helpers
-# ----------------------------
-def _db_conn():
-    db_url = os.getenv("DB_URL", "").strip()
+def _connect_db() -> psycopg2.extensions.connection:
+    db_url = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
     if not db_url:
-        raise RuntimeError("DB_URL env var is required")
+        raise RuntimeError("DB_URL (or DATABASE_URL) is not set")
     return psycopg2.connect(db_url)
 
 
+def _pick_latest_translation(cur) -> Optional[Dict[str, Any]]:
+    """
+    Picks the most recent translation row. This keeps it simple + reliable.
+    """
+    cur.execute(
+        """
+        select translation_id, proposal_id, token, venue, symbol, action, ts
+        from alpha_translations
+        order by ts desc
+        limit 1;
+        """
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _already_outboxed(cur, translation_id: str) -> bool:
+    cur.execute(
+        "select 1 from alpha_dryrun_orderplace_outbox where translation_id=%s limit 1;",
+        (translation_id,),
+    )
+    return cur.fetchone() is not None
+
+
+def _command_exists_by_hash(cur, intent_hash: str) -> Optional[int]:
+    cur.execute("select id from commands where intent_hash=%s order by id desc limit 1;", (intent_hash,))
+    r = cur.fetchone()
+    return int(r["id"]) if r else None
+
+
+def _insert_command(cur, agent_id: str, intent: Dict[str, Any], intent_hash: str) -> int:
+    cur.execute(
+        """
+        insert into commands (created_at, status, agent_id, intent, intent_hash)
+        values (now(), 'queued', %s, %s::jsonb, %s)
+        returning id;
+        """,
+        (agent_id, json.dumps(intent), intent_hash),
+    )
+    return int(cur.fetchone()["id"])
+
+
+def _insert_outbox(cur, outbox_row: Dict[str, Any]) -> None:
+    cur.execute(
+        """
+        insert into alpha_dryrun_orderplace_outbox
+        (translation_id, proposal_id, token, venue, symbol, side, cmd_id, intent_hash, intent, note)
+        values
+        (%(translation_id)s, %(proposal_id)s, %(token)s, %(venue)s, %(symbol)s, %(side)s,
+         %(cmd_id)s, %(intent_hash)s, %(intent)s::jsonb, %(note)s)
+        on conflict (translation_id) do nothing;
+        """,
+        {
+            **outbox_row,
+            "intent": json.dumps(outbox_row["intent"]),
+        },
+    )
+
+
 def run() -> None:
+    """
+    Env controls:
+      - ALPHA26E_TEST_SIDE=BUY|SELL (optional, default derived from translation action)
+      - ALPHA26E_IDEM_PREFIX=... (optional, affects idempotency_key)
+      - ALPHA26E_FORCE_REPROCESS=1 (ignore UNIQUE translation_id block)
+      - ALPHA26E_FORCE_REQUEUE=1 (ignore intent_hash dedupe)
+      - ALPHA26E_HASH_INCLUDE_IDEM=1 (make intent_hash unique per idem key for repeated tests)
+    """
     cfg = _load_alpha_config()
 
-    enabled = bool(_get_cfg(cfg, "phase26.dryrun.enabled", True))
-    allow_order_place = bool(_get_cfg(cfg, "phase26.dryrun.allow_order_place", True))
-    kill_global = bool(_get_cfg(cfg, "kill_switches.global", False))
-    kill_edge = bool(_get_cfg(cfg, "kill_switches.edge_hold", False))
-    allow_immature = bool(_get_cfg(cfg, "gates.allow_immature_dryrun", True))
+    dryrun_enabled = bool(_cfg_get(cfg, ("phase26", "dryrun", "enabled"), True))
+    allow_order_place = bool(_cfg_get(cfg, ("phase26", "dryrun", "allow_order_place"), True))
 
-    if not enabled:
-        LOG.info("alpha_outbox_orderplace_dryrun: disabled by config (phase26.dryrun.enabled=false)")
-        return
-    if not allow_order_place:
-        LOG.info("alpha_outbox_orderplace_dryrun: allow_order_place=false (no enqueue)")
-        return
-    if kill_global or kill_edge:
-        LOG.warning(
-            "alpha_outbox_orderplace_dryrun: kill switch active global=%s edge_hold=%s (no enqueue)",
-            kill_global,
-            kill_edge,
-        )
+    if not dryrun_enabled or not allow_order_place:
+        LOG.warning("Phase26 dryrun disabled (enabled=%s allow_order_place=%s) -> skipping",
+                    dryrun_enabled, allow_order_place)
         return
 
-    idem_prefix = os.getenv("ALPHA26E_IDEM_PREFIX", "alpha26e_preview").strip() or "alpha26e_preview"
-    side = (os.getenv("ALPHA26E_TEST_SIDE", "BUY") or "BUY").upper().strip()
-    max_rows = int(os.getenv("ALPHA26E_MAX_ROWS", "1") or "1")
+    buy_max_usd = float(_cfg_get(cfg, ("phase26", "dryrun", "buy_max_usd"), 10.0))
+    sell_base_amount = float(_cfg_get(cfg, ("phase26", "dryrun", "sell_base_amount"), 0.00005))
+
+    force_reprocess = _env_bool("ALPHA26E_FORCE_REPROCESS", False)
+    force_requeue = _env_bool("ALPHA26E_FORCE_REQUEUE", False)
+    hash_include_idem = _env_bool("ALPHA26E_HASH_INCLUDE_IDEM", True)
 
     processed = 0
     enqueued_new = 0
+    skipped = 0
 
-    with _db_conn() as conn:
-        conn.autocommit = False
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with _connect_db() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            t = _pick_latest_translation(cur)
+            if not t:
+                LOG.warning("No rows in alpha_translations -> nothing to do")
+                return
 
-        # Pull latest approved translations that aren't already in alpha_dryrun_orderplace_outbox
-        # Note: we intentionally do not require "mature" if allow_immature_dryrun=true.
-        # If you later want a strict gate, add WHERE clauses based on payload/gates.
-        cur.execute(
-            """
-            SELECT
-              t.translation_id::text,
-              t.proposal_id::text,
-              COALESCE(NULLIF(t.token,''), '') AS token,
-              COALESCE(NULLIF(t.venue,''), '') AS venue,
-              COALESCE(NULLIF(t.symbol,''), '') AS symbol,
-              COALESCE(NULLIF(t.agent_id,''), 'edge-primary') AS agent_id,
-              COALESCE(NULLIF(t.action,''), '') AS action,
-              t.ts
-            FROM alpha_translations t
-            WHERE COALESCE(NULLIF(t.approval_decision,''),'') = 'APPROVE'
-              AND NOT EXISTS (
-                SELECT 1 FROM alpha_dryrun_orderplace_outbox o
-                WHERE o.translation_id = t.translation_id
-              )
-            ORDER BY t.ts DESC
-            LIMIT %s;
-            """,
-            (max_rows,),
-        )
-        rows = cur.fetchall() or []
+            translation_id = str(t["translation_id"])
+            proposal_id = str(t["proposal_id"])
+            token = str(t["token"] or "").upper()
+            venue = str(t["venue"] or "").upper()
+            symbol = str(t["symbol"] or "")
+            action = str(t["action"] or "").upper()
 
-        for r in rows:
+            # Choose side
+            side_env = (os.getenv("ALPHA26E_TEST_SIDE") or "").strip().upper()
+            if side_env in ("BUY", "SELL"):
+                side = side_env
+            else:
+                # derive from action when possible
+                if "SELL" in action:
+                    side = "SELL"
+                else:
+                    side = "BUY"
+
             processed += 1
 
-            translation_id = r["translation_id"]
-            proposal_id = r["proposal_id"]
-            token = (r["token"] or "").strip()
-            venue = (r["venue"] or "").strip()
-            symbol = (r["symbol"] or "").strip()
-            agent_id = (r["agent_id"] or "edge-primary").strip()
+            if not force_reprocess and _already_outboxed(cur, translation_id):
+                skipped += 1
+                LOG.info("skip: translation_id already in outbox (UNIQUE). Set ALPHA26E_FORCE_REPROCESS=1 to override. translation_id=%s",
+                         translation_id)
+                return
 
-            # sanity checks
-            if not venue or not symbol:
-                LOG.warning("skip translation_id=%s missing venue/symbol venue='%s' symbol='%s'", translation_id, venue, symbol)
-                continue
+            idem_prefix = os.getenv("ALPHA26E_IDEM_PREFIX", "alpha26e")
+            # include a timestamp to make repeated tests unique if you want
+            idem_key = f"{idem_prefix}:{_sha256_hex(translation_id + '|' + side + '|' + str(time.time_ns()))}"
 
-            # If you ever want to block WOULD_WATCH translations unless allow_immature, do it here.
-            # For now: honor allow_immature_dryrun; enqueue even from watch as a realistic dryrun test.
-            if not allow_immature and (r.get("action") == "WOULD_WATCH"):
-                LOG.info("skip translation_id=%s action=WOULD_WATCH and allow_immature_dryrun=false", translation_id)
-                continue
+            payload: Dict[str, Any] = {
+                "meta": {"phase": "26E", "proposal_id": proposal_id, "translation_id": translation_id},
+                "side": side,
+                "token": token,
+                "venue": venue,
+                "symbol": symbol,
+                "dry_run": True,
+                "idempotency_key": idem_key,
+            }
 
-            intent, intent_hash, idempotency_key = _build_intent_and_hash(
-                translation_id=translation_id,
-                proposal_id=proposal_id,
-                token=token,
-                venue=venue,
-                symbol=symbol,
-                side=side,
-                cfg=cfg,
-                idem_prefix=idem_prefix,
-            )
+            # BUY = quote sizing (USD), SELL = base sizing
+            if side == "BUY":
+                payload["amount_usd"] = float(buy_max_usd)
+            else:
+                payload["amount_base"] = float(sell_base_amount)
 
-            # Ensure BUY has positive amount_usd; SELL has positive amount_base
-            payload = intent.get("payload", {})
-            if intent["payload"].get("side") == "BUY" and float(payload.get("amount_usd") or 0) <= 0:
-                LOG.warning("skip translation_id=%s BUY amount_usd<=0", translation_id)
-                continue
-            if intent["payload"].get("side") == "SELL" and float(payload.get("amount_base") or 0) <= 0:
-                LOG.warning("skip translation_id=%s SELL amount_base<=0", translation_id)
-                continue
+            intent = {"type": "order.place", "payload": payload}
 
-            # Insert command (must include intent_hash)
-            cur.execute(
-                """
-                INSERT INTO commands (agent_id, intent, intent_hash, status, created_at)
-                VALUES (%s, %s::jsonb, %s, 'queued', now())
-                RETURNING id;
-                """,
-                (agent_id, json.dumps(intent), intent_hash),
-            )
-            cmd_id = cur.fetchone()["id"]
+            intent_hash = _stable_intent_hash(intent, include_idem=hash_include_idem)
 
-            # Record outbox row (unique per translation_id)
-            note = f"Alpha26E dryrun {intent['payload'].get('side')} queued cmd_id={cmd_id} idem={idempotency_key}"
-            cur.execute(
-                """
-                INSERT INTO alpha_dryrun_orderplace_outbox
-                  (translation_id, proposal_id, token, venue, symbol, side, cmd_id, intent_hash, intent, note)
-                VALUES
-                  (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-                ON CONFLICT (translation_id) DO NOTHING;
-                """,
-                (
-                    translation_id,
-                    proposal_id,
-                    token,
-                    venue,
-                    symbol,
-                    intent["payload"].get("side", ""),
-                    cmd_id,
-                    intent_hash,
-                    json.dumps(intent),
-                    note,
-                ),
+            existing_cmd = _command_exists_by_hash(cur, intent_hash)
+            if existing_cmd and not force_requeue:
+                skipped += 1
+                LOG.info(
+                    "skip: command already exists for intent_hash=%s (cmd_id=%s). "
+                    "Set ALPHA26E_FORCE_REQUEUE=1 or ALPHA26E_HASH_INCLUDE_IDEM=1 to override.",
+                    intent_hash, existing_cmd
+                )
+                return
+
+            cmd_id = _insert_command(cur, DEFAULT_AGENT_ID, intent, intent_hash)
+
+            _insert_outbox(
+                cur,
+                {
+                    "translation_id": translation_id,
+                    "proposal_id": proposal_id,
+                    "token": token,
+                    "venue": venue,
+                    "symbol": symbol,
+                    "side": side,
+                    "cmd_id": cmd_id,
+                    "intent_hash": intent_hash,
+                    "intent": intent,
+                    "note": f"Phase26E dryrun order.place ({side}) from translation {translation_id}",
+                },
             )
 
             enqueued_new += 1
+            conn.commit()
 
-        conn.commit()
-
-    LOG.info("alpha_outbox_orderplace_dryrun: processed=%s enqueued_new=%s", processed, enqueued_new)
+    LOG.info(
+        "alpha_outbox_orderplace_dryrun: processed=%s enqueued_new=%s skipped=%s (side=%s venue=%s symbol=%s)",
+        processed, enqueued_new, skipped, os.getenv("ALPHA26E_TEST_SIDE", ""), venue, symbol
+    )
 
 
 if __name__ == "__main__":
