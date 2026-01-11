@@ -1,164 +1,176 @@
-# alpha_outbox_orderplace_dryrun.py
-# Phase 26E – Dryrun order.place (BUY / SELL)
-# Bullet-proof sizing enforcement
+#!/usr/bin/env python3
+"""
+Phase 26E — Dryrun order.place outbox (BUY / SELL)
+
+• BUY  -> quote-sized using buy_max_usd
+• SELL -> base-sized using sell_base_amount
+• Fully dryrun-safe
+• No utils.log dependency
+"""
 
 import os
 import json
 import hashlib
-from datetime import datetime
+import logging
 import psycopg2
+from psycopg2.extras import RealDictCursor
+from datetime import datetime
 
-from utils import log
-
-DB_URL = os.environ["DB_URL"]
-
-# Load ALPHA_CONFIG_JSON (single env var strategy)
-ALPHA_CONFIG = json.loads(os.environ.get("ALPHA_CONFIG_JSON", "{}"))
-
-DRYRUN_CFG = (
-    ALPHA_CONFIG
-    .get("phase26", {})
-    .get("dryrun", {})
+# ------------------------------------------------------------------------------
+# Logging (bullet-proof)
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[% (asctime)s] %(levelname)s  %(message)s",
 )
+LOG = logging.getLogger("alpha_outbox_orderplace_dryrun")
 
-BUY_MAX_USD = float(DRYRUN_CFG.get("buy_max_usd", 0))
-SELL_BASE_AMOUNT = float(DRYRUN_CFG.get("sell_base_amount", 0))
+# ------------------------------------------------------------------------------
+# Config helpers
+# ------------------------------------------------------------------------------
+def load_alpha_config():
+    raw = os.getenv("ALPHA_CONFIG_JSON", "{}")
+    try:
+        return json.loads(raw)
+    except Exception:
+        LOG.error("Invalid ALPHA_CONFIG_JSON — defaulting empty")
+        return {}
 
-ALLOW_ORDER_PLACE = bool(DRYRUN_CFG.get("allow_order_place", False))
-DRYRUN_ENABLED = bool(DRYRUN_CFG.get("enabled", False))
+CFG = load_alpha_config()
 
-IDEM_PREFIX = os.environ.get("ALPHA26E_IDEM_PREFIX", "alpha26e")
+PHASE = CFG.get("phase26", {}).get("dryrun", {})
+BUY_MAX_USD = float(PHASE.get("buy_max_usd", 10))
+SELL_BASE_AMOUNT = float(PHASE.get("sell_base_amount", 0.00005))
+ALLOW_ORDER_PLACE = bool(PHASE.get("allow_order_place", False))
 
-def make_intent_hash(payload: dict) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+IDEM_PREFIX = os.getenv("ALPHA26E_IDEM_PREFIX", "alpha26e")
 
+DB_URL = os.getenv("DB_URL")
+AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
+
+# ------------------------------------------------------------------------------
+# DB helpers
+# ------------------------------------------------------------------------------
+def db():
+    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+
+def sha(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+# ------------------------------------------------------------------------------
+# Main logic
+# ------------------------------------------------------------------------------
 def run():
-    if not DRYRUN_ENABLED or not ALLOW_ORDER_PLACE:
-        log.info("alpha_outbox_orderplace_dryrun: disabled by config")
+    if not ALLOW_ORDER_PLACE:
+        LOG.info("26E disabled via config")
         return
 
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
+    inserted = 0
+    enqueued = 0
 
-    # Pull newest translation
-    cur.execute("""
-        select
-            translation_id,
-            proposal_id,
-            token,
-            venue,
-            symbol,
-            action,
-            confidence,
-            rationale
-        from alpha_translations
-        order by ts desc
-        limit 1;
-    """)
+    with db() as conn:
+        with conn.cursor() as cur:
 
-    row = cur.fetchone()
-    if not row:
-        log.info("alpha_outbox_orderplace_dryrun: no translations")
-        return
+            # Pull latest translation that has not been outboxed
+            cur.execute("""
+                SELECT *
+                FROM alpha_translations t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM alpha_dryrun_orderplace_outbox o
+                    WHERE o.translation_id = t.translation_id
+                )
+                ORDER BY ts DESC
+                LIMIT 1
+            """)
+            t = cur.fetchone()
 
-    (
-        translation_id,
-        proposal_id,
-        token,
-        venue,
-        symbol,
-        action,
-        confidence,
-        rationale
-    ) = row
+            if not t:
+                LOG.info("No eligible translations")
+                return
 
-    # Decide side
-    if action.upper() in ("WOULD_BUY", "BUY"):
-        side = "BUY"
-    elif action.upper() in ("WOULD_SELL", "SELL"):
-        side = "SELL"
-    else:
-        log.info(f"alpha_outbox_orderplace_dryrun: action={action} not tradable")
-        return
+            token = t["token"]
+            venue = t["venue"]
+            symbol = t["symbol"]
+            action = t["action"]
 
-    payload = {
-        "dry_run": True,
-        "idempotency_key": f"{IDEM_PREFIX}:{translation_id}",
-        "meta": {
-            "phase": "26E",
-            "confidence": float(confidence),
-            "rationale": rationale,
-            "translation_id": str(translation_id),
-            "proposal_id": str(proposal_id),
-            "token": token,
-        },
-    }
+            # Decide side
+            if action in ("WOULD_BUY", "BUY"):
+                side = "BUY"
+            elif action in ("WOULD_SELL", "SELL"):
+                side = "SELL"
+            else:
+                LOG.info("Skipping non-trade action=%s", action)
+                return
 
-    # 🔒 STRICT SIZING RULES
-    if side == "BUY":
-        if BUY_MAX_USD <= 0:
-            log.info("alpha_outbox_orderplace_dryrun: BUY disabled (buy_max_usd <= 0)")
-            return
-        payload["amount_usd"] = BUY_MAX_USD
+            # Size logic (critical fix)
+            payload = {
+                "dry_run": True,
+                "venue": venue,
+                "symbol": symbol,
+                "side": side,
+                "token": token,
+            }
 
-    elif side == "SELL":
-        if SELL_BASE_AMOUNT <= 0:
-            log.info("alpha_outbox_orderplace_dryrun: SELL disabled (sell_base_amount <= 0)")
-            return
-        payload["amount_base"] = SELL_BASE_AMOUNT
+            if side == "BUY":
+                payload["amount_usd"] = BUY_MAX_USD
+            else:
+                payload["amount_base"] = SELL_BASE_AMOUNT
 
-    intent = {
-        "type": "order.place",
-        "venue": venue,
-        "symbol": symbol,
-        "side": side,
-        "payload": payload,
-    }
+            idem = f"{IDEM_PREFIX}:{t['translation_id']}"
+            payload["idempotency_key"] = idem
 
-    intent_hash = make_intent_hash(intent)
+            intent = {
+                "type": "order.place",
+                "payload": payload,
+            }
 
-    # Insert command
-    cur.execute("""
-        insert into commands (intent, status)
-        values (%s, 'queued')
-        returning id;
-    """, (json.dumps(intent),))
+            intent_hash = sha(json.dumps(intent, sort_keys=True))
 
-    cmd_id = cur.fetchone()[0]
+            # Enqueue command
+            cur.execute("""
+                INSERT INTO commands (agent_id, intent, status)
+                VALUES (%s, %s::jsonb, 'queued')
+                RETURNING id
+            """, (AGENT_ID, json.dumps(intent)))
+            cmd_id = cur.fetchone()["id"]
+            enqueued += 1
 
-    # Mirror into dryrun outbox
-    cur.execute("""
-        insert into alpha_dryrun_orderplace_outbox (
-            translation_id,
-            proposal_id,
-            token,
-            venue,
-            symbol,
-            side,
-            cmd_id,
-            intent_hash,
-            intent,
-            note
-        ) values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        on conflict (translation_id) do nothing;
-    """, (
-        translation_id,
-        proposal_id,
-        token,
-        venue,
-        symbol,
-        side,
-        cmd_id,
-        intent_hash,
-        json.dumps(intent),
-        "Phase 26E dryrun order.place",
-    ))
+            # Record outbox
+            cur.execute("""
+                INSERT INTO alpha_dryrun_orderplace_outbox (
+                    translation_id,
+                    proposal_id,
+                    token,
+                    venue,
+                    symbol,
+                    side,
+                    cmd_id,
+                    intent_hash,
+                    intent,
+                    note
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                t["translation_id"],
+                t["proposal_id"],
+                token,
+                venue,
+                symbol,
+                side,
+                cmd_id,
+                intent_hash,
+                json.dumps(intent),
+                "26E dryrun order.place",
+            ))
 
-    conn.commit()
-    cur.close()
-    conn.close()
+            inserted += 1
+            conn.commit()
 
-    log.info("alpha_outbox_orderplace_dryrun: processed=1 enqueued_new=1")
+    LOG.info(
+        "alpha_outbox_orderplace_dryrun: processed=%d enqueued_new=%d",
+        inserted,
+        enqueued,
+    )
 
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     run()
