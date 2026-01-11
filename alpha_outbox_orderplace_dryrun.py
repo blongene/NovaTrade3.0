@@ -1,27 +1,37 @@
 #!/usr/bin/env python3
 """
-alpha_outbox_orderplace_dryrun.py — Phase 26E
+alpha_outbox_orderplace_dryrun.py — Phase 26E (BUS)
 
-Enqueue APPROVED alpha translations as dryrun order.place commands (BUY/SELL).
+Enqueue APPROVED alpha translations as dryrun order.place commands (BUY/SELL),
+while keeping the system close to full operation.
 
 Key behaviors:
-- Only enqueues when Gate A passes AND blockers are empty.
-- Only for actions: WOULD_TRADE, WOULD_BUY, WOULD_SELL
-- BUY uses amount_usd (quote sizing).
-- SELL uses fixed amount_base (base sizing).
-- Always dry_run=true + mode="dryrun"
-- Adds venue/symbol at intent root (Edge expectation).
-- Idempotent: one enqueue per translation_id (records to alpha_dryrun_orderplace_outbox).
+- Requires APPROVE.
+- Only enqueues for actions: WOULD_BUY, WOULD_SELL
+  (WOULD_WATCH should remain note/noop; not an order.place)
+- Dryrun-only: dry_run=true, mode="dryrun"
+- BUY uses amount_usd (quote sizing) and must be > 0
+- SELL uses amount_base (base sizing) and must be > 0
+- Intent root MUST include venue + symbol (Edge expectation)
+- Idempotent: one enqueue per translation_id (alpha_dryrun_orderplace_outbox)
 
-Config (env):
-- PREVIEW_ENABLED=1                (required)
-- ALPHA_EXECUTION_PREVIEW_ENABLED=1 (required)
-- ALPHA26E_BUY_USD_DEFAULT=10
-- ALPHA26E_SELL_BASE_DEFAULT=1
-- ALPHA26E_SELL_BASE_MAP='{"BTC":0.00005,"ETH":0.001}'   (optional)
+Config sources:
+- ALPHA_CONFIG_JSON / ALPHA_CONFIG_PATH via alpha_config.get_alpha_config()
+- Supported keys (matching your posted JSON):
+    phase26.dryrun.enabled (bool)
+    phase26.dryrun.allow_order_place (bool)
+    phase26.dryrun.sell_base_amount (float)
+    phase26.dryrun.buy_max_usd (float)
+    gates.allow_immature_dryrun (bool)
+    kill_switches.global (bool)
+    kill_switches.edge_hold (bool)
+    venues.coinbase.allow_dryrun (bool)   (optional; venue-specific gate)
+
+Env overrides (optional):
+- PREVIEW_ENABLED=1
+- ALPHA_EXECUTION_PREVIEW_ENABLED=1
+- ALPHA26E_IDEM_PREFIX=alpha26e_test_123   (changes idempotency key prefix)
 - ALPHA26E_DEDUP_TTL_SECONDS=3600
-
-Also supports ALPHA_CONFIG_JSON / ALPHA_CONFIG_PATH via alpha_config.py.
 """
 
 from __future__ import annotations
@@ -33,7 +43,6 @@ from typing import Any, Dict, List, Tuple
 from bus_store_pg import get_store, _intent_hash
 from db_backbone import _get_conn
 from utils import info, warn, error
-
 from alpha_config import get_alpha_config, cfg_get
 
 AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
@@ -41,38 +50,13 @@ AGENT_ID = os.getenv("AGENT_ID", "edge-primary")
 PREVIEW_ENABLED = os.getenv("PREVIEW_ENABLED", "0").strip().lower() in ("1", "true", "yes")
 EXEC_PREVIEW_ENABLED = os.getenv("ALPHA_EXECUTION_PREVIEW_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 DEDUP_TTL = int(os.getenv("ALPHA26E_DEDUP_TTL_SECONDS", "3600") or "3600")
+IDEM_PREFIX = (os.getenv("ALPHA26E_IDEM_PREFIX", "") or "").strip()
 
-DEFAULT_BUY_USD = float(os.getenv("ALPHA26E_BUY_USD_DEFAULT", "10") or "10")
-DEFAULT_SELL_BASE = float(os.getenv("ALPHA26E_SELL_BASE_DEFAULT", "1") or "1")
-SELL_BASE_MAP_RAW = os.getenv("ALPHA26E_SELL_BASE_MAP", "").strip()
-
-if side == "BUY":
-    payload["amount_usd"] = config["phase26"]["dryrun"]["buy_max_usd"]
-elif side == "SELL":
-    payload["amount_base"] = config["phase26"]["dryrun"]["sell_base_amount"]
-
-def _load_sell_base_map() -> Dict[str, float]:
-    if not SELL_BASE_MAP_RAW:
-        return {}
-    try:
-        obj = json.loads(SELL_BASE_MAP_RAW)
-        if not isinstance(obj, dict):
-            return {}
-        out: Dict[str, float] = {}
-        for k, v in obj.items():
-            try:
-                out[str(k).upper()] = float(v)
-            except Exception:
-                continue
-        return out
-    except Exception:
-        return {}
-
-SELL_BASE_MAP = _load_sell_base_map()
+DEFAULT_BUY_MAX_USD = float(os.getenv("ALPHA26E_BUY_MAX_USD_DEFAULT", "10") or "10")
+DEFAULT_SELL_BASE_AMOUNT = float(os.getenv("ALPHA26E_SELL_BASE_AMOUNT_DEFAULT", "0.00005") or "0.00005")
 
 
 def _fetch_latest_approved_translations(cur, limit: int = 50) -> List[Dict[str, Any]]:
-    # Keep SQL conservative to avoid view drift; do JSON filtering in Python.
     cur.execute(
         """
         SELECT
@@ -119,8 +103,50 @@ def _fetch_latest_approved_translations(cur, limit: int = 50) -> List[Dict[str, 
     return out
 
 
+def _already_enqueued(cur, translation_id: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM alpha_dryrun_orderplace_outbox WHERE translation_id=%s LIMIT 1",
+        (translation_id,),
+    )
+    return cur.fetchone() is not None
+
+
+def _boolish(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return int(v) != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "y", "on")
+    return False
+
+
+def _allow_immature(gates: Dict[str, Any], allow_immature_dryrun: bool) -> bool:
+    """
+    If allow_immature_dryrun=true, then allow Gate A failure only when the blocker is IMMATURE.
+    """
+    if not allow_immature_dryrun:
+        return False
+    blockers = gates.get("blockers", [])
+    primary = (gates.get("primary_blocker") or "").upper()
+
+    if isinstance(blockers, str):
+        # if stored as a string, be conservative: require it explicitly contains IMMATURE
+        s = blockers.upper()
+        return "IMMATURE" in s and ("[" not in s or "IMMATURE" == primary or primary == "")
+    if isinstance(blockers, list):
+        if len(blockers) == 0:
+            return False
+        upper = [str(b).upper() for b in blockers]
+        # allow if ALL blockers are IMMATURE
+        return all(b == "IMMATURE" for b in upper)
+    # unknown type -> do not allow
+    return False
+
+
 def _gate_a_ok(gates: Dict[str, Any]) -> bool:
-    # Accept both "A":1 and "A":true styles
     v = gates.get("A", 0)
     if isinstance(v, bool):
         return bool(v)
@@ -130,37 +156,41 @@ def _gate_a_ok(gates: Dict[str, Any]) -> bool:
         return False
 
 
-def _blockers_empty(gates: Dict[str, Any]) -> bool:
-    blockers = gates.get("blockers", [])
-    if blockers is None:
-        return True
-    if isinstance(blockers, list):
-        return len(blockers) == 0
-    # sometimes stored as stringified list
-    if isinstance(blockers, str):
-        s = blockers.strip()
-        if not s:
-            return True
-        # naive: treat any non-empty as blocked
+def _allowed_by_killswitch(cfg: Dict[str, Any]) -> bool:
+    if _boolish(cfg_get(cfg, "kill_switches.global", False)):
         return False
-    return False
+    if _boolish(cfg_get(cfg, "kill_switches.edge_hold", False)):
+        return False
+    return True
 
 
-def _already_enqueued(cur, translation_id: str) -> bool:
-    cur.execute("SELECT 1 FROM alpha_dryrun_orderplace_outbox WHERE translation_id=%s LIMIT 1", (translation_id,))
-    return cur.fetchone() is not None
+def _venue_allows_dryrun(cfg: Dict[str, Any], venue: str) -> bool:
+    # Optional; default allow.
+    key = f"venues.{venue.lower()}.allow_dryrun"
+    v = cfg_get(cfg, key, None)
+    if v is None:
+        return True
+    return _boolish(v)
 
 
-def _build_intent(t: Dict[str, Any], buy_usd_default: float, sell_base_default: float) -> Dict[str, Any]:
-    token = t.get("token") or ""
-    venue = t.get("venue") or ""
+def _build_intent(
+    *,
+    t: Dict[str, Any],
+    buy_max_usd: float,
+    sell_base_amount: float,
+) -> Dict[str, Any]:
+    token = (t.get("token") or "").upper()
+    venue = (t.get("venue") or "").upper()
     symbol = t.get("symbol") or ""
-    action = t.get("action") or ""
-    notional = float(t.get("notional_usd") or 0)
-    confidence = float(t.get("confidence") or 0)
+    action = (t.get("action") or "").upper()
 
-    # Map action -> side
-    side = "SELL" if action == "WOULD_SELL" else "BUY"
+    if action == "WOULD_SELL":
+        side = "SELL"
+    else:
+        side = "BUY"
+
+    # Stable, operator-visible idempotency key
+    idem_key = f"{IDEM_PREFIX}:{t.get('translation_id')}" if IDEM_PREFIX else f"alpha26e_dryrun:{t.get('translation_id')}"
 
     payload: Dict[str, Any] = {
         "venue": venue,
@@ -168,15 +198,14 @@ def _build_intent(t: Dict[str, Any], buy_usd_default: float, sell_base_default: 
         "side": side,
         "dry_run": True,
         "mode": "dryrun",
-        "idempotency_key": f"alpha26e_dryrun:{t.get('translation_id')}",
-        "note": f"Phase26E dryrun order.place ({side}) from translation {t.get('translation_id')}",
+        "idempotency_key": idem_key,
         "meta": {
             "phase": "26E",
             "translation_id": t.get("translation_id"),
             "proposal_id": t.get("proposal_id"),
             "token": token,
             "action": action,
-            "confidence": confidence,
+            "confidence": float(t.get("confidence") or 0),
             "gates": t.get("gates") or {},
             "rationale": t.get("rationale") or "",
             "approval": {
@@ -184,20 +213,27 @@ def _build_intent(t: Dict[str, Any], buy_usd_default: float, sell_base_default: 
                 "note": t.get("approval_note") or "",
             },
         },
+        "note": f"Phase26E dryrun order.place ({side}) from translation {t.get('translation_id')}",
     }
 
     if side == "BUY":
-        amt = notional if notional > 0 else buy_usd_default
-        payload["amount_usd"] = float(amt)
+        notional = float(t.get("notional_usd") or 0)
+        amt_usd = notional if notional > 0 else float(buy_max_usd)
+        # must be > 0 or Edge will reject
+        if amt_usd <= 0:
+            amt_usd = float(DEFAULT_BUY_MAX_USD)
+        payload["amount_usd"] = float(amt_usd)
+
     else:
-        base_amt = SELL_BASE_MAP.get(token.upper(), sell_base_default)
+        base_amt = float(sell_base_amount)
+        if base_amt <= 0:
+            base_amt = float(DEFAULT_SELL_BASE_AMOUNT)
         payload["amount_base"] = float(base_amt)
 
-    # IMPORTANT: venue/symbol at intent root for Edge
     return {
         "type": "order.place",
-        "venue": venue,
-        "symbol": symbol,
+        "venue": venue,     # REQUIRED at root
+        "symbol": symbol,   # REQUIRED at root
         "payload": payload,
     }
 
@@ -205,6 +241,7 @@ def _build_intent(t: Dict[str, Any], buy_usd_default: float, sell_base_default: 
 def _record(cur, t: Dict[str, Any], cmd_id: int, intent: Dict[str, Any]) -> int:
     ih = _intent_hash(intent)
     side = str(intent.get("payload", {}).get("side", ""))
+
     cur.execute(
         """
         INSERT INTO alpha_dryrun_orderplace_outbox(
@@ -247,34 +284,71 @@ def run(limit: int = 50) -> Tuple[int, int, str]:
         return 0, 0, "no_db"
 
     cfg = get_alpha_config()
-    buy_usd_default = float(cfg_get(cfg, "phase26.e.buy_usd_default", DEFAULT_BUY_USD))
-    sell_base_default = float(cfg_get(cfg, "phase26.e.sell_base_default", DEFAULT_SELL_BASE))
+
+    # Master dryrun toggles (your JSON)
+    dryrun_enabled = _boolish(cfg_get(cfg, "phase26.dryrun.enabled", True))
+    allow_order_place = _boolish(cfg_get(cfg, "phase26.dryrun.allow_order_place", False))
+    allow_immature_dryrun = _boolish(cfg_get(cfg, "gates.allow_immature_dryrun", False))
+
+    buy_max_usd = float(cfg_get(cfg, "phase26.dryrun.buy_max_usd", DEFAULT_BUY_MAX_USD))
+    sell_base_amount = float(cfg_get(cfg, "phase26.dryrun.sell_base_amount", DEFAULT_SELL_BASE_AMOUNT))
+
+    if not dryrun_enabled:
+        info("alpha_outbox_orderplace_dryrun: skipped (phase26.dryrun.enabled=false)")
+        return 0, 0, "disabled"
+    if not allow_order_place:
+        info("alpha_outbox_orderplace_dryrun: skipped (phase26.dryrun.allow_order_place=false)")
+        return 0, 0, "not_allowed"
+    if not _allowed_by_killswitch(cfg):
+        warn("alpha_outbox_orderplace_dryrun: blocked by kill_switches")
+        return 0, 0, "killed"
 
     store = get_store()
-
     processed = 0
     enq = 0
+
     try:
         cur = conn.cursor()
         translations = _fetch_latest_approved_translations(cur, limit=limit)
         processed = len(translations)
 
         for t in translations:
-            # eligibility
-            gates = t.get("gates") or {}
-            if not _gate_a_ok(gates):
-                continue
-            if not _blockers_empty(gates):
-                continue
-
             action = (t.get("action") or "").upper()
-            if action not in ("WOULD_TRADE", "WOULD_BUY", "WOULD_SELL"):
+            if action not in ("WOULD_BUY", "WOULD_SELL"):
+                # IMPORTANT: do not create orders for WOULD_WATCH
                 continue
 
-            if _already_enqueued(cur, t.get("translation_id") or ""):
+            venue = (t.get("venue") or "").upper()
+            if not _venue_allows_dryrun(cfg, venue):
                 continue
 
-            intent = _build_intent(t, buy_usd_default, sell_base_default)
+            gates = t.get("gates") or {}
+            gate_a = _gate_a_ok(gates)
+            blockers = gates.get("blockers", [])
+
+            # eligibility:
+            # - normal: Gate A ok AND no blockers
+            # - override: allow immature dryrun (Gate A may fail) only when blocker(s) are IMMATURE
+            if gate_a:
+                # Gate A passed: require no blockers at all
+                if isinstance(blockers, list) and len(blockers) > 0:
+                    continue
+                if isinstance(blockers, str) and blockers.strip():
+                    continue
+            else:
+                # Gate A failed
+                if not _allow_immature(gates, allow_immature_dryrun):
+                    continue
+
+            translation_id = t.get("translation_id") or ""
+            if not translation_id:
+                continue
+            if _already_enqueued(cur, translation_id):
+                continue
+
+            intent = _build_intent(t=t, buy_max_usd=buy_max_usd, sell_base_amount=sell_base_amount)
+
+            # enqueue
             res = store.enqueue(agent_id=AGENT_ID, intent=intent, dedup_ttl_seconds=DEDUP_TTL)
             cmd_id = int(res.get("id") or 0)
             if cmd_id <= 0:
