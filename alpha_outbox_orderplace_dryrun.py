@@ -46,6 +46,11 @@ DEFAULT_BUY_USD = float(os.getenv("ALPHA26E_BUY_USD_DEFAULT", "10") or "10")
 DEFAULT_SELL_BASE = float(os.getenv("ALPHA26E_SELL_BASE_DEFAULT", "1") or "1")
 SELL_BASE_MAP_RAW = os.getenv("ALPHA26E_SELL_BASE_MAP", "").strip()
 
+if side == "BUY":
+    payload["amount_usd"] = config["phase26"]["dryrun"]["buy_max_usd"]
+elif side == "SELL":
+    payload["amount_base"] = config["phase26"]["dryrun"]["sell_base_amount"]
+
 def _load_sell_base_map() -> Dict[str, float]:
     if not SELL_BASE_MAP_RAW:
         return {}
