@@ -173,6 +173,16 @@ from wallet_monitor import run_wallet_monitor
 
 _schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="13:10")
 
+# --- Phase 26A (Preview-only proposals) -------------------------------------
+# Bus-only cognition. The Edge never sees proposals.
+# Safe to schedule even when disabled: alpha_phase26_tick self-gates on env.
+try:
+    alpha_every = int(os.getenv("ALPHA_PHASE26_EVERY_MIN", "15"))
+except Exception:
+    alpha_every = 15
+
+_schedule("Phase 26A Tick (WOULD_* proposals)", "alpha_phase26_tick", "run_alpha_phase26_tick", every=alpha_every, unit="minutes")
+
 # --- Boot orchestration ------------------------------------------------------
 def _boot_serialize_first_minute():
     """
