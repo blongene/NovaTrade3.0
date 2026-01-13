@@ -25,6 +25,8 @@ Safety
 from __future__ import annotations
 
 import os
+import logging
+logger = logging.getLogger(__name__)
 
 
 def _truthy(v: str | None) -> bool:
