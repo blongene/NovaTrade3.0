@@ -1,129 +1,111 @@
+# alpha_command_outbox.py
+from __future__ import annotations
+
+import hashlib
+import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, Tuple
 
-import psycopg2
-import psycopg2.extras
+from db import get_db_conn  # keep your existing db helper import if different
 
-def _db_url() -> str:
-    u = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
-    if not u:
-        raise RuntimeError("DB_URL (or DATABASE_URL) is required")
-    return u
 
-def _get_columns(conn, table: str, schema: str = "public") -> List[str]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema=%s AND table_name=%s
-            ORDER BY ordinal_position
-            """,
-            (schema, table),
-        )
-        return [r[0] for r in cur.fetchall()]
+DEFAULT_AGENT_ID = os.getenv("CLOUD_AGENT_ID", "cloud")
+DEFAULT_DEDUP_TTL_SECONDS = int(os.getenv("COMMANDS_DEDUP_TTL_SECONDS", "900"))
 
-def _pick_first(cols: List[str], candidates: List[str]) -> Optional[str]:
-    s = set(cols)
-    for c in candidates:
-        if c in s:
-            return c
-    return None
+
+def _stable_json(obj: Any) -> str:
+    """Stable JSON string for hashing."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def ensure_intent_has_type(intent: Any) -> Dict[str, Any]:
+    """
+    Guarantees intent is a dict and has a top-level 'type' key.
+
+    - {} becomes: {'type':'invalid','note':'auto-fixed empty intent'}
+    - dict without 'type' becomes: {'type':'legacy.command','legacy': <original>}
+    - non-dict becomes: {'type':'legacy.command','legacy': {'value': <original>}}
+    """
+    if intent is None:
+        return {"type": "invalid", "note": "auto-fixed null intent"}
+    if not isinstance(intent, dict):
+        return {"type": "legacy.command", "legacy": {"value": intent}}
+
+    if intent == {}:
+        return {"type": "invalid", "note": "auto-fixed empty intent"}
+
+    if "type" in intent and isinstance(intent["type"], str) and intent["type"].strip():
+        return intent
+
+    # If it looks like an older shape, wrap it so the constraint is satisfied
+    return {"type": "legacy.command", "legacy": intent}
+
+
+def compute_intent_hash(intent: Dict[str, Any]) -> str:
+    intent = ensure_intent_has_type(intent)
+    return _sha256_hex(_stable_json(intent))
+
 
 def enqueue_command(
+    intent: Dict[str, Any],
     *,
-    command_type: str,
-    payload: Dict[str, Any],
-    idempotency_key: str,
-    note: str = "",
-    source: str = "alpha26",
+    agent_id: Optional[str] = None,
     status: str = "queued",
-) -> int:
+    dedup_ttl_seconds: Optional[int] = None,
+) -> Tuple[int, str]:
     """
-    Insert a row into `commands` with schema adaptation.
+    Inserts into canonical commands table:
+      (agent_id, intent, intent_hash, status, dedup_ttl_seconds)
 
-    We *discover* the column names at runtime and map:
-      - payload column: payload|intent|command|body|data|json
-      - type column: type|command_type|kind
-      - status column: status|state
-      - idempotency: idempotency_key|idem_key|dedupe_key|request_id
-      - note: note|reason|memo|message
-      - source: source|origin|producer
+    Returns: (cmd_id, intent_hash)
     """
-    conn = psycopg2.connect(_db_url(), sslmode="require")
-    try:
-        cols = _get_columns(conn, "commands")
-        payload_col = _pick_first(cols, ["payload", "intent", "command", "body", "data", "json"])
-        type_col = _pick_first(cols, ["type", "command_type", "kind"])
-        status_col = _pick_first(cols, ["status", "state"])
-        idem_col = _pick_first(cols, ["idempotency_key", "idem_key", "dedupe_key", "request_id"])
-        note_col = _pick_first(cols, ["note", "reason", "memo", "message"])
-        source_col = _pick_first(cols, ["source", "origin", "producer"])
+    agent_id = agent_id or DEFAULT_AGENT_ID
+    dedup_ttl_seconds = int(dedup_ttl_seconds or DEFAULT_DEDUP_TTL_SECONDS)
 
-        if not payload_col:
-            raise RuntimeError(f"commands table has no recognized payload column. columns={cols}")
+    intent = ensure_intent_has_type(intent)
+    intent_hash = compute_intent_hash(intent)
 
-        insert_cols = []
-        insert_vals = []
+    sql = """
+        INSERT INTO commands (agent_id, intent, intent_hash, status, dedup_ttl_seconds)
+        VALUES (%s, %s::jsonb, %s, %s, %s)
+        ON CONFLICT (intent_hash) DO NOTHING
+        RETURNING id;
+    """
 
-        if type_col:
-            insert_cols.append(type_col); insert_vals.append(command_type)
-        if status_col:
-            insert_cols.append(status_col); insert_vals.append(status)
-        if idem_col:
-            insert_cols.append(idem_col); insert_vals.append(idempotency_key)
-        if note_col:
-            insert_cols.append(note_col); insert_vals.append(note)
-        if source_col:
-            insert_cols.append(source_col); insert_vals.append(source)
-
-        insert_cols.append(payload_col)
-        insert_vals.append(psycopg2.extras.Json(payload))
-
-        cols_sql = ", ".join(insert_cols)
-        ph_sql = ", ".join(["%s"] * len(insert_vals))
-
-        returning = "id" if "id" in cols else insert_cols[0]
-        sql = f"INSERT INTO commands ({cols_sql}) VALUES ({ph_sql}) RETURNING {returning};"
-
+    with get_db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, insert_vals)
-            new_id = cur.fetchone()[0]
-        conn.commit()
-        return int(new_id)
-    finally:
-        conn.close()
+            cur.execute(sql, (agent_id, json.dumps(intent), intent_hash, status, dedup_ttl_seconds))
+            row = cur.fetchone()
+            conn.commit()
+
+    # If dedup prevented insert, we still want to return the existing id
+    if not row:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM commands WHERE intent_hash=%s;", (intent_hash,))
+                got = cur.fetchone()
+                if not got:
+                    raise RuntimeError("Dedup hit but could not find existing command by intent_hash.")
+                return int(got[0]), intent_hash
+
+    return int(row[0]), intent_hash
+
 
 def debug_dump_latest_commands(limit: int = 10) -> None:
-    conn = psycopg2.connect(_db_url(), sslmode="require")
-    try:
-        cols = _get_columns(conn, "commands")
-        want = []
-        for c in [
-            "id","ts","created_at",
-            "status","state",
-            "type","command_type","kind",
-            "idempotency_key","idem_key","dedupe_key","request_id",
-            "note","reason","memo","message",
-            "source","origin","producer",
-        ]:
-            if c in cols:
-                want.append(c)
-
-        payload_col = _pick_first(cols, ["payload", "intent", "command", "body", "data", "json"])
-        if payload_col:
-            want.append(payload_col)
-
-        proj = ", ".join(want) if want else "*"
-        order_col = "id" if "id" in cols else (want[0] if want else "1")
-
+    sql = """
+        SELECT id, created_at, status, intent
+        FROM commands
+        ORDER BY id DESC
+        LIMIT %s;
+    """
+    with get_db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT {proj} FROM commands ORDER BY {order_col} DESC LIMIT %s;", (limit,))
+            cur.execute(sql, (int(limit),))
             rows = cur.fetchall()
-
-        print("commands.columns =", cols)
-        print("---- latest commands ----")
-        for r in rows:
-            print(r)
-    finally:
-        conn.close()
+    print("---- latest commands ----")
+    for r in rows:
+        print(r)
