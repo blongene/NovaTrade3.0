@@ -1,27 +1,27 @@
 # alpha_proposals_mirror.py
 """
-Phase 26A — Mirror alpha_proposals → Google Sheet (Alpha_Proposals)
+Phase 26A/26E — Mirror alpha_proposals → Google Sheet (Alpha_Proposals)
 
-This is *presentation only*. It does NOT trigger trades or commands.
+Presentation only. Does NOT trigger trades or commands.
 
-Why Step 3 exists
-- Render Bus env var slots are constrained.
-- We avoid adding new env vars by reading routing/toggles from DB_READ_JSON when present.
-- We also avoid "one pointer fits all" confusion: proposals mirror should have its own tab
-  independent of any ideas intake surfaces.
+Why this version:
+- Avoids the classic confusion where ALPHA_SHEET_TAB (often set to Alpha_Ideas)
+  hijacks proposals mirroring.
+- Prefers Phase 26 config (DB_READ_JSON.phase26.alpha.*), then Phase 25 for legacy.
+- Logs chosen tab + source for easy diagnosis.
 
 Enable (preview-only):
 - PREVIEW_ENABLED=1
 - ALPHA_PREVIEW_PROPOSALS_ENABLED=1
 
-Optional toggles (no new env vars required):
-- DB_READ_JSON.phase25.alpha.mirror.enabled (default true)
-- DB_READ_JSON.phase25.alpha.mirror.silence_row (default true)
-- DB_READ_JSON.phase25.alpha.sources.proposals_tab (default "Alpha_Proposals")
+Toggles/routing (preferred, no new env vars required):
+- DB_READ_JSON.phase26.alpha.mirror.enabled (default true)
+- DB_READ_JSON.phase26.alpha.mirror.silence_row (default true)
+- DB_READ_JSON.phase26.alpha.sources.proposals_tab (default "Alpha_Proposals")
 
-Legacy / fallback env vars (still supported):
-- ALPHA_SHEETS_MIRROR_ENABLED (default 1)
-- ALPHA_SHEET_TAB (fallback tab if DB_READ_JSON does not specify proposals_tab)
+Legacy fallback:
+- DB_READ_JSON.phase25.alpha.mirror.*, DB_READ_JSON.phase25.alpha.sources.*
+- ALPHA_PROPOSALS_SHEET_TAB (optional explicit env override)
 - ALPHA_SHEET_LIMIT (default 200)
 
 DB:
@@ -33,7 +33,7 @@ from __future__ import annotations
 import os
 import json
 from datetime import datetime, timezone
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Tuple
 
 try:
     from utils import info, warn, error, get_sheet
@@ -75,13 +75,27 @@ def _load_db_read_json() -> Dict[str, Any]:
         return {}
 
 
+def _deep_get(d: Dict[str, Any], *path: str) -> Any:
+    cur: Any = d
+    for p in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(p)
+    return cur
+
+
 def _cfg_alpha() -> Dict[str, Any]:
+    """
+    Prefer Phase 26 config; fallback to Phase 25 for legacy installs.
+    """
     cfg = _load_db_read_json()
-    phase25 = cfg.get("phase25") or {}
-    if not isinstance(phase25, dict):
-        return {}
-    alpha = phase25.get("alpha") or {}
-    return alpha if isinstance(alpha, dict) else {}
+    alpha26 = _deep_get(cfg, "phase26", "alpha")
+    if isinstance(alpha26, dict):
+        return alpha26
+    alpha25 = _deep_get(cfg, "phase25", "alpha")
+    if isinstance(alpha25, dict):
+        return alpha25
+    return {}
 
 
 def _sources() -> Dict[str, Any]:
@@ -97,11 +111,10 @@ def _mirror_cfg() -> Dict[str, Any]:
 
 
 def _mirror_enabled() -> bool:
-    # Prefer DB_READ_JSON toggle (no env slot) when present
     m = _mirror_cfg()
     if "enabled" in m:
         return _truthy(m.get("enabled"))
-    # Legacy env fallback
+    # Legacy env fallback (still honored)
     return _truthy(os.getenv("ALPHA_SHEETS_MIRROR_ENABLED", "1"))
 
 
@@ -109,24 +122,28 @@ def _silence_row_enabled() -> bool:
     m = _mirror_cfg()
     if "silence_row" in m:
         return _truthy(m.get("silence_row"))
-    # Default ON for Phase 26A trust-building
     return True
 
 
-def _target_tab() -> str:
-    # Prefer per-surface routing from DB_READ_JSON (no env slot)
+def _target_tab() -> Tuple[str, str]:
+    """
+    Returns (tab, source_description)
+    """
+    # 1) Explicit env override for proposals (safe, non-confusing)
+    env_tab = (os.getenv("ALPHA_PROPOSALS_SHEET_TAB") or "").strip()
+    if env_tab:
+        return env_tab, "env:ALPHA_PROPOSALS_SHEET_TAB"
+
+    # 2) DB_READ_JSON routing (preferred)
     src = _sources()
     tab = src.get("proposals_tab") or src.get("proposalsTab") or None
     if isinstance(tab, str) and tab.strip():
-        return tab.strip()
+        t = tab.strip()
+        return t, "DB_READ_JSON:(phase26|phase25).alpha.sources.proposals_tab"
 
-    # Legacy fallback: if operator is still using ALPHA_SHEET_TAB, honor it
-    env_tab = os.getenv("ALPHA_SHEET_TAB", "") or ""
-    if env_tab.strip():
-        return env_tab.strip()
-
-    # Default
-    return "Alpha_Proposals"
+    # 3) DO NOT use ALPHA_SHEET_TAB by default (too easy to point at Alpha_Ideas)
+    # If you truly want to route via env, set ALPHA_PROPOSALS_SHEET_TAB.
+    return "Alpha_Proposals", "default:Alpha_Proposals"
 
 
 def _get_db_url() -> Optional[str]:
@@ -149,14 +166,13 @@ def _connect():
 
 
 def _rows_for_today(cur, limit: int = 200) -> List[Dict[str, Any]]:
-    # UTC day window (using DB clock)
     cur.execute(
         """
         SELECT
           ts AT TIME ZONE 'UTC' AS ts_utc,
           token,
-          COALESCE(venue,'') AS venue,
           COALESCE(symbol,'') AS symbol,
+          COALESCE(venue,'') AS venue,
           action,
           COALESCE(notional_usd::text,'') AS notional_usd,
           COALESCE(confidence::text,'') AS confidence,
@@ -174,10 +190,10 @@ def _rows_for_today(cur, limit: int = 200) -> List[Dict[str, Any]]:
     for r in cur.fetchall() or []:
         out.append(
             {
-                "ts_utc": str(r[0]),
+                "ts": str(r[0]),
                 "token": r[1],
-                "venue": r[2],
-                "symbol": r[3],
+                "symbol": r[2],
+                "venue": r[3],
                 "action": r[4],
                 "notional_usd": r[5],
                 "confidence": r[6],
@@ -202,10 +218,9 @@ def run_alpha_proposals_mirror() -> None:
     if conn is None:
         return
 
-    tab = _target_tab()
+    tab, tab_src = _target_tab()
     limit = int(os.getenv("ALPHA_SHEET_LIMIT", "200"))
 
-    # Simple, stable schema for Alpha_Proposals.v1 (daily snapshot)
     header = [
         "ts",
         "token",
@@ -222,7 +237,6 @@ def run_alpha_proposals_mirror() -> None:
     try:
         cur = conn.cursor()
 
-        # Check table exists quickly
         cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'alpha_proposals' LIMIT 1;")
         if cur.fetchone() is None:
             warn("alpha_proposals_mirror: missing table alpha_proposals; nothing to mirror.")
@@ -237,13 +251,14 @@ def run_alpha_proposals_mirror() -> None:
             warn(f"alpha_proposals_mirror: sheet tab '{tab}' missing; creating.")
             ws = sheet.add_worksheet(title=tab, rows="500", cols="20")
 
-        # Replace-mode mirror (clears tab and writes today's snapshot)
+        # Replace-mode snapshot
         try:
             ws.clear()
         except Exception:
             pass
 
         ws.append_row(header)
+        info(f"alpha_proposals_mirror: target_tab='{tab}' (source={tab_src}) limit={limit}")
 
         if not rows:
             if _silence_row_enabled():
@@ -280,7 +295,7 @@ def run_alpha_proposals_mirror() -> None:
 
             values.append(
                 [
-                    r.get("ts_utc") or "",
+                    r.get("ts") or "",
                     r.get("token") or "",
                     r.get("symbol") or "",
                     r.get("venue") or "",
@@ -293,7 +308,6 @@ def run_alpha_proposals_mirror() -> None:
                 ]
             )
 
-        # batch append for quota safety
         ws.append_rows(values, value_input_option="RAW")
         info(f"alpha_proposals_mirror: mirrored {len(values)} rows to sheet tab '{tab}'.")
 
