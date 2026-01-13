@@ -64,3 +64,12 @@ def run_alpha_phase26_tick() -> None:
             warn(f"alpha_phase26_tick: proposals mirror failed: {e}")
         except Exception:
             print(f"alpha_phase26_tick: proposals mirror failed: {e}", flush=True)
+            
+    # --- Phase 26E Step 1: enqueue approved intents into commands outbox (schema-adaptive)
+    try:
+        from alpha_phase26e_enqueue import enqueue_from_approvals
+        p, n = enqueue_from_approvals(limit=25)
+        if n:
+            logger.info(f"alpha26e_enqueue: processed={p} enqueued_new={n}")
+    except Exception as e:
+        logger.warning(f"alpha26e_enqueue: skipped/failed: {e}")
