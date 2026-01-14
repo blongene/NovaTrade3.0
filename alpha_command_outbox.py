@@ -5,8 +5,13 @@ import hashlib
 import json
 import os
 from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timezone
 
-from db import get_db_conn  # keep your existing db helper import if different
+# 🔁 ADAPT HERE — use YOUR real DB helper
+try:
+    from db import get_db_conn  # preferred if exists
+except ImportError:
+    from db import get_conn as get_db_conn  # most common fallback
 
 
 DEFAULT_AGENT_ID = os.getenv("CLOUD_AGENT_ID", "cloud")
