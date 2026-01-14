@@ -7,11 +7,32 @@ import os
 from typing import Any, Dict, Optional, Tuple
 from datetime import datetime, timezone
 
-# 🔁 ADAPT HERE — use YOUR real DB helper
+# -----------------------------------------------------------------------------
+# DB connection adapter (bullet-proof)
+# -----------------------------------------------------------------------------
+def _fallback_db_url() -> str:
+    url = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DB_URL (or DATABASE_URL) is not set")
+    return url
+
+
+def _fallback_get_db_conn():
+    try:
+        import psycopg2  # type: ignore
+    except Exception as e:
+        raise RuntimeError("psycopg2 is required for alpha_command_outbox fallback connector") from e
+    return psycopg2.connect(_fallback_db_url())
+
+
+# Try project db helpers first; fallback to direct psycopg2 connect
 try:
     from db import get_db_conn  # preferred if exists
-except ImportError:
-    from db import get_conn as get_db_conn  # most common fallback
+except Exception:
+    try:
+        from db import get_conn as get_db_conn  # common shim name
+    except Exception:
+        get_db_conn = _fallback_get_db_conn  # final fallback
 
 
 DEFAULT_AGENT_ID = os.getenv("CLOUD_AGENT_ID", "cloud")
@@ -46,7 +67,6 @@ def ensure_intent_has_type(intent: Any) -> Dict[str, Any]:
     if "type" in intent and isinstance(intent["type"], str) and intent["type"].strip():
         return intent
 
-    # If it looks like an older shape, wrap it so the constraint is satisfied
     return {"type": "legacy.command", "legacy": intent}
 
 
@@ -81,13 +101,14 @@ def enqueue_command(
         RETURNING id;
     """
 
+    # Insert attempt
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (agent_id, json.dumps(intent), intent_hash, status, dedup_ttl_seconds))
             row = cur.fetchone()
             conn.commit()
 
-    # If dedup prevented insert, we still want to return the existing id
+    # If dedup prevented insert, return existing id
     if not row:
         with get_db_conn() as conn:
             with conn.cursor() as cur:
