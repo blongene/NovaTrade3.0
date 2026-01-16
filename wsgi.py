@@ -40,7 +40,7 @@ def _pull_commands(agent_id: str, max_items: int = 10, lease_seconds: int = 90) 
     # normalize to the legacy shape used by your handlers
     out = []
     for row in leased:
-        out.append({"id": str(row.get("id")), "payload": row.get("intent")})
+        out.append({"id": str(row.get("id")), "payload": _canonicalize_order_place_intent(row.get("intent") or {})})
     return out
 
 def _ack_command(cmd_id: str, agent_id: str, status: str, detail: dict | None = None) -> None:
@@ -116,6 +116,97 @@ def _env_true(k: str) -> bool:
 def _canonical(d: dict) -> bytes:
     return json.dumps(d, separators=(",",":"), sort_keys=True).encode("utf-8")
 
+
+# ========== Intent canonicalization (Edge compatibility) ==========
+# Some command producers send order.place intents as:
+#   {"type":"order.place", "payload": { ... amount_usd ... }}
+# while some Edge executors expect sizing fields (amount_usd/amount_quote/amount_base)
+# at the top-level. This helper promotes common fields from payload -> root and
+# guarantees type/side normalization without breaking backwards compatibility.
+
+def _canonicalize_order_place_intent(intent: dict) -> dict:
+    try:
+        if not isinstance(intent, dict):
+            return {}
+        # Shallow copy so we never mutate DB objects in-place
+        out = dict(intent)
+        payload = out.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+
+        # If this isn't an order.place, do nothing
+        itype = (out.get("type") or payload.get("type") or "").strip()
+        if itype and itype != "order.place":
+            return out
+        # Heuristic: treat as order.place when side present in payload/root
+        if not itype and not (out.get("side") or payload.get("side")):
+            return out
+
+        out["type"] = "order.place"
+
+        # Promote common fields
+        promote_keys = [
+            "venue","symbol","token","side","mode","note","flags",
+            "amount_usd","amount_quote","amount_base",
+            "price","price_usd","limit_price","time_in_force",
+            "dry_run","idempotency_key","client_order_id","meta"
+        ]
+        for k in promote_keys:
+            if out.get(k) in (None, "", [], {}):
+                v = payload.get(k)
+                if v not in (None, ""):
+                    out[k] = v
+
+        # Normalize side
+        if isinstance(out.get("side"), str):
+            out["side"] = out["side"].upper()
+
+        # Quote sizing default: many producers use amount_usd; Edge may read amount_quote
+        if out.get("amount_quote") in (None, "", 0, 0.0) and out.get("amount_usd") not in (None, "", 0, 0.0):
+            out["amount_quote"] = out.get("amount_usd")
+
+        # Float coercion (safe)
+        for nk in ("amount_usd","amount_quote","amount_base","price","price_usd","limit_price"):
+            if nk in out and out[nk] not in (None, ""):
+                try:
+                    out[nk] = float(out[nk])
+                except Exception:
+                    pass
+
+        # Backfill payload with promoted fields so older consumers still find them there
+        if payload is not None:
+            new_payload = dict(payload)
+            for k in promote_keys:
+                if new_payload.get(k) in (None, "", [], {}):
+                    if out.get(k) not in (None, ""):
+                        new_payload[k] = out.get(k)
+            out["payload"] = new_payload
+
+        return out
+    except Exception:
+        # Never fail routing because of canonicalization
+        return intent if isinstance(intent, dict) else {}
+
+
+def _canonicalize_leased_commands(rows: list) -> list:
+    """Normalize leased command rows into an Edge-safe shape."""
+    out = []
+    for row in (rows or []):
+        if not isinstance(row, dict):
+            out.append(row)
+            continue
+        r = dict(row)
+        # common shapes: {id, intent:{...}} or {id, payload:{...}}
+        if isinstance(r.get("intent"), dict):
+            it = r["intent"]
+            if (it.get("type") == "order.place") or (isinstance(it.get("payload"), dict) and (it.get("payload") or {}).get("side")):
+                r["intent"] = _canonicalize_order_place_intent(it)
+        if isinstance(r.get("payload"), dict):
+            it = r["payload"]
+            if (it.get("type") == "order.place") or (isinstance(it.get("payload"), dict) and (it.get("payload") or {}).get("side")):
+                r["payload"] = _canonicalize_order_place_intent(it)
+        out.append(r)
+    return out
 # ========== Telegram ==========
 ENABLE_TELEGRAM = _env_true("ENABLE_TELEGRAM")
 def _bot_token() -> Optional[str]:
@@ -1039,6 +1130,8 @@ def cmd_pull():
     # Lease commands for this agent
     try:
         out = store.lease(agent, n) or []
+        # Canonicalize intents before sending to Edge (backward compatible)
+        out = _canonicalize_leased_commands(out)
     except Exception as e:
         log.exception("cmd_pull: lease error agent=%s", agent)
         return jsonify({"ok": False, "error": f"lease_error: {e}"}), 500
