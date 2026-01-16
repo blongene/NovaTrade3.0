@@ -328,6 +328,11 @@ def healthz():
     except Exception as e: info["queue_error"] = str(e)
     return jsonify(info), 200
 
+@flask_app.get("/health")
+def health():
+    """Compatibility alias for older clients/scripts."""
+    return healthz()
+
 @flask_app.get("/readyz")
 def readyz():
     return jsonify(ok=True), 200
