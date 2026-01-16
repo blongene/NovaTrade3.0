@@ -16,7 +16,7 @@ for noisy, level in {
     "gspread": "WARNING",
     "googleapiclient": "WARNING",
     "google": "WARNING",
-    "urllib3": "WARNING",
+    "urllib3": "ERROR",
     "httpx": "WARNING",
     "asyncio": "WARNING",
     "apscheduler": "WARNING",
