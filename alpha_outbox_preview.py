@@ -95,6 +95,59 @@ def _already_enqueued(cur, row_hash: str) -> bool:
     return cur.fetchone() is not None
 
 
+
+def _canon_order_place_payload(payload: dict) -> dict:
+    """Normalize order.place payload sizing fields so Edge executors don't reject.
+
+    Edge expects:
+      - BUY: amount_quote (quote sizing), optionally amount_usd mirror
+      - SELL: amount_base
+
+    We tolerate legacy keys (amount_usd, quote_amount, amount) and coerce to floats.
+    """
+    try:
+        side = str(payload.get("side") or "").upper().strip()
+        if side == "BUY":
+            amt = payload.get("amount_quote")
+            if amt is None:
+                amt = payload.get("quote_amount")
+            if amt is None:
+                amt = payload.get("amount_usd")
+            if amt is None:
+                amt = payload.get("amount")
+            try:
+                amt_f = float(amt) if amt is not None else 0.0
+            except Exception:
+                amt_f = 0.0
+            if amt_f <= 0:
+                amt_f = 1.0
+            payload["amount_quote"] = float(amt_f)
+            # Keep amount_usd as a friendly mirror for downstream policy/logging.
+            if payload.get("amount_usd") is None:
+                payload["amount_usd"] = float(amt_f)
+            else:
+                try:
+                    payload["amount_usd"] = float(payload.get("amount_usd") or amt_f)
+                except Exception:
+                    payload["amount_usd"] = float(amt_f)
+
+        elif side == "SELL":
+            amt = payload.get("amount_base")
+            if amt is None:
+                amt = payload.get("base_amount")
+            if amt is None:
+                amt = payload.get("amount")
+            if amt is not None:
+                try:
+                    payload["amount_base"] = float(amt)
+                except Exception:
+                    # leave as-is; Edge will reject and log clearly
+                    pass
+
+    except Exception:
+        pass
+    return payload
+
 def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
     action = (t.get("action") or "").upper()
     venue = (t.get("venue") or "").upper()
@@ -141,6 +194,7 @@ def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
         "venue": venue,
         "symbol": symbol,
         "side": "BUY",
+        "amount_quote": max(notional, 1.0),
         "amount_usd": max(notional, 1.0),
         "dry_run": True,
         "mode": "dryrun",
@@ -148,6 +202,8 @@ def _build_outbox_intent(t: Dict[str, Any]) -> Dict[str, Any]:
         "note": f"Alpha26D-preview ORDER (dryrun) from translation {t.get('translation_id')} (proposal {t.get('proposal_id')})",
         "meta": meta,
     }
+    payload = _canon_order_place_payload(payload)
+
     return {
         "type": "order.place",
         "venue": venue,     # root-level for Edge
