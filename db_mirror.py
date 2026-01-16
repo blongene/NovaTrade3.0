@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -51,6 +52,8 @@ try:
     import psycopg2.extras  # type: ignore
 except Exception:  # pragma: no cover
     psycopg2 = None  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 # One-time per-boot observability
 _LOGGED_TABS: set[str] = set()
@@ -242,15 +245,17 @@ _MIRROR = _Mirror()
 # ----------------- public helpers -----------------
 
 def mirror_append(tab: str, rows: List[Any]) -> None:
+    # mirror_append signature is stable; keep wrapper ultra-safe.
     try:
-        _MIRROR.mirror_append(tab, rows, source="read")
-    except TypeError:
         _MIRROR.mirror_append(tab, rows)
+    except Exception:
+        pass
+
 def mirror_rows(tab: str, rows: List[Any]) -> None:
     try:
-        _MIRROR.mirror_rows(tab, rows, source="read")
-    except TypeError:
         _MIRROR.mirror_rows(tab, rows)
+    except Exception:
+        return
     # ---- observability: log once per tab per boot ----
     try:
         global _LOGGED_TABS
