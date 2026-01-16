@@ -46,6 +46,24 @@ def _ts(): return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 def info(msg):  print(f"[{_ts()}] INFO  {msg}")
 def warn(msg):  print(f"[{_ts()}] WARN  {msg}")
 def error(msg): print(f"[{_ts()}] ERROR {msg}")
+
+# Throttled WARN helper (prevents log spam during transient outages)
+_WARN_TTL_S = int(os.getenv("WARN_TTL_S", "600"))  # 10 min default
+_warn_cache: dict[str, float] = {}
+_warn_lock = threading.Lock()
+def warn_throttled(key: str, msg: str, ttl_s: int | None = None):
+    try:
+        ttl = _WARN_TTL_S if ttl_s is None else int(ttl_s)
+        now = time.time()
+        with _warn_lock:
+            last = _warn_cache.get(key, 0.0)
+            if now - last < ttl:
+                return
+            _warn_cache[key] = now
+        warn(msg)
+    except Exception:
+        warn(msg)
+
 import os
 from typing import Optional
 
@@ -508,14 +526,14 @@ def with_sheet_backoff(fn):
             except gspread.exceptions.APIError as e:
                 msg = str(e).lower()
                 if any(s in msg for s in ["rate limit", "quota", "429", "500", "503", "user rate limit"]):
-                    warn(f"Sheets backoff ({fn.__name__}): {e}")
+                    warn_throttled(f"sheets_backoff:{fn.__name__}", f"Sheets backoff ({fn.__name__}): {e}")
                     time.sleep(delay)
                     delay = min(BACKOFF_MAX_S, delay * 1.8)
                     continue
                 raise
             except Exception as e:
                 if any(x in str(e).lower() for x in ["timed out", "connection reset", "temporarily", "unavailable"]):
-                    warn(f"Transient error ({fn.__name__}): {e}; retrying…")
+                    warn_throttled(f"transient:{fn.__name__}", f"Transient error ({fn.__name__}): {e}; retrying…")
                     time.sleep(delay)
                     delay = min(BACKOFF_MAX_S, delay * 1.8)
                     continue
