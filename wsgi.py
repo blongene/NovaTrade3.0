@@ -249,17 +249,18 @@ REQUIRE_HMAC_OPS = _env_true("REQUIRE_HMAC_OPS")
 REQUIRE_HMAC_PULL = _env_true("REQUIRE_HMAC_PULL")
 REQUIRE_HMAC_TELEMETRY = _env_true("REQUIRE_HMAC_TELEMETRY")
 
-def _verify_hmac_json(secret_env: str, header_name: str):
-    """
-    Verify an HMAC-SHA256 signature over the raw request body.
+def _verify_hmac_json(secret_env: str, header_name):
+    """Verify an HMAC-SHA256 signature over the request body.
 
-    Edge sends:
-      - body: canonical JSON bytes (sorted keys, no spaces)
-      - header: header_name (e.g. 'X-OUTBOX-SIGN')
-      - key:   value from env[secret_env] (e.g. 'OUTBOX_SECRET')
+    Compatibility rules (to tolerate older Edge builds):
+    - Accepts a single header name or a list/tuple of names.
+    - Tries verifying against:
+        1) the raw request bytes
+        2) canonical JSON bytes (sorted keys, compact separators)
 
     Returns: (ok, body_dict, provided_sig, expected_sig)
     """
+
     raw = request.get_data() or b""
     try:
         body = json.loads(raw.decode("utf-8") or "{}")
@@ -267,20 +268,44 @@ def _verify_hmac_json(secret_env: str, header_name: str):
         body = {}
 
     secret = os.getenv(secret_env, "")
-    provided = request.headers.get(header_name, "") or ""
+
+    # Accept a single header string or multiple possible header names
+    if isinstance(header_name, (list, tuple)):
+        header_names = list(header_name)
+    else:
+        header_names = [header_name]
+
+    # Always tolerate common legacy names
+    for hn in ("X-OUTBOX-SIGN", "X-Signature", "X-SIGNATURE"):
+        if hn not in header_names:
+            header_names.append(hn)
+
+    provided = ""
+    for hn in header_names:
+        v = request.headers.get(hn, "") or ""
+        if v:
+            provided = v
+            break
 
     if not secret or not provided:
         # signal that we couldn't even attempt verification
-        return False, body, "", "missing_secret_or_sig"
+        return False, body, provided or "", "missing_secret_or_sig"
 
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        raw,
-        hashlib.sha256,
-    ).hexdigest()
+    # 1) Verify against raw bytes
+    expected_raw = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    if hmac.compare_digest(expected_raw, provided):
+        return True, body, provided, expected_raw
 
-    ok = hmac.compare_digest(expected, provided)
-    return ok, body, provided, expected
+    # 2) Verify against canonical JSON
+    try:
+        canon = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        expected_canon = hmac.new(secret.encode("utf-8"), canon, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected_canon, provided):
+            return True, body, provided, expected_canon
+    except Exception:
+        pass
+
+    return False, body, provided, expected_raw
 
 def _require_json():
     if not request.is_json: return None, (jsonify(ok=False, error="invalid_or_missing_json"), 400)
