@@ -24,7 +24,7 @@ import json
 import time
 import logging
 import hashlib
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +172,8 @@ def _compare(tab: str, sheets_rows: List[Dict[str, Any]], db_rows: List[Dict[str
             "tab": tab,
             "sheets_n": len(sheets_rows),
             "db_n": len(db_rows),
+            "s_compared": len(s_proj),
+            "d_compared": len(d_proj),
             "overlap": overlap,
             "only_sheets": only_s,
             "only_db": only_d,
@@ -206,6 +208,8 @@ def _compare(tab: str, sheets_rows: List[Dict[str, Any]], db_rows: List[Dict[str
         "tab": tab,
         "sheets_n": len(sheets_rows),
         "db_n": len(db_rows),
+        "s_compared": len(s),
+        "d_compared": len(d),
         "overlap": overlap,
         "only_sheets": only_s,
         "only_db": only_d,
@@ -258,8 +262,16 @@ def run_sheet_mirror_parity_validator() -> Dict[str, Any]:
 
         count_gap = abs(int(r["sheets_n"]) - int(r["db_n"]))
         col_drift = bool(r["missing_in_db_cols"] or r["extra_in_db_cols"])
-        overlap_min = max(1, int(min(len(sheets_rows), len(db_rows), max_compare) * 0.8))
-        overlap_ok = r["overlap"] >= overlap_min
+        # Determine a sensible overlap threshold based on what we actually compared.
+        s_comp = int(r.get("s_compared", min(len(sheets_rows), max_compare)))
+        d_comp = int(r.get("d_compared", min(len(db_rows), max_compare)))
+        min_comp = min(s_comp, d_comp)
+        # If both sides are empty, that's parity (avoid false drift warnings).
+        if int(r["sheets_n"]) == 0 and int(r["db_n"]) == 0:
+            overlap_ok = True
+        else:
+            overlap_min = max(1, int(min_comp * 0.8))
+            overlap_ok = r["overlap"] >= overlap_min
 
         if count_gap > 5 or (not overlap_ok) or col_drift:
             drift.append(r)
