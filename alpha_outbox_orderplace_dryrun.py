@@ -11,6 +11,42 @@ import psycopg2.extras
 
 
 LOG = logging.getLogger("alpha_outbox_orderplace_dryrun")
+
+
+def _canon_order_place_payload(payload: dict) -> dict:
+    """Normalize order.place payload fields so Edge always sees non-zero sizing.
+
+    BUY sizing: amount_quote preferred (quote currency). If only amount_usd is present,
+    we mirror it into amount_quote.
+
+    SELL sizing: amount_base required (base currency).
+    """
+    try:
+        side = (payload.get("side") or "").upper()
+        if side == "BUY":
+            amt = payload.get("amount_quote")
+            if amt is None:
+                amt = payload.get("quote_amount") or payload.get("amount_usd") or payload.get("amount")
+            try:
+                amt_f = float(amt)
+            except Exception:
+                amt_f = 0.0
+            if amt_f <= 0:
+                amt_f = 1.0
+            payload["amount_quote"] = amt_f
+            payload["amount_usd"] = float(payload.get("amount_usd") or amt_f)
+        elif side == "SELL":
+            amt = payload.get("amount_base")
+            if amt is None:
+                amt = payload.get("base_amount") or payload.get("amount")
+            if amt is not None:
+                try:
+                    payload["amount_base"] = float(amt)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return payload
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="[%(asctime)s] %(levelname)s  %(message)s",
@@ -214,9 +250,11 @@ def run() -> None:
             # BUY = quote sizing (USD), SELL = base sizing
             if side == "BUY":
                 payload["amount_usd"] = float(buy_max_usd)
+                payload["amount_quote"] = float(buy_max_usd)
             else:
                 payload["amount_base"] = float(sell_base_amount)
 
+            payload = _canon_order_place_payload(payload)
             intent = {"type": "order.place", "payload": payload}
 
             intent_hash = _stable_intent_hash(intent, include_idem=hash_include_idem)
