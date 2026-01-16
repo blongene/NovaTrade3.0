@@ -52,15 +52,66 @@ def _env_bool(name: str, default: str = "0") -> bool:
 
 
 def _load_db_read_json() -> Dict[str, Any]:
-    raw = os.getenv("DB_READ_JSON", "") or ""
-    raw = raw.strip()
+    """Parse DB_READ_JSON robustly.
+
+    Render env-var constraints + copy/paste can sometimes produce malformed JSON,
+    commonly:
+      - two JSON objects pasted back-to-back separated by a comma
+      - stray leading/trailing braces
+      - accidental whitespace / newlines
+
+    Canon rule: config parsing must never crash NovaTrade.
+    We therefore attempt a couple of safe recoveries and otherwise return {}.
+    """
+
+    raw = (os.getenv("DB_READ_JSON", "") or "").strip()
     if not raw:
         return {}
+
+    def _as_dict(x: Any) -> Dict[str, Any]:
+        return x if isinstance(x, dict) else {}
+
+    # 1) normal case
     try:
         obj = json.loads(raw)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
+        if isinstance(obj, dict):
+            return obj
+        # allow list-of-dicts (merge left-to-right)
+        if isinstance(obj, list):
+            merged: Dict[str, Any] = {}
+            for part in obj:
+                if isinstance(part, dict):
+                    merged.update(part)
+            return merged
         return {}
+    except Exception:
+        pass
+
+    # 2) common copy/paste error: "{...}, {....}" (two objects)
+    try:
+        obj2 = json.loads("[" + raw + "]")
+        if isinstance(obj2, list):
+            merged: Dict[str, Any] = {}
+            for part in obj2:
+                if isinstance(part, dict):
+                    merged.update(part)
+            return merged
+    except Exception:
+        pass
+
+    # 3) last-resort: try to extract the first valid object
+    # (best-effort; keeps system running)
+    try:
+        # heuristic: find first '{' and last '}'
+        a = raw.find("{")
+        b = raw.rfind("}")
+        if a != -1 and b != -1 and b > a:
+            obj3 = json.loads(raw[a : b + 1])
+            return _as_dict(obj3)
+    except Exception:
+        pass
+
+    return {}
 
 
 _CFG = _load_db_read_json()
