@@ -1173,6 +1173,35 @@ def cmd_pull():
     
     # Agent authority denied → soft block (no retry storm)
     if not trusted:
+        try:
+            # Auto-expire any queued commands for this untrusted agent
+            store.exec_sql(
+                """
+                with blocked as (
+                    update commands
+                       set status = 'error'
+                     where agent_id = %s
+                       and status = 'queued'
+                       and created_at < now() - interval '2 minutes'
+                     returning id
+                )
+                insert into receipts (cmd_id, agent_id, ok, receipt)
+                select b.id,
+                       'bus',
+                       false,
+                       jsonb_build_object(
+                           'ok', false,
+                           'status', 'blocked',
+                           'reason', 'agent_untrusted',
+                           'message', 'Command blocked by Authority Gate (pre-lease).'
+                       )
+                from blocked b;
+                """,
+                (agent,),
+            )
+        except Exception:
+            log.exception("authority_gate cleanup failed for agent=%s", agent)
+    
         resp = lease_block_response(agent)
         resp["lease_seconds"] = OUTBOX_LEASE_SECONDS
         return jsonify(resp)
