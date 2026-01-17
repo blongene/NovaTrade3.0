@@ -13,6 +13,7 @@ from sheets_bp import SHEETS_ROUTES, start_background_flusher
 from telemetry_routes import bp_telemetry
 from autonomy_modes import get_autonomy_state
 from ops_api import bp as ops_bp
+from telegram_webhook import bp_telegram, set_telegram_webhook
 
 # Phase 24C+ / 28.2 Authority Gate
 # Prefer the newer authority_gate module when present, but fall back to
@@ -34,6 +35,7 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING if LOG_LEVEL != "DEBUG" e
 flask_app = Flask(__name__)
 store = get_store()
 flask_app.register_blueprint(SHEETS_ROUTES, url_prefix="/sheets")
+
 
 # ---- Outbox shims (route-safe; delegate to Postgres store) ----
 def _enqueue_command(cmd_id: str, payload: dict) -> None:
@@ -216,42 +218,18 @@ def _canonicalize_leased_commands(rows: list) -> list:
         out.append(r)
     return out
     
-# ========== Telegram ==========
-from telegram_webhook import bp_telegram
-flask_app.register_blueprint(bp_telegram)
+flask_app.register_blueprint(SHEETS_ROUTES, url_prefix="/sheets")
 
-ENABLE_TELEGRAM = _env_true("ENABLE_TELEGRAM")
-def _bot_token() -> Optional[str]:
-    return os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-_TELEGRAM_TOKEN = _bot_token()
-_TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
-
-def send_telegram(text: str):
-    if not (ENABLE_TELEGRAM and _TELEGRAM_TOKEN and _TELEGRAM_CHAT):
-        return
-    try:
-        import requests
-        r = requests.post(
-            f"https://api.telegram.org/bot{_TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": _TELEGRAM_CHAT, "text": text[:4000], "parse_mode": "HTML"},
-            timeout=8
-        )
-        if not r.ok:
-            log.warning("Telegram send failed: %s", r.text)
-    except Exception as e:
-        log.warning("Telegram degraded: %s", e)
-
-# Optional webhook blueprint
+# ========== Telegram (Phase 28.3 decision surface) ==========
 try:
-    import telegram_webhook as _tg
-    if hasattr(_tg, "tg_blueprint"):
-        flask_app.register_blueprint(_tg.tg_blueprint, url_prefix="/tg")
-        log.info("Telegram blueprint mounted at /tg")
-    if hasattr(_tg, "set_telegram_webhook"):
-        try: _tg.set_telegram_webhook()
-        except Exception as e: log.info("Telegram webhook setter degraded: %s", e)
+    flask_app.register_blueprint(bp_telegram)  # /tg/health, /tg/webhook, /telegram/prompt
+    try:
+        set_telegram_webhook()
+    except Exception as e:
+        log.warning("telegram webhook set failed: %r", e)
+    log.info("Telegram blueprint mounted (bp_telegram).")
 except Exception as e:
-    log.info("telegram_webhook not mounted: %s", e)
+    log.warning("Telegram blueprint degraded (not mounted): %r", e)
 
 # ========== HMAC (ROBUST PATCH) ==========
 OUTBOX_SECRET = os.getenv("OUTBOX_SECRET", "")
