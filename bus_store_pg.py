@@ -15,9 +15,28 @@ OUTBOX_LEASE_SECONDS = int(os.getenv("OUTBOX_LEASE_SECONDS", "60"))
 OUTBOX_MAX_ATTEMPTS  = int(os.getenv("OUTBOX_MAX_ATTEMPTS", "5"))
 
 def _intent_hash(payload: Dict[str, Any]) -> str:
-    # Stable, HMAC-safe hash for idempotency
+    """Stable hash of the intent payload.
+
+    Used when no explicit idempotency_key is supplied.
+    """
     msg = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return hashlib.sha256(msg).hexdigest()
+
+
+def _dedup_hash(agent_id: str, intent: Dict[str, Any], idempotency_key: Optional[str]) -> str:
+    """Hash used for *dedupe/idempotency*.
+
+    We intentionally reuse the existing `commands.intent_hash` uniqueness constraint.
+    If the caller supplies `idempotency_key`, we derive a deterministic hash from it
+    (scoped by agent_id) so repeated smoke tests / retries do not create duplicates.
+
+    This avoids any schema changes.
+    """
+    k = (idempotency_key or "").strip()
+    if k:
+        msg = f"idem|{(agent_id or '').strip()}|{k}".encode("utf-8")
+        return hashlib.sha256(msg).hexdigest()
+    return _intent_hash(intent)
 
 # ------------------- Postgres Impl -------------------
 class PGStore:
@@ -35,8 +54,14 @@ class PGStore:
         finally:
             conn.close()
 
-    def enqueue(self, agent_id: str, intent: Dict[str, Any], dedup_ttl_seconds: int = 900) -> Dict[str, Any]:
-        h = _intent_hash(intent)
+    def enqueue(
+        self,
+        agent_id: str,
+        intent: Dict[str, Any],
+        dedup_ttl_seconds: int = 900,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        h = _dedup_hash(agent_id, intent, idempotency_key)
         with self.cx() as c:
             cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             # Try insert; on conflict (same intent_hash), return existing row (idempotent)
@@ -152,8 +177,14 @@ class SQLiteStore:
             """)
             c.commit()
 
-    def enqueue(self, agent_id: str, intent: Dict[str, Any], dedup_ttl_seconds: int = 900) -> Dict[str, Any]:
-        h = _intent_hash(intent)
+    def enqueue(
+        self,
+        agent_id: str,
+        intent: Dict[str, Any],
+        dedup_ttl_seconds: int = 900,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        h = _dedup_hash(agent_id, intent, idempotency_key)
         with sqlite3.connect(self.path) as c:
             cur = c.cursor()
             # try insert; ignore on conflict
