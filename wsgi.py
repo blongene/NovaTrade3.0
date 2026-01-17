@@ -13,16 +13,22 @@ from sheets_bp import SHEETS_ROUTES, start_background_flusher
 from telemetry_routes import bp_telemetry
 from autonomy_modes import get_autonomy_state
 from ops_api import bp as ops_bp
-from telegram_webhook import bp_telegram, set_telegram_webhook
+
+# Telegram surface (buttons/webhook). Safe if telegram is disabled/misconfigured.
+try:
+    from telegram_webhook import tg_blueprint as bp_telegram, set_telegram_webhook  # type: ignore
+except Exception:
+    bp_telegram = None  # type: ignore
+    def set_telegram_webhook() -> None:  # type: ignore
+        return
 
 # Phase 24C+ / 28.2 Authority Gate
 # Prefer the newer authority_gate module when present, but fall back to
 # legacy edge_authority to keep older deployments working.
 try:
     from authority_gate import evaluate_agent, lease_block_response  # type: ignore
-except Exception as e:
+except Exception:
     from edge_authority import evaluate_agent, lease_block_response
-
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
@@ -34,8 +40,32 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING if LOG_LEVEL != "DEBUG" e
 # ========== Flask ==========
 flask_app = Flask(__name__)
 store = get_store()
-flask_app.register_blueprint(SHEETS_ROUTES, url_prefix="/sheets")
 
+def _register_bp_once(app: Flask, bp: Any, url_prefix: str | None = None) -> None:
+    """Register a blueprint exactly once.
+
+    Render/Uvicorn will import wsgi.py; accidental duplicate registration
+    should not crash the service.
+    """
+    if bp is None:
+        return
+    try:
+        name = getattr(bp, "name", None) or ""
+        if name and name in getattr(app, "blueprints", {}):
+            return
+        app.register_blueprint(bp, url_prefix=url_prefix)
+    except ValueError:
+        # Blueprint already registered
+        return
+
+_register_bp_once(flask_app, SHEETS_ROUTES, url_prefix="/sheets")
+
+# Mount Telegram blueprint at /tg (health: /tg/health; webhook: /tg/webhook; prompt: /tg/prompt)
+_register_bp_once(flask_app, bp_telegram, url_prefix="/tg")
+try:
+    set_telegram_webhook()
+except Exception as e:
+    log.warning("telegram webhook set failed: %r", e)
 
 # ---- Outbox shims (route-safe; delegate to Postgres store) ----
 def _enqueue_command(cmd_id: str, payload: dict) -> None:
@@ -217,18 +247,39 @@ def _canonicalize_leased_commands(rows: list) -> list:
                 r["payload"] = _canonicalize_order_place_intent(it)
         out.append(r)
     return out
-    
+# ========== Telegram ==========
+ENABLE_TELEGRAM = _env_true("ENABLE_TELEGRAM")
+def _bot_token() -> Optional[str]:
+    return os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+_TELEGRAM_TOKEN = _bot_token()
+_TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
 
-# ========== Telegram (Phase 28.3 decision surface) ==========
-try:
-    flask_app.register_blueprint(bp_telegram)  # /tg/health, /tg/webhook, /telegram/prompt
+def send_telegram(text: str):
+    if not (ENABLE_TELEGRAM and _TELEGRAM_TOKEN and _TELEGRAM_CHAT):
+        return
     try:
-        set_telegram_webhook()
+        import requests
+        r = requests.post(
+            f"https://api.telegram.org/bot{_TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": _TELEGRAM_CHAT, "text": text[:4000], "parse_mode": "HTML"},
+            timeout=8
+        )
+        if not r.ok:
+            log.warning("Telegram send failed: %s", r.text)
     except Exception as e:
-        log.warning("telegram webhook set failed: %r", e)
-    log.info("Telegram blueprint mounted (bp_telegram).")
+        log.warning("Telegram degraded: %s", e)
+
+# Optional webhook blueprint
+try:
+    import telegram_webhook as _tg
+    if hasattr(_tg, "tg_blueprint"):
+        flask_app.register_blueprint(_tg.tg_blueprint, url_prefix="/tg")
+        log.info("Telegram blueprint mounted at /tg")
+    if hasattr(_tg, "set_telegram_webhook"):
+        try: _tg.set_telegram_webhook()
+        except Exception as e: log.info("Telegram webhook setter degraded: %s", e)
 except Exception as e:
-    log.warning("Telegram blueprint degraded (not mounted): %r", e)
+    log.info("telegram_webhook not mounted: %s", e)
 
 # ========== HMAC (ROBUST PATCH) ==========
 OUTBOX_SECRET = os.getenv("OUTBOX_SECRET", "")
@@ -1136,52 +1187,25 @@ def cmd_pull():
         n = 5
     n = max(1, min(n, 25))
 
-    # --- Authority Gate (Phase 28.2) ---
+    # Phase 24C+ trust boundary
     trusted, reason, age = evaluate_agent(agent)
-    
-    # Cloud-level hard hold (supersedes agent trust)
+
+    # If cloud hold is active, stop dispatch (keep 200 to avoid retry storms)
     if _cloud_hold_active():
-        return jsonify({
-            "ok": True,
-            "commands": [],
-            "lease_seconds": OUTBOX_LEASE_SECONDS,
-            "hold": True,
-            "reason": _cloud_hold_reason(),
-            "agent_id": agent,
-            "age_sec": age,
-        })
-    
-    # Agent authority denied → soft block (no retry storm)
+        return jsonify(
+            {
+                "ok": True,
+                "commands": [],
+                "lease_seconds": OUTBOX_LEASE_SECONDS,
+                "hold": True,
+                "reason": _cloud_hold_reason(),
+                "agent_id": agent,
+                "age_sec": age,
+            }
+        )
+
+    # If edge authority is enabled and agent is not trusted, do not dispatch.
     if not trusted:
-        try:
-            # Auto-expire any queued commands for this untrusted agent
-            store.exec_sql(
-                """
-                with blocked as (
-                    update commands
-                       set status = 'error'
-                     where agent_id = %s
-                       and status = 'queued'
-                       and created_at < now() - interval '2 minutes'
-                     returning id
-                )
-                insert into receipts (cmd_id, agent_id, ok, receipt)
-                select b.id,
-                       'bus',
-                       false,
-                       jsonb_build_object(
-                           'ok', false,
-                           'status', 'blocked',
-                           'reason', 'agent_untrusted',
-                           'message', 'Command blocked by Authority Gate (pre-lease).'
-                       )
-                from blocked b;
-                """,
-                (agent,),
-            )
-        except Exception:
-            log.exception("authority_gate cleanup failed for agent=%s", agent)
-    
         resp = lease_block_response(agent)
         resp["lease_seconds"] = OUTBOX_LEASE_SECONDS
         return jsonify(resp)
