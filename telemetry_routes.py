@@ -252,6 +252,25 @@ def update_from_push(
         # Soft-fail only; we don’t want telemetry to break because SQLite is unhappy
         pass
 
+    # Phase 28.1: also persist telemetry into Postgres (best-effort)
+    # This enables DB-backed observability queries without relying on Sheets.
+    try:
+        from db_backbone import record_telemetry_snapshot
+
+        record_telemetry_snapshot(
+            agent_id=str(agent or "edge"),
+            payload={
+                "agent": str(agent or "edge"),
+                "ts": now_ts,
+                "by_venue": _last_balances,
+                "aggregates": _last_aggregates,
+            },
+            kind="telemetry_push",
+        )
+    except Exception:
+        # Soft-fail only
+        pass
+
 def get_latest_heartbeat() -> Dict[str, Any]:
     return dict(_last_heartbeat)
 
