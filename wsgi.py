@@ -13,8 +13,14 @@ from sheets_bp import SHEETS_ROUTES, start_background_flusher
 from telemetry_routes import bp_telemetry
 from autonomy_modes import get_autonomy_state
 from ops_api import bp as ops_bp
-from edge_authority import evaluate_agent, lease_block_response
-__all__ = ["evaluate_agent", "lease_block_response"]
+# Phase 24C+ / 28.2 Authority Gate
+# Prefer the newer authority_gate module when present, but fall back to
+# legacy edge_authority to keep older deployments working.
+try:
+    from authority_gate import evaluate_agent, lease_block_response  # type: ignore
+except Exception:
+    from edge_authority import evaluate_agent, lease_block_response
+
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
