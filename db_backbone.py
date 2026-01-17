@@ -259,6 +259,50 @@ def record_telemetry(agent_id: str, payload: Dict[str, Any], kind: str = None) -
     except Exception as e:
         print(f"[db_backbone] record_telemetry failed: {e}")
         traceback.print_exc()
+
+
+def record_telemetry_snapshot(agent_id: str, payload: Dict[str, Any], kind: str = None) -> None:
+    """
+    Phase 28.1: Persist telemetry into BOTH schemas:
+
+      1) legacy `telemetry` table (used by early queries / ops tooling)
+      2) `nova_telemetry` (richer, tagged, forward path)
+
+    This function is intentionally best-effort: telemetry must never
+    break the bus.
+    """
+    conn = _get_conn()
+    if not conn:
+        return
+    _ensure_schema()
+
+    # Always try nova_telemetry first (forward path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO nova_telemetry (agent_id, kind, payload)
+            VALUES (%s, %s, %s)
+            """,
+            (agent_id, kind, psycopg2.extras.Json(payload)),
+        )
+    except Exception:
+        # Soft-fail
+        pass
+
+    # Then try legacy telemetry table (if present)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO telemetry (agent_id, payload)
+            VALUES (%s, %s)
+            """,
+            (agent_id, psycopg2.extras.Json(payload)),
+        )
+    except Exception:
+        # Soft-fail
+        pass
       
 # --- DB observability helpers (Phase 19 Step 3) -----------------------------
 def _fetchall(query: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
