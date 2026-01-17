@@ -218,7 +218,6 @@ def _canonicalize_leased_commands(rows: list) -> list:
         out.append(r)
     return out
     
-flask_app.register_blueprint(SHEETS_ROUTES, url_prefix="/sheets")
 
 # ========== Telegram (Phase 28.3 decision surface) ==========
 try:
