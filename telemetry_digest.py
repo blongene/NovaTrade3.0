@@ -28,6 +28,7 @@ try:
     from utils import (
         get_gspread_client,
         send_telegram_message_dedup,
+        send_once_per_day,
         warn,
         info,
     )
@@ -48,6 +49,33 @@ except Exception:
         if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
             return
         print("[TG]", key, message)
+
+    def send_once_per_day(key: str, message: str) -> None:  # type: ignore
+        # Fallback: best-effort daily keying using the in-memory deduper.
+        today_key = f"{key}:{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+        send_telegram_message_dedup(message, today_key, ttl_min=24 * 60)
+
+
+def _daily_marker_path(prefix: str, day_str: str) -> str:
+    """Cross-process daily marker to prevent duplicate daily messages on Render."""
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in prefix)
+    return f"/tmp/{safe}_{day_str}.marker"
+
+
+def _should_send_daily(prefix: str) -> bool:
+    """Return True if we haven't already sent today's message for this prefix."""
+    try:
+        day_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        marker = _daily_marker_path(prefix, day_str)
+        if os.path.exists(marker):
+            return False
+        # Touch marker now (so even if send fails, we won't spam).
+        with open(marker, "w") as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+        return True
+    except Exception:
+        # If filesystem unavailable for any reason, fall back to in-memory dedupe.
+        return True
 
 
 def _http_get(url: str) -> Dict[str, Any]:
@@ -169,11 +197,11 @@ def _compute_stable_digest(
     return ", ".join(parts) + " (USD+USDT+USDC)", totals
 
 
-def _send_tg(msg: str, key: str) -> None:
+def _send_tg(msg: str, key: str, ttl_min: int = 15) -> None:
     if not BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        send_telegram_message_dedup(msg, key=key)
+        send_telegram_message_dedup(msg, key=key, ttl_min=ttl_min)
     except Exception as e:
         warn(f"telemetry_digest: telegram send failed: {e}")
 
@@ -265,6 +293,7 @@ def run_telemetry_digest() -> None:
                     f"⚠️ Edge heartbeat stale: {int(age_min)} min "
                     f"(>{HEARTBEAT_ALERT_MIN} min)",
                     key=f"hb:{int(age_min)}",
+                    ttl_min=15,
                 )
     except Exception:
         pass
@@ -273,10 +302,22 @@ def run_telemetry_digest() -> None:
     try:
         if per_venue:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            _send_tg(
-                f"📊 Telemetry digest {today}: {digest_str}",
-                key=f"tel_digest:{today}",
-            )
+
+            # IMPORTANT: utils.py dedupe is in-memory only. On Render, multiple
+            # workers/restarts can cause the same "daily" digest to send twice.
+            # We use a /tmp marker for cross-process idempotency, and also use
+            # utils.send_once_per_day() as a secondary guard.
+            msg = f"📊 Telemetry digest {today}: {digest_str}"
+
+            if _should_send_daily("telemetry_digest"):
+                # Secondary guard: daily keying through utils.
+                try:
+                    send_once_per_day("telemetry_digest", msg)
+                except Exception:
+                    # Fall back to explicit dedupe key with a 24h TTL.
+                    _send_tg(msg, key=f"tel_digest:{today}", ttl_min=24 * 60)
+            else:
+                info(f"telemetry_digest: already sent for {today}; skipping")
     except Exception as e:
         warn(f"telemetry_digest: digest telegram failed: {e}")
 
