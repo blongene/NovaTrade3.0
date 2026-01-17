@@ -13,6 +13,8 @@ from sheets_bp import SHEETS_ROUTES, start_background_flusher
 from telemetry_routes import bp_telemetry
 from autonomy_modes import get_autonomy_state
 from ops_api import bp as ops_bp
+from telegram_webhook import bp_telegram
+flask_app.register_blueprint(bp_telegram)
 
 # Phase 24C+ / 28.2 Authority Gate
 # Prefer the newer authority_gate module when present, but fall back to
