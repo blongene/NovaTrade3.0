@@ -19,9 +19,7 @@ from ops_api import bp as ops_bp
 # legacy edge_authority to keep older deployments working.
 try:
     from authority_gate import evaluate_agent, lease_block_response  # type: ignore
-    log.info("Authority Gate: using DB-first authority_gate.py")
 except Exception as e:
-    log.warning("Authority Gate: falling back to legacy edge_authority (%r)", e)
     from edge_authority import evaluate_agent, lease_block_response
 
 
