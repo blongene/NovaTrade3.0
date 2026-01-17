@@ -309,9 +309,32 @@ def run_telegram_summaries(force: bool = False):
         info("telegram_summaries: disabled via TELEGRAM_SUMMARIES_ENABLED=0 (no-op).")
         return
 
-    key = f"{SUMMARY_KEY_BASE}:{_utc_date()}"
+    # ---------------------------------------------------------------------
+    # Cross-worker / cross-restart daily dedupe (Render often runs multiple
+    # workers and cold restarts can reset in-memory dedup caches).
+    #
+    # We use a tiny file marker in /tmp to suppress duplicates for the day.
+    # This is safe, cheap, and works across processes on the same instance.
+    # ---------------------------------------------------------------------
+    today = _utc_date()
+    marker = f"/tmp/novatrade_summary_daily_{today}.sent"
+    if not force:
+        try:
+            if os.path.exists(marker):
+                return
+            # Create marker atomically.
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w") as f:
+                f.write(str(int(time.time())))
+        except FileExistsError:
+            return
+        except Exception:
+            # If filesystem dedupe fails, fall back to in-memory dedupe.
+            pass
+
+    key = f"{SUMMARY_KEY_BASE}:{today}"
     if not force and not _tg_should_send("daily_summary", key=key, ttl_min=DEDUP_TTL_MIN, consume=True):
-        # Already sent today; stay quiet
+        # Already sent today (in-memory dedupe); stay quiet
         return
 
     try:
