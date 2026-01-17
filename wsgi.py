@@ -14,6 +14,7 @@ from telemetry_routes import bp_telemetry
 from autonomy_modes import get_autonomy_state
 from ops_api import bp as ops_bp
 from edge_authority import evaluate_agent, lease_block_response
+__all__ = ["evaluate_agent", "lease_block_response"]
 
 # ========== Logging ==========
 LOG_LEVEL = os.environ.get("NOVA_LOG_LEVEL", "INFO").upper()
@@ -1147,24 +1148,22 @@ def cmd_pull():
         n = 5
     n = max(1, min(n, 25))
 
-    # Phase 24C+ trust boundary
+    # --- Authority Gate (Phase 28.2) ---
     trusted, reason, age = evaluate_agent(agent)
-
-    # If cloud hold is active, stop dispatch (keep 200 to avoid retry storms)
+    
+    # Cloud-level hard hold (supersedes agent trust)
     if _cloud_hold_active():
-        return jsonify(
-            {
-                "ok": True,
-                "commands": [],
-                "lease_seconds": OUTBOX_LEASE_SECONDS,
-                "hold": True,
-                "reason": _cloud_hold_reason(),
-                "agent_id": agent,
-                "age_sec": age,
-            }
-        )
-
-    # If edge authority is enabled and agent is not trusted, do not dispatch.
+        return jsonify({
+            "ok": True,
+            "commands": [],
+            "lease_seconds": OUTBOX_LEASE_SECONDS,
+            "hold": True,
+            "reason": _cloud_hold_reason(),
+            "agent_id": agent,
+            "age_sec": age,
+        })
+    
+    # Agent authority denied → soft block (no retry storm)
     if not trusted:
         resp = lease_block_response(agent)
         resp["lease_seconds"] = OUTBOX_LEASE_SECONDS
