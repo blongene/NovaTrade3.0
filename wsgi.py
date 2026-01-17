@@ -1075,8 +1075,26 @@ def ops_enqueue():
     if not isinstance(intent, dict):
         intent = {"raw": intent}
 
+    # Optional idempotency / dedupe key (kept OUTSIDE the intent payload by design)
+    # We accept multiple common aliases.
+    idempotency_key = (
+        payload.get("idempotency_key")
+        or payload.get("idempotencyKey")
+        or payload.get("dedupe_key")
+        or payload.get("dedupeKey")
+        or j.get("idempotency_key")
+        or j.get("idempotencyKey")
+        or j.get("dedupe_key")
+        or j.get("dedupeKey")
+    )
+    if isinstance(idempotency_key, (int, float)):
+        idempotency_key = str(idempotency_key)
+    if not isinstance(idempotency_key, str):
+        idempotency_key = None
+
     try:
-        res = store.enqueue(agent_id, intent)
+        # Prefer explicit idempotency_key for dedupe when supplied.
+        res = store.enqueue(agent_id, intent, idempotency_key=idempotency_key)
         # Cache minimal context for Trade_Log correlation
         _cache_cmd_ctx(res.get("id"), {"id": res.get("id"), "agent_id": agent_id, "intent": intent, "payload": intent, "hash": res.get("hash")})
         # Expect res like: {"ok": True, "id": ..., "status": "queued", "hash": "..."}
