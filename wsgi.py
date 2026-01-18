@@ -14,6 +14,12 @@ from telemetry_routes import bp_telemetry
 from autonomy_modes import get_autonomy_state
 from ops_api import bp as ops_bp
 
+# Phase 29 safety: one-line boot config health (warnings only)
+try:
+    from bus_config_doctor import emit_once as _bus_config_emit_once  # type: ignore
+except Exception:
+    _bus_config_emit_once = None  # type: ignore
+
 # Telegram surface (buttons/webhook). Safe if telegram is disabled/misconfigured.
 try:
     from telegram_webhook import tg_blueprint as bp_telegram, set_telegram_webhook  # type: ignore
@@ -36,6 +42,19 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bus")
 logging.getLogger("werkzeug").setLevel(logging.WARNING if LOG_LEVEL != "DEBUG" else logging.DEBUG)
+
+# Emit one concise config line at boot (no behavior change)
+try:
+    if _bus_config_emit_once:
+        _bus_config_emit_once(prefix="BUS_CONFIG")
+except Exception:
+    pass
+
+try:
+    if _bus_config_emit_once:
+        _bus_config_emit_once(prefix="BUS_CONFIG")
+except Exception:
+    pass
 
 # ========== Flask ==========
 flask_app = Flask(__name__)
