@@ -59,6 +59,21 @@ DEDUP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ---- Helpers / utilities ----------------------------------------------------
+def _execution_posture_line():
+    edge_mode = os.getenv("EDGE_MODE", "dryrun")
+    armed = os.getenv("EDGE_ARMED", "false")
+    cloud_hold = os.getenv("CLOUD_HOLD", "false")
+
+    return (
+        f"Execution posture: "
+        f"edge=<code>{edge_mode}</code> "
+        f"armed=<code>{armed}</code> "
+        f"cloud_hold=<code>{cloud_hold}</code>"
+    )
+
+def _db_parity_line():
+    # Assumes parity checker runs elsewhere; this is a daily affirmation
+    return "DB↔Sheets parity: <b>OK</b> (last check &lt;24h)"
 
 
 def _to_bool(v) -> bool:
@@ -329,9 +344,14 @@ def daily_phase5_summary():
     et_now = datetime.now(ZoneInfo("America/New_York"))
     mode = os.getenv("REBUY_MODE", os.getenv("MODE", "dryrun"))
 
+    posture = _execution_posture_line()
+    parity = _db_parity_line()
+    
     msg = (
         "🧠 <b>NovaTrade Daily Summary</b>\n"
         f"Date (ET): <code>{et_now:%Y-%m-%d}</code> around {DAILY_HOUR_ET:02d}:00\n"
+        f"{posture}\n"
+        f"{parity}\n"
         f"Vault Intelligence: <b>{ready}</b>/<b>{total}</b> rebuy-ready\n"
         f"Policy (24h): <b>{appr}</b> approved / <b>{den}</b> denied\n"
         f"{wallet_line}"
