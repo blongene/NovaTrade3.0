@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """
-Inject a single Kraken SELL command into the NovaTrade Bus outbox.
+Unified Kraken trade injector (BUY / SELL, base-sized).
+
+Defaults:
+- DRYRUN unless --live is passed
+- side=buy
+- base sizing (amount_base)
+
+Usage:
+  python tools/inject_kraken.py \
+    --base-url https://<bus> \
+    --agent edge-primary \
+    --symbol XBT/USDT \
+    --side buy \
+    --amount-base 5e-05
 """
 
 import argparse
@@ -11,8 +24,10 @@ import os
 import time
 from urllib import request as urlrequest
 
+
 def _hmac_sig(secret: str, body_bytes: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+
 
 def _http_post(url: str, body: dict, secret: str | None, timeout: int = 20):
     body_bytes = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -24,6 +39,7 @@ def _http_post(url: str, body: dict, secret: str | None, timeout: int = 20):
         raw = resp.read().decode("utf-8", errors="replace")
         return resp.status, raw
 
+
 def _print_resp(status: int, raw: str):
     print(f"HTTP {status}")
     try:
@@ -32,13 +48,29 @@ def _print_resp(status: int, raw: str):
     except Exception:
         print(raw)
 
+
+def _make_body(agent: str, cmd: dict, source: str, ts: int):
+    return {
+        "agent": agent,
+        "agent_id": agent,
+        "agentId": agent,
+        "agent_name": agent,
+        "agentName": agent,
+        "target_agent": agent,
+        "agent_target": agent,
+        "command": cmd,
+        "meta": {"source": source, "ts": ts},
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", required=True)
     ap.add_argument("--secret", default=os.getenv("OUTBOX_SECRET"))
     ap.add_argument("--agent", required=True)
     ap.add_argument("--symbol", default="XBT/USDT")
-    ap.add_argument("--amount-base", type=float, default=0.00005)
+    ap.add_argument("--side", choices=["buy", "sell"], default="buy")
+    ap.add_argument("--amount-base", type=float, required=True)
     ap.add_argument("--venue", default="KRAKEN")
     ap.add_argument("--client-order-id", default=None)
     ap.add_argument("--live", action="store_true")
@@ -47,36 +79,37 @@ def main():
 
     base_url = args.base_url.rstrip("/")
     url = f"{base_url}/ops/enqueue"
-
     now = int(time.time())
-    cid = args.client_order_id or f"sell-kraken-{args.symbol.replace('/','-').lower()}-{int(args.amount_base*1e8)}-{now}"
+
+    cid = args.client_order_id or (
+        f"{args.side}-{args.venue.lower()}-"
+        f"{args.symbol.replace('/','-').lower()}-"
+        f"base-{int(args.amount_base * 1e8)}-{now}"
+    )
+
+    # Operator preflight (psychological safety)
+    mode = "live" if args.live else "dryrun"
+    print(
+        f"enqueue venue={args.venue} symbol={args.symbol} "
+        f"side={args.side.upper()} amount_base={args.amount_base} mode={mode}"
+    )
 
     cmd = {
         "type": "trade",
         "venue": args.venue,
         "symbol": args.symbol,
-        "side": "sell",
+        "side": args.side,
         "amount_base": float(args.amount_base),
         "flags": ["base"],
         "dry_run": (not args.live),
         "client_order_id": cid,
-        "idempotency_key": cid
+        "idempotency_key": cid,
     }
 
-    body = {
-        "agent": args.agent,
-        "agent_id": args.agent,
-        "agentId": args.agent,
-        "agent_name": args.agent,
-        "agentName": args.agent,
-        "target_agent": args.agent,
-        "agent_target": args.agent,
-        "command": cmd,
-        "meta": {"source": "inject_kraken_sell_base.py", "ts": now},
-    }
-
+    body = _make_body(args.agent, cmd, "inject_kraken.py", now)
     status, raw = _http_post(url, body, args.secret, timeout=args.timeout)
     _print_resp(status, raw)
+
 
 if __name__ == "__main__":
     main()
