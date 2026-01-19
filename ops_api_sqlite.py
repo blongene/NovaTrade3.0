@@ -126,6 +126,12 @@ def ops_enqueue():
     if not (venue and symbol and side in ("BUY", "SELL")):
         return _bad("missing or invalid fields: venue/symbol/side", 422)
 
+    mode = (body.get("mode") or "dryrun").lower()
+    cloud_armed = (os.getenv("CLOUD_ARMED", "0") or "").lower() in ("1", "true", "yes")
+    
+    if mode == "live" and not cloud_armed:
+        return _bad("cloud_not_armed", 403)
+
     def _ins(c):
         c.execute("insert into outbox (payload) values (?)", [json.dumps(body)])
         return c.execute("select last_insert_rowid()").fetchone()[0]
@@ -156,10 +162,20 @@ def commands_ack():
         return _bad("missing or invalid fields: id/status", 422)
 
     def _ack(c):
+        # Fetch current status so we can log only on first terminal transition
+        row = c.execute("select status from outbox where id=?", [cid]).fetchone()
+        prev = (row[0] if row else None) or ""
+    
         c.execute("update outbox set status=? where id=?", [status, cid])
         c.execute("insert into receipts (payload) values (?)", [json.dumps(j)])
-    _exec_retry(_ack)
-    return jsonify({"ok": True}), 200
+    
+        # One calm, operator-visible line (no payload), only if status actually changed into terminal
+        if prev.upper() != status and status in ("DONE", "ERROR", "HELD"):
+            agent = j.get("agent_id") or j.get("agent") or j.get("agentId") or "?"
+            ok = j.get("ok")
+            # ok may not exist on HELD; default to True unless explicitly false
+            ok_str = "true" if (ok is None or bool(ok)) else "false"
+            print(f"[OPS_ACK] cmd={cid} status={status.lower()} ok={ok_str} agent={agent}")
 
 @OPS.route("/receipts/ack", methods=["POST"])
 def receipts_ack():
