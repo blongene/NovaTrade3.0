@@ -182,6 +182,13 @@ def commands_ack():
             pass
 
         return ify({"ok": True}), 200
+
+        buslog = logging.getLogger("bus")
+        agent = (meta.get("agent_id") or j.get("agent_id") or j.get("agent") or "?")
+        ok_val = j.get("ok", None)
+        ok_str = "true" if ok_val is None or bool(ok_val) else "false"
+        buslog.info("ops_ack: agent=%s cmd=%s status=%s ok=%s", agent, cid, status.lower(), ok_str)
+
     except Exception as e:
         print(f"[ops_api] ack error: {e}")
         traceback.print_exc()
