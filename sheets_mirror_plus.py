@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, sqlite3, json
 from datetime import datetime, timezone
 
-OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "/opt/render/project/src/outbox.sqlite")
+OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "/data/legacy_bus.sqlite")
 RANGE_PD = os.getenv("SHEETS_RANGE_PD_SUMMARY", "Performance_Dashboard!A2:F")
 MAX_ROWS = int(os.getenv("SHEETS_MIRROR_MAX_ROWS", "500"))
 
