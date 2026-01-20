@@ -3,7 +3,7 @@
 import os, sqlite3, time, json, uuid
 from typing import List, Dict, Optional, Tuple
 
-DB_PATH = os.getenv("OUTBOX_DB_PATH", "./outbox.sqlite")
+DB_PATH = os.getenv("OUTBOX_DB_PATH", "/data/legacy_bus.sqlite")
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
