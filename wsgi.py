@@ -1579,7 +1579,7 @@ flask_app.register_blueprint(_receipts_bp)
 import telemetry_api
 flask_app.register_blueprint(telemetry_api.bp)
 flask_app.register_blueprint(bp_telemetry)
-flask_app.register_blueprint(ops_bp, url_prefix="/api")
+flask_app.register_blueprint(ops_bp, url_prefix="/api/ops")
 
 # --- Start Nova loops when the web app loads (once) -------------------------
 try:
