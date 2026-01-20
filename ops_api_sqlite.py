@@ -1,6 +1,8 @@
 # ops_api_sqlite.py — Durable outbox + receipts using SQLite (with schema migration & lock retries)
 import os, json, hmac, hashlib, sqlite3, time
 from flask import Blueprint, request, jsonify
+import logging
+buslog = logging.getLogger("bus")
 
 OPS = Blueprint("ops_api_sqlite_v1", __name__, url_prefix="/api")
 
@@ -175,7 +177,7 @@ def commands_ack():
             ok = j.get("ok")
             # ok may not exist on HELD; default to True unless explicitly false
             ok_str = "true" if (ok is None or bool(ok)) else "false"
-            print(f"[OPS_ACK] cmd={cid} status={status.lower()} ok={ok_str} agent={agent}")
+            buslog.info("ops_ack: agent=%s cmd=%s status=%s ok=%s", agent, cid, status.lower(), ok_str)
 
 @OPS.route("/receipts/ack", methods=["POST"])
 def receipts_ack():
