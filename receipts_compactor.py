@@ -4,7 +4,7 @@
 from __future__ import annotations
 import os, sqlite3, json, time
 
-OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "/opt/render/project/src/outbox.sqlite")
+OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "/data/legacy_bus.sqlite")
 RETENTION_DAYS = int(os.getenv("RECEIPTS_RETENTION_DAYS", "14"))
 MAX_DELETE = int(os.getenv("COMPACTOR_MAX_DELETE", "5000"))
 
