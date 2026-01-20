@@ -2,7 +2,7 @@
 """init_outbox.py — ensure outbox.sqlite schema exists (idempotent)"""
 import os, sqlite3
 
-DB = os.getenv("OUTBOX_DB_PATH", "/opt/render/project/src/outbox.sqlite")
+DB = os.getenv("OUTBOX_DB_PATH", "/data/legacy_bus.sqlite")
 os.makedirs(os.path.dirname(DB), exist_ok=True)
 
 SCHEMA = """
