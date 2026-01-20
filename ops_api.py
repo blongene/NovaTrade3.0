@@ -137,7 +137,8 @@ def commands_ack():
     Body:
       {
         "id": <cmd_id>,
-        "status": "ok|error|held",
+        "status": "done|error|held"  (or ok/error/held — we normalize)
+        "ok": true|false (optional),
         "receipt": { ... exchange/broker payload ... },
         "meta": {"agent_id":"edge-primary", "ts": "..."},
         "command": { optional echo of the command fields }
@@ -148,62 +149,80 @@ def commands_ack():
         if not _verify_signature(raw):
             return jsonify({"ok": False, "error": "invalid signature"}), 401
 
-        j = json.loads(raw.decode("utf-8"))
-        cid     = int(j.get("id") or j.get("cmd_id") or 0)
-        status  = str(j.get("status") or "").lower() or "ok"
-        receipt = j.get("receipt") or {}
-        meta    = j.get("meta") or {}
-        command = j.get("command") or {}
+        try:
+            j = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return jsonify({"ok": False, "error": "invalid json body"}), 400
 
+        # ---- Parse / normalize ----
+        cid = int(j.get("id") or j.get("cmd_id") or 0)
         if not cid:
             return jsonify({"ok": False, "error": "missing id"}), 400
 
-        # mirror for bridge
+        status_in = str(j.get("status") or "").strip().lower()
+
+        # Normalize common shapes into terminal statuses
+        if status_in in ("ok", "done", "success", "completed"):
+            status = "DONE"
+        elif status_in in ("error", "failed", "fail"):
+            status = "ERROR"
+        elif status_in in ("held", "hold", "blocked"):
+            status = "HELD"
+        else:
+            # If unknown, treat as ERROR to avoid “silent ok”
+            status = "ERROR"
+
+        receipt = j.get("receipt") or {}
+        meta = j.get("meta") or {}
+        command = j.get("command") or {}
+
+        agent = (meta.get("agent_id") or j.get("agent_id") or j.get("agent") or "?")
+        ok_val = j.get("ok", None)
+        ok_str = "true" if (ok_val is None or bool(ok_val)) else "false"
+
+        # Mirror payload we store (keeps bridge compatibility)
         payload = json.dumps({
             "cmd_id": cid,
-            "status": status,
-            "receipt": receipt,
+            "status": status.lower(),
+            "ok": (True if ok_val is None else bool(ok_val)),
+            "agent_id": agent,
             "meta": meta,
+            "receipt": receipt,
             "command": command,
-        })
+        }, separators=(",", ":"), sort_keys=True)
 
+        # ---- DB writes ----
         con = _open_db()
         _ensure_schema(con)
         cur = con.cursor()
 
-        # write receipt first (never blocks the outbox state update)
-        cur.execute("INSERT INTO receipts (payload) VALUES (?)", [payload])
+        # receipt first (never blocks the state update)
+        cur.execute("INSERT INTO receipts (payload) VALUES (?)", (payload,))
 
-        # update outbox row if present
+        # outbox status update (safe even if row missing)
         try:
             cur.execute(
                 "UPDATE outbox SET status=?, updated_ts=datetime('now') WHERE id=?",
-                [status.upper(), cid],
+                (status, cid),
             )
         except sqlite3.OperationalError:
-            # tolerate legacy outbox without status column (should be fixed by ensure_schema)
+            # legacy tolerance if schema is old; ensure_schema should prevent this
             pass
 
-        # commit so the ack is durable before we return 200
-        try:
-            con.commit()
-        except Exception:
-            pass
+        con.commit()
 
-        # operator-visible log line
+        # ---- One clean, operator-visible line ----
         buslog = logging.getLogger("bus")
-        agent = (meta.get("agent_id") or j.get("agent_id") or j.get("agent") or "?")
-        ok_val = j.get("ok", None)
-        ok_str = "true" if ok_val is None or bool(ok_val) else "false"
         buslog.info("ops_ack: agent=%s cmd=%s status=%s ok=%s", agent, cid, status.lower(), ok_str)
 
         return jsonify({"ok": True}), 200
 
     except Exception as e:
-        print(f"[ops_api] ack error: {e}")
-        traceback.print_exc()
+        try:
+            logging.getLogger("bus").exception("[ops_api] commands_ack failed: %s", e)
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 # ---------------- Council Insight API ----------------
 
