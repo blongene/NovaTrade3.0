@@ -137,92 +137,117 @@ def commands_ack():
     Body:
       {
         "id": <cmd_id>,
-        "status": "done|error|held"  (or ok/error/held — we normalize)
-        "ok": true|false (optional),
-        "receipt": { ... exchange/broker payload ... },
-        "meta": {"agent_id":"edge-primary", "ts": "..."},
-        "command": { optional echo of the command fields }
+        "status": "ok|error|held|done",
+        "ok": true|false,                       # optional
+        "receipt": { ... },                     # optional
+        "meta": {"agent_id":"edge-primary", ...},
+        "command": { ... }                      # optional
       }
     """
     try:
         raw = request.get_data(cache=False) or b"{}"
         if not _verify_signature(raw):
-            return jsonify({"ok": False, "error": "invalid signature"}), 401
+            return ify({"ok": False, "error": "invalid signature"}), 401
 
         try:
             j = json.loads(raw.decode("utf-8"))
         except Exception:
-            return jsonify({"ok": False, "error": "invalid json body"}), 400
+            return ify({"ok": False, "error": "invalid_json"}), 400
 
-        # ---- Parse / normalize ----
         cid = int(j.get("id") or j.get("cmd_id") or 0)
         if not cid:
-            return jsonify({"ok": False, "error": "missing id"}), 400
+            return ify({"ok": False, "error": "missing id"}), 400
 
-        status_in = str(j.get("status") or "").strip().lower()
-
-        # Normalize common shapes into terminal statuses
-        if status_in in ("ok", "done", "success", "completed"):
-            status = "DONE"
-        elif status_in in ("error", "failed", "fail"):
-            status = "ERROR"
-        elif status_in in ("held", "hold", "blocked"):
-            status = "HELD"
-        else:
-            # If unknown, treat as ERROR to avoid “silent ok”
-            status = "ERROR"
-
+        meta    = j.get("meta") or {}
         receipt = j.get("receipt") or {}
-        meta = j.get("meta") or {}
         command = j.get("command") or {}
 
         agent = (meta.get("agent_id") or j.get("agent_id") or j.get("agent") or "?")
+        status_in = (j.get("status") or receipt.get("status") or "").strip().lower()
+
+        # Normalize status into terminal set we use everywhere
         ok_val = j.get("ok", None)
-        ok_str = "true" if (ok_val is None or bool(ok_val)) else "false"
+        if ok_val is None:
+            ok_val = receipt.get("ok", None)
+        if ok_val is None:
+            ok_val = True  # default optimistic unless explicitly false
 
-        # Mirror payload we store (keeps bridge compatibility)
-        payload = json.dumps({
-            "cmd_id": cid,
-            "status": status.lower(),
-            "ok": (True if ok_val is None else bool(ok_val)),
-            "agent_id": agent,
-            "meta": meta,
-            "receipt": receipt,
-            "command": command,
-        }, separators=(",", ":"), sort_keys=True)
+        if not status_in:
+            status_in = "done" if bool(ok_val) else "error"
 
-        # ---- DB writes ----
+        if status_in in ("ok", "success", "succeeded"):
+            status = "DONE"
+        elif status_in in ("done",):
+            status = "DONE"
+        elif status_in in ("held", "hold"):
+            status = "HELD"
+        elif status_in in ("error", "failed", "fail"):
+            status = "ERROR"
+        else:
+            # preserve unknown but uppercase it
+            status = status_in.upper()
+
+        payload = json.dumps(
+            {
+                "cmd_id": cid,
+                "status": status.lower(),
+                "ok": bool(ok_val),
+                "agent_id": agent,
+                "receipt": receipt,
+                "meta": meta,
+                "command": command,
+            },
+            separators=(",", ":"),
+        )
+
         con = _open_db()
-        _ensure_schema(con)
-        cur = con.cursor()
-
-        # receipt first (never blocks the state update)
-        cur.execute("INSERT INTO receipts (payload) VALUES (?)", (payload,))
-
-        # outbox status update (safe even if row missing)
         try:
-            cur.execute(
-                "UPDATE outbox SET status=?, updated_ts=datetime('now') WHERE id=?",
-                (status, cid),
-            )
-        except sqlite3.OperationalError:
-            # legacy tolerance if schema is old; ensure_schema should prevent this
-            pass
+            _ensure_schema(con)
+            cur = con.cursor()
 
-        con.commit()
+            # receipts table: tolerate either the "simple" schema (payload only)
+            # OR the richer schema (payload + cmd_id/status/agent_id/txid/message)
+            cols = [r[1] for r in cur.execute("pragma table_info(receipts)").fetchall()]
+            if "cmd_id" in cols:
+                txid = receipt.get("txid") or receipt.get("order_id") or receipt.get("id")
+                msg  = receipt.get("message") or receipt.get("error") or receipt.get("reason") or ""
+                cur.execute(
+                    """
+                    INSERT INTO receipts (payload, cmd_id, status, agent_id, txid, message)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (payload, cid, status, agent, str(txid) if txid is not None else None, str(msg) if msg else None),
+                )
+            else:
+                cur.execute("INSERT INTO receipts (payload) VALUES (?)", (payload,))
 
-        # ---- One clean, operator-visible line ----
-        buslog = logging.getLogger("bus")
-        buslog.info("ops_ack: agent=%s cmd=%s status=%s ok=%s", agent, cid, status.lower(), ok_str)
+            # update outbox row if present (won't exist if Postgres is the real store)
+            try:
+                cur.execute(
+                    "UPDATE outbox SET status=?, updated_ts=datetime('now') WHERE id=?",
+                    (status, cid),
+                )
+            except Exception:
+                pass
 
-        return jsonify({"ok": True}), 200
+            con.commit()
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+        ok_str = "true" if bool(ok_val) else "false"
+        logging.getLogger("bus").info(
+            "ops_ack: agent=%s cmd=%s status=%s ok=%s",
+            agent, cid, status.lower(), ok_str
+        )
+        return ify({"ok": True}), 200
 
     except Exception as e:
-        try:
-            logging.getLogger("bus").exception("[ops_api] commands_ack failed: %s", e)
-        except Exception:
-            pass
-        return jsonify({"ok": False, "error": str(e)}), 500
+        logging.getLogger("bus").exception("[ops_api] commands_ack failed: %s", e)
+        return ify({"ok": False, "error": str(e)}), 500
+
 
 # ---------------- Council Insight API ----------------
 
