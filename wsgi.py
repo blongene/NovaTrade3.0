@@ -1353,7 +1353,7 @@ def cmd_ack():
     # ---- 1) HMAC verification ----------------------------------------------
     ok, body, provided, expected = _verify_hmac_json("OUTBOX_SECRET", "X-OUTBOX-SIGN")
     if not ok:
-        cmd_id = body.get("id") or body.get("cmd_id")
+        cmd_id = (body or {}).get("id") or (body or {}).get("cmd_id")
         log.error(
             "cmd_ack: invalid HMAC for id=%s provided=%s expected=%s",
             cmd_id,
@@ -1373,16 +1373,32 @@ def cmd_ack():
         )
 
     # ---- 2) Normalize fields -----------------------------------------------
-    agent_id = (body.get("agent_id") or "edge").strip()
-    cmd_id   = body.get("id") or body.get("cmd_id")
+    receipt = body.get("receipt") or {}
 
+    agent_id = (
+        (body.get("meta") or {}).get("agent_id")
+        or body.get("agent_id")
+        or body.get("agent")
+        or "edge"
+    ).strip()
+
+    cmd_id = body.get("id") or body.get("cmd_id")
     if cmd_id is None:
         return jsonify({"ok": False, "error": "missing cmd id"}), 400
 
-    receipt = body.get("receipt") or {}
-    # status/ok from either wrapper body or receipt itself
-    status  = (body.get("status") or receipt.get("status") or "").lower()
-    ok_val  = bool(receipt.get("ok", True))
+    # status can come from wrapper body or receipt
+    status = (body.get("status") or receipt.get("status") or "").strip().lower()
+
+    # ok can come from wrapper body OR receipt; if absent, infer from status
+    ok_raw = body.get("ok", None)
+    if ok_raw is None:
+        ok_raw = receipt.get("ok", None)
+
+    if ok_raw is None:
+        # infer if not explicitly provided
+        ok_val = status not in ("error", "failed", "held")
+    else:
+        ok_val = bool(ok_raw)
 
     if not status:
         status = "ok" if ok_val else "error"
@@ -1416,11 +1432,20 @@ def cmd_ack():
     except Exception:
         log.exception("cmd_ack: failed to persist receipt / mark status for id=%s", cmd_id)
 
-    # ---- 4) Best-effort, idempotent Trade_Log append -----------------------
+    # ---- 3.5) Operator-visible ack line (grep target) -----------------------
+    try:
+        buslog = logging.getLogger("bus")
+        ok_str = "true" if ok_val else "false"
+        buslog.info("ops_ack: agent=%s cmd=%s status=%s ok=%s", agent_id, cmd_id, status, ok_str)
+    except Exception:
+        log.exception("cmd_ack: failed to write ops_ack log for id=%s", cmd_id)
+
+    # ---- 4) Best-effort, idempotent Trade_Log append ------------------------
     append_trade_log_safe(cmd_id, agent_id, receipt, status=status, ok_val=ok_val)
 
     # ---- 5) Final JSON response back to Edge --------------------------------
     return jsonify({"ok": True})
+
 
 @flask_app.get("/api/debug/outbox")
 def dbg_outbox():
