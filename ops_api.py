@@ -146,7 +146,7 @@ def commands_ack():
     try:
         raw = request.get_data(cache=False) or b"{}"
         if not _verify_signature(raw):
-            return ify({"ok": False, "error": "invalid signature"}), 401
+            return jsonify({"ok": False, "error": "invalid signature"}), 401
 
         j = json.loads(raw.decode("utf-8"))
         cid     = int(j.get("id") or j.get("cmd_id") or 0)
@@ -156,7 +156,7 @@ def commands_ack():
         command = j.get("command") or {}
 
         if not cid:
-            return ify({"ok": False, "error": "missing id"}), 400
+            return jsonify({"ok": False, "error": "missing id"}), 400
 
         # mirror for bridge
         payload = json.dumps({
@@ -164,7 +164,7 @@ def commands_ack():
             "status": status,
             "receipt": receipt,
             "meta": meta,
-            "command": command
+            "command": command,
         })
 
         con = _open_db()
@@ -176,23 +176,34 @@ def commands_ack():
 
         # update outbox row if present
         try:
-            cur.execute("UPDATE outbox SET status=?, updated_ts=datetime('now') WHERE id=?", [status.upper(), cid])
+            cur.execute(
+                "UPDATE outbox SET status=?, updated_ts=datetime('now') WHERE id=?",
+                [status.upper(), cid],
+            )
         except sqlite3.OperationalError:
             # tolerate legacy outbox without status column (should be fixed by ensure_schema)
             pass
 
-        return ify({"ok": True}), 200
+        # commit so the ack is durable before we return 200
+        try:
+            con.commit()
+        except Exception:
+            pass
 
+        # operator-visible log line
         buslog = logging.getLogger("bus")
         agent = (meta.get("agent_id") or j.get("agent_id") or j.get("agent") or "?")
         ok_val = j.get("ok", None)
         ok_str = "true" if ok_val is None or bool(ok_val) else "false"
         buslog.info("ops_ack: agent=%s cmd=%s status=%s ok=%s", agent, cid, status.lower(), ok_str)
 
+        return jsonify({"ok": True}), 200
+
     except Exception as e:
         print(f"[ops_api] ack error: {e}")
         traceback.print_exc()
-        return ify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # ---------------- Council Insight API ----------------
 
