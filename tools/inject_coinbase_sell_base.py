@@ -35,7 +35,7 @@ def _http_post(url: str, body: dict, secret: str | None, timeout: int = 20):
         return resp.status, raw
 
 def _print_resp(status: int, raw: str):
-    print(f"HTTP {status}\")
+    print(f"HTTP {status}")
     try:
         obj = json.loads(raw)
         print(json.dumps(obj, indent=2, sort_keys=True))
