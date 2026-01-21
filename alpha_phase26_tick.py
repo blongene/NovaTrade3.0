@@ -22,7 +22,28 @@ Safety
 from __future__ import annotations
 
 import os
+import json
 import logging
+
+
+def _load_db_read_json() -> dict:
+    raw = (os.getenv("DB_READ_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cfg_get(cfg: dict, dotted: str, default=None):
+    cur = cfg
+    for p in dotted.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(p)
+    return default if cur is None else cur
 
 
 def _truthy(v: str | None) -> bool:
@@ -36,10 +57,19 @@ def run_alpha_phase26_tick() -> None:
     """
     log = logging.getLogger("alpha_phase26_tick")
 
+    cfg = _load_db_read_json()
+
     # ----------------------------
     # Phase 26A gates (preview)
     # ----------------------------
-    preview_ok = _truthy(os.getenv("PREVIEW_ENABLED")) and _truthy(os.getenv("ALPHA_PREVIEW_PROPOSALS_ENABLED"))
+    # JSON-first (Render env-var slots are scarce):
+    #   DB_READ_JSON.phases.phase26.alpha.planning_enabled == 1
+    # Fallback to legacy envs if JSON isn't present.
+    planning_enabled = _truthy(_cfg_get(cfg, "phases.phase26.alpha.planning_enabled", None))
+    if _cfg_get(cfg, "phases.phase26", None) is None:
+        preview_ok = _truthy(os.getenv("PREVIEW_ENABLED")) and _truthy(os.getenv("ALPHA_PREVIEW_PROPOSALS_ENABLED"))
+    else:
+        preview_ok = planning_enabled
     if not preview_ok:
         # Quiet skip; upstream scheduler already prints its label.
         return
@@ -69,6 +99,17 @@ def run_alpha_phase26_tick() -> None:
             log.exception("alpha_phase26_tick: proposals mirror failed")
             print(f"alpha_phase26_tick: proposals mirror failed: {e}", flush=True)
 
+    # 2b) Mirror Alpha "Why Nothing Happened" explanations (presentation-only)
+    try:
+        from alpha_wnh_mirror import run_alpha_wnh_mirror
+        run_alpha_wnh_mirror()
+    except Exception as e:
+        try:
+            from utils import warn
+            warn(f"alpha_phase26_tick: alpha WNH mirror failed: {e}")
+        except Exception:
+            log.warning("alpha_phase26_tick: alpha WNH mirror failed: %s", e)
+
     # ----------------------------
     # Phase 26E gate (enqueue)
     # ----------------------------
@@ -77,13 +118,24 @@ def run_alpha_phase26_tick() -> None:
     #   PHASE26E_ENQUEUE_ENABLED=1  (recommended)
     #   ALPHA_PHASE26E_ENQUEUE_ENABLED=1
     #   ALPHA_EXECUTION_ENABLED=1   (if you prefer this as the “go” flag)
-    enqueue_ok = (
-        _truthy(os.getenv("PHASE26E_ENQUEUE_ENABLED"))
-        or _truthy(os.getenv("ALPHA_PHASE26E_ENQUEUE_ENABLED"))
-        or _truthy(os.getenv("ALPHA_EXECUTION_ENABLED"))
-    )
+    execution_enabled = _truthy(_cfg_get(cfg, "phases.phase26.alpha.execution_enabled", None))
+    if _cfg_get(cfg, "phases.phase26", None) is None:
+        enqueue_ok = (
+            _truthy(os.getenv("PHASE26E_ENQUEUE_ENABLED"))
+            or _truthy(os.getenv("ALPHA_PHASE26E_ENQUEUE_ENABLED"))
+            or _truthy(os.getenv("ALPHA_EXECUTION_ENABLED"))
+        )
+    else:
+        enqueue_ok = execution_enabled
     if not enqueue_ok:
         return
+
+    # Emit Alpha-WNH every tick (safe; deduped)
+    try:
+        from alpha_wnh_mirror import run_alpha_wnh_mirror
+        run_alpha_wnh_mirror()
+    except Exception:
+        pass
 
     try:
         # Support either function name depending on your current module
