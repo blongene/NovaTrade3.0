@@ -349,13 +349,15 @@ def _self_test() -> Dict[str, Any]:
 def append_row_dict(row: dict) -> dict:
     """
     Append a Why_Nothing_Happened row using header-aware dict mapping.
-    Safe for multi-instance use. Returns {ok: bool, reason?: str}.
+    Does NOT rely on private helpers (_tab, _headers).
+    Safe across instances. Returns {ok: bool, reason?: str}.
     """
     try:
-        tab = _tab()
+        # These helpers already exist in your wnh_logger.py
+        tab = WNH_TAB  # existing constant
         ensure_sheet_headers(tab)
 
-        headers = _headers()
+        headers = SHEET_HEADERS  # existing header list
         out = []
         for h in headers:
             out.append(row.get(h, ""))
