@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -48,7 +49,8 @@ def _load_db_read_json() -> Dict[str, Any]:
             return {}
         try:
             b = json.loads(bundle)
-            return (b.get("vars") or {}).get("DB_READ_JSON") or {}
+            v = (b.get("vars") or {}).get("DB_READ_JSON") or {}
+            return v if isinstance(v, dict) else {}
         except Exception:
             return {}
     try:
@@ -74,7 +76,6 @@ def _db_url() -> str:
 
 
 def _utc_day() -> str:
-    # Avoid datetime import overhead; UTC day string is sufficient.
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
@@ -166,7 +167,7 @@ def _fetch_alpha_today(conn) -> Tuple[Optional[str], List[Dict[str, Any]]]:
 
 
 def _headers() -> List[str]:
-    # Shared with global WNH; keep stable.
+    # Match your WNH sheet layout (includes Signature).
     return [
         "Timestamp",
         "Token",
@@ -180,43 +181,54 @@ def _headers() -> List[str]:
         "Story",
         "Decision_JSON",
         "Intent_JSON",
+        "Signature",
     ]
 
 
 def _ensure_sheet_headers(tab: str) -> None:
+    # Prefer your guarded helper; fall back to direct worksheet creation if needed.
     try:
         from utils import ensure_sheet_headers  # type: ignore
 
         ensure_sheet_headers(tab, _headers())
+        return
     except Exception:
-        # Fall back to the policy_logger's legacy creation pattern.
-        try:
-            import gspread
-            from oauth2client.service_account import ServiceAccountCredentials
+        pass
 
-            sheet_url = os.getenv("SHEET_URL")
-            if not sheet_url:
-                return
-            svc = (
-                os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-                or os.getenv("GOOGLE_CREDENTIALS_JSON")
-                or os.getenv("SVC_JSON")
-                or "sentiment-log-service.json"
-            )
-            scope = [
-                "https://spreadsheets.google.com/feeds",
-                "https://www.googleapis.com/auth/drive",
-            ]
-            creds = ServiceAccountCredentials.from_json_keyfile_name(svc, scope)
-            gc = gspread.authorize(creds)
-            sh = gc.open_by_url(sheet_url)
-            try:
-                ws = sh.worksheet(tab)
-            except Exception:
-                ws = sh.add_worksheet(title=tab, rows=4000, cols=20)
+    try:
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
+
+        sheet_url = os.getenv("SHEET_URL")
+        if not sheet_url:
+            return
+        svc = (
+            os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            or os.getenv("GOOGLE_CREDENTIALS_JSON")
+            or os.getenv("SVC_JSON")
+            or "sentiment-log-service.json"
+        )
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(svc, scope)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_url(sheet_url)
+        try:
+            ws = sh.worksheet(tab)
+        except Exception:
+            ws = sh.add_worksheet(title=tab, rows=4000, cols=30)
+            ws.append_row(_headers(), value_input_option="USER_ENTERED")
+        # If sheet exists but has no headers, attempt to write them once
+        try:
+            vals = ws.get_all_values()
+            if not vals:
                 ws.append_row(_headers(), value_input_option="USER_ENTERED")
         except Exception:
-            return
+            pass
+    except Exception:
+        return
 
 
 def _append_row(tab: str, row: List[Any]) -> None:
@@ -229,7 +241,6 @@ def _append_row(tab: str, row: List[Any]) -> None:
     except Exception:
         pass
 
-    # Legacy fallback
     try:
         import gspread
         from oauth2client.service_account import ServiceAccountCredentials
@@ -257,7 +268,6 @@ def _append_row(tab: str, row: List[Any]) -> None:
 
 
 def _mirror_db(tab: str, row: List[Any]) -> None:
-    """Best-effort DB mirror (append shadow-write)."""
     try:
         from db_mirror import mirror_append  # type: ignore
 
@@ -267,14 +277,20 @@ def _mirror_db(tab: str, row: List[Any]) -> None:
 
 
 def _make_story(token: str, outcome: str, reason: str, extra: str = "") -> str:
-    # Keep it short; no council voice here (alpha is upstream). Decision_story is policy-oriented.
     base = f"ALPHA {token} {outcome}. {reason}".strip()
     if extra:
         return f"{base} ({extra})"
     return base
 
 
+def _signature(token: str, stage: str, outcome: str, primary_reason: str, secondary: str = "") -> str:
+    # Short stable signature for dedupe + human diffing
+    s = f"{token}|{stage}|{outcome}|{primary_reason}|{secondary}".upper().encode("utf-8")
+    return hashlib.sha256(s).hexdigest()[:16]
+
+
 def _dedupe_signature(token: str, stage: str, outcome: str, primary_reason: str) -> str:
+    # in-memory dedupe key (coarser than Signature column)
     return f"{token}|{stage}|{outcome}|{primary_reason}".upper()
 
 
@@ -283,7 +299,6 @@ _RECENT: Dict[str, float] = {}
 
 def _deduped(sig: str, ttl: int) -> bool:
     now = time.time()
-    # purge a little
     for k, ts in list(_RECENT.items())[:200]:
         if (now - ts) > ttl:
             _RECENT.pop(k, None)
@@ -305,34 +320,35 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
     tab = str(wnh.get("tab") or "Why_Nothing_Happened")
     ttl = int(wnh.get("dedupe_ttl_sec") or 3600)
 
-    # Phase 26 alpha gates (JSON-first)
     alpha_enabled = _truthy(_cfg_get(cfg, "phases.phase26.enabled", 0))
     planning_enabled = _truthy(_cfg_get(cfg, "phases.phase26.alpha.planning_enabled", 0))
     exec_enabled = _truthy(_cfg_get(cfg, "phases.phase26.alpha.execution_enabled", 0))
     mode = str(_cfg_get(cfg, "phases.phase26.mode", "")).strip()
 
-    # If alpha planning is off, emit a single row explaining the silence.
+    autonomy = f"mode={mode} exec_enabled={1 if exec_enabled else 0}"
+
     if not (alpha_enabled and planning_enabled):
-        token = ""
         stage = "ALPHA"
         outcome = "NOOP"
         primary_reason = "ALPHA_PLANNING_DISABLED"
-        sig = _dedupe_signature(token or "(all)", stage, outcome, primary_reason)
+        sig = _dedupe_signature("(all)", stage, outcome, primary_reason)
         if not _deduped(sig, ttl):
             _ensure_sheet_headers(tab)
+            signature = _signature("", stage, outcome, primary_reason)
             row = [
                 _now_utc(),
-                token,
+                "",
                 stage,
                 outcome,
                 primary_reason,
                 "",
                 "",
-                f"mode={mode}",
+                autonomy,
                 "",
                 _make_story("(all)", outcome, "Alpha planning is disabled in DB_READ_JSON."),
                 _safe_json({"mode": mode}),
                 _safe_json({}),
+                signature,
             ]
             _append_row(tab, row)
             _mirror_db(tab, row)
@@ -340,13 +356,13 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
 
     conn = _connect_pg()
     if conn is None:
-        # DB unavailable: still log a WNH row so you can see the cause.
         stage = "ALPHA"
         outcome = "BLOCKED"
         primary_reason = "DB_UNAVAILABLE"
         sig = _dedupe_signature("(all)", stage, outcome, primary_reason)
         if not _deduped(sig, ttl):
             _ensure_sheet_headers(tab)
+            signature = _signature("", stage, outcome, primary_reason)
             row = [
                 _now_utc(),
                 "",
@@ -355,11 +371,12 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
                 primary_reason,
                 "",
                 "",
-                f"mode={mode}",
+                autonomy,
                 "",
                 _make_story("(all)", outcome, "DATABASE_URL/DB_URL not configured or DB connect failed."),
                 _safe_json({"mode": mode}),
                 _safe_json({}),
+                signature,
             ]
             _append_row(tab, row)
             _mirror_db(tab, row)
@@ -380,6 +397,7 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
         primary_reason = "ALPHA_QUERY_FAILED"
         sig = _dedupe_signature("(all)", stage, outcome, primary_reason)
         if not _deduped(sig, ttl):
+            signature = _signature("", stage, outcome, primary_reason, err)
             row = [
                 _now_utc(),
                 "",
@@ -388,11 +406,12 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
                 primary_reason,
                 err,
                 "",
-                f"mode={mode}",
+                autonomy,
                 "",
                 _make_story("(all)", outcome, "Failed to query alpha_proposals.", extra=err),
                 _safe_json({"error": err}),
                 _safe_json({}),
+                signature,
             ]
             _append_row(tab, row)
             _mirror_db(tab, row)
@@ -405,6 +424,7 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
         primary_reason = "NO_PROPOSALS"
         sig = _dedupe_signature("(all)", stage, outcome, primary_reason)
         if not _deduped(sig, ttl):
+            signature = _signature("", stage, outcome, primary_reason)
             row = [
                 _now_utc(),
                 "",
@@ -413,18 +433,18 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
                 primary_reason,
                 "",
                 "",
-                f"mode={mode}",
+                autonomy,
                 "",
                 _make_story("(all)", outcome, "Alpha ran, but produced no proposals for today (UTC)."),
                 _safe_json({"utc_day": _utc_day()}),
                 _safe_json({}),
+                signature,
             ]
             _append_row(tab, row)
             _mirror_db(tab, row)
             written += 1
         return {"ok": True, "rows": written, "note": "no proposals"}
 
-    # One row per token with inaction reason (multiple if reasons differ via dedupe signature)
     for r in rows:
         token = str(r.get("token") or "").upper().strip()
         if not token:
@@ -449,7 +469,6 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
         approval_decision = str(r.get("approval_decision") or "").upper().strip()
 
         stage = "ALPHA"
-        autonomy = f"mode={mode} exec_enabled={1 if exec_enabled else 0}"
         decision_id = str(r.get("proposal_id") or "")
 
         outcome = "NOOP"
@@ -462,7 +481,6 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
             secondary = blockers_s
         elif action == "WOULD_WATCH":
             outcome = "DEFERRED"
-            # In your generator, WOULD_WATCH implies gate A immature.
             primary_reason = primary_blocker or "IMMATURE"
             secondary = blockers_s
         elif action == "WOULD_TRADE":
@@ -472,26 +490,22 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
             elif approval_decision == "HOLD":
                 outcome = "DEFERRED"
                 primary_reason = "HUMAN_HOLD"
-                secondary = (r.get("approval_note") or "")
+                secondary = str(r.get("approval_note") or "")
             elif approval_decision == "DENY":
                 outcome = "BLOCKED"
                 primary_reason = "HUMAN_DENY"
-                secondary = (r.get("approval_note") or "")
+                secondary = str(r.get("approval_note") or "")
             elif approval_decision == "APPROVE":
                 if not exec_enabled:
                     outcome = "BLOCKED"
                     primary_reason = "ENQUEUE_DISABLED"
                 else:
-                    # If execution is enabled, WNH isn't appropriate; something *should* happen downstream.
-                    # We still log a deferred row if mode isn't live.
                     if "dryrun" in mode.lower():
                         outcome = "DEFERRED"
                         primary_reason = "APPROVED_DRYRUN"
                     else:
-                        # In live mode, approved SHOULD enqueue; don't spam WNH.
                         continue
         else:
-            # Unknown action; skip.
             continue
 
         if not primary_reason:
@@ -524,6 +538,8 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
             "utc_day": _utc_day(),
         }
 
+        signature = _signature(token, stage, outcome, primary_reason, secondary)
+
         row = [
             _now_utc(),
             token,
@@ -537,6 +553,7 @@ def run_alpha_wnh_mirror() -> Dict[str, Any]:
             story,
             _safe_json(decision_json),
             _safe_json(intent_json),
+            signature,
         ]
 
         _append_row(tab, row)
