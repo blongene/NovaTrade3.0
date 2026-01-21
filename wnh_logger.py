@@ -346,6 +346,31 @@ def _self_test() -> Dict[str, Any]:
     )
     return {"ok": True, "attempted_write": bool(ok), "tab": tab_name()}
 
+def append_row_dict(row: dict) -> dict:
+    """
+    Append a Why_Nothing_Happened row using header-aware dict mapping.
+    Safe for multi-instance use. Returns {ok: bool, reason?: str}.
+    """
+    try:
+        tab = _tab()
+        ensure_sheet_headers(tab)
+
+        headers = _headers()
+        out = []
+        for h in headers:
+            out.append(row.get(h, ""))
+
+        _append_row(tab, out)
+
+        # Optional DB mirror (best-effort)
+        try:
+            _mirror_db(tab, out)
+        except Exception:
+            pass
+
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "reason": f"{e.__class__.__name__}:{e}"}
 
 if __name__ == "__main__":
     print(_safe_json(_self_test()))
