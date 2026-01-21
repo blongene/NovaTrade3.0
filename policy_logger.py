@@ -301,6 +301,14 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
     except Exception as e:
         warn(f"policy_logger: insight logging failed: {e}")
         
+
+    # Why Nothing Happened (WNH): compile + persist non-actions (DB + Sheet mirror).
+    try:
+        from wnh_logger import maybe_log_wnh
+        maybe_log_wnh(decision, intent, when=ts)
+    except Exception:
+        pass
+
 def log_decision_insight(decision: Dict[str, Any], intent: Dict[str, Any]) -> None:
     """
     Best-effort: append a CouncilInsight row to council_insights.jsonl.
