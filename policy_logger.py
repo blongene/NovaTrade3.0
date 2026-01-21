@@ -300,15 +300,97 @@ def log_decision(decision: Any, intent: Dict[str, Any], when: Optional[str] = No
         log_decision_insight(decision, intent)
     except Exception as e:
         warn(f"policy_logger: insight logging failed: {e}")
-        
 
-    # Why Nothing Happened (WNH): compile + persist non-actions (DB + Sheet mirror).
+    # ------------------------------------------------------------
+    # Why Nothing Happened (WNH) — silence explanations
+    # ------------------------------------------------------------
+    # Best-effort only. Never blocks policy logging.
     try:
-        from wnh_logger import maybe_log_wnh
-        maybe_log_wnh(decision, intent, when=ts)
+        _maybe_emit_wnh(decision, intent, ts)
     except Exception:
         pass
 
+
+def _maybe_emit_wnh(decision: Dict[str, Any], intent: Dict[str, Any], ts: str) -> None:
+    """Emit a WNH row for "inaction" outcomes.
+
+    Rules (conservative):
+      - Denials (ok=False)
+      - Explicit HOLD/NOOP style decisions (action==DECISION)
+      - Cloud/edge holds surfaced as reasons/flags
+
+    We avoid emitting WNH for approved trades (ok=True) because those are *actions*,
+    and already show up in Trade_Log / outbox previews.
+    """
+    try:
+        from wnh_logger import emit as _wnh_emit
+    except Exception:
+        return
+
+    if not isinstance(decision, dict):
+        return
+    if not isinstance(intent, dict):
+        intent = {}
+
+    token = (intent.get("token") or intent.get("asset") or intent.get("base") or "").upper()
+    action = (intent.get("action") or intent.get("side") or "").upper()
+
+    ok = bool(decision.get("ok", True))
+    reason = str(decision.get("reason") or decision.get("status") or "").strip()
+    flags = decision.get("flags") or []
+    if isinstance(flags, str):
+        flags = [flags]
+    flags_s = {str(f).strip() for f in flags if str(f).strip()}
+
+    # Detect "inaction". Keep this intentionally conservative.
+    inaction = (not ok) or (action == "DECISION") or ("HOLD" in reason.upper()) or ("NOOP" in reason.upper())
+    if not inaction:
+        return
+
+    stage = "POLICY"
+    outcome = "BLOCKED" if not ok else "NOOP"
+    primary_reason = reason or ("FLAGS:" + ",".join(sorted(flags_s)) if flags_s else "UNKNOWN")
+    secondary = sorted(flags_s)[:10]
+
+    limits_applied = []
+    try:
+        meta = decision.get("meta") or {}
+        if isinstance(meta, dict):
+            la = meta.get("limits_applied")
+            if isinstance(la, list):
+                limits_applied = [str(x) for x in la if str(x).strip()]
+    except Exception:
+        pass
+
+    # Human story (optional)
+    story = ""
+    try:
+        from decision_story import generate_decision_story
+        story = generate_decision_story(intent, decision)
+    except Exception:
+        # fallback: compact reason
+        if token and primary_reason:
+            story = f"{token}: {primary_reason}"
+        else:
+            story = primary_reason
+
+    decision_id = decision.get("decision_id") or ""
+
+    _wnh_emit(
+        token=token or (intent.get("symbol") or ""),
+        stage=stage,
+        outcome=outcome,
+        primary_reason=primary_reason,
+        secondary_reasons=secondary,
+        limits_applied=limits_applied,
+        autonomy=str(decision.get("autonomy") or decision.get("autonomy_mode") or ""),
+        decision_id=str(decision_id),
+        story=story,
+        decision_json=decision,
+        intent_json=intent,
+        ts=ts,
+    )
+        
 def log_decision_insight(decision: Dict[str, Any], intent: Dict[str, Any]) -> None:
     """
     Best-effort: append a CouncilInsight row to council_insights.jsonl.
