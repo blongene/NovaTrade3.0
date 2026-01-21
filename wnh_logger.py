@@ -1,112 +1,38 @@
 #!/usr/bin/env python3
-"""
-wnh_logger.py — "Why Nothing Happened" (WNH) compiler + logger (DB + Sheet mirror)
+"""wnh_logger.py
 
-Goal:
-- Persist a normalized explanation record any time a decision results in:
-  - blocked / denied
-  - hold / noop / deferred / skipped
-- Keep this SAFE in observation mode: write-only, tolerant of missing DB/Sheets,
-  and aggressively de-duped to avoid noise.
+Why Nothing Happened (WNH) — shared silence explanation surface.
 
-Integration point:
-- policy_logger.log_decision() calls wnh_logger.maybe_log_wnh(decision, intent, when=ts)
+Design
+------
+This is a *compiler + mirror* for "inaction" outcomes.
 
-Notes:
-- DB-first: attempts DB insert if db_write_adapter is available; always best-effort.
-- Sheet mirror: appends to WNH worksheet when SHEET_URL is configured.
-- De-dupe: in-memory TTL de-dupe + optional sheet tail check (lightweight).
+It is intentionally:
+  - best-effort (never raises)
+  - JSON-first (uses DB_READ_JSON.wnh)
+  - DB-first (mirrors to Postgres via db_mirror when enabled)
+  - Sheets-friendly (auto-creates the WNH tab + headers)
 
-Phase: 29+ runway enablement (observation compatible)
+It does NOT:
+  - enqueue commands
+  - modify policy decisions
+
+Used by:
+  - policy_logger.py (policy decisions)
+  - alpha_wnh_mirror.py (alpha proposals/approvals)
 """
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
-
-from decision_story import generate_decision_story
-
-try:
-    from utils import ensure_sheet_headers, get_records_cached, get_ws_cached, ws_append_row
-except Exception:  # pragma: no cover
-    ensure_sheet_headers = None  # type: ignore
-    get_records_cached = None  # type: ignore
-    get_ws_cached = None  # type: ignore
-    ws_append_row = None  # type: ignore
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 
-SHEET_URL = os.getenv("SHEET_URL")
+DEFAULT_TAB = "Why_Nothing_Happened"
 
-# Configuration is JSON-first to avoid Render env-var limits.
-# Primary: DB_READ_JSON. Fallback: CONFIG_BUNDLE_JSON.vars.DB_READ_JSON
-_WNH_CFG_CACHE: Optional[Dict[str, Any]] = None
-
-def _truthy_cfg(v: Any) -> bool:
-    if v is None:
-        return False
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return v != 0
-    s = str(v).strip().lower()
-    return s in {"1", "true", "yes", "y", "on"}
-
-def _load_json_env(name: str) -> Dict[str, Any]:
-    raw = (os.getenv(name) or "").strip()
-    if not raw:
-        return {}
-    try:
-        obj = json.loads(raw)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
-
-def _load_db_read_json() -> Dict[str, Any]:
-    raw = (os.getenv("DB_READ_JSON") or "").strip()
-    if raw:
-        try:
-            obj = json.loads(raw)
-            return obj if isinstance(obj, dict) else {}
-        except Exception:
-            return {}
-    # Fallback: CONFIG_BUNDLE_JSON.vars.DB_READ_JSON
-    bundle = _load_json_env("CONFIG_BUNDLE_JSON")
-    vars_obj = bundle.get("vars") if isinstance(bundle, dict) else None
-    if isinstance(vars_obj, dict):
-        dbj = vars_obj.get("DB_READ_JSON")
-        if isinstance(dbj, dict):
-            return dbj
-    return {}
-
-def _wnh_cfg() -> Dict[str, Any]:
-    global _WNH_CFG_CACHE
-    if _WNH_CFG_CACHE is not None:
-        return _WNH_CFG_CACHE
-    base = _load_db_read_json()
-    w = base.get("wnh") or base.get("why_nothing_happened") or {}
-    if not isinstance(w, dict):
-        w = {}
-    # defaults: enabled on, tab name stable, de-dupe 1h, tail 80
-    _WNH_CFG_CACHE = {
-        "enabled": _truthy_cfg(w.get("enabled", 1)),
-        "tab": str(w.get("tab") or w.get("ws") or "Why_Nothing_Happened"),
-        "dedupe_ttl_sec": int(w.get("dedupe_ttl_sec") or 3600),
-        "sheet_tail_n": int(w.get("sheet_tail_n") or 80),
-    }
-    return _WNH_CFG_CACHE
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
-
-_DEDUPE: Dict[str, float] = {}
-
-def _now() -> float:
-    return time.time()
 
 def _truthy(v: Any) -> bool:
     if v is None:
@@ -117,137 +43,65 @@ def _truthy(v: Any) -> bool:
         return v != 0
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
 def _safe_json(obj: Any) -> str:
     try:
-        return json.dumps(obj, ensure_ascii=False, default=str, separators=(",", ":"))
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, default=str)
     except Exception:
         return "{}"
 
-def _norm_token(intent: Dict[str, Any], decision: Dict[str, Any]) -> str:
-    tok = (
-        (intent.get("token") or intent.get("asset") or intent.get("base") or "")
-        or (decision.get("token") or decision.get("base") or "")
-    )
-    return str(tok).strip().upper()
 
-def _norm_venue(intent: Dict[str, Any], decision: Dict[str, Any]) -> str:
-    return str(intent.get("venue") or decision.get("venue") or "").strip().upper()
-
-def _norm_quote(intent: Dict[str, Any], decision: Dict[str, Any]) -> str:
-    return str(intent.get("quote") or decision.get("quote") or "").strip().upper()
-
-def _pull_decision_id(decision: Dict[str, Any]) -> str:
-    return str(decision.get("decision_id") or decision.get("id") or "").strip()
-
-def _pull_limits_applied(decision: Dict[str, Any]) -> List[str]:
-    # support both policy_decision.py meta.limits_applied and ad-hoc decision dicts
-    meta = decision.get("meta") or {}
-    out = decision.get("limits_applied") or meta.get("limits_applied") or []
-    if isinstance(out, str):
-        out = [out]
-    if isinstance(out, list):
-        return [str(x) for x in out if str(x).strip()]
-    return []
-
-def _pull_council_trace(decision: Dict[str, Any]) -> Dict[str, Any]:
-    meta = decision.get("meta") or {}
-    ct = decision.get("council_trace") or meta.get("council_trace") or decision.get("council") or {}
-    return ct if isinstance(ct, dict) else {}
-
-def _pull_autonomy_context(decision: Dict[str, Any]) -> Dict[str, Any]:
-    # Many flows embed this differently; tolerate all.
-    out: Dict[str, Any] = {}
-    for k in ("autonomy", "autonomy_mode", "mode", "edge_mode"):
-        v = decision.get(k)
-        if v:
-            out[k] = v
-    holds = decision.get("holds") or (decision.get("autonomy_state") or {}).get("holds") or {}
-    if isinstance(holds, dict):
-        active = [name for name, on in holds.items() if _truthy(on)]
-        if active:
-            out["holds"] = active
-    return out
-
-def _classify_outcome(decision: Dict[str, Any]) -> Tuple[str, str, List[str]]:
-    """
-    Returns (outcome, primary_reason, secondary_reasons[])
-    outcome in: blocked | deferred | noop | hold | resized | unknown
-    """
-    ok = bool(decision.get("ok", True))
-    skipped = _truthy(decision.get("skipped"))
-    recommendation = str(decision.get("recommendation") or "").strip().upper()
-    status = str(decision.get("status") or "").strip()
-    reason = str(decision.get("reason") or status or "").strip()
-
-    secondary: List[str] = []
-
-    # Many decision-only flows use "reasons": [...]
-    rs = decision.get("reasons")
-    if isinstance(rs, list):
-        secondary.extend([str(x) for x in rs if str(x).strip()])
-
-    # Signals error breadcrumbs, etc.
-    if decision.get("signals_error"):
-        secondary.append(f"signals_error={decision.get('signals_error')}")
-
-    # Generic flags/applied limits, etc.
-    flags = decision.get("flags") or decision.get("applied") or []
-    if isinstance(flags, list):
-        secondary.extend([str(x) for x in flags if str(x).strip()])
-
-    # Determine outcome
-    if not ok:
-        outcome = "blocked"
-    elif skipped:
-        outcome = "deferred"
-    elif recommendation in {"HOLD", "STOP", "PAUSE"}:
-        outcome = "hold"
-    elif recommendation in {"NOOP", "NONE", "SKIP"}:
-        outcome = "noop"
-    else:
-        # Detect resize (patched intent amount differs)
-        try:
-            intent = decision.get("intent") or {}
-            patched = decision.get("patched") or decision.get("patched_intent") or {}
-            req = float(intent.get("amount_usd")) if intent.get("amount_usd") is not None else None
-            appr = float(patched.get("amount_usd")) if patched.get("amount_usd") is not None else None
-            if req is not None and appr is not None and abs(req - appr) > 1e-6:
-                outcome = "resized"
-            else:
-                outcome = "unknown"
-        except Exception:
-            outcome = "unknown"
-
-    if not reason:
-        # Make sure primary reason is never empty
-        if outcome == "hold":
-            reason = "HOLD"
-        elif outcome == "noop":
-            reason = "NOOP"
-        elif outcome == "deferred":
-            reason = "DEFERRED"
-        elif outcome == "blocked":
-            reason = "DENIED"
-        else:
-            reason = "UNSPECIFIED"
-
-    # De-dup secondary
-    seen=set()
-    sec2=[]
-    for s in secondary:
-        s=str(s).strip()
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        sec2.append(s)
-    return outcome, reason, sec2
-
-def _should_log(outcome: str) -> bool:
-    # WNH is about non-actions. We log these outcomes.
-    return outcome in {"blocked", "deferred", "noop", "hold"}
+def _load_db_read_json() -> Dict[str, Any]:
+    raw = (os.getenv("DB_READ_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
 
 
-def _headers() -> List[str]:
+def _cfg() -> Dict[str, Any]:
+    cfg = _load_db_read_json()
+    wnh = cfg.get("wnh") or {}
+    return wnh if isinstance(wnh, dict) else {}
+
+
+def enabled() -> bool:
+    c = _cfg()
+    return _truthy(c.get("enabled", 0))
+
+
+def tab_name() -> str:
+    c = _cfg()
+    t = str(c.get("tab") or DEFAULT_TAB).strip()
+    return t or DEFAULT_TAB
+
+
+def dedupe_ttl_sec() -> int:
+    c = _cfg()
+    try:
+        v = int(c.get("dedupe_ttl_sec") or 3600)
+        return max(60, min(v, 7 * 24 * 3600))
+    except Exception:
+        return 3600
+
+
+def sheet_tail_n() -> int:
+    c = _cfg()
+    try:
+        v = int(c.get("sheet_tail_n") or 80)
+        return max(10, min(v, 500))
+    except Exception:
+        return 80
+
+
+def _now_utc() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def headers() -> List[str]:
     return [
         "Timestamp",
         "Token",
@@ -257,165 +111,241 @@ def _headers() -> List[str]:
         "Secondary_Reasons",
         "Limits_Applied",
         "Autonomy",
-        "Venue",
-        "Quote",
-        "Agent_ID",
-        "Decision_IDs",
+        "Decision_ID",
         "Story",
         "Decision_JSON",
         "Intent_JSON",
     ]
 
 
-def _dedupe_key(ts: str, token: str, stage: str, outcome: str, primary_reason: str) -> str:
-    # We intentionally do NOT include ts in the key.
-    return "|".join([token, stage, outcome, primary_reason])[:400]
+_DEDUP_CACHE: Dict[str, float] = {}
 
 
-def _dedupe_hit(key: str) -> bool:
-    # in-memory TTL de-dupe
-    now = _now()
-    # purge
-    for k, t in list(_DEDUPE.items()):
-        if now - t > _wnh_cfg().get("dedupe_ttl_sec"):
-            _DEDUPE.pop(k, None)
-    t = _DEDUPE.get(key)
-    if t is not None and (now - t) <= _wnh_cfg().get("dedupe_ttl_sec"):
+def _dedupe_key(token: str, stage: str, outcome: str, primary_reason: str) -> str:
+    return "|".join(
+        [
+            (token or "").strip().upper(),
+            (stage or "").strip().upper(),
+            (outcome or "").strip().upper(),
+            (primary_reason or "").strip(),
+        ]
+    )
+
+
+def _should_dedupe(key: str) -> bool:
+    ttl = dedupe_ttl_sec()
+    now = time.time()
+    ts = _DEDUP_CACHE.get(key)
+    if ts is not None and (now - ts) < ttl:
         return True
-    _DEDUPE[key] = now
+    _DEDUP_CACHE[key] = now
+    # prune occasionally
+    if len(_DEDUP_CACHE) > 5000:
+        cutoff = now - ttl
+        for k in list(_DEDUP_CACHE.keys())[:1000]:
+            if _DEDUP_CACHE.get(k, 0) < cutoff:
+                _DEDUP_CACHE.pop(k, None)
     return False
 
 
-def _sheet_tail_has(key: str) -> bool:
-    """
-    Optional extra de-dupe: look at last N rows in the sheet and suppress duplicates.
-    Safe if Sheets is down (returns False).
-    """
-    if not SHEET_URL or not get_records_cached:
-        return False
-    try:
-        rows = get_records_cached(_wnh_cfg().get("tab"), ttl_s=60) or []
-        tail = rows[-_wnh_cfg().get("sheet_tail_n"):] if len(rows) > _wnh_cfg().get("sheet_tail_n") else rows
-        for r in tail:
-            tok = str(r.get("Token","")).strip().upper()
-            stage = str(r.get("Stage","")).strip()
-            outcome = str(r.get("Outcome","")).strip()
-            pr = str(r.get("Primary_Reason","")).strip()
-            k = _dedupe_key("", tok, stage, outcome, pr)
-            if k == key:
-                return True
-    except Exception:
-        return False
-    return False
+def _ensure_sheet_headers(tab: str) -> None:
+    """Ensure worksheet exists + has headers.
 
-
-# -----------------------------
-# Core: compile + log
-# -----------------------------
-
-def compile_wnh_record(decision: Dict[str, Any], intent: Dict[str, Any], when: str) -> Optional[Dict[str, Any]]:
-    if not _wnh_cfg().get("enabled"):
-        return None
-    if not isinstance(decision, dict) or not isinstance(intent, dict):
-        return None
-
-    token = _norm_token(intent, decision)
-    venue = _norm_venue(intent, decision)
-    quote = _norm_quote(intent, decision)
-
-    outcome, primary_reason, secondary = _classify_outcome(decision)
-    if not _should_log(outcome):
-        return None
-
-    stage = str(decision.get("phase") or decision.get("stage") or intent.get("stage") or "policy").strip() or "policy"
-
-    limits = _pull_limits_applied(decision)
-    autonomy = _pull_autonomy_context(decision)
-    council_trace = _pull_council_trace(decision)
-
-    # Story (human)
-    try:
-        story = generate_decision_story(intent=intent, decision=decision, autonomy_state=autonomy or None)
-    except Exception:
-        story = str(decision.get("reason") or decision.get("status") or "")
-
-    agent_id = str(decision.get("agent_id") or intent.get("agent_id") or "").strip()
-
-    decision_ids = []
-    did = _pull_decision_id(decision)
-    if did:
-        decision_ids.append(did)
-
-    record = {
-        "Timestamp": when,
-        "Token": token,
-        "Stage": stage,
-        "Outcome": outcome,
-        "Primary_Reason": primary_reason,
-        "Secondary_Reasons": "; ".join(secondary[:12]),
-        "Limits_Applied": "; ".join(limits[:12]),
-        "Autonomy": _safe_json({"autonomy": autonomy, "council_trace": council_trace}) if (autonomy or council_trace) else "",
-        "Venue": venue,
-        "Quote": quote,
-        "Agent_ID": agent_id,
-        "Decision_IDs": ";".join(decision_ids),
-        "Story": story,
-        "Decision_JSON": _safe_json(decision),
-        "Intent_JSON": _safe_json(intent),
-    }
-    return record
-
-
-def _write_db(record: Dict[str, Any]) -> None:
-    """
-    Best-effort DB insert using db_mirror (append-only event mirror).
-
-    We intentionally re-use the existing mirror schema (sheet_mirror_events)
-    so this stays DB-first without requiring a new migration.
+    Prefer utils.ensure_sheet_headers if available; fallback to direct gspread.
     """
     try:
-        from db_mirror import mirror_append  # type: ignore
-    except Exception:
+        from utils import ensure_sheet_headers
+        ensure_sheet_headers(tab, headers())
         return
+    except Exception:
+        pass
+
+    # Fallback path (mirrors policy_logger legacy auth style)
     try:
-        # Mirror tab name matches the Sheet tab to keep parity simple.
-        mirror_append(_wnh_cfg().get("tab"), [record])
-    except Exception:
-        return
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
 
-
-def _write_sheet(record: Dict[str, Any]) -> None:
-    if not SHEET_URL or not ensure_sheet_headers or not get_ws_cached or not ws_append_row:
-        return
-    try:
-        ensure_sheet_headers(_wnh_cfg().get("tab"), _headers())
-        ws = get_ws_cached(_wnh_cfg().get("tab"), ttl_s=60)
-        row = [record.get(h, "") for h in _headers()]
-        ws_append_row(ws, row)
-    except Exception:
-        return
-
-
-def maybe_log_wnh(decision: Any, intent: Dict[str, Any], when: str) -> None:
-    """
-    Main entrypoint. Safe: never raises.
-    """
-    if not _wnh_cfg().get("enabled"):
-        return
-    if not isinstance(decision, dict):
-        try:
-            decision = dict(decision)  # type: ignore
-        except Exception:
+        sheet_url = os.getenv("SHEET_URL")
+        if not sheet_url:
             return
 
-    rec = compile_wnh_record(decision, intent, when=when)
-    if not rec:
+        svc = (
+            os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            or os.getenv("GOOGLE_CREDENTIALS_JSON")
+            or os.getenv("SVC_JSON")
+            or "sentiment-log-service.json"
+        )
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(svc, scope)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_url(sheet_url)
+        try:
+            ws = sh.worksheet(tab)
+        except Exception:
+            ws = sh.add_worksheet(title=tab, rows=4000, cols=max(12, len(headers()) + 2))
+            ws.append_row(headers(), value_input_option="USER_ENTERED")
+            return
+
+        # If exists, ensure first row matches headers; if empty, write headers.
+        try:
+            existing = ws.row_values(1)
+        except Exception:
+            existing = []
+        if not existing:
+            ws.append_row(headers(), value_input_option="USER_ENTERED")
+    except Exception:
         return
 
-    key = _dedupe_key(when, rec.get("Token",""), rec.get("Stage",""), rec.get("Outcome",""), rec.get("Primary_Reason",""))
-    if _dedupe_hit(key) or _sheet_tail_has(key):
+
+def _append_row(tab: str, row: List[Any]) -> None:
+    # Prefer cached worksheet helpers
+    try:
+        from utils import get_ws_cached, ws_append_row
+        ws = get_ws_cached(tab, ttl_s=60)
+        ws_append_row(ws, row)
+        return
+    except Exception:
+        pass
+
+    # Fallback to legacy open (like policy_logger)
+    try:
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
+
+        sheet_url = os.getenv("SHEET_URL")
+        if not sheet_url:
+            return
+
+        svc = (
+            os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            or os.getenv("GOOGLE_CREDENTIALS_JSON")
+            or os.getenv("SVC_JSON")
+            or "sentiment-log-service.json"
+        )
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(svc, scope)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_url(sheet_url)
+        ws = sh.worksheet(tab)
+        try:
+            ws.append_row(row, value_input_option="USER_ENTERED")
+        except TypeError:
+            ws.append_row(row)
+    except Exception:
         return
 
-    # DB + Sheet mirror (best-effort, never block)
-    _write_db(rec)
-    _write_sheet(rec)
+
+def _mirror_db(tab: str, row: List[Any]) -> None:
+    try:
+        from db_mirror import mirror_append
+        mirror_append(tab, [row])
+    except Exception:
+        return
+
+
+def _tail_has_key(tab: str, key: str) -> bool:
+    """Best-effort sheet tail check to survive restarts.
+
+    If we can read the last N rows, look for a matching dedupe key.
+    This is intentionally lightweight; failures return False.
+    """
+    n = sheet_tail_n()
+    try:
+        from utils import get_records_cached
+        rows = get_records_cached(tab, ttl_s=60) or []
+        if not rows:
+            return False
+        tail = rows[-n:]
+        for r in tail:
+            tok = str(r.get("Token", "") or "").upper()
+            stage = str(r.get("Stage", "") or "")
+            outc = str(r.get("Outcome", "") or "")
+            prim = str(r.get("Primary_Reason", "") or "")
+            if _dedupe_key(tok, stage, outc, prim) == key:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def emit(
+    *,
+    token: str,
+    stage: str,
+    outcome: str,
+    primary_reason: str,
+    secondary_reasons: Optional[List[str]] = None,
+    limits_applied: Optional[List[str]] = None,
+    autonomy: str = "",
+    decision_id: str = "",
+    story: str = "",
+    decision_json: Optional[Dict[str, Any]] = None,
+    intent_json: Optional[Dict[str, Any]] = None,
+    ts: Optional[str] = None,
+) -> bool:
+    """Emit a WNH row to Sheets + DB mirror (best-effort).
+
+    Returns True if we attempted to write (i.e., not deduped/disabled).
+    """
+    if not enabled():
+        return False
+
+    tab = tab_name()
+    token_u = (token or "").strip().upper()
+    stage_u = (stage or "").strip().upper()
+    outcome_u = (outcome or "").strip().upper()
+    prim = (primary_reason or "").strip()
+    key = _dedupe_key(token_u, stage_u, outcome_u, prim)
+
+    # De-dupe (in-memory + tail check)
+    if _should_dedupe(key) or _tail_has_key(tab, key):
+        return False
+
+    _ensure_sheet_headers(tab)
+
+    sec = ";".join([s for s in (secondary_reasons or []) if str(s).strip()])
+    lim = ";".join([s for s in (limits_applied or []) if str(s).strip()])
+
+    row = [
+        ts or _now_utc(),
+        token_u,
+        stage_u,
+        outcome_u,
+        prim,
+        sec,
+        lim,
+        autonomy or "",
+        decision_id or "",
+        story or "",
+        _safe_json(decision_json or {}),
+        _safe_json(intent_json or {}),
+    ]
+
+    _append_row(tab, row)
+    _mirror_db(tab, row)
+    return True
+
+
+def _self_test() -> Dict[str, Any]:
+    """Convenience: running `python wnh_logger.py` should create the tab + write one breadcrumb."""
+    ok = emit(
+        token="SYSTEM",
+        stage="WNH",
+        outcome="NOOP",
+        primary_reason="SELF_TEST",
+        secondary_reasons=["If you can read this row, WNH wiring + Sheets access works."],
+        story="WNH self-test row (safe).",
+        decision_json={"type": "self_test"},
+        intent_json={"source": "wnh_logger.__main__"},
+    )
+    return {"ok": True, "attempted_write": bool(ok), "tab": tab_name()}
+
+
+if __name__ == "__main__":
+    print(_safe_json(_self_test()))
