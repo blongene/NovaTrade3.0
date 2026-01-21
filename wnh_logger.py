@@ -348,29 +348,131 @@ def _self_test() -> Dict[str, Any]:
 
 def append_row_dict(row: dict) -> dict:
     """
-    Append a Why_Nothing_Happened row using header-aware dict mapping.
-    Does NOT rely on private helpers (_tab, _headers).
-    Safe across instances. Returns {ok: bool, reason?: str}.
+    Append a Why_Nothing_Happened row using dict->sheet-header mapping.
+    Bullet-proof: does NOT rely on internal module constants/functions (_tab/WNH_TAB/etc).
+    Uses the sheet's header row as source-of-truth so it stays compatible with your current tab layout.
     """
-    try:
-        # These helpers already exist in your wnh_logger.py
-        tab = DEFAULT_TAB  # existing constant
-        ensure_sheet_headers(tab)
+    import os, json
 
-        headers = SHEET_HEADERS  # existing header list
+    def _load_db_read_json() -> dict:
+        raw = (os.getenv("DB_READ_JSON") or "").strip()
+        if not raw:
+            return {}
+        try:
+            o = json.loads(raw)
+            return o if isinstance(o, dict) else {}
+        except Exception:
+            return {}
+
+    def _truthy(v) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return v != 0
+        return str(v).strip().lower() in {"1","true","yes","y","on"}
+
+    def _tabname() -> str:
+        cfg = _load_db_read_json()
+        wnh = cfg.get("wnh") or {}
+        if isinstance(wnh, dict):
+            t = str(wnh.get("tab") or "").strip()
+            if t:
+                return t
+        return "Why_Nothing_Happened"
+
+    # Canonical fallback headers (used only if sheet is empty)
+    # Matches what you've shown: ends at Intent_JSON, Signature optional.
+    FALLBACK_HEADERS = [
+        "Timestamp",
+        "Token",
+        "Stage",
+        "Outcome",
+        "Primary_Reason",
+        "Secondary_Reasons",
+        "Limits_Applied",
+        "Autonomy",
+        "Decision_ID",
+        "Story",
+        "Decision_JSON",
+        "Intent_JSON",
+        # If your sheet has Signature, it will already be in the live header row;
+        # we won't force it here unless the sheet is empty and you want it.
+        # "Signature",
+    ]
+
+    tab = _tabname()
+
+    try:
+        # Prefer your cached ws helper if present
+        try:
+            from utils import get_ws_cached  # type: ignore
+            ws = get_ws_cached(tab, ttl_s=30)
+        except Exception:
+            # Fallback to gspread direct (works in Render if creds are set)
+            import gspread
+            from oauth2client.service_account import ServiceAccountCredentials
+
+            sheet_url = os.getenv("SHEET_URL")
+            if not sheet_url:
+                return {"ok": False, "reason": "SHEET_URL not set"}
+
+            svc = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            if not svc:
+                return {"ok": False, "reason": "GOOGLE_APPLICATION_CREDENTIALS not set"}
+
+            scope = [
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive",
+            ]
+            creds = ServiceAccountCredentials.from_json_keyfile_name(svc, scope)
+            gc = gspread.authorize(creds)
+            sh = gc.open_by_url(sheet_url)
+            try:
+                ws = sh.worksheet(tab)
+            except Exception:
+                ws = sh.add_worksheet(title=tab, rows=4000, cols=30)
+
+        # Read header row (source-of-truth)
+        try:
+            header = ws.row_values(1)
+        except Exception:
+            try:
+                vals = ws.get_all_values()
+                header = vals[0] if vals else []
+            except Exception:
+                header = []
+
+        # If sheet is empty, write fallback headers
+        if not header:
+            try:
+                ws.append_row(FALLBACK_HEADERS, value_input_option="USER_ENTERED")
+            except Exception:
+                # if append_row signature differs
+                ws.append_row(FALLBACK_HEADERS)
+            header = list(FALLBACK_HEADERS)
+
+        # Build row in header order
         out = []
-        for h in headers:
+        for h in header:
             out.append(row.get(h, ""))
 
-        _append_row(tab, out)
+        # Append
+        try:
+            ws.append_row(out, value_input_option="USER_ENTERED")
+        except Exception:
+            ws.append_row(out)
 
         # Optional DB mirror (best-effort)
         try:
-            _mirror_db(tab, out)
+            from db_mirror import mirror_append  # type: ignore
+            mirror_append(tab, [out])
         except Exception:
             pass
 
         return {"ok": True}
+
     except Exception as e:
         return {"ok": False, "reason": f"{e.__class__.__name__}:{e}"}
 
