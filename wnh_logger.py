@@ -354,7 +354,7 @@ def append_row_dict(row: dict) -> dict:
     """
     try:
         # These helpers already exist in your wnh_logger.py
-        tab = WNH_TAB  # existing constant
+        tab = DEFAULT_TAB  # existing constant
         ensure_sheet_headers(tab)
 
         headers = SHEET_HEADERS  # existing header list
