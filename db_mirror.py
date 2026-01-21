@@ -87,6 +87,7 @@ DEFAULT_TABS = [
     "Scout Decisions",
     "Sentiment_Log",
     "Rebuy_Insights",
+    "Why_Nothing_Happened",
 ]
 
 def allowed_tabs() -> set[str]:
