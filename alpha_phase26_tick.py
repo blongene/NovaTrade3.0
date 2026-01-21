@@ -109,6 +109,13 @@ def run_alpha_phase26_tick() -> None:
         except Exception:
             log.warning("alpha_phase26_tick: alpha WNH mirror failed: %s", e)
 
+    # 2c) Daily WNH summary (one row per UTC day; presentation-only)
+    try:
+        from wnh_daily_summary import run_wnh_daily_summary
+        run_wnh_daily_summary()
+    except Exception:
+        pass
+    
     # ----------------------------
     # Phase 26E gate (enqueue)
     # ----------------------------
