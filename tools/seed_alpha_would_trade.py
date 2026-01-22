@@ -1,11 +1,15 @@
-# tools/seed_alpha_would_trade.py
+#!/usr/bin/env python3
+"""
+tools/seed_alpha_would_trade.py
+
+Seed a single synthetic Alpha proposal (WOULD_TRADE) for WNH lane testing.
+- No schema guesses beyond required columns used elsewhere (proposal_id, proposal_hash, token, action, confidence, payload)
+- Idempotent WITHOUT requiring a unique constraint (WHERE NOT EXISTS)
+"""
 from __future__ import annotations
 
-import os
-import json
-import uuid
+import os, json, uuid
 from datetime import datetime, timezone
-
 import psycopg2
 
 
@@ -16,7 +20,7 @@ def utc_day() -> str:
 def main():
     url = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
     if not url:
-        raise RuntimeError("DATABASE_URL / DB_URL not set")
+        raise RuntimeError("DATABASE_URL/DB_URL not set")
 
     proposal_id = str(uuid.uuid4())
     token = "TESTTRADE"
@@ -39,29 +43,16 @@ def main():
     conn.autocommit = True
     cur = conn.cursor()
 
-    # Idempotent insert WITHOUT needing a unique constraint
     cur.execute(
         """
         insert into alpha_proposals (proposal_id, proposal_hash, token, action, confidence, payload)
         select %s, %s, %s, %s, %s, %s::jsonb
         where not exists (
-            select 1
-            from alpha_proposals
-            where proposal_hash = %s
+            select 1 from alpha_proposals where proposal_hash = %s
         )
         """,
-        (
-            proposal_id,
-            proposal_hash,
-            token,
-            action,
-            confidence,
-            json.dumps(payload),
-            proposal_hash,
-        ),
+        (proposal_id, proposal_hash, token, action, confidence, json.dumps(payload), proposal_hash),
     )
-
-    # Confirm whether it inserted (rowcount can be 0/1)
     inserted = (cur.rowcount == 1)
 
     cur.close()
