@@ -2,38 +2,16 @@
 """
 WNH → Council_Insight Weekly Digest (Bus/DB-driven; Sheets-mirrored)
 
-What it does
-------------
-- Reads Why_Nothing_Happened (WNH) rows from Sheets (presentation plane)
-- Aggregates the last N days (default 7) into a weekly digest
-- Writes a single row into Council_Insight with:
-  - Stage/Outcome counts
-  - Top primary + secondary reasons
-  - Token leaderboard (top tokens by WNH appearances)
+Reads Why_Nothing_Happened (WNH) rows from Sheets, aggregates a rolling window
+(default 7 days, UTC), and appends a single weekly digest row into Council_Insight.
 
-Scheduling
-----------
-Safe to schedule daily from main.py. This module self-gates:
-- Only runs on configured weekday (default: Thursday)
-- Dedupe by week_id + decision_id unless force=True
+Designed to be scheduled DAILY from the Bus scheduler (main.py); it self-gates
+by weekday and dedupes by decision_id (week id).
 
-Config (DB_READ_JSON)
----------------------
-{
-  "wnh": {
-    "tab": "Why_Nothing_Happened",
-    "weekly_digest": {
-      "enabled": 1,
-      "days": 7,
-      "dow": "thu",                 # mon,tue,wed,thu,fri,sat,sun
-      "drop_tokens": ["SYSTEM"],
-      "drop_primary": ["DAILY_SUMMARY","SELF_TEST","SELF_TEST_POLICY_DENY (safe)"],
-      "primary_map": {"APPROVED_DRYRUN":"APPROVED_BUT_GATED"},
-      "leaderboard_n": 10,
-      "council_insight_tab": "Council_Insight"
-    }
-  }
-}
+Council_Insight header (expected)
+Timestamp	decision_id	Autonomy	OK	Reason	Story	Ash's Lens	Soul	Nova	Orion	Ash	Lumen	Vigil
+Raw Intent	Patched	Flags	Exec Timestamp	Exec Status	Exec Cmd_ID	Exec Notional_USD	Exec Quote
+Outcome Tag	Mark Price_USD	PnL_USD_Current	PnL_Tag_Current
 """
 
 from __future__ import annotations
@@ -41,17 +19,15 @@ from __future__ import annotations
 import os
 import json
 import time
-import uuid
 import logging
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
-
 
 log = logging.getLogger("wnh_weekly_digest")
 
 
 # -----------------------------
-# small helpers
+# helpers
 # -----------------------------
 
 def _truthy(v) -> bool:
@@ -94,18 +70,17 @@ def _iso_week_id(dt: datetime) -> str:
 
 
 def _dow_str(dt: datetime) -> str:
-    # mon..sun
     return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt.weekday()]
 
 
 def _parse_ts(s: str) -> datetime | None:
     """
-    Accepts either:
+    Accepts:
       - 2026-01-22 00:52:50
       - 1/22/2026 13:07:19
       - 01/22/2026 13:07:19
-      - 2026-01-22T00:52:50Z (rare)
-    Returns UTC-aware datetime.
+      - 2026-01-22T00:52:50Z
+    Returns UTC-aware dt.
     """
     if not s:
         return None
@@ -113,7 +88,6 @@ def _parse_ts(s: str) -> datetime | None:
     if not s:
         return None
 
-    # Normalize ISO-ish Z
     if s.endswith("Z") and "T" in s:
         try:
             return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
@@ -133,7 +107,6 @@ def _parse_ts(s: str) -> datetime | None:
         except Exception:
             continue
 
-    # Last resort: try fromisoformat without timezone
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
@@ -143,33 +116,27 @@ def _parse_ts(s: str) -> datetime | None:
         return None
 
 
-def _retry(callable_fn, *, tries: int = 6, base_sleep: float = 0.6):
-    """
-    Minimal exponential backoff wrapper for gspread calls.
-    """
+def _retry(fn, tries: int = 6, base_sleep: float = 0.6):
     last = None
     for i in range(tries):
         try:
-            return callable_fn()
+            return fn()
         except Exception as e:
             last = e
-            # jitterless but increasing
             time.sleep(base_sleep * (2 ** i))
     raise last  # type: ignore
 
 
 def _get_ws(tab: str):
     """
-    Prefer your cached helper if present; fallback to gspread direct.
+    Prefer utils.get_ws_cached(tab, ttl_s=30) if present, else gspread direct.
     """
-    # 1) Preferred: utils.get_ws_cached (you already use this pattern elsewhere)
     try:
         from utils import get_ws_cached  # type: ignore
         return get_ws_cached(tab, ttl_s=30)
     except Exception:
         pass
 
-    # 2) Fallback: direct gspread
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
 
@@ -213,11 +180,7 @@ def _append_by_header(ws, row_dict: dict) -> None:
         _retry(lambda: ws.append_row(row))
 
 
-def _dedupe_recent(ws, decision_id: str, window: int = 250) -> bool:
-    """
-    Returns True if decision_id already exists in recent rows.
-    (Lightweight: reads all values then slices tail; OK because Council_Insight is modest.)
-    """
+def _dedupe_recent(ws, decision_id: str, window: int = 400) -> bool:
     vals = _retry(lambda: ws.get_all_values()) or []
     if len(vals) <= 1:
         return False
@@ -225,9 +188,7 @@ def _dedupe_recent(ws, decision_id: str, window: int = 250) -> bool:
     try:
         didx = header.index("decision_id")
     except Exception:
-        # if no decision_id column, can't dedupe reliably
         return False
-
     tail = vals[max(1, len(vals) - window):]
     for r in tail:
         if len(r) > didx and r[didx] == decision_id:
@@ -238,19 +199,16 @@ def _dedupe_recent(ws, decision_id: str, window: int = 250) -> bool:
 def _compact_pairs(pairs: list[tuple[str, int]], limit: int = 6) -> str:
     if not pairs:
         return "none"
-    out = []
-    for k, n in pairs[:limit]:
-        out.append(f"{k}={n}")
-    return ", ".join(out)
+    return ", ".join([f"{k}={n}" for k, n in pairs[:limit]])
 
 
 def _format_token_leaderboard(lb_rows: list[dict], limit: int = 10) -> str:
     """
-    Example: XYZ(12: B=9 D=3) top=STALE; TESTTRADE(7: B=0 D=7) top=APPROVED_BUT_GATED
+    Short, readable one-liner for the Story cell.
     """
     if not lb_rows:
         return "none"
-    chunks = []
+    parts = []
     for r in lb_rows[:limit]:
         tok = r["token"]
         total = r["total"]
@@ -258,19 +216,27 @@ def _format_token_leaderboard(lb_rows: list[dict], limit: int = 10) -> str:
         d = r.get("deferred", 0)
         top_reason = r.get("top_primary", "")
         if top_reason:
-            chunks.append(f"{tok}({total}: B={b} D={d}) top={top_reason}")
+            parts.append(f"{tok}({total}:B{b}/D{d})[{top_reason}]")
         else:
-            chunks.append(f"{tok}({total}: B={b} D={d})")
-    return " | ".join(chunks)
+            parts.append(f"{tok}({total}:B{b}/D{d})")
+    return " | ".join(parts)
+
+
+def _safe_json(obj) -> str:
+    try:
+        return json.dumps(obj, separators=(",", ":"), sort_keys=True, default=str)
+    except Exception:
+        return "{}"
 
 
 # -----------------------------
-# public entrypoint
+# entrypoint
 # -----------------------------
 
 def run_wnh_weekly_digest(force: bool = False) -> dict:
     cfg = _load_db_read_json()
 
+    # config
     enabled = _truthy(_cfg_get(cfg, "wnh.weekly_digest.enabled", 1))
     if not enabled and not force:
         return {"ok": True, "rows": 0, "skipped": "disabled"}
@@ -279,7 +245,11 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
     dow = str(_cfg_get(cfg, "wnh.weekly_digest.dow", "thu") or "thu").strip().lower()
 
     drop_tokens = _cfg_get(cfg, "wnh.weekly_digest.drop_tokens", ["SYSTEM"]) or ["SYSTEM"]
-    drop_primary = _cfg_get(cfg, "wnh.weekly_digest.drop_primary", ["DAILY_SUMMARY", "SELF_TEST", "SELF_TEST_POLICY_DENY (safe)"]) or []
+    drop_primary = _cfg_get(
+        cfg,
+        "wnh.weekly_digest.drop_primary",
+        ["DAILY_SUMMARY", "SELF_TEST", "SELF_TEST_POLICY_DENY (safe)"],
+    ) or []
     primary_map = _cfg_get(cfg, "wnh.weekly_digest.primary_map", {"APPROVED_DRYRUN": "APPROVED_BUT_GATED"}) or {}
     leaderboard_n = int(_cfg_get(cfg, "wnh.weekly_digest.leaderboard_n", 10) or 10)
 
@@ -287,9 +257,8 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
     council_tab = str(_cfg_get(cfg, "wnh.weekly_digest.council_insight_tab", "Council_Insight") or "Council_Insight").strip() or "Council_Insight"
 
     now = _now_utc()
-    # self-gate by weekday unless force
     if not force and dow and _dow_str(now) != dow:
-        return {"ok": True, "rows": 0, "skipped": f"dow_mismatch (now={_dow_str(now)} want={dow})"}
+        return {"ok": True, "rows": 0, "skipped": f"dow_mismatch(now={_dow_str(now)} want={dow})"}
 
     window_end = now
     window_start = now - timedelta(days=days)
@@ -297,21 +266,13 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
     week_id = _iso_week_id(now)
     decision_id = f"wnh_weekly_{week_id}"
 
-    # Load WNH sheet
+    # Load WNH values
     ws_wnh = _get_ws(wnh_tab)
     vals = _retry(lambda: ws_wnh.get_all_values()) or []
-    if len(vals) <= 1:
-        # No data rows; still emit a digest if force, otherwise skip quietly.
-        if not force:
-            return {"ok": True, "rows": 0, "skipped": "no_wnh_rows"}
-        header = vals[0] if vals else []
-        # proceed with empty aggregates
-
     header = vals[0] if vals else []
     rows = vals[1:] if len(vals) > 1 else []
 
-    # Column indices (best effort)
-    def idx(name: str) -> int | None:
+    def idx(name: str):
         try:
             return header.index(name)
         except Exception:
@@ -324,7 +285,6 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
     i_primary = idx("Primary_Reason")
     i_secondary = idx("Secondary_Reasons")
 
-    # Aggregate
     stage_counts = Counter()
     outcome_counts = Counter()
     primary_counts = Counter()
@@ -333,12 +293,14 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
     token_total = Counter()
     token_blocked = Counter()
     token_deferred = Counter()
-    token_primary = defaultdict(Counter)  # token -> Counter(primary)
+    token_primary = defaultdict(Counter)
 
     considered_rows = 0
 
+    drop_tok_set = set(drop_tokens)
+    drop_primary_set = set(drop_primary)
+
     for r in rows:
-        # timestamp filter
         ts_val = r[i_ts] if (i_ts is not None and len(r) > i_ts) else ""
         ts = _parse_ts(ts_val)
         if not ts:
@@ -347,11 +309,11 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
             continue
 
         tok = (r[i_token] if (i_token is not None and len(r) > i_token) else "").strip()
-        if tok in set(drop_tokens):
+        if tok in drop_tok_set:
             continue
 
         primary = (r[i_primary] if (i_primary is not None and len(r) > i_primary) else "").strip()
-        if primary in set(drop_primary):
+        if primary in drop_primary_set:
             continue
         if primary in primary_map:
             primary = str(primary_map[primary])
@@ -385,13 +347,12 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
     top_primary = primary_counts.most_common(10)
     top_secondary = secondary_counts.most_common(10)
 
-    # Build leaderboard objects
-    lb = []
+    leaderboard = []
     for tok, total in token_total.most_common(leaderboard_n):
         tp = ""
         if token_primary.get(tok):
             tp = token_primary[tok].most_common(1)[0][0]
-        lb.append({
+        leaderboard.append({
             "token": tok,
             "total": int(total),
             "blocked": int(token_blocked.get(tok, 0)),
@@ -399,18 +360,27 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
             "top_primary": tp,
         })
 
-    # Story formatting (keep it readable in a single cell)
+    # Story (single cell, readable)
     start_s = window_start.strftime("%Y-%m-%d")
     end_s = window_end.strftime("%Y-%m-%d")
-    story_lines = [
-        f"WNH Weekly Digest (UTC {start_s}→{end_s}): rows={considered_rows}",
-        f"Stages={json.dumps(dict(stage_counts), separators=(',',':'))}",
-        f"Outcomes={json.dumps(dict(outcome_counts), separators=(',',':'))}",
-        f"Primary={_compact_pairs(top_primary, limit=6)}",
-        f"Secondary={_compact_pairs(top_secondary, limit=6)}",
-        f"Token Leaderboard={_format_token_leaderboard(lb, limit=leaderboard_n)}",
-    ]
-    story = " | ".join([s for s in story_lines if s])
+    story = (
+        f"WNH Weekly Digest (UTC {start_s}→{end_s}): rows={considered_rows} | "
+        f"stages={_safe_json(dict(stage_counts))} | "
+        f"outcomes={_safe_json(dict(outcome_counts))} | "
+        f"primary={_compact_pairs(top_primary, 6)} | "
+        f"secondary={_compact_pairs(top_secondary, 6)} | "
+        f"tokens={_format_token_leaderboard(leaderboard, leaderboard_n)}"
+    )
+
+    # Council voice columns (short + useful)
+    # Keep them very compact so Council_Insight stays scannable.
+    ash_lens = "clean"
+    soul = f"Theme: {_compact_pairs(top_primary, 3)}"
+    nova = f"Friction: {_compact_pairs(top_secondary, 3)}"
+    orion = f"Hot tokens: " + (", ".join([x["token"] for x in leaderboard[:5]]) if leaderboard else "none")
+    ash = f"Rows={considered_rows} Days={days}"
+    lumen = f"Outcomes: " + (", ".join([f"{k}={v}" for k, v in outcome_counts.most_common(3)]) if outcome_counts else "none")
+    vigil = "No exec; observation rollup"
 
     raw_intent = {
         "week_id": week_id,
@@ -424,7 +394,7 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
         "outcome_counts": dict(outcome_counts),
         "top_primary_reasons": [[k, int(v)] for k, v in top_primary],
         "top_secondary_reasons": [[k, int(v)] for k, v in top_secondary],
-        "token_leaderboard": lb,
+        "token_leaderboard": leaderboard,
         "filters": {
             "drop_tokens": drop_tokens,
             "drop_primary": drop_primary,
@@ -433,11 +403,11 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
         "source": "wnh_weekly_digest",
     }
 
-    # Write to Council_Insight
-    ws_council = _get_ws(council_tab)
+    # Append to Council_Insight
+    ws_ci = _get_ws(council_tab)
 
-    if not force and _dedupe_recent(ws_council, decision_id):
-        return {"ok": True, "rows": 0, "decision_id": decision_id, "week_id": week_id, "tab": council_tab, "deduped": True}
+    if not force and _dedupe_recent(ws_ci, decision_id):
+        return {"ok": True, "rows": 0, "deduped": True, "decision_id": decision_id, "week_id": week_id}
 
     ts_out = _now_utc().strftime("%m/%d/%Y %H:%M:%S")
 
@@ -448,23 +418,33 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
         "OK": "TRUE",
         "Reason": "WNH_WEEKLY_DIGEST",
         "Story": story,
-        "Ash's Lens": "clean",
-        "Raw Intent": json.dumps(raw_intent, separators=(",", ":"), sort_keys=True),
-        "Flags": json.dumps(["wnh_weekly", week_id]),
+
+        "Ash's Lens": ash_lens,
+        "Soul": soul,
+        "Nova": nova,
+        "Orion": orion,
+        "Ash": ash,
+        "Lumen": lumen,
+        "Vigil": vigil,
+
+        "Raw Intent": _safe_json(raw_intent),
+        "Patched": "",  # reserved for later “post-processing” / normalization
+        "Flags": _safe_json(["wnh_weekly", week_id]),
+
+        # Exec / PnL fields intentionally blank for digest rows
+        "Exec Timestamp": "",
+        "Exec Status": "",
+        "Exec Cmd_ID": "",
+        "Exec Notional_USD": "",
+        "Exec Quote": "",
+
         "Outcome Tag": "WNH_WEEKLY",
+        "Mark Price_USD": "",
+        "PnL_USD_Current": "",
+        "PnL_Tag_Current": "",
     }
 
-    _append_by_header(ws_council, row_dict)
-
-    # Best-effort: mirror append event (if you have it)
-    try:
-        from db_mirror import mirror_append  # type: ignore
-        # We don't know the exact header order here; mirror_append expects [row] arrays typically.
-        # Safer: mirror payload event instead if you have it; otherwise skip.
-        pass
-    except Exception:
-        pass
-
+    _append_by_header(ws_ci, row_dict)
     return {"ok": True, "rows": 1, "decision_id": decision_id, "week_id": week_id, "tab": council_tab}
 
 
