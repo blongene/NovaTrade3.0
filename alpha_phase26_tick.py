@@ -10,7 +10,6 @@ Sequence
 --------
 1) Generate preview-only WOULD_* proposals via the SQL-native runner.
 2) Mirror today's proposals to Sheets (presentation only).
-2b) Mirror Alpha "Why Nothing Happened" to shared WNH surface (presentation only).
 3) (Optional) Phase 26E: enqueue approved intents into canonical commands outbox.
 
 Safety
@@ -72,6 +71,7 @@ def run_alpha_phase26_tick() -> None:
     else:
         preview_ok = planning_enabled
     if not preview_ok:
+        # Quiet skip; upstream scheduler already prints its label.
         return
 
     # 1) Generate proposals (SQL-native runner)
@@ -79,6 +79,7 @@ def run_alpha_phase26_tick() -> None:
         from alpha_proposal_runner import run_alpha_proposal_runner
         run_alpha_proposal_runner()
     except Exception as e:
+        # Prefer utils.warn if available, but never fail the tick because warn isn't available.
         try:
             from utils import warn
             warn(f"alpha_phase26_tick: proposal runner failed: {e}")
@@ -102,20 +103,20 @@ def run_alpha_phase26_tick() -> None:
     try:
         from alpha_wnh_mirror import run_alpha_wnh_mirror
         run_alpha_wnh_mirror()
-    except Exception as e:
+    
+        # Daily WNH summary (one row per UTC day; presentation-only)
+        try:
+            from wnh_daily_summary import run_wnh_daily_summary
+            run_wnh_daily_summary()
+        except Exception:
+            pass
+except Exception as e:
         try:
             from utils import warn
             warn(f"alpha_phase26_tick: alpha WNH mirror failed: {e}")
         except Exception:
             log.warning("alpha_phase26_tick: alpha WNH mirror failed: %s", e)
 
-    # 2c) Daily WNH summary (one row per UTC day; presentation-only)
-    try:
-        from wnh_daily_summary import run_wnh_daily_summary
-        run_wnh_daily_summary()
-    except Exception:
-        pass
-    
     # ----------------------------
     # Phase 26E gate (enqueue)
     # ----------------------------
@@ -136,12 +137,21 @@ def run_alpha_phase26_tick() -> None:
     if not enqueue_ok:
         return
 
+    # Emit Alpha-WNH every tick (safe; deduped)
     try:
+        from alpha_wnh_mirror import run_alpha_wnh_mirror
+        run_alpha_wnh_mirror()
+    except Exception:
+        pass
+
+    try:
+        # Support either function name depending on your current module
         from alpha_phase26e_enqueue import enqueue_from_approvals
         processed, enq_new = enqueue_from_approvals(limit=25)
         if enq_new:
             log.info("alpha26e_enqueue: processed=%s enqueued_new=%s", processed, enq_new)
     except Exception as e:
+        # Never fail the tick because enqueue had a problem.
         log.warning("alpha26e_enqueue: skipped/failed: %s", e)
 
 
