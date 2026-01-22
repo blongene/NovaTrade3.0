@@ -444,9 +444,21 @@ def run_wnh_weekly_digest(force: bool = False) -> dict:
         "PnL_Tag_Current": "",
     }
 
-    _append_by_header(ws_ci, row_dict)
-    return {"ok": True, "rows": 1, "decision_id": decision_id, "week_id": week_id, "tab": council_tab}
+    from event_store import put_council_event
 
+    put_council_event(
+        decision_id,
+        row_dict,
+        tab="Council_Insight",
+    )
+
+    return {
+        "ok": True,
+        "rows": 1,
+        "decision_id": decision_id,
+        "week_id": week_id,
+        "tab": council_tab,
+    }
 
 if __name__ == "__main__":
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
