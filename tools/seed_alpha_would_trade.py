@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import psycopg2
 
 
-def utc_day():
+def utc_day() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
@@ -18,17 +18,13 @@ def main():
     if not url:
         raise RuntimeError("DATABASE_URL / DB_URL not set")
 
-    conn = psycopg2.connect(url)
-    conn.autocommit = True
-    cur = conn.cursor()
-
     proposal_id = str(uuid.uuid4())
     token = "TESTTRADE"
     action = "WOULD_TRADE"
     confidence = 0.42
 
-    today = utc_day()
-    proposal_hash = f"{token}|{action}|{today}"
+    day = utc_day()
+    proposal_hash = f"{token}|{action}|{day}"
 
     payload = {
         "token": token,
@@ -36,21 +32,23 @@ def main():
         "confidence": confidence,
         "source": "seed_alpha_would_trade",
         "note": "Synthetic test proposal for WNH coverage",
-        "utc_day": today,
+        "utc_day": day,
     }
 
+    conn = psycopg2.connect(url)
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    # Idempotent insert WITHOUT needing a unique constraint
     cur.execute(
         """
-        insert into alpha_proposals (
-            proposal_id,
-            proposal_hash,
-            token,
-            action,
-            confidence,
-            payload
+        insert into alpha_proposals (proposal_id, proposal_hash, token, action, confidence, payload)
+        select %s, %s, %s, %s, %s, %s::jsonb
+        where not exists (
+            select 1
+            from alpha_proposals
+            where proposal_hash = %s
         )
-        values (%s, %s, %s, %s, %s, %s::jsonb)
-        on conflict (proposal_hash) do nothing
         """,
         (
             proposal_id,
@@ -59,25 +57,25 @@ def main():
             action,
             confidence,
             json.dumps(payload),
+            proposal_hash,
         ),
     )
+
+    # Confirm whether it inserted (rowcount can be 0/1)
+    inserted = (cur.rowcount == 1)
 
     cur.close()
     conn.close()
 
-    print("Seeded alpha_proposals row:")
-    print(
-        json.dumps(
-            {
-                "proposal_id": proposal_id,
-                "proposal_hash": proposal_hash,
-                "action": action,
-                "token": token,
-                "confidence": confidence,
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "ok": True,
+        "inserted": inserted,
+        "proposal_id": proposal_id,
+        "proposal_hash": proposal_hash,
+        "token": token,
+        "action": action,
+        "confidence": confidence
+    }, indent=2))
 
 
 if __name__ == "__main__":
