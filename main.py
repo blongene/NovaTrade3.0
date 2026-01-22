@@ -1,4 +1,3 @@
-import time
 
 # main.py — NovaTrade 3.0 (bullet-proof boot, lazy imports, quota-safe) — PHASE 9 PATCHED
 import os, time, random, threading, schedule
@@ -99,10 +98,10 @@ if RUN_WEBHOOK_IN_MAIN:
 
 # --- Safe import + call helpers ----------------------------------------------
 def _safe_import(module_path: str):
-    """Import a module by string. Returns module or None."""
+    """Import a module by string. Returns the module object or None. Never raises."""
     try:
-        __import__(module_path)
-        return globals()[module_path] if module_path in globals() else __import__(module_path)
+        import importlib
+        return importlib.import_module(module_path)
     except Exception as e:
         warn(f"Import skipped ({module_path}): {e}")
         return None
@@ -239,7 +238,56 @@ def _phase22a_interval_min() -> int:
         return int(os.getenv("PHASE22A_ADVISORY_EVERY_MIN", "60") or "60")
     except Exception:
         return 60
+        
+def _council_rollup_every_min(default: int) -> int:
+    """
+    Read cadence from DB_READ_JSON if present (preferred), else fall back to env, else default.
+    Keeps env-var count low.
+    """
+    try:
+        raw = (os.getenv("DB_READ_JSON") or "").strip()
+        if raw:
+            cfg = json.loads(raw)
+            council = cfg.get("council_rollups") or {}
+            if isinstance(council, dict):
+                v = council.get("every_min")
+                if v is not None:
+                    return max(5, int(v))
+    except Exception:
+        pass
+    try:
+        return max(5, int(os.getenv("COUNCIL_ROLLUPS_EVERY_MIN", str(default)) or str(default)))
+    except Exception:
+        return default
 
+def _council_pnl_every_min(default: int) -> int:
+    try:
+        raw = (os.getenv("DB_READ_JSON") or "").strip()
+        if raw:
+            cfg = json.loads(raw)
+            council = cfg.get("council_rollups") or {}
+            if isinstance(council, dict):
+                v = council.get("pnl_every_min")
+                if v is not None:
+                    return max(5, int(v))
+    except Exception:
+        pass
+    return default
+
+def _council_index_every_min(default: int) -> int:
+    try:
+        raw = (os.getenv("DB_READ_JSON") or "").strip()
+        if raw:
+            cfg = json.loads(raw)
+            council = cfg.get("council_rollups") or {}
+            if isinstance(council, dict):
+                v = council.get("index_every_min")
+                if v is not None:
+                    return max(5, int(v))
+    except Exception:
+        pass
+    return default
+    
 def _set_schedules():
     # Frequent cadence / watchers
     _schedule("Nova Trigger Watcher",          "nova_trigger_watcher",       "check_nova_trigger",            every=2,  unit="minutes")
@@ -308,57 +356,6 @@ def _set_schedules():
         print("🧪 Scheduled DB parity validator every 6 hours", flush=True)
     except Exception as e:
         print(f"DB parity validator not scheduled: {e}", flush=True)
-
-def _council_rollup_every_min(default: int) -> int:
-    """
-    Read cadence from DB_READ_JSON if present (preferred), else fall back to env, else default.
-    Keeps env-var count low.
-    """
-    try:
-        raw = (os.getenv("DB_READ_JSON") or "").strip()
-        if raw:
-            cfg = json.loads(raw)
-            council = cfg.get("council_rollups") or {}
-            if isinstance(council, dict):
-                v = council.get("every_min")
-                if v is not None:
-                    return max(5, int(v))
-    except Exception:
-        pass
-    try:
-        return max(5, int(os.getenv("COUNCIL_ROLLUPS_EVERY_MIN", str(default)) or str(default)))
-    except Exception:
-        return default
-
-
-def _council_pnl_every_min(default: int) -> int:
-    try:
-        raw = (os.getenv("DB_READ_JSON") or "").strip()
-        if raw:
-            cfg = json.loads(raw)
-            council = cfg.get("council_rollups") or {}
-            if isinstance(council, dict):
-                v = council.get("pnl_every_min")
-                if v is not None:
-                    return max(5, int(v))
-    except Exception:
-        pass
-    return default
-
-
-def _council_index_every_min(default: int) -> int:
-    try:
-        raw = (os.getenv("DB_READ_JSON") or "").strip()
-        if raw:
-            cfg = json.loads(raw)
-            council = cfg.get("council_rollups") or {}
-            if isinstance(council, dict):
-                v = council.get("index_every_min")
-                if v is not None:
-                    return max(5, int(v))
-    except Exception:
-        pass
-    return default
 
 
 def _kick_once_and_threads():
