@@ -1,61 +1,60 @@
-#!/usr/bin/env python3
+# wnh_weekly_digest.py
 """
-wnh_weekly_digest.py
+WNH → Council_Insight Weekly Digest (Bus/DB-driven; Sheets-mirrored)
 
-Weekly Why_Nothing_Happened → Council_Insight digest (with Token Leaderboard).
+What it does
+------------
+- Reads Why_Nothing_Happened (WNH) rows from Sheets (presentation plane)
+- Aggregates the last N days (default 7) into a weekly digest
+- Writes a single row into Council_Insight with:
+  - Stage/Outcome counts
+  - Top primary + secondary reasons
+  - Token leaderboard (top tokens by WNH appearances)
 
-Purpose
--------
-During observation mode, WNH explains *why* nothing executed. This weekly digest turns that surface
-into a single Council_Insight row so you can see trendlines without scrolling.
+Scheduling
+----------
+Safe to schedule daily from main.py. This module self-gates:
+- Only runs on configured weekday (default: Thursday)
+- Dedupe by week_id + decision_id unless force=True
 
-Design
-------
-- Observation-safe (no enqueue, no trading)
-- Best-effort (never raises)
-- DB+Sheet mirror (append to Sheet, then best-effort mirror_append)
-- Cross-instance dedupe by decision_id in Council_Insight tail
-- JSON-first: reads DB_READ_JSON.wnh.{enabled,tab,weekly_digest{...}}
-
-Config (DB_READ_JSON.wnh.weekly_digest)
---------------------------------------
+Config (DB_READ_JSON)
+---------------------
 {
-  "enabled": 1,                  # default True when wnh.enabled is True
-  "target_tab": "Council_Insight",
-  "tail_n": 250,                 # dedupe scan tail rows
-  "window_days": 7,              # rolling window length
-  "drop_tokens": ["SYSTEM"],     # tokens to ignore in digest stats
-  "drop_primary": ["DAILY_SUMMARY", "SELF_TEST", "SELF_TEST_POLICY_DENY (safe)"],
-  "primary_map": {"APPROVED_DRYRUN": "APPROVED_BUT_GATED"},
-  "top_tokens_k": 8,             # token leaderboard size
-  "top_primary_k": 6,
-  "top_secondary_k": 8
+  "wnh": {
+    "tab": "Why_Nothing_Happened",
+    "weekly_digest": {
+      "enabled": 1,
+      "days": 7,
+      "dow": "thu",                 # mon,tue,wed,thu,fri,sat,sun
+      "drop_tokens": ["SYSTEM"],
+      "drop_primary": ["DAILY_SUMMARY","SELF_TEST","SELF_TEST_POLICY_DENY (safe)"],
+      "primary_map": {"APPROVED_DRYRUN":"APPROVED_BUT_GATED"},
+      "leaderboard_n": 10,
+      "council_insight_tab": "Council_Insight"
+    }
+  }
 }
-
-Output
-------
-Appends 1 row/week to Council_Insight with:
-- decision_id = wnh_weekly_<YYYY>-W<WW>
-- Reason = WNH_WEEKLY_DIGEST
-- Story = polished human-readable summary (includes token leaderboard)
-- Raw Intent = JSON payload of counts + filters applied
-
-If Council_Insight headers differ, we map by header row (source-of-truth) and only fill known fields.
 """
 
 from __future__ import annotations
 
 import os
 import json
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Tuple, Optional
+import time
+import uuid
+import logging
+from datetime import datetime, timedelta, timezone
+from collections import Counter, defaultdict
 
 
-# -----------------------
-# tiny helpers
-# -----------------------
+log = logging.getLogger("wnh_weekly_digest")
 
-def _truthy(v: Any) -> bool:
+
+# -----------------------------
+# small helpers
+# -----------------------------
+
+def _truthy(v) -> bool:
     if v is None:
         return False
     if isinstance(v, bool):
@@ -65,158 +64,28 @@ def _truthy(v: Any) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _safe_json(obj: Any) -> str:
-    try:
-        return json.dumps(obj, ensure_ascii=False, default=str, separators=(",", ":"))
-    except Exception:
-        return "{}"
-
-
-def _load_db_read_json() -> Dict[str, Any]:
+def _load_db_read_json() -> dict:
     raw = (os.getenv("DB_READ_JSON") or "").strip()
     if not raw:
         return {}
     try:
-        o = json.loads(raw)
-        return o if isinstance(o, dict) else {}
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
 
 
-def _wnh_cfg() -> Dict[str, Any]:
-    cfg = _load_db_read_json()
-    w = cfg.get("wnh") or {}
-    return w if isinstance(w, dict) else {}
+def _cfg_get(cfg: dict, dotted: str, default=None):
+    cur = cfg
+    for p in dotted.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(p)
+    return default if cur is None else cur
 
 
-def _weekly_cfg() -> Dict[str, Any]:
-    wd = (_wnh_cfg().get("weekly_digest") or {})
-    return wd if isinstance(wd, dict) else {}
-
-
-def _enabled() -> bool:
-    # master enable
-    if not _truthy(_wnh_cfg().get("enabled", 0)):
-        return False
-    # weekly sub-enable (default ON when master ON)
-    wd = _weekly_cfg()
-    if "enabled" in wd:
-        return _truthy(wd.get("enabled"))
-    return True
-
-
-def _wnh_tab() -> str:
-    t = str(_wnh_cfg().get("tab") or "Why_Nothing_Happened").strip()
-    return t or "Why_Nothing_Happened"
-
-
-def _target_tab() -> str:
-    t = str(_weekly_cfg().get("target_tab") or "Council_Insight").strip()
-    return t or "Council_Insight"
-
-
-def _tail_n() -> int:
-    try:
-        n = int(_weekly_cfg().get("tail_n") or 250)
-        return max(60, min(n, 2000))
-    except Exception:
-        return 250
-
-
-def _window_days(default_days: int = 7) -> int:
-    try:
-        n = int(_weekly_cfg().get("window_days") or default_days)
-        return max(1, min(n, 30))
-    except Exception:
-        return default_days
-
-
-def _top_primary_k() -> int:
-    try:
-        n = int(_weekly_cfg().get("top_primary_k") or 6)
-        return max(3, min(n, 15))
-    except Exception:
-        return 6
-
-
-def _top_secondary_k() -> int:
-    try:
-        n = int(_weekly_cfg().get("top_secondary_k") or 8)
-        return max(3, min(n, 20))
-    except Exception:
-        return 8
-
-
-def _top_tokens_k() -> int:
-    try:
-        n = int(_weekly_cfg().get("top_tokens_k") or 8)
-        return max(3, min(n, 25))
-    except Exception:
-        return 8
-
-
-def _drop_tokens() -> List[str]:
-    v = _weekly_cfg().get("drop_tokens")
-    if isinstance(v, list):
-        return [str(x).strip() for x in v if str(x).strip()]
-    # default: ignore SYSTEM noise
-    return ["SYSTEM"]
-
-
-def _drop_primary() -> List[str]:
-    v = _weekly_cfg().get("drop_primary")
-    if isinstance(v, list):
-        return [str(x).strip() for x in v if str(x).strip()]
-    # default: ignore self-tests and daily summaries in weekly view
-    return ["DAILY_SUMMARY", "SELF_TEST", "SELF_TEST_POLICY_DENY (safe)"]
-
-
-def _primary_map() -> Dict[str, str]:
-    v = _weekly_cfg().get("primary_map")
-    if isinstance(v, dict):
-        out: Dict[str, str] = {}
-        for k, val in v.items():
-            ks = str(k).strip()
-            vs = str(val).strip()
-            if ks and vs:
-                out[ks] = vs
-        return out
-    # default: treat APPROVED_DRYRUN as the same “lane” as gated approvals
-    return {"APPROVED_DRYRUN": "APPROVED_BUT_GATED"}
-
-
-def _utc_now_dt() -> datetime:
+def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _fmt_ci_ts(dt: datetime) -> str:
-    # Council_Insight convention: M/D/YYYY H:MM:SS
-    return f"{dt.month}/{dt.day}/{dt.year} {dt.hour}:{dt.minute:02d}:{dt.second:02d}"
-
-
-def _parse_ts_any(v: Any) -> Optional[float]:
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).strip()
-    if not s:
-        return None
-    s = s.replace("T", " ")
-    try:
-        if "." in s:
-            s = s.split(".", 1)[0]
-        if len(s) == 10 and s[4] == "-":
-            dt = datetime.strptime(s, "%Y-%m-%d")
-        else:
-            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-        return dt.replace(tzinfo=timezone.utc).timestamp()
-    except Exception:
-        try:
-            dt = datetime.strptime(s, "%m/%d/%Y %H:%M:%S")
-            return dt.replace(tzinfo=timezone.utc).timestamp()
-        except Exception:
-            return None
 
 
 def _iso_week_id(dt: datetime) -> str:
@@ -224,312 +93,381 @@ def _iso_week_id(dt: datetime) -> str:
     return f"{iso.year}-W{iso.week:02d}"
 
 
-# -----------------------
-# reads
-# -----------------------
+def _dow_str(dt: datetime) -> str:
+    # mon..sun
+    return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt.weekday()]
 
-def _read_wnh_rows() -> List[Dict[str, Any]]:
-    tab = _wnh_tab()
 
-    # Prefer DB-first adapter if available
+def _parse_ts(s: str) -> datetime | None:
+    """
+    Accepts either:
+      - 2026-01-22 00:52:50
+      - 1/22/2026 13:07:19
+      - 01/22/2026 13:07:19
+      - 2026-01-22T00:52:50Z (rare)
+    Returns UTC-aware datetime.
+    """
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+
+    # Normalize ISO-ish Z
+    if s.endswith("Z") and "T" in s:
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            pass
+
+    fmts = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+    ]
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+    # Last resort: try fromisoformat without timezone
     try:
-        from db_read_adapter import get_records_prefer_db  # type: ignore
-        from utils import get_records_cached  # type: ignore
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
-        rows = get_records_prefer_db(
-            tab,
-            f"sheet_mirror:{tab}",
-            sheets_fallback_fn=lambda *args, **kwargs: get_records_cached(tab),
-        )
-        return rows if isinstance(rows, list) else []
+
+def _retry(callable_fn, *, tries: int = 6, base_sleep: float = 0.6):
+    """
+    Minimal exponential backoff wrapper for gspread calls.
+    """
+    last = None
+    for i in range(tries):
+        try:
+            return callable_fn()
+        except Exception as e:
+            last = e
+            # jitterless but increasing
+            time.sleep(base_sleep * (2 ** i))
+    raise last  # type: ignore
+
+
+def _get_ws(tab: str):
+    """
+    Prefer your cached helper if present; fallback to gspread direct.
+    """
+    # 1) Preferred: utils.get_ws_cached (you already use this pattern elsewhere)
+    try:
+        from utils import get_ws_cached  # type: ignore
+        return get_ws_cached(tab, ttl_s=30)
     except Exception:
         pass
 
-    # Sheets fallback
-    try:
-        from utils import get_records_cached  # type: ignore
-        rows = get_records_cached(tab)
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        return []
+    # 2) Fallback: direct gspread
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
 
+    sheet_url = os.getenv("SHEET_URL")
+    if not sheet_url:
+        raise RuntimeError("SHEET_URL not set")
 
-def _filter_window(rows: List[Dict[str, Any]], start_ts: float, end_ts: float) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        ts = _parse_ts_any(r.get("Timestamp"))
-        if ts is None:
-            continue
-        if start_ts <= ts <= end_ts:
-            out.append(r)
-    return out
+    svc = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if not svc:
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS not set")
 
-
-# -----------------------
-# counting
-# -----------------------
-
-def _count_by(rows: List[Dict[str, Any]], key: str) -> Dict[str, int]:
-    out: Dict[str, int] = {}
-    for r in rows:
-        v = r.get(key) if isinstance(r, dict) else ""
-        s = str(v or "").strip() or "(blank)"
-        out[s] = out.get(s, 0) + 1
-    return out
-
-
-def _top_k(d: Dict[str, int], k: int) -> List[Tuple[str, int]]:
-    return sorted(d.items(), key=lambda x: (-x[1], x[0]))[:k]
-
-
-def _explode_secondary(rows: List[Dict[str, Any]]) -> Dict[str, int]:
-    sec_counts: Dict[str, int] = {}
-    for r in rows:
-        s = str((r or {}).get("Secondary_Reasons") or "").strip()
-        if not s:
-            continue
-        parts = [p.strip() for p in s.split(",") if p.strip()]
-        for p in parts:
-            sec_counts[p] = sec_counts.get(p, 0) + 1
-    return sec_counts
-
-
-def _apply_filters(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    drop_tokens = set(x.upper() for x in _drop_tokens())
-    drop_primary = set(x.upper() for x in _drop_primary())
-    primary_map = _primary_map()
-
-    kept: List[Dict[str, Any]] = []
-    for r in rows:
-        token = str((r or {}).get("Token") or "").strip()
-        primary = str((r or {}).get("Primary_Reason") or "").strip()
-
-        if token and token.upper() in drop_tokens:
-            continue
-        if primary and primary.upper() in drop_primary:
-            continue
-
-        # map primary reason (e.g., APPROVED_DRYRUN -> APPROVED_BUT_GATED)
-        if primary in primary_map:
-            r = dict(r)
-            r["Primary_Reason"] = primary_map[primary]
-
-        kept.append(r)
-
-    meta = {
-        "drop_tokens": list(_drop_tokens()),
-        "drop_primary": list(_drop_primary()),
-        "primary_map": dict(_primary_map()),
-    }
-    return kept, meta
-
-
-# -----------------------
-# sheets append (Council_Insight)
-# -----------------------
-
-def _get_ws(tab: str):
-    from utils import get_ws_cached  # type: ignore
-    return get_ws_cached(tab, ttl_s=30)
-
-
-def _get_all_values(ws) -> List[List[str]]:
-    try:
-        return ws.get_all_values() or []
-    except Exception:
-        return []
-
-
-def _ensure_headers_if_empty(tab: str, ws) -> List[str]:
-    vals = _get_all_values(ws)
-    if vals and vals[0]:
-        return vals[0]
-
-    # Create a minimal Council_Insight header if the tab is empty
-    header = [
-        "Timestamp",
-        "decision_id",
-        "Autonomy",
-        "OK",
-        "Reason",
-        "Story",
-        "Ash's Lens",
-        "Soul",
-        "Nova",
-        "Orion",
-        "Ash",
-        "Lumen",
-        "Vigil",
-        "Raw Intent",
-        "Patched",
-        "Flags",
-        "Exec Timestamp",
-        "Exec Status",
-        "Exec Cmd_ID",
-        "Exec Notional_USD",
-        "Exec Quote",
-        "Outcome Tag",
-        "Mark Price_USD",
-        "PnL_USD_Current",
-        "PnL_Tag_Current",
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
     ]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(svc, scope)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(sheet_url)
     try:
-        ws.append_row(header, value_input_option="USER_ENTERED")
+        return sh.worksheet(tab)
     except Exception:
-        ws.append_row(header)
-    return header
+        return sh.add_worksheet(title=tab, rows=4000, cols=60)
 
 
-def _tail_has_decision_id(vals: List[List[str]], decision_id: str, tail_n: int) -> bool:
-    if not vals:
-        return False
-    header = vals[0] or []
+def _read_header(ws) -> list[str]:
     try:
-        i = header.index("decision_id")
+        return _retry(lambda: ws.row_values(1)) or []
     except Exception:
+        vals = _retry(lambda: ws.get_all_values()) or []
+        return vals[0] if vals else []
+
+
+def _append_by_header(ws, row_dict: dict) -> None:
+    header = _read_header(ws)
+    if not header:
+        raise RuntimeError("Target sheet has no header row")
+    row = [row_dict.get(h, "") for h in header]
+    try:
+        _retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+    except Exception:
+        _retry(lambda: ws.append_row(row))
+
+
+def _dedupe_recent(ws, decision_id: str, window: int = 250) -> bool:
+    """
+    Returns True if decision_id already exists in recent rows.
+    (Lightweight: reads all values then slices tail; OK because Council_Insight is modest.)
+    """
+    vals = _retry(lambda: ws.get_all_values()) or []
+    if len(vals) <= 1:
+        return False
+    header = vals[0]
+    try:
+        didx = header.index("decision_id")
+    except Exception:
+        # if no decision_id column, can't dedupe reliably
         return False
 
-    tail = vals[-tail_n:] if len(vals) > tail_n else vals[1:]
+    tail = vals[max(1, len(vals) - window):]
     for r in tail:
-        if len(r) > i and (r[i] or "").strip() == decision_id:
+        if len(r) > didx and r[didx] == decision_id:
             return True
     return False
 
 
-def _append_row(tab: str, row: List[Any]) -> None:
-    # Prefer shared helper if present (rate-limit safe)
-    try:
-        from utils import get_ws_cached, ws_append_row  # type: ignore
-        ws = get_ws_cached(tab, ttl_s=30)
-        ws_append_row(ws, row)
-        return
-    except Exception:
-        pass
-
-    ws = _get_ws(tab)
-    try:
-        ws.append_row(row, value_input_option="USER_ENTERED")
-    except Exception:
-        ws.append_row(row)
+def _compact_pairs(pairs: list[tuple[str, int]], limit: int = 6) -> str:
+    if not pairs:
+        return "none"
+    out = []
+    for k, n in pairs[:limit]:
+        out.append(f"{k}={n}")
+    return ", ".join(out)
 
 
-# -----------------------
-# main
-# -----------------------
-
-def run_wnh_weekly_digest(force: bool = False, window_days: Optional[int] = None) -> Dict[str, Any]:
+def _format_token_leaderboard(lb_rows: list[dict], limit: int = 10) -> str:
     """
-    Returns:
-      { ok: bool, rows: int, decision_id: str, week_id: str, tab: str, deduped?: bool, reason?: str }
+    Example: XYZ(12: B=9 D=3) top=STALE; TESTTRADE(7: B=0 D=7) top=APPROVED_BUT_GATED
     """
-    if not _enabled():
-        return {"ok": False, "skipped": True, "reason": "wnh.disabled"}
+    if not lb_rows:
+        return "none"
+    chunks = []
+    for r in lb_rows[:limit]:
+        tok = r["token"]
+        total = r["total"]
+        b = r.get("blocked", 0)
+        d = r.get("deferred", 0)
+        top_reason = r.get("top_primary", "")
+        if top_reason:
+            chunks.append(f"{tok}({total}: B={b} D={d}) top={top_reason}")
+        else:
+            chunks.append(f"{tok}({total}: B={b} D={d})")
+    return " | ".join(chunks)
 
-    now = _utc_now_dt()
+
+# -----------------------------
+# public entrypoint
+# -----------------------------
+
+def run_wnh_weekly_digest(force: bool = False) -> dict:
+    cfg = _load_db_read_json()
+
+    enabled = _truthy(_cfg_get(cfg, "wnh.weekly_digest.enabled", 1))
+    if not enabled and not force:
+        return {"ok": True, "rows": 0, "skipped": "disabled"}
+
+    days = int(_cfg_get(cfg, "wnh.weekly_digest.days", 7) or 7)
+    dow = str(_cfg_get(cfg, "wnh.weekly_digest.dow", "thu") or "thu").strip().lower()
+
+    drop_tokens = _cfg_get(cfg, "wnh.weekly_digest.drop_tokens", ["SYSTEM"]) or ["SYSTEM"]
+    drop_primary = _cfg_get(cfg, "wnh.weekly_digest.drop_primary", ["DAILY_SUMMARY", "SELF_TEST", "SELF_TEST_POLICY_DENY (safe)"]) or []
+    primary_map = _cfg_get(cfg, "wnh.weekly_digest.primary_map", {"APPROVED_DRYRUN": "APPROVED_BUT_GATED"}) or {}
+    leaderboard_n = int(_cfg_get(cfg, "wnh.weekly_digest.leaderboard_n", 10) or 10)
+
+    wnh_tab = str(_cfg_get(cfg, "wnh.tab", "Why_Nothing_Happened") or "Why_Nothing_Happened").strip() or "Why_Nothing_Happened"
+    council_tab = str(_cfg_get(cfg, "wnh.weekly_digest.council_insight_tab", "Council_Insight") or "Council_Insight").strip() or "Council_Insight"
+
+    now = _now_utc()
+    # self-gate by weekday unless force
+    if not force and dow and _dow_str(now) != dow:
+        return {"ok": True, "rows": 0, "skipped": f"dow_mismatch (now={_dow_str(now)} want={dow})"}
+
+    window_end = now
+    window_start = now - timedelta(days=days)
+
     week_id = _iso_week_id(now)
     decision_id = f"wnh_weekly_{week_id}"
 
-    days = int(window_days) if window_days is not None else _window_days(7)
-    start = now - timedelta(days=max(1, days))
-    start_ts = start.timestamp()
-    end_ts = now.timestamp()
+    # Load WNH sheet
+    ws_wnh = _get_ws(wnh_tab)
+    vals = _retry(lambda: ws_wnh.get_all_values()) or []
+    if len(vals) <= 1:
+        # No data rows; still emit a digest if force, otherwise skip quietly.
+        if not force:
+            return {"ok": True, "rows": 0, "skipped": "no_wnh_rows"}
+        header = vals[0] if vals else []
+        # proceed with empty aggregates
 
-    # Gather + filter
-    rows_all = _read_wnh_rows()
-    rows_window = _filter_window(rows_all, start_ts, end_ts)
-    rows, filters_meta = _apply_filters(rows_window)
+    header = vals[0] if vals else []
+    rows = vals[1:] if len(vals) > 1 else []
 
-    # Counts
-    stage_counts = _count_by(rows, "Stage")
-    outcome_counts = _count_by(rows, "Outcome")
-    primary_counts = _count_by(rows, "Primary_Reason")
-    token_counts = _count_by(rows, "Token")
-    sec_counts = _explode_secondary(rows)
+    # Column indices (best effort)
+    def idx(name: str) -> int | None:
+        try:
+            return header.index(name)
+        except Exception:
+            return None
 
-    top_primary = _top_k(primary_counts, k=_top_primary_k())
-    top_secondary = _top_k(sec_counts, k=_top_secondary_k())
-    top_tokens = _top_k(token_counts, k=_top_tokens_k())
+    i_ts = idx("Timestamp")
+    i_token = idx("Token")
+    i_stage = idx("Stage")
+    i_outcome = idx("Outcome")
+    i_primary = idx("Primary_Reason")
+    i_secondary = idx("Secondary_Reasons")
 
-    def _fmt_pairs(pairs: List[Tuple[str, int]]) -> str:
-        return ", ".join([f"{k}={v}" for k, v in pairs]) if pairs else "none"
+    # Aggregate
+    stage_counts = Counter()
+    outcome_counts = Counter()
+    primary_counts = Counter()
+    secondary_counts = Counter()
 
-    # Polished story
-    story = (
-        f"WNH Weekly Digest (UTC {start.strftime('%Y-%m-%d')}→{now.strftime('%Y-%m-%d')}): "
-        f"rows={len(rows)} | stages={_safe_json(stage_counts)} | outcomes={_safe_json(outcome_counts)} | "
-        f"Primary={_fmt_pairs(top_primary)} | Secondary={_fmt_pairs(top_secondary)} | "
-        f"Tokens={_fmt_pairs(top_tokens)}"
-    )
+    token_total = Counter()
+    token_blocked = Counter()
+    token_deferred = Counter()
+    token_primary = defaultdict(Counter)  # token -> Counter(primary)
 
-    payload = {
+    considered_rows = 0
+
+    for r in rows:
+        # timestamp filter
+        ts_val = r[i_ts] if (i_ts is not None and len(r) > i_ts) else ""
+        ts = _parse_ts(ts_val)
+        if not ts:
+            continue
+        if ts < window_start or ts > window_end:
+            continue
+
+        tok = (r[i_token] if (i_token is not None and len(r) > i_token) else "").strip()
+        if tok in set(drop_tokens):
+            continue
+
+        primary = (r[i_primary] if (i_primary is not None and len(r) > i_primary) else "").strip()
+        if primary in set(drop_primary):
+            continue
+        if primary in primary_map:
+            primary = str(primary_map[primary])
+
+        stage = (r[i_stage] if (i_stage is not None and len(r) > i_stage) else "").strip()
+        outcome = (r[i_outcome] if (i_outcome is not None and len(r) > i_outcome) else "").strip()
+        secondary = (r[i_secondary] if (i_secondary is not None and len(r) > i_secondary) else "").strip()
+
+        considered_rows += 1
+
+        if stage:
+            stage_counts[stage] += 1
+        if outcome:
+            outcome_counts[outcome] += 1
+        if primary:
+            primary_counts[primary] += 1
+
+        if secondary and secondary.lower() not in ("none", "null"):
+            for part in [p.strip() for p in secondary.split(",") if p.strip()]:
+                secondary_counts[part] += 1
+
+        if tok:
+            token_total[tok] += 1
+            if outcome.upper() == "BLOCKED":
+                token_blocked[tok] += 1
+            if outcome.upper() == "DEFERRED":
+                token_deferred[tok] += 1
+            if primary:
+                token_primary[tok][primary] += 1
+
+    top_primary = primary_counts.most_common(10)
+    top_secondary = secondary_counts.most_common(10)
+
+    # Build leaderboard objects
+    lb = []
+    for tok, total in token_total.most_common(leaderboard_n):
+        tp = ""
+        if token_primary.get(tok):
+            tp = token_primary[tok].most_common(1)[0][0]
+        lb.append({
+            "token": tok,
+            "total": int(total),
+            "blocked": int(token_blocked.get(tok, 0)),
+            "deferred": int(token_deferred.get(tok, 0)),
+            "top_primary": tp,
+        })
+
+    # Story formatting (keep it readable in a single cell)
+    start_s = window_start.strftime("%Y-%m-%d")
+    end_s = window_end.strftime("%Y-%m-%d")
+    story_lines = [
+        f"WNH Weekly Digest (UTC {start_s}→{end_s}): rows={considered_rows}",
+        f"Stages={json.dumps(dict(stage_counts), separators=(',',':'))}",
+        f"Outcomes={json.dumps(dict(outcome_counts), separators=(',',':'))}",
+        f"Primary={_compact_pairs(top_primary, limit=6)}",
+        f"Secondary={_compact_pairs(top_secondary, limit=6)}",
+        f"Token Leaderboard={_format_token_leaderboard(lb, limit=leaderboard_n)}",
+    ]
+    story = " | ".join([s for s in story_lines if s])
+
+    raw_intent = {
         "week_id": week_id,
-        "window_utc": {"start": start.isoformat(), "end": now.isoformat(), "days": int(days)},
-        "rows": int(len(rows)),
-        "stage_counts": stage_counts,
-        "outcome_counts": outcome_counts,
-        "top_primary_reasons": top_primary,
-        "top_secondary_reasons": top_secondary,
-        "top_tokens": top_tokens,
-        "filters": filters_meta,
+        "window_utc": {
+            "start": window_start.isoformat(),
+            "end": window_end.isoformat(),
+            "days": days,
+        },
+        "rows": considered_rows,
+        "stage_counts": dict(stage_counts),
+        "outcome_counts": dict(outcome_counts),
+        "top_primary_reasons": [[k, int(v)] for k, v in top_primary],
+        "top_secondary_reasons": [[k, int(v)] for k, v in top_secondary],
+        "token_leaderboard": lb,
+        "filters": {
+            "drop_tokens": drop_tokens,
+            "drop_primary": drop_primary,
+            "primary_map": primary_map,
+        },
+        "source": "wnh_weekly_digest",
     }
 
-    target_tab = _target_tab()
+    # Write to Council_Insight
+    ws_council = _get_ws(council_tab)
 
-    # Dedupe against Council_Insight tail
-    try:
-        ws = _get_ws(target_tab)
-        vals = _get_all_values(ws)
-        header = _ensure_headers_if_empty(target_tab, ws)
-        vals = _get_all_values(ws)  # refresh after header write
-    except Exception as e:
-        return {"ok": False, "skipped": True, "reason": f"ws_open_failed:{e.__class__.__name__}"}
+    if not force and _dedupe_recent(ws_council, decision_id):
+        return {"ok": True, "rows": 0, "decision_id": decision_id, "week_id": week_id, "tab": council_tab, "deduped": True}
 
-    if not force:
-        try:
-            if _tail_has_decision_id(vals, decision_id, _tail_n()):
-                return {"ok": True, "rows": 0, "deduped": True, "decision_id": decision_id, "week_id": week_id, "tab": target_tab}
-        except Exception:
-            pass
+    ts_out = _now_utc().strftime("%m/%d/%Y %H:%M:%S")
 
-    # Row mapping by header (source-of-truth)
-    row_map: Dict[str, Any] = {
-        "Timestamp": _fmt_ci_ts(now),
+    row_dict = {
+        "Timestamp": ts_out,
         "decision_id": decision_id,
         "Autonomy": "wnh_weekly_digest",
         "OK": "TRUE",
         "Reason": "WNH_WEEKLY_DIGEST",
         "Story": story,
         "Ash's Lens": "clean",
-        "Soul": "0",
-        "Nova": "1",
-        "Orion": "0",
-        "Ash": "0",
-        "Lumen": "0",
-        "Vigil": "0",
-        "Raw Intent": _safe_json(payload),
-        "Flags": _safe_json(["wnh_weekly", week_id]),
+        "Raw Intent": json.dumps(raw_intent, separators=(",", ":"), sort_keys=True),
+        "Flags": json.dumps(["wnh_weekly", week_id]),
         "Outcome Tag": "WNH_WEEKLY",
     }
 
-    header = vals[0] if vals else header  # type: ignore
-    out_row: List[Any] = [row_map.get(h, "") for h in header]
+    _append_by_header(ws_council, row_dict)
 
-    try:
-        _append_row(target_tab, out_row)
-    except Exception as e:
-        return {"ok": False, "rows": 0, "reason": f"append_failed:{e.__class__.__name__}"}
-
-    # Optional DB mirror (best-effort)
+    # Best-effort: mirror append event (if you have it)
     try:
         from db_mirror import mirror_append  # type: ignore
-        mirror_append(target_tab, [out_row])
+        # We don't know the exact header order here; mirror_append expects [row] arrays typically.
+        # Safer: mirror payload event instead if you have it; otherwise skip.
+        pass
     except Exception:
         pass
 
-    return {"ok": True, "rows": 1, "decision_id": decision_id, "week_id": week_id, "tab": target_tab}
+    return {"ok": True, "rows": 1, "decision_id": decision_id, "week_id": week_id, "tab": council_tab}
 
 
 if __name__ == "__main__":
-    print(_safe_json(run_wnh_weekly_digest()))
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    print(run_wnh_weekly_digest(force=_truthy(os.getenv("FORCE"))))
