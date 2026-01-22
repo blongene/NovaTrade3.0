@@ -1,49 +1,24 @@
-#!/usr/bin/env python3
-"""
-wnh_weekly_digest.py
+# wnh_weekly_digest.py
+# Weekly WNH → Council_Insight digest (presentation-only)
+# - Rolls up last N days (default 7) from Why_Nothing_Happened
+# - Writes 1 row per ISO week: decision_id=wnh_weekly_YYYY-Www
+# - Idempotent: skips if decision_id already exists (unless force=True)
+# - Polished: filters test/wiring noise, normalizes APPROVED_DRYRUN -> APPROVED_BUT_GATED
 
-Weekly Why_Nothing_Happened → Council_Insight digest.
-
-Purpose
--------
-During observation mode, WNH explains *why* nothing executed. This weekly digest turns that surface
-into a single Council_Insight row so you can see trendlines without scrolling.
-
-Design
-------
-- Observation-safe (no enqueue, no trading)
-- Best-effort (never raises)
-- DB+Sheet mirror (append to Sheet, then best-effort mirror_append)
-- Cross-instance dedupe by decision_id in Council_Insight tail
-- JSON-first: reads DB_READ_JSON.wnh.{enabled,tab,weekly_digest.{enabled,tail_n,target_tab}}
-
-Output
-------
-Appends 1 row/week to Council_Insight with:
-- decision_id = wnh_weekly_<YYYY>-W<WW>
-- Reason = WNH_WEEKLY_DIGEST
-- Story = human-readable summary
-- Raw Intent = JSON payload of counts (stages/outcomes/reasons/etc)
-
-If Council_Insight headers differ, we map by header row (source-of-truth) and only fill known fields.
-"""
 from __future__ import annotations
 
-import os
 import json
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Tuple
+import os
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 
-def _truthy(v: Any) -> bool:
-    if v is None:
-        return False
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return v != 0
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+DEFAULT_WNH_TAB = "Why_Nothing_Happened"
+DEFAULT_TARGET_TAB = "Council_Insight"
 
+
+# ---------- config helpers ----------
 
 def _load_db_read_json() -> Dict[str, Any]:
     raw = (os.getenv("DB_READ_JSON") or "").strip()
@@ -55,305 +30,339 @@ def _load_db_read_json() -> Dict[str, Any]:
     except Exception:
         return {}
 
-
-def _wnh_cfg() -> Dict[str, Any]:
-    cfg = _load_db_read_json()
-    w = cfg.get("wnh") or {}
-    return w if isinstance(w, dict) else {}
-
-
-def _enabled() -> bool:
-    # Overall WNH master enable
-    if not _truthy(_wnh_cfg().get("enabled", 0)):
+def _truthy(v: Any) -> bool:
+    if v is None:
         return False
-    # Weekly digest sub-enable (default ON when wnh.enabled is ON)
-    wd = (_wnh_cfg().get("weekly_digest") or {})
-    if isinstance(wd, dict) and "enabled" in wd:
-        return _truthy(wd.get("enabled"))
-    return True
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+def _cfg() -> Dict[str, Any]:
+    cfg = _load_db_read_json()
+    wnh = cfg.get("wnh") or {}
+    if isinstance(wnh, dict):
+        weekly = wnh.get("weekly_digest") or {}
+        if isinstance(weekly, dict):
+            return weekly
+    return {}
 
 def _wnh_tab() -> str:
-    return str(_wnh_cfg().get("tab") or "Why_Nothing_Happened").strip() or "Why_Nothing_Happened"
-
-
-def _target_tab() -> str:
-    wd = (_wnh_cfg().get("weekly_digest") or {})
-    if isinstance(wd, dict):
-        t = str(wd.get("target_tab") or "Council_Insight").strip()
+    cfg = _load_db_read_json()
+    wnh = cfg.get("wnh") or {}
+    if isinstance(wnh, dict):
+        t = str(wnh.get("tab") or "").strip()
         if t:
             return t
-    return "Council_Insight"
+    return DEFAULT_WNH_TAB
 
+def _target_tab() -> str:
+    c = _cfg()
+    t = str(c.get("target_tab") or "").strip()
+    return t or DEFAULT_TARGET_TAB
+
+def _enabled() -> bool:
+    c = _cfg()
+    # default ON if file exists (safe: idempotent + presentation-only)
+    if "enabled" in c:
+        return _truthy(c.get("enabled"))
+    return True
 
 def _tail_n() -> int:
-    wd = (_wnh_cfg().get("weekly_digest") or {})
+    c = _cfg()
     try:
-        n = int((wd or {}).get("tail_n") or 250)
-        return max(60, min(n, 2000))
+        n = int(c.get("tail_n") or 300)
+        return max(50, min(n, 2000))
     except Exception:
-        return 250
+        return 300
 
+def _window_days() -> int:
+    c = _cfg()
+    try:
+        d = int(c.get("window_days") or 7)
+        return max(3, min(d, 21))
+    except Exception:
+        return 7
 
-def _utc_now_dt() -> datetime:
+def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+def _now_ts_str_localish() -> str:
+    # your sheet shows "1/22/2026 2:31:01" style; we mimic month/day/year no leading zeros
+    dt = _now_utc().astimezone(timezone.utc)
+    return dt.strftime("%-m/%-d/%Y %-H:%M:%S") if os.name != "nt" else dt.strftime("%m/%d/%Y %H:%M:%S")
 
-def _fmt_ci_ts(dt: datetime) -> str:
-    # Council_Insight historically uses M/D/YYYY H:MM:SS
-    return f"{dt.month}/{dt.day}/{dt.year} {dt.hour}:{dt.minute:02d}:{dt.second:02d}"
 
+# ---------- sheets helpers ----------
 
-def _safe_json(obj: Any) -> str:
+def _open_ws(tab: str):
     try:
-        return json.dumps(obj, ensure_ascii=False, default=str, separators=(",", ":"))
+        from utils import get_ws_cached  # type: ignore
+        return get_ws_cached(tab, ttl_s=30)
     except Exception:
-        return "{}"
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
 
+        sheet_url = os.getenv("SHEET_URL")
+        if not sheet_url:
+            raise RuntimeError("SHEET_URL not set")
 
-def _parse_ts_any(v: Any) -> float | None:
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).strip()
-    if not s:
-        return None
-    s = s.replace("T", " ")
-    # common: "YYYY-MM-DD HH:MM:SS" (UTC)
-    try:
-        if "." in s:
-            s = s.split(".", 1)[0]
-        if len(s) == 10 and s[4] == "-":
-            dt = datetime.strptime(s, "%Y-%m-%d")
-        else:
-            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-        return dt.replace(tzinfo=timezone.utc).timestamp()
-    except Exception:
-        # as a last resort, accept M/D/YYYY H:MM:SS
+        svc = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if not svc:
+            raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS not set")
+
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(svc, scope)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_url(sheet_url)
+
         try:
-            dt = datetime.strptime(s, "%m/%d/%Y %H:%M:%S")
-            return dt.replace(tzinfo=timezone.utc).timestamp()
+            return sh.worksheet(tab)
         except Exception:
-            return None
-
-
-def _read_wnh_rows() -> List[Dict[str, Any]]:
-    tab = _wnh_tab()
-
-    # Prefer DB-first adapter if available (DB+Sheet mirror architecture)
-    try:
-        from db_read_adapter import get_records_prefer_db  # type: ignore
-        from utils import get_records_cached  # type: ignore
-
-        rows = get_records_prefer_db(
-            tab,
-            f"sheet_mirror:{tab}",
-            sheets_fallback_fn=lambda *args, **kwargs: get_records_cached(tab),
-        )
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        pass
-
-    # Fallback to Sheets cached reader
-    try:
-        from utils import get_records_cached  # type: ignore
-        rows = get_records_cached(tab)
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        return []
-
-
-def _count_by(rows: List[Dict[str, Any]], key: str) -> Dict[str, int]:
-    out: Dict[str, int] = {}
-    for r in rows:
-        v = (r.get(key) or "") if isinstance(r, dict) else ""
-        s = str(v).strip() or "(blank)"
-        out[s] = out.get(s, 0) + 1
-    return out
-
-
-def _top_k(d: Dict[str, int], k: int = 6) -> List[Tuple[str, int]]:
-    return sorted(d.items(), key=lambda x: (-x[1], x[0]))[:k]
-
-
-def _filter_window(rows: List[Dict[str, Any]], start_ts: float, end_ts: float) -> List[Dict[str, Any]]:
-    out = []
-    for r in rows:
-        ts = _parse_ts_any((r or {}).get("Timestamp"))
-        if ts is None:
-            continue
-        if start_ts <= ts <= end_ts:
-            out.append(r)
-    return out
-
-
-def _iso_week_id(dt: datetime) -> str:
-    iso = dt.isocalendar()
-    return f"{iso.year}-W{iso.week:02d}"
-
-
-def _get_ws(tab: str):
-    from utils import get_ws_cached  # type: ignore
-    return get_ws_cached(tab, ttl_s=30)
-
+            return sh.add_worksheet(title=tab, rows=4000, cols=30)
 
 def _get_all_values(ws) -> List[List[str]]:
     try:
-        return ws.get_all_values() or []
+        return ws.get_all_values()
     except Exception:
         return []
 
-
-def _ensure_headers_if_empty(tab: str, ws) -> List[str]:
+def _header(ws) -> List[str]:
     vals = _get_all_values(ws)
-    if vals and vals[0]:
-        return vals[0]
-
-    # If empty, create a minimal Council_Insight header (your sheet usually already exists)
-    header = [
-        "Timestamp",
-        "decision_id",
-        "Autonomy",
-        "OK",
-        "Reason",
-        "Story",
-        "Ash's Lens",
-        "Soul",
-        "Nova",
-        "Orion",
-        "Ash",
-        "Lumen",
-        "Vigil",
-        "Raw Intent",
-        "Patched",
-        "Flags",
-        "Exec Timestamp",
-        "Exec Status",
-        "Exec Cmd_ID",
-        "Exec Notional_USD",
-        "Exec Quote",
-        "Outcome Tag",
-        "Mark Price_USD",
-        "PnL_USD_Current",
-        "PnL_Tag_Current",
-    ]
-    try:
-        ws.append_row(header, value_input_option="USER_ENTERED")
-    except Exception:
-        ws.append_row(header)
-    return header
-
-
-def _tail_has_decision_id(vals: List[List[str]], decision_id: str, tail_n: int) -> bool:
     if not vals:
-        return False
-    header = vals[0] or []
-    try:
-        i = header.index("decision_id")
-    except Exception:
-        return False
-    tail = vals[-tail_n:] if len(vals) > tail_n else vals[1:]
+        return []
+    return [str(x).strip() for x in vals[0]]
+
+def _rows_as_dicts(ws, tail_n: int) -> List[Dict[str, Any]]:
+    vals = _get_all_values(ws)
+    if not vals or len(vals) < 2:
+        return []
+    hdr = vals[0]
+    body = vals[1:]
+    tail = body[-tail_n:] if len(body) > tail_n else body
+    out: List[Dict[str, Any]] = []
     for r in tail:
-        if len(r) > i and (r[i] or "").strip() == decision_id:
-            return True
-    return False
+        d: Dict[str, Any] = {}
+        for i, k in enumerate(hdr):
+            if not k:
+                continue
+            d[k] = r[i] if i < len(r) else ""
+        out.append(d)
+    return out
 
+def _append_row_dict(tab: str, row_dict: Dict[str, Any]) -> Dict[str, Any]:
+    ws = _open_ws(tab)
+    hdr = _header(ws)
+    if not hdr:
+        return {"ok": False, "reason": "missing_header_row"}
 
-def _append_row(tab: str, row: List[Any]) -> None:
-    # Prefer shared append helper if present (rate-limit safe)
+    out = [row_dict.get(h, "") for h in hdr]
+
     try:
-        from utils import get_ws_cached, ws_append_row  # type: ignore
-        ws = get_ws_cached(tab, ttl_s=30)
-        ws_append_row(ws, row)
-        return
+        ws.append_row(out, value_input_option="USER_ENTERED")
+    except Exception:
+        ws.append_row(out)
+
+    # Optional DB mirror
+    try:
+        from db_mirror import mirror_append  # type: ignore
+        mirror_append(tab, [out])
     except Exception:
         pass
-    ws = _get_ws(tab)
+
+    return {"ok": True}
+
+
+# ---------- parsing + normalization ----------
+
+def _parse_ts_any(v: Any) -> Optional[datetime]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+
+    # WNH timestamps appear as "YYYY-MM-DD HH:MM:SS" in your sheet.
+    s_norm = s.replace("T", " ")
     try:
-        ws.append_row(row, value_input_option="USER_ENTERED")
+        if "." in s_norm:
+            s_norm = s_norm.split(".", 1)[0]
+        dt = datetime.strptime(s_norm, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc)
     except Exception:
-        ws.append_row(row)
+        pass
+
+    # Sometimes Sheets render "1/22/2026 2:31:01"
+    try:
+        dt = datetime.strptime(s, "%m/%d/%Y %H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+
+    return None
+
+def _iso_week_id(dt: datetime) -> str:
+    y, w, _ = dt.isocalendar()
+    return f"{y}-W{w:02d}"
+
+# Normalize legacy terms into canonical language
+PRIMARY_MAP = {
+    "APPROVED_DRYRUN": "APPROVED_BUT_GATED",
+}
+
+# Noise filters (primary reasons / tokens)
+NOISE_PRIMARY = {
+    "SELF_TEST",
+    "DAILY_SUMMARY",
+    "SELF_TEST_POLICY_DENY (safe)",
+}
+NOISE_TOKEN = {"SYSTEM"}  # keep the system *functional* data out of weekly insight
+
+def _clean_primary(p: str) -> str:
+    p = (p or "").strip()
+    return PRIMARY_MAP.get(p, p) if p else "UNKNOWN"
+
+def _split_secondary(s: str) -> List[str]:
+    s = (s or "").strip()
+    if not s or s.lower() == "none":
+        return []
+    # common format: "STALE,IMMATURE" or "foo=1, bar=2"
+    parts = [x.strip() for x in s.split(",") if x.strip()]
+    return parts
+
+def _is_noise_secondary(x: str) -> bool:
+    xl = x.lower()
+    # filter wiring/self-test artifacts and "explanatory text" that shouldn't be blockers
+    if "wiring" in xl:
+        return True
+    if "if you can read this row" in xl:
+        return True
+    if "sheets access works" in xl:
+        return True
+    if xl.startswith("self_test"):
+        return True
+    if xl.startswith("daily_summary"):
+        return True
+    # also filter key=value counters that came from the daily summary row being re-ingested
+    if "=" in x and any(k in xl for k in ["stale=", "unknown=", "self_test="]):
+        return True
+    return False
+
+def _filter_rows(rows: List[Dict[str, Any]], start_utc: datetime, end_utc: datetime) -> List[Dict[str, Any]]:
+    out = []
+    for r in rows:
+        ts = _parse_ts_any(r.get("Timestamp"))
+        if not ts:
+            continue
+        if ts < start_utc or ts > end_utc:
+            continue
+
+        token = str(r.get("Token") or "").strip()
+        primary = str(r.get("Primary_Reason") or "").strip()
+
+        # Drop known test/system noise from weekly digest
+        if token in NOISE_TOKEN:
+            # BUT keep SYSTEM rows if they are not noise primaries? For weekly digest, we exclude all SYSTEM by default.
+            continue
+        if primary in NOISE_PRIMARY:
+            continue
+
+        out.append(r)
+    return out
 
 
-def run_wnh_weekly_digest(force: bool = False, window_days: int = 7) -> Dict[str, Any]:
+# ---------- main digest ----------
+
+def run_wnh_weekly_digest(force: bool = False) -> Dict[str, Any]:
     if not _enabled():
-        return {"ok": False, "skipped": True, "reason": "wnh.disabled"}
+        return {"ok": True, "rows": 0, "skipped": True, "reason": "disabled"}
 
-    now = _utc_now_dt()
+    now = _now_utc()
     week_id = _iso_week_id(now)
     decision_id = f"wnh_weekly_{week_id}"
 
-    start = now - timedelta(days=max(1, int(window_days)))
-    start_ts = start.timestamp()
-    end_ts = now.timestamp()
+    wnh_ws = _open_ws(_wnh_tab())
+    rows = _rows_as_dicts(wnh_ws, tail_n=_tail_n())
 
-    # Compute weekly stats
-    rows_all = _read_wnh_rows()
-    rows = _filter_window(rows_all, start_ts, end_ts)
+    # Rolling window: last N days (inclusive)
+    days = _window_days()
+    start = now - timedelta(days=days)
+    end = now
 
-    stage_counts = _count_by(rows, "Stage")
-    outcome_counts = _count_by(rows, "Outcome")
-    reason_counts = _count_by(rows, "Primary_Reason")
+    filtered = _filter_rows(rows, start, end)
 
-    # Secondary reasons are comma-separated; explode for top blockers
-    sec_counts: Dict[str, int] = {}
-    for r in rows:
-        s = str((r or {}).get("Secondary_Reasons") or "").strip()
-        if not s:
-            continue
-        parts = [p.strip() for p in s.split(",") if p.strip()]
-        for p in parts:
-            sec_counts[p] = sec_counts.get(p, 0) + 1
+    # Counters
+    stage_c = Counter()
+    outcome_c = Counter()
+    primary_c = Counter()
+    secondary_c = Counter()
 
-    top_primary = _top_k(reason_counts, k=6)
-    top_secondary = _top_k(sec_counts, k=8)
+    for r in filtered:
+        stage = str(r.get("Stage") or "").strip() or "UNKNOWN"
+        outcome = str(r.get("Outcome") or "").strip() or "UNKNOWN"
+        primary = _clean_primary(str(r.get("Primary_Reason") or ""))
+        sec_list = _split_secondary(str(r.get("Secondary_Reasons") or ""))
 
-    top_primary_str = ", ".join([f"{k}={v}" for k, v in top_primary]) if top_primary else "none"
-    top_secondary_str = ", ".join([f"{k}={v}" for k, v in top_secondary]) if top_secondary else "none"
+        stage_c[stage] += 1
+        outcome_c[outcome] += 1
+        primary_c[primary] += 1
+
+        for s in sec_list:
+            s2 = _clean_primary(s)  # allow map here too
+            if _is_noise_secondary(s2):
+                continue
+            secondary_c[s2] += 1
+
+    top_primary = primary_c.most_common(8)
+    top_secondary = secondary_c.most_common(10)
+
+    # Build human story
+    stage_str = json.dumps(dict(stage_c), separators=(",", ":"), ensure_ascii=False) if stage_c else "{}"
+    outcome_str = json.dumps(dict(outcome_c), separators=(",", ":"), ensure_ascii=False) if outcome_c else "{}"
+    prim_str = ", ".join([f"{k}={v}" for k, v in top_primary]) if top_primary else "none"
+    sec_str = ", ".join([f"{k}={v}" for k, v in top_secondary]) if top_secondary else "none"
 
     story = (
-        f"WNH Weekly Digest (UTC {start.strftime('%Y-%m-%d')}→{now.strftime('%Y-%m-%d')}): "
-        f"rows={len(rows)} | stages={_safe_json(stage_counts)} | outcomes={_safe_json(outcome_counts)} | "
-        f"Primary={top_primary_str} | Secondary={top_secondary_str}"
+        f"WNH Weekly Digest (UTC {start.date()}→{end.date()}): rows={len(filtered)} "
+        f"| stages={stage_str} | outcomes={outcome_str} | Primary={prim_str} | Secondary={sec_str}"
     )
 
     payload = {
         "week_id": week_id,
         "window_utc": {
             "start": start.isoformat(),
-            "end": now.isoformat(),
-            "days": int(window_days),
+            "end": end.isoformat(),
+            "days": days,
         },
-        "rows": int(len(rows)),
-        "stage_counts": stage_counts,
-        "outcome_counts": outcome_counts,
+        "rows": len(filtered),
+        "stage_counts": dict(stage_c),
+        "outcome_counts": dict(outcome_c),
         "top_primary_reasons": top_primary,
         "top_secondary_reasons": top_secondary,
+        "filters": {
+            "drop_tokens": sorted(list(NOISE_TOKEN)),
+            "drop_primary": sorted(list(NOISE_PRIMARY)),
+            "primary_map": PRIMARY_MAP,
+        },
     }
 
     target_tab = _target_tab()
+    t_ws = _open_ws(target_tab)
 
-    # Dedupe (read target sheet tail)
-    try:
-        ws = _get_ws(target_tab)
-        vals = _get_all_values(ws)
-        header = _ensure_headers_if_empty(target_tab, ws)
-        vals = _get_all_values(ws)  # refresh after header write
-    except Exception as e:
-        return {"ok": False, "skipped": True, "reason": f"ws_open_failed:{e.__class__.__name__}"}
-
+    # Idempotency: skip if decision_id already exists in recent tail (unless force)
     if not force:
-        try:
-            if _tail_has_decision_id(vals, decision_id, _tail_n()):
-                return {"ok": True, "rows": 0, "deduped": True, "decision_id": decision_id}
-        except Exception:
-            pass
+        tail = _rows_as_dicts(t_ws, tail_n=800)
+        for r in tail:
+            if str(r.get("decision_id") or "").strip() == decision_id:
+                return {"ok": True, "rows": 0, "skipped": True, "reason": "already_emitted", "decision_id": decision_id, "week_id": week_id}
 
-    # Build row in target header order (source-of-truth)
-    # Fill known fields; unknown remain blank.
-    row_map: Dict[str, Any] = {
-        "Timestamp": _fmt_ci_ts(now),
+    # Map to Council_Insight headers (fill what exists; header-driven append does the right thing)
+    row = {
+        "Timestamp": _now_ts_str_localish(),
         "decision_id": decision_id,
         "Autonomy": "wnh_weekly_digest",
         "OK": "TRUE",
@@ -361,35 +370,22 @@ def run_wnh_weekly_digest(force: bool = False, window_days: int = 7) -> Dict[str
         "Story": story,
         "Ash's Lens": "clean",
         "Soul": "0",
-        "Nova": "1",
+        "Nova": "0",
         "Orion": "0",
         "Ash": "0",
         "Lumen": "0",
         "Vigil": "0",
-        "Raw Intent": _safe_json(payload),
-        "Flags": _safe_json(["wnh_weekly", week_id]),
+        "Raw Intent": json.dumps(payload, ensure_ascii=False),
+        "Flags": json.dumps(["wnh_weekly", week_id]),
         "Outcome Tag": "WNH_WEEKLY",
     }
 
-    header = vals[0] if vals else header  # type: ignore
-    out_row: List[Any] = []
-    for h in header:
-        out_row.append(row_map.get(h, ""))
+    res = _append_row_dict(target_tab, row)
+    if not res.get("ok"):
+        return res
 
-    try:
-        _append_row(target_tab, out_row)
-    except Exception as e:
-        return {"ok": False, "rows": 0, "reason": f"append_failed:{e.__class__.__name__}"}
-
-    # Optional DB mirror (best-effort)
-    try:
-        from db_mirror import mirror_append  # type: ignore
-        mirror_append(target_tab, [out_row])
-    except Exception:
-        pass
-
-    return {"ok": True, "rows": 1, "decision_id": decision_id, "week_id": week_id}
+    return {"ok": True, "rows": 1, "decision_id": decision_id, "week_id": week_id, "tab": target_tab}
 
 
 if __name__ == "__main__":
-    print(_safe_json(run_wnh_weekly_digest()))
+    print(run_wnh_weekly_digest(force=True))
