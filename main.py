@@ -9,6 +9,7 @@ from policy_bias_engine import run_policy_bias_builder
 from telegram_summaries import run_telegram_summaries
 from stalled_autotrader import run_stalled_autotrader_shadow
 from sheet_mirror_parity_validator import run_sheet_mirror_parity_validator
+from sheet_mirror_worker import run_sheet_mirror_worker
 
 # Enable asynchronous Sheets gateway flusher
 try:
@@ -291,7 +292,8 @@ def _council_index_every_min(default: int) -> int:
     
 def _set_schedules():
     # Frequent cadence / watchers
-    _schedule("Nova Trigger Watcher",          "nova_trigger_watcher",       "check_nova_trigger",            every=2,  unit="minutes")
+    _schedule("Council Event Poller",         "sheet_mirror_worker",         "run_sheet_mirror_worker",       every=5,  units="minutes")
+    _schedule("Nova Trigger Watcher",         "nova_trigger_watcher",        "check_nova_trigger",            every=2,  unit="minutes")
     _schedule("Planner→Log Sync",             "planner_to_log_sync",         "run_planner_to_log_sync",       every=30, unit="minutes")
     _schedule("Council Drift Detector",       "council_drift_detector",      "run_council_drift_detector",    every=30, unit="minutes")
     _schedule("Milestone Alerts",             "milestone_alerts",            "run_milestone_alerts",          every=1,  unit="hours")
