@@ -1,4 +1,4 @@
-# /tools/seed_alpha_would_trade.py
+# tools/seed_alpha_would_trade.py
 from __future__ import annotations
 
 import os
@@ -9,8 +9,8 @@ from datetime import datetime, timezone
 import psycopg2
 
 
-def utc_now():
-    return datetime.now(timezone.utc)
+def utc_day():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def main():
@@ -26,19 +26,17 @@ def main():
     token = "TESTTRADE"
     action = "WOULD_TRADE"
     confidence = 0.42
-    venue = "COINBASE"
-    symbol = "TESTTRADE/USDC"
 
-    today = utc_now().strftime("%Y-%m-%d")
+    today = utc_day()
     proposal_hash = f"{token}|{action}|{today}"
 
     payload = {
         "token": token,
-        "venue": venue,
-        "symbol": symbol,
+        "action": action,
         "confidence": confidence,
         "source": "seed_alpha_would_trade",
         "note": "Synthetic test proposal for WNH coverage",
+        "utc_day": today,
     }
 
     cur.execute(
@@ -49,11 +47,10 @@ def main():
             token,
             action,
             confidence,
-            payload,
-            created_at
+            payload
         )
-        values (%s, %s, %s, %s, %s, %s::jsonb, %s)
-        on conflict do nothing
+        values (%s, %s, %s, %s, %s, %s::jsonb)
+        on conflict (proposal_hash) do nothing
         """,
         (
             proposal_id,
@@ -62,7 +59,6 @@ def main():
             action,
             confidence,
             json.dumps(payload),
-            utc_now(),
         ),
     )
 
