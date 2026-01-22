@@ -169,6 +169,7 @@ from telemetry_digest import run_telemetry_digest
 from unified_snapshot import run_unified_snapshot
 from telemetry_mirror import run_telemetry_mirror
 from wallet_monitor import run_wallet_monitor
+from wnh_weekly_digest import run_wnh_weekly_digest
 
 _schedule("Telemetry Digest", "telemetry_digest", "run_telemetry_digest", when="13:10")
 
@@ -348,6 +349,7 @@ def _set_schedules():
     _schedule("Council Outcomes+PnL Rollup", "council_outcomes_pnl_rollup",  "run_council_outcomes_pnl_rollup", every=_council_pnl_every_min(15), unit="minutes")
     _schedule("Council Analytics Rollup",    "council_analytics_rollup",     "run_council_analytics_rollup",    every=_council_rollup_every_min(30), unit="minutes")
     _schedule("Council Index Health Tick",   "council_index_health_tick",    "run_index_health_tick",           every=_council_index_every_min(15), unit="minutes")
+    _schedule("WNH Weekly Digest",           "wnh_weekly_digest",            "run_wnh_weekly_digest",           when="13:15")
 
     # DB parity (Phase 22B)
     try:
