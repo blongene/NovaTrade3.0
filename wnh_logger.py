@@ -346,6 +346,9 @@ def _self_test() -> Dict[str, Any]:
     )
     return {"ok": True, "attempted_write": bool(ok), "tab": tab_name()}
 
+# NOTE: FROZEN API
+# append_row_dict(row: dict) is a stable interface.
+# Do not change signature or behavior without system-wide review.
 def append_row_dict(row: dict) -> dict:
     """
     Append a Why_Nothing_Happened row using dict->sheet-header mapping.
