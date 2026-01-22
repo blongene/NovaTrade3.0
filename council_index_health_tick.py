@@ -182,7 +182,7 @@ def run_council_index_health_tick(force: bool = False) -> Dict[str, Any]:
         except Exception as e:
             issues.append(f"{tab}:{e.__class__.__name__}")
 
-    decision_id = f"index_health_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
+    decision_id = f"index_health_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
     dedupe_key = f"council_index_health:{'|'.join(issues) if issues else 'ok'}"
     if not force and _dedup_send(dedupe_key, ttl_sec=_dedupe_ttl()):
         return {"ok": True, "rows": 0, "deduped": True, "issues": issues}
@@ -201,7 +201,8 @@ def run_council_index_health_tick(force: bool = False) -> Dict[str, Any]:
             "Flags": json.dumps(["index_health"], ensure_ascii=False),
             "Raw Intent": json.dumps({"check_tabs": _check_tabs(), "issues": issues}, ensure_ascii=False),
         }
-        _append_dict(_tabname(), row)
+        from event_store import put_council_event
+        put_council_event(decision_id, row, tab=_tabname())
         return {"ok": True, "rows": 1, "issues": issues, "tab": _tabname(), "decision_id": decision_id}
 
     return {"ok": True, "rows": 0, "issues": issues}
