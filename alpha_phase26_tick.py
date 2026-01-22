@@ -110,7 +110,7 @@ def run_alpha_phase26_tick() -> None:
             run_wnh_daily_summary()
         except Exception:
             pass
-except Exception as e:
+    except Exception as e:
         try:
             from utils import warn
             warn(f"alpha_phase26_tick: alpha WNH mirror failed: {e}")
