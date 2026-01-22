@@ -260,6 +260,13 @@ def run_wnh_daily_summary(force: bool = False) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "rows": 0, "reason": f"append_failed:{e.__class__.__name__}"}
 
+    # After successful append to Why_Nothing_Happened:
+    try:
+        from wnh_decision_analytics_rollup import emit_wnh_daily_rollup
+        emit_wnh_daily_rollup(utc_day, summary_dict)  # use the same summary you already built
+    except Exception:
+        pass
+
     # Optional DB mirror (best-effort)
     try:
         from db_mirror import mirror_append  # type: ignore
