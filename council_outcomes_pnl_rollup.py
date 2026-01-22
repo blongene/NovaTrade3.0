@@ -227,7 +227,7 @@ def run_council_outcomes_pnl_rollup(force: bool = False) -> Dict[str, Any]:
                 "Flags": json.dumps((intent or {}).get("flags") or [], ensure_ascii=False),
                 "Exec Timestamp": created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "Exec Status": status,
-                "Exec Cmd_ID": str(cmd_id),
+                "Exec Cmd_ID": cmd_id,
                 "Exec Notional_USD": float(amount_usd) if amount_usd not in ("", None) else "",
                 "Exec Quote": quote,
                 "Outcome Tag": status,
@@ -237,8 +237,13 @@ def run_council_outcomes_pnl_rollup(force: bool = False) -> Dict[str, Any]:
                 "PnL_Tag_Current": "",
             }
 
-            _append_dict(tab, row)
-            _note_row_hash(cur, tab, row_hash, {"decision_id": decision_id, "status": status, "cmd_id": cmd_id})
+            from event_store import put_council_event
+            
+            put_council_event(
+                decision_id=decision_id,
+                payload=row,
+                tab=tab,  # "Council_Insight"
+            )
             rows_written += 1
 
-    return {"ok": True, "rows": rows_written, "tab": tab, "lookback_hours": _lookback_hours()}
+    return {"ok": True, "rows": rows_written, "decision_id": decision_id, "tab": tab, "lookback_hours": _lookback_hours()}
