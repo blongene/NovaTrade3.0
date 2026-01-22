@@ -295,6 +295,12 @@ def _set_schedules():
     _schedule("Stalled Autotrader (Shadow)",  "stalled_autotrader",          "run_stalled_autotrader_shadow", every=6, unit="hours")
     _schedule("Sheet Mirror Parity Validator", "sheet_mirror_parity_validator", "run_sheet_mirror_parity_validator", every=6, unit="hours")
 
+    # --- Council rollups (Bus/DB-driven; Sheets-mirrored) -------------------
+    # These modules should self-gate on DB_READ_JSON so scheduling them is always safe.
+    _schedule("Council Outcomes+PnL Rollup", "council_outcomes_pnl_rollup",  "run_council_outcomes_pnl_rollup", every=_council_pnl_every_min(15), unit="minutes")
+    _schedule("Council Analytics Rollup",    "council_analytics_rollup",     "run_council_analytics_rollup",    every=_council_rollup_every_min(30), unit="minutes")
+    _schedule("Council Index Health Tick",   "council_index_health_tick",    "run_index_health_tick",           every=_council_index_every_min(15), unit="minutes")
+
     # DB parity (Phase 22B)
     try:
         from db_parity_validator import run_db_parity_validator
@@ -303,6 +309,56 @@ def _set_schedules():
     except Exception as e:
         print(f"DB parity validator not scheduled: {e}", flush=True)
 
+def _council_rollup_every_min(default: int) -> int:
+    """
+    Read cadence from DB_READ_JSON if present (preferred), else fall back to env, else default.
+    Keeps env-var count low.
+    """
+    try:
+        raw = (os.getenv("DB_READ_JSON") or "").strip()
+        if raw:
+            cfg = json.loads(raw)
+            council = cfg.get("council_rollups") or {}
+            if isinstance(council, dict):
+                v = council.get("every_min")
+                if v is not None:
+                    return max(5, int(v))
+    except Exception:
+        pass
+    try:
+        return max(5, int(os.getenv("COUNCIL_ROLLUPS_EVERY_MIN", str(default)) or str(default)))
+    except Exception:
+        return default
+
+
+def _council_pnl_every_min(default: int) -> int:
+    try:
+        raw = (os.getenv("DB_READ_JSON") or "").strip()
+        if raw:
+            cfg = json.loads(raw)
+            council = cfg.get("council_rollups") or {}
+            if isinstance(council, dict):
+                v = council.get("pnl_every_min")
+                if v is not None:
+                    return max(5, int(v))
+    except Exception:
+        pass
+    return default
+
+
+def _council_index_every_min(default: int) -> int:
+    try:
+        raw = (os.getenv("DB_READ_JSON") or "").strip()
+        if raw:
+            cfg = json.loads(raw)
+            council = cfg.get("council_rollups") or {}
+            if isinstance(council, dict):
+                v = council.get("index_every_min")
+                if v is not None:
+                    return max(5, int(v))
+    except Exception:
+        pass
+    return default
 
 
 def _kick_once_and_threads():
