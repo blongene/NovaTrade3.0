@@ -263,10 +263,11 @@ def build_decision() -> Dict[str, Any]:
         "rebuy": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="REBUY_CANDIDATE"][:5],
         "watch": [f'{s.get("token")} ({int(float(s.get("confidence") or 0)*100)}%)' for s in signals if s.get("type")=="WATCH"][:5],
     }
+    summary["noop"] = (recommendation == "NOOP")
 
     decision_id = os.urandom(8).hex()
 
-    return {
+    out = {
         "ok": bool(ok),
         "decision_id": decision_id,
         "ts": _now_ts(),
