@@ -4,26 +4,22 @@ Purpose
 - Formalize the trust boundary for Edge command leasing (/api/commands/pull).
 - Only lease commands when the requesting agent is considered *healthy*.
 
-Design goals
-- No new Bus env vars required (Render env var limits).
-- Optional configuration via DB_READ_JSON:
-    {
-      "edge_authority": {
-        "enabled": 1,
-        "max_age_sec": 300,
-        "allow_agents": ["edge-primary","edge-nl1"]
-      }
-    }
+Config (via DB_READ_JSON; no new env vars)
+{
+  "edge_authority": {
+    "enabled": 1,
+    "max_age_sec": 7200,
+    "allow_agents": ["edge-primary","edge-nl1"]
+  }
+}
+
+DB-first posture
+- Prefer Postgres telemetry (nova_telemetry) when present.
+- Gracefully degrade to Wallet_Monitor freshness, then NovaHeartbeat freshness
+  while telemetry is still being wired during Sheets → DB-first migration.
 
 Fail-safe posture
-- If DB is unavailable or telemetry missing, we treat the agent as NOT trusted
-  (deny lease) but return ok=true with empty commands to avoid retry storms.
-- If you prefer permissive behavior, set edge_authority.enabled=0.
-
-DB-first note
-- Preferred trust signal is Postgres table nova_telemetry.
-- If nova_telemetry is empty/unavailable (common during Sheets→DB migration),
-  we gracefully degrade to Wallet_Monitor and then NovaHeartbeat freshness.
+- If no acceptable freshness signal is available, treat agent as NOT trusted (deny lease).
 """
 
 from __future__ import annotations
@@ -70,6 +66,7 @@ def authority_enabled() -> bool:
 
 
 def max_age_sec() -> int:
+    # Your bundle uses 7200; allow up to 24h safely.
     ea = _cfg()
     try:
         v = int(ea.get("max_age_sec") or 300)
@@ -95,16 +92,16 @@ def _parse_ts(ts: Any) -> Optional[datetime]:
         s = str(ts).strip()
         if not s:
             return None
-        # Sheets format: "YYYY-MM-DD HH:MM:SS"
+        # Common Sheets format: "YYYY-MM-DD HH:MM:SS"
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
 
-def _age_seconds_from_sheet(tab: str, agent_id: str) -> Optional[int]:
+def _age_seconds_from_tab(tab: str, agent_id: str) -> Optional[int]:
     """
-    Fallback: compute age from latest row in a Sheets/Cache tab.
-    get_records_cached() in this codebase already abstracts DB-first vs Sheets mirror.
+    Uses utils.get_records_cached(tab) which in your system already supports DB-first
+    + Sheets mirror behavior depending on configuration.
     """
     try:
         from utils import get_records_cached  # type: ignore
@@ -116,7 +113,7 @@ def _age_seconds_from_sheet(tab: str, agent_id: str) -> Optional[int]:
         if not rows:
             return None
 
-        cand = []
+        best_dt: Optional[datetime] = None
         for r in rows:
             if not isinstance(r, dict):
                 continue
@@ -125,17 +122,15 @@ def _age_seconds_from_sheet(tab: str, agent_id: str) -> Optional[int]:
             if a and a != agent_id:
                 continue
 
-            ts = r.get("Timestamp") or r.get("ts") or r.get("created_at")
-            dt = _parse_ts(ts)
-            if dt:
-                cand.append(dt)
+            dt = _parse_ts(r.get("Timestamp") or r.get("ts") or r.get("created_at"))
+            if dt and (best_dt is None or dt > best_dt):
+                best_dt = dt
 
-        if not cand:
+        if best_dt is None:
             return None
 
-        latest = max(cand)
         now = datetime.now(timezone.utc)
-        return int((now - latest).total_seconds())
+        return int((now - best_dt).total_seconds())
     except Exception:
         return None
 
@@ -143,9 +138,7 @@ def _age_seconds_from_sheet(tab: str, agent_id: str) -> Optional[int]:
 def _latest_telemetry_age_seconds(agent_id: str) -> Optional[int]:
     """
     Preferred: Postgres nova_telemetry.
-    Fallbacks:
-      - Wallet_Monitor freshness
-      - NovaHeartbeat freshness
+    Fallbacks: Wallet_Monitor freshness, then NovaHeartbeat freshness.
     """
     # 1) DB telemetry (best)
     try:
@@ -168,12 +161,13 @@ def _latest_telemetry_age_seconds(agent_id: str) -> Optional[int]:
     except Exception:
         pass
 
-    # 2) Graceful degradation: these are real “edge freshness” surfaces today
-    age = _age_seconds_from_sheet("Wallet_Monitor", agent_id)
+    # 2) Wallet_Monitor (your current “freshness truth”)
+    age = _age_seconds_from_tab("Wallet_Monitor", agent_id)
     if age is not None:
         return age
 
-    age = _age_seconds_from_sheet("NovaHeartbeat", agent_id)
+    # 3) NovaHeartbeat (last resort; often lower cadence)
+    age = _age_seconds_from_tab("NovaHeartbeat", agent_id)
     if age is not None:
         return age
 
@@ -207,7 +201,6 @@ def evaluate_agent(agent_id: str) -> Tuple[bool, str, Optional[int]]:
         return False, "no_telemetry", None
 
     best_agent, best_age = sorted(ages, key=lambda x: x[1])[0]
-
     if best_age > max_age_sec():
         return False, f"stale_telemetry>{max_age_sec()}s", best_age
 
