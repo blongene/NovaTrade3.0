@@ -1,5 +1,7 @@
 Current Operating State (Observation Mode — Production-Grade)
 
+For a mechanical view of phase capabilities, see PHASE_TRUTH_TABLE.md.
+
 NovaTrade is currently operating in Observation Mode with live signal ingestion and proposal generation, while all execution paths remain explicitly disarmed.
 
 Phase 25 runs continuously in decision_only mode for framing, diagnostics, and Council insight. Command enqueue is explicitly disabled.
