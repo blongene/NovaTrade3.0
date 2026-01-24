@@ -186,6 +186,7 @@ def run_council_outcomes_pnl_rollup(force: bool = False) -> Dict[str, Any]:
             (lookback, limit)
         )
         data = cur.fetchall()
+        decision_id = None
 
         for created_at, agent_id, cmd_id, ok, receipt, intent in data:
             receipt = receipt or {}
@@ -246,4 +247,11 @@ def run_council_outcomes_pnl_rollup(force: bool = False) -> Dict[str, Any]:
             )
             rows_written += 1
 
-    return {"ok": True, "rows": rows_written, "decision_id": decision_id, "tab": tab, "lookback_hours": _lookback_hours()}
+    return {
+        "ok": True,
+        "rows": rows_written,
+        "decision_id": decision_id or "",
+        "tab": tab,
+        "lookback_hours": _lookback_hours(),
+    }
+
