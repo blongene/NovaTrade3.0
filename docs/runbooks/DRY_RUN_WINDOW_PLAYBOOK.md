@@ -1,5 +1,7 @@
 # Dry‑Run Window Playbook (Observation → Controlled Verification)
 
+“This playbook assumes the system state described in CURRENT_STATE.md and PHASE_TRUTH_TABLE.md.”
+
 ## Purpose
 
 This playbook defines the **only approved method** for temporarily exercising NovaTrade’s command path while remaining in Observation Mode. It exists to prove wiring, gating, approvals, and rollback — **not** to trade.
