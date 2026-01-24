@@ -18,12 +18,14 @@ A2. Phase Truth Table (simple, visual grounding)
 
 Add a table like this (docs or charter appendix):
 
-Phase	Capability Exists	Actively Running	Can Enqueue	Can Execute
-25	✅ Yes	✅ Yes	❌ No	❌ No
-26A	✅ Yes	✅ Yes	❌ No	❌ No
-26B–E	✅ Yes	❌ Dormant	❌ No	❌ No
-27	✅ Yes	❌ Dormant	❌ No	❌ No
-28	✅ Yes	❌ Dormant	❌ No	❌ No
+| Phase | Exists | Actively Running  | Can Enqueue | Can Execute | Notes                 |
+| ----- | ------ | ----------------- | ----------- | ----------- | --------------------- |
+| 25    | ✅      | ✅ (decision_only) | ❌           | ❌           | Framing + diagnostics |
+| 26A   | ✅      | ✅                 | ❌           | ❌           | Proposals only        |
+| 26B–E | ✅      | ❌                 | ❌           | ❌           | Scaffolded, dormant   |
+| 28    | ✅      | ❌                 | ❌           | ❌           | Proven, closed        |
+| Edge  | ✅      | ✅ (dryrun)        | N/A         | ❌           | LIVE_ARMED=NO         |
+
 
 This makes it impossible to misinterpret status later.
 
